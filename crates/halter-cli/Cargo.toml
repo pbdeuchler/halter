@@ -1,0 +1,31 @@
+[package]
+name = "halter-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+autobins = false
+default-run = "halter"
+
+[[bin]]
+name = "halter"
+path = "src/main.rs"
+
+[[bin]]
+name = "halter-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+halter = { path = "../halter" }
+halter-config = { path = "../halter-config" }
+halter-protocol = { path = "../halter-protocol" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true

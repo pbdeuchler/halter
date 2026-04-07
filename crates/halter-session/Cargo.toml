@@ -1,0 +1,13 @@
+[package]
+name = "halter-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+halter-protocol = { path = "../halter-protocol" }
+tokio.workspace = true
+tracing.workspace = true

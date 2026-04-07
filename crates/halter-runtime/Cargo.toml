@@ -1,0 +1,26 @@
+[package]
+name = "halter-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arc-swap.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+halter-protocol = { path = "../halter-protocol" }
+halter-providers = { path = "../halter-providers" }
+halter-session = { path = "../halter-session" }
+halter-tools = { path = "../halter-tools" }
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

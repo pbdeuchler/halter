@@ -1,0 +1,400 @@
+// pattern: Imperative Shell
+
+use std::sync::Arc;
+
+use anyhow::Context;
+use async_trait::async_trait;
+use halter_protocol::{
+    CloseSubagentRequest, SendSubagentInputRequest, SpawnSubagentRequest, ToolCapabilities,
+    ToolConcurrency, ToolName, ToolResult, ToolSpec, WaitSubagentRequest,
+};
+use serde_json::{Value, json};
+
+use crate::{SubagentControl, Tool, ToolContext, ToolRuntime, ToolRuntimeEvent};
+
+pub fn register_subagent_tools(
+    runtime: &ToolRuntime,
+    control: Arc<dyn SubagentControl>,
+    enabled: &[String],
+) {
+    let register_all = enabled.is_empty();
+    for tool in [
+        Arc::new(SpawnAgentTool::new(control.clone())) as Arc<dyn Tool>,
+        Arc::new(SendInputTool::new(control.clone())),
+        Arc::new(WaitAgentTool::new(control.clone())),
+        Arc::new(CloseAgentTool::new(control.clone())),
+    ] {
+        let tool_name = tool.spec().name.0;
+        if register_all || enabled.iter().any(|name| name == &tool_name) {
+            runtime.register(tool);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SpawnAgentTool {
+    control: Arc<dyn SubagentControl>,
+}
+
+impl SpawnAgentTool {
+    fn new(control: Arc<dyn SubagentControl>) -> Self {
+        Self { control }
+    }
+}
+
+#[async_trait]
+impl Tool for SpawnAgentTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: ToolName::from("spawn_agent"),
+            description: "Spawn a child session to work on a delegated task".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" },
+                    "agent_type": { "type": "string" },
+                    "fork_context": { "type": "boolean" },
+                    "model": { "type": "string" }
+                },
+                "required": ["message"],
+            }),
+            concurrency: ToolConcurrency::Exclusive,
+            capabilities: ToolCapabilities {
+                mutating: false,
+                requires_approval: false,
+                cancellable: false,
+                long_running: false,
+            },
+            provider_aliases: Default::default(),
+        }
+    }
+
+    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+        emit_started(&context, "spawn_agent");
+        let parent = context
+            .subagent_parent
+            .as_ref()
+            .context("failed to execute spawn_agent tool: missing parent session context")?;
+        let request: SpawnSubagentRequest = serde_json::from_value(input)
+            .context("failed to execute spawn_agent tool: invalid input")?;
+        let status = self.control.spawn(parent, request).await?;
+        emit_completed(&context, "spawn_agent");
+        Ok(ToolResult::Json {
+            value: serde_json::to_value(status)
+                .context("failed to execute spawn_agent tool: invalid status payload")?,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct SendInputTool {
+    control: Arc<dyn SubagentControl>,
+}
+
+impl SendInputTool {
+    fn new(control: Arc<dyn SubagentControl>) -> Self {
+        Self { control }
+    }
+}
+
+#[async_trait]
+impl Tool for SendInputTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: ToolName::from("send_input"),
+            description: "Send a follow-up task to an existing child session".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string" },
+                    "message": { "type": "string" }
+                },
+                "required": ["target", "message"],
+            }),
+            concurrency: ToolConcurrency::Exclusive,
+            capabilities: ToolCapabilities {
+                mutating: false,
+                requires_approval: false,
+                cancellable: false,
+                long_running: false,
+            },
+            provider_aliases: Default::default(),
+        }
+    }
+
+    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+        emit_started(&context, "send_input");
+        let request: SendSubagentInputRequest = serde_json::from_value(input)
+            .context("failed to execute send_input tool: invalid input")?;
+        let status = self.control.send_input(request).await?;
+        emit_completed(&context, "send_input");
+        Ok(ToolResult::Json {
+            value: serde_json::to_value(status)
+                .context("failed to execute send_input tool: invalid status payload")?,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct WaitAgentTool {
+    control: Arc<dyn SubagentControl>,
+}
+
+impl WaitAgentTool {
+    fn new(control: Arc<dyn SubagentControl>) -> Self {
+        Self { control }
+    }
+}
+
+#[async_trait]
+impl Tool for WaitAgentTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: ToolName::from("wait_agent"),
+            description: "Wait for one of the target child sessions to reach a terminal state"
+                .to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "timeout_ms": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["targets"],
+            }),
+            concurrency: ToolConcurrency::ReadOnly,
+            capabilities: ToolCapabilities {
+                mutating: false,
+                requires_approval: false,
+                cancellable: false,
+                long_running: true,
+            },
+            provider_aliases: Default::default(),
+        }
+    }
+
+    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+        emit_started(&context, "wait_agent");
+        let request: WaitSubagentRequest = serde_json::from_value(input)
+            .context("failed to execute wait_agent tool: invalid input")?;
+        let response = self.control.wait(request).await?;
+        emit_completed(&context, "wait_agent");
+        Ok(ToolResult::Json {
+            value: serde_json::to_value(response)
+                .context("failed to execute wait_agent tool: invalid response payload")?,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct CloseAgentTool {
+    control: Arc<dyn SubagentControl>,
+}
+
+impl CloseAgentTool {
+    fn new(control: Arc<dyn SubagentControl>) -> Self {
+        Self { control }
+    }
+}
+
+#[async_trait]
+impl Tool for CloseAgentTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: ToolName::from("close_agent"),
+            description: "Close an existing child session and stop accepting follow-up input"
+                .to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string" }
+                },
+                "required": ["target"],
+            }),
+            concurrency: ToolConcurrency::Exclusive,
+            capabilities: ToolCapabilities {
+                mutating: false,
+                requires_approval: false,
+                cancellable: false,
+                long_running: false,
+            },
+            provider_aliases: Default::default(),
+        }
+    }
+
+    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+        emit_started(&context, "close_agent");
+        let request: CloseSubagentRequest = serde_json::from_value(input)
+            .context("failed to execute close_agent tool: invalid input")?;
+        let response = self.control.close(request).await?;
+        emit_completed(&context, "close_agent");
+        Ok(ToolResult::Json {
+            value: serde_json::to_value(response)
+                .context("failed to execute close_agent tool: invalid response payload")?,
+        })
+    }
+}
+
+fn emit_started(context: &ToolContext, tool_name: &str) {
+    context.emit.emit(ToolRuntimeEvent::Started {
+        tool_name: tool_name.to_owned(),
+    });
+}
+
+fn emit_completed(context: &ToolContext, tool_name: &str) {
+    context.emit.emit(ToolRuntimeEvent::Completed {
+        tool_name: tool_name.to_owned(),
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use halter_protocol::{
+        AgentId, AgentName, CloseSubagentResponse, ModelId, ResourceSnapshot, SessionBlueprint,
+        SessionId, SessionState, SpawnSubagentRequest, SubagentState, SubagentStatus,
+        WaitSubagentRequest, WaitSubagentResponse,
+    };
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{
+        DefaultToolPolicy, NoopToolEventSink, PolicySettings, SubagentParentContext, ToolPolicy,
+    };
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingSubagentControl {
+        requests: Mutex<Vec<SpawnSubagentRequest>>,
+    }
+
+    #[async_trait]
+    impl SubagentControl for RecordingSubagentControl {
+        async fn spawn(
+            &self,
+            _parent: &SubagentParentContext,
+            request: SpawnSubagentRequest,
+        ) -> anyhow::Result<SubagentStatus> {
+            self.requests.lock().expect("requests").push(request);
+            Ok(SubagentStatus {
+                agent_id: AgentId::from("agent-1"),
+                session_id: SessionId::from("session-1"),
+                agent_type: Some(AgentName::from("helper")),
+                task: "delegate this".to_owned(),
+                state: SubagentState::Running,
+                last_message: None,
+                usage: None,
+                error: None,
+            })
+        }
+
+        async fn send_input(
+            &self,
+            _request: SendSubagentInputRequest,
+        ) -> anyhow::Result<SubagentStatus> {
+            unreachable!("send_input not used in this test")
+        }
+
+        async fn wait(
+            &self,
+            _request: WaitSubagentRequest,
+        ) -> anyhow::Result<WaitSubagentResponse> {
+            unreachable!("wait not used in this test")
+        }
+
+        async fn close(
+            &self,
+            _request: CloseSubagentRequest,
+        ) -> anyhow::Result<CloseSubagentResponse> {
+            unreachable!("close not used in this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_forwards_request() {
+        let control = Arc::new(RecordingSubagentControl::default());
+        let tool = SpawnAgentTool::new(control.clone());
+        let context = ToolContext {
+            session_id: SessionId::new(),
+            working_dir: ".".into(),
+            file_view: Arc::new(Default::default()),
+            snapshot: Arc::new(ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(NoopToolEventSink),
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
+                as Arc<dyn ToolPolicy>,
+            max_tool_output_bytes: 16_384,
+            shell_timeout_secs: 30,
+            subagent_parent: Some(Arc::new(SubagentParentContext {
+                blueprint: SessionBlueprint {
+                    session_id: SessionId::from("parent-session"),
+                    parent_session_id: None,
+                    default_model: ModelId::from("default"),
+                    subagent_model: ModelId::from("subagent"),
+                    snapshot_revision: "revision".into(),
+                    working_dir: ".".into(),
+                    system_prompt_seed: Vec::new(),
+                    max_turns: None,
+                    subagent_depth: 0,
+                },
+                state: SessionState::default(),
+                snapshot: Arc::new(ResourceSnapshot::empty()),
+                subagent_model: ModelId::from("subagent"),
+            })),
+        };
+
+        let result = tool
+            .execute(
+                context,
+                json!({
+                    "message": "delegate this",
+                    "agent_type": "helper",
+                    "fork_context": false,
+                    "model": "custom"
+                }),
+            )
+            .await
+            .expect("spawn succeeds");
+
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result");
+        };
+        assert_eq!(value["agent_id"], "agent-1");
+        let requests = control.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].message, "delegate this");
+        assert_eq!(requests[0].agent_type, Some(AgentName::from("helper")));
+        assert!(!requests[0].fork_context);
+        assert_eq!(requests[0].model, Some(ModelId::from("custom")));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_requires_parent_context() {
+        let tool = SpawnAgentTool::new(Arc::new(RecordingSubagentControl::default()));
+        let context = ToolContext {
+            session_id: SessionId::new(),
+            working_dir: ".".into(),
+            file_view: Arc::new(Default::default()),
+            snapshot: Arc::new(ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(NoopToolEventSink),
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
+                as Arc<dyn ToolPolicy>,
+            max_tool_output_bytes: 16_384,
+            shell_timeout_secs: 30,
+            subagent_parent: None,
+        };
+
+        let error = tool
+            .execute(context, json!({ "message": "delegate this" }))
+            .await
+            .expect_err("missing parent context should fail");
+
+        assert!(error.to_string().contains("missing parent session context"));
+    }
+}
