@@ -1,0 +1,43 @@
+# Example config for the halter harness.
+# Set OPENAI_API_KEY in your environment, or define [providers.openai].api_key below.
+# Logging is silent by default. Set RUST_LOG=info (or a more specific filter) to enable it.
+
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5.4-mini"
+reasoning = "high"
+
+# [models.subagent]
+# provider = "openai"
+# model = "gpt-5.4-nano"
+# reasoning = "medium"
+
+# [providers.openai]
+# base_url = "https://myproxy.example.com"
+# api_key = "sk-..."
+
+[resources.skills]
+roots = ["./.agent/skills"]
+
+[resources.plugins]
+roots = ["./.agent/plugins"]
+
+[tools]
+enabled = ["read", "write", "glob", "shell"]
+
+[policy]
+allowed_write_roots = ["./", "/tmp/halter"]
+max_read_bytes = 1048576
+max_tool_output_bytes = 262144
+max_subagent_depth = 3
+max_concurrent_subagents = 8
+
+[policy.shell]
+enabled = true
+allow = ["git", "cargo", "rg", "ls", "find"]
+timeout_secs = 30
+
+[sessions]
+backend = "memory"
