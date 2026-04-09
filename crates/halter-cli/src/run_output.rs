@@ -2,9 +2,11 @@
 
 use clap::Args;
 use halter_protocol::{
-    AssistantMessage, AssistantPart, Message, MessageId, ReplayMeta, SessionEvent,
-    SessionEventPayload, StopReason, Usage,
+    AssistantMessage, AssistantPart, Message, SessionEvent, SessionEventPayload,
 };
+
+#[cfg(test)]
+use halter_protocol::{MessageId, ReplayMeta, StopReason, Usage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutputMode {

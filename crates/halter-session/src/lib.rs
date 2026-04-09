@@ -1,6 +1,8 @@
 // pattern: Functional Core
 
 mod memory;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 
 use std::sync::Arc;
 
@@ -9,6 +11,8 @@ use async_trait::async_trait;
 use halter_protocol::{ResourceSnapshot, SessionBlueprint, SessionEvent, SessionId, SessionState};
 
 pub use memory::InMemorySessionStore;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteSessionStore;
 
 #[derive(Debug, Clone)]
 pub struct StoredSession {

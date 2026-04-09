@@ -509,10 +509,10 @@ fn normalized_roots(roots: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 
 fn expand_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
-    if let Some(stripped) = raw.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(stripped);
-        }
+    if let Some(stripped) = raw.strip_prefix("~/")
+        && let Ok(home) = env::var("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
     }
     PathBuf::from(raw.as_ref())
 }

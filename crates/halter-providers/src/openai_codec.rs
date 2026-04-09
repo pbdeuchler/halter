@@ -646,13 +646,13 @@ impl ResponsesStreamDecoder {
             tool_call_id,
             name: tool_name,
         });
-        if let Some(full_arguments) = full_arguments {
-            if !full_arguments.is_empty() {
-                events.push(StreamEvent::ToolArgsDelta {
-                    id: block_id.clone(),
-                    delta: full_arguments.to_owned(),
-                });
-            }
+        if let Some(full_arguments) = full_arguments
+            && !full_arguments.is_empty()
+        {
+            events.push(StreamEvent::ToolArgsDelta {
+                id: block_id.clone(),
+                delta: full_arguments.to_owned(),
+            });
         }
         events.push(StreamEvent::ToolCallEnd { id: block_id });
         Ok(())
@@ -698,10 +698,10 @@ pub(crate) fn encode_chat_request(
     if let Some(max_output_tokens) = request.model.max_output_tokens {
         body.insert("max_tokens".to_owned(), json!(max_output_tokens));
     }
-    if include_reasoning {
-        if let Some(reasoning) = encode_openai_reasoning(request.model.reasoning, None) {
-            body.insert("reasoning".to_owned(), reasoning);
-        }
+    if include_reasoning
+        && let Some(reasoning) = encode_openai_reasoning(request.model.reasoning, None)
+    {
+        body.insert("reasoning".to_owned(), reasoning);
     }
     if !request.tools.is_empty() {
         body.insert("tools".to_owned(), Value::Array(encode_chat_tools(request)));

@@ -62,6 +62,7 @@ impl HarnessConfig {
         }
 
         self.providers.validate()?;
+        self.sessions.validate()?;
 
         let model = self.default_model()?;
         validate_model_config("models.default", model)?;
@@ -474,19 +475,14 @@ pub struct NetworkPolicyConfig {
     pub allowed_hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionBackend {
+    #[default]
     Memory,
     FlatFile,
     Sqlite,
     Postgres,
-}
-
-impl Default for SessionBackend {
-    fn default() -> Self {
-        Self::Memory
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -494,13 +490,28 @@ impl Default for SessionBackend {
 pub struct SessionsConfig {
     #[serde(default)]
     pub backend: SessionBackend,
+    #[serde(default)]
+    pub sqlite_path: Option<PathBuf>,
 }
 
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
             backend: SessionBackend::Memory,
+            sqlite_path: None,
         }
+    }
+}
+
+impl SessionsConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(path) = &self.sqlite_path
+            && path.as_os_str().is_empty()
+        {
+            anyhow::bail!("invalid configuration: sessions.sqlite_path must not be empty");
+        }
+
+        Ok(())
     }
 }
 

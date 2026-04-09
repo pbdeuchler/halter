@@ -41,3 +41,4 @@ timeout_secs = 30
 
 [sessions]
 backend = "memory"
+# sqlite_path = "/tmp/halter/sessions.db"

@@ -68,6 +68,7 @@ impl SessionStore for InMemorySessionStore {
         })?;
 
         if let Some(snapshot) = snapshot {
+            session.blueprint.snapshot_revision = snapshot.revision.clone();
             session.snapshot = snapshot;
         }
 

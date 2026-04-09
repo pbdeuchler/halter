@@ -146,6 +146,7 @@ allowed_hosts = []
 
 [sessions]
 backend = "memory"
+# sqlite_path = "/tmp/halter/sessions.db"
 "#
     .to_owned()
 }
@@ -389,10 +390,10 @@ pub fn config_fingerprint(config: &HarnessConfig) -> String {
 #[must_use]
 pub fn expand_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
-    if let Some(stripped) = raw.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(stripped);
-        }
+    if let Some(stripped) = raw.strip_prefix("~/")
+        && let Ok(home) = env::var("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
     }
     PathBuf::from(raw.as_ref())
 }
