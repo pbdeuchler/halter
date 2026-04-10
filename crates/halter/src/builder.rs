@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use halter_config::{
     ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, PolicyConfig, ResolvedProviderConfig,
-    SUBAGENT_MODEL_ID, load_path, resolve_provider_runtime_config,
+    SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, load_path, resolve_provider_runtime_config,
 };
 use halter_protocol::{ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot};
 use halter_providers::{AnthropicProvider, ModelRegistry, OpenAiProvider, OpenRouterProvider};
@@ -16,7 +16,7 @@ use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
     RuntimeServices, SessionInit, SessionRuntime,
 };
-use halter_session::InMemorySessionStore;
+use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
     DefaultToolPolicy, PolicySettings, Tool, ToolRuntime, register_builtin_tools,
     register_subagent_tools,
@@ -25,6 +25,9 @@ use tracing::{debug, info};
 
 use crate::{LoadedPlugin, LoadedSkill, ResourceCompiler};
 
+#[cfg(feature = "sqlite")]
+use halter_session::SqliteSessionStore;
+
 #[derive(Default)]
 pub struct HalterBuilder {
     config: HarnessConfig,
@@ -32,6 +35,7 @@ pub struct HalterBuilder {
     loaded_skills: Vec<LoadedSkill>,
     loaded_plugins: Vec<LoadedPlugin>,
     tools: Vec<Arc<dyn Tool>>,
+    session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl HalterBuilder {
@@ -70,6 +74,12 @@ impl HalterBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
     pub async fn build(self) -> anyhow::Result<Halter> {
         let config = self.config;
         debug!("validating halter builder config");
@@ -93,11 +103,20 @@ impl HalterBuilder {
         }
 
         let policy = Arc::new(DefaultToolPolicy::new(policy_from_config(&config.policy)));
+        let session_backend = self
+            .session_store
+            .as_ref()
+            .map(|_| "custom".to_owned())
+            .unwrap_or_else(|| describe_session_backend(&config.sessions).to_owned());
+        let sessions = match self.session_store {
+            Some(store) => store,
+            None => build_session_store(&config.sessions)?,
+        };
         let services = Arc::new(RuntimeServices {
             resources: Arc::new(ResourceHandle::new(snapshot)),
             models,
             tools,
-            sessions: Arc::new(InMemorySessionStore::default()),
+            sessions,
             policy: policy.clone(),
             prompt_assembler: Arc::new(DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::new(
@@ -120,6 +139,7 @@ impl HalterBuilder {
             default_model = %default_model.model,
             subagent_provider = %subagent_model.provider,
             subagent_model = %subagent_model.model,
+            session_backend,
             tool_count = services.tools.specs().len(),
             snapshot_revision = %services.resources.snapshot().revision,
             "built halter runtime"
@@ -181,6 +201,48 @@ impl Halter {
     #[must_use]
     pub fn config(&self) -> &HarnessConfig {
         &self.config
+    }
+}
+
+fn build_session_store(config: &SessionsConfig) -> anyhow::Result<Arc<dyn SessionStore>> {
+    match config.backend {
+        SessionBackend::Memory => Ok(Arc::new(InMemorySessionStore::default())),
+        SessionBackend::Sqlite => build_sqlite_session_store(config),
+        SessionBackend::FlatFile => {
+            anyhow::bail!(
+                "failed to build halter runtime: session backend 'flat_file' is not implemented"
+            );
+        }
+        SessionBackend::Postgres => {
+            anyhow::bail!(
+                "failed to build halter runtime: session backend 'postgres' is not implemented"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn build_sqlite_session_store(config: &SessionsConfig) -> anyhow::Result<Arc<dyn SessionStore>> {
+    let store = match config.sqlite_path.as_ref() {
+        Some(path) => SqliteSessionStore::open(path)?,
+        None => SqliteSessionStore::open_default()?,
+    };
+    Ok(Arc::new(store))
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn build_sqlite_session_store(_config: &SessionsConfig) -> anyhow::Result<Arc<dyn SessionStore>> {
+    anyhow::bail!(
+        "failed to build halter runtime: session backend 'sqlite' requires the 'sqlite' cargo feature"
+    );
+}
+
+fn describe_session_backend(config: &SessionsConfig) -> &'static str {
+    match config.backend {
+        SessionBackend::Memory => "memory",
+        SessionBackend::FlatFile => "flat_file",
+        SessionBackend::Sqlite => "sqlite",
+        SessionBackend::Postgres => "postgres",
     }
 }
 
@@ -265,7 +327,7 @@ fn resolve_selected_provider_config(
     config: &HarnessConfig,
     provider: ConfiguredProvider,
 ) -> anyhow::Result<ResolvedProviderConfig> {
-    resolve_provider_runtime_config(provider, config.provider_config(provider), |name| {
+    resolve_selected_provider_config_with(config, provider, |name| {
         let Some(raw) = env::var_os(name) else {
             return Ok(None);
         };
@@ -274,6 +336,17 @@ fn resolve_selected_provider_config(
             .map_err(|_| anyhow::anyhow!("invalid utf-8 in {}", name))?;
         Ok(Some(value))
     })
+}
+
+fn resolve_selected_provider_config_with<F>(
+    config: &HarnessConfig,
+    provider: ConfiguredProvider,
+    lookup_env: F,
+) -> anyhow::Result<ResolvedProviderConfig>
+where
+    F: FnMut(&str) -> anyhow::Result<Option<String>>,
+{
+    resolve_provider_runtime_config(provider, config.provider_config(provider), lookup_env)
 }
 
 fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
@@ -293,8 +366,13 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
     use halter_config::{ModelConfig, ProviderConfig};
     use halter_protocol::ReasoningEffort;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -328,17 +406,71 @@ mod tests {
 
     #[tokio::test]
     async fn builder_requires_provider_api_key_when_not_configured() {
-        let error = match HalterBuilder::default()
-            .with_config(openai_config(None))
+        let error = resolve_selected_provider_config_with(
+            &openai_config(None),
+            ConfiguredProvider::OpenAi,
+            |_| Ok(None),
+        )
+        .expect_err("provider resolution should fail");
+
+        assert!(error.to_string().contains("OPENAI_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn builder_uses_injected_session_store() {
+        let temp = tempdir().expect("tempdir");
+        let store = CountingSessionStore::default();
+        let store_for_builder: Arc<dyn SessionStore> = Arc::new(store.clone());
+        let halter = HalterBuilder::default()
+            .with_config(openai_config(Some("test-key")))
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .with_session_store(store_for_builder)
+            .build()
+            .await
+            .expect("build halter");
+
+        halter
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("create session");
+
+        assert_eq!(store.create_calls(), 1);
+        assert_eq!(store.commit_calls(), 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn builder_uses_sqlite_store_from_config() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("sessions.db");
+        let mut config = openai_config(Some("test-key"));
+        config.sessions.backend = SessionBackend::Sqlite;
+        config.sessions.sqlite_path = Some(db_path.clone());
+
+        let halter = HalterBuilder::default()
+            .with_config(config)
             .with_resource_snapshot(ResourceSnapshot::empty())
             .build()
             .await
-        {
-            Ok(_) => panic!("build should fail"),
-            Err(error) => error,
-        };
+            .expect("build halter");
 
-        assert!(error.to_string().contains("OPENAI_API_KEY"));
+        halter
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("create session");
+
+        let persisted = SqliteSessionStore::open(&db_path)
+            .expect("open persisted sqlite store")
+            .list_sessions()
+            .await
+            .expect("list persisted sessions");
+        assert_eq!(persisted.len(), 1);
     }
 
     fn openai_config(api_key: Option<&str>) -> HarnessConfig {
@@ -355,5 +487,62 @@ mod tests {
             api_key: api_key.map(ToOwned::to_owned),
         });
         config
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingSessionStore {
+        inner: InMemorySessionStore,
+        create_calls: Arc<AtomicUsize>,
+        commit_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingSessionStore {
+        fn create_calls(&self) -> usize {
+            self.create_calls.load(Ordering::SeqCst)
+        }
+
+        fn commit_calls(&self) -> usize {
+            self.commit_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SessionStore for CountingSessionStore {
+        async fn create_session(
+            &self,
+            session: halter_session::StoredSession,
+        ) -> anyhow::Result<()> {
+            self.create_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.create_session(session).await
+        }
+
+        async fn load_session(
+            &self,
+            session_id: &halter_protocol::SessionId,
+        ) -> anyhow::Result<Option<halter_session::StoredSession>> {
+            self.inner.load_session(session_id).await
+        }
+
+        async fn commit(
+            &self,
+            session_id: &halter_protocol::SessionId,
+            snapshot: Option<Arc<halter_protocol::ResourceSnapshot>>,
+            state: Option<halter_protocol::SessionState>,
+            events: Vec<halter_protocol::SessionEvent>,
+        ) -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
+            self.commit_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.commit(session_id, snapshot, state, events).await
+        }
+
+        async fn replay(
+            &self,
+            session_id: &halter_protocol::SessionId,
+        ) -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
+            self.inner.replay(session_id).await
+        }
+
+        async fn list_sessions(&self) -> anyhow::Result<Vec<halter_protocol::SessionBlueprint>> {
+            self.inner.list_sessions().await
+        }
     }
 }

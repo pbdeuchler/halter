@@ -104,14 +104,13 @@ impl JsonHttpClient {
 
 fn response_error_message(body: &str) -> String {
     let parsed = serde_json::from_str::<Value>(body);
-    if let Ok(value) = parsed {
-        if let Some(message) = value
+    if let Ok(value) = parsed
+        && let Some(message) = value
             .pointer("/error/message")
             .and_then(Value::as_str)
             .or_else(|| value.get("message").and_then(Value::as_str))
-        {
-            return message.to_owned();
-        }
+    {
+        return message.to_owned();
     }
 
     body.trim().to_owned()

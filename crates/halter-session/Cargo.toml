@@ -5,9 +5,17 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 halter-protocol = { path = "../halter-protocol" }
+rusqlite = { workspace = true, optional = true }
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -10,6 +10,13 @@ pub use resources::{
     SkillLoader,
 };
 
+pub mod session {
+    pub use halter_session::{InMemorySessionStore, SessionStore, StoredSession};
+
+    #[cfg(feature = "sqlite")]
+    pub use halter_session::SqliteSessionStore;
+}
+
 pub mod prelude {
     pub use halter_config::HarnessConfig;
     pub use halter_protocol::{
