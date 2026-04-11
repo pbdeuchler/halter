@@ -31,13 +31,17 @@ pub async fn collect_output(
     tokio::pin!(reader);
 
     loop {
+        debug_assert!(pending <= BUFFER_SIZE);
+
         #[cfg(unix)]
         let read = {
             let mut readiness = tokio::select! {
                 ready = reader.readable() => ready,
                 () = cancel.cancelled() => break,
             }?;
-            match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buffer[pending..BUFFER_SIZE])) {
+            match readiness.try_io(|inner| {
+                read_nonblocking(inner.get_ref(), &mut buffer[pending..BUFFER_SIZE])
+            }) {
                 Ok(Ok(0)) => break,
                 Ok(Ok(count)) => count,
                 Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -79,7 +83,8 @@ pub async fn collect_output(
                 Err(error) => {
                     let valid_up_to = error.valid_up_to();
                     if valid_up_to > 0 {
-                        let valid = unsafe { str::from_utf8_unchecked(&available[..valid_up_to]) };
+                        let valid = str::from_utf8(&available[..valid_up_to])
+                            .expect("utf-8 error valid prefix must decode");
                         emit_chunk(&mut collected, &emit, tool_name, valid);
                         buffer.copy_within(valid_up_to..pending, 0);
                         pending -= valid_up_to;
@@ -158,15 +163,20 @@ fn read_nonblocking<T: std::os::fd::AsRawFd>(file: &T, buffer: &mut [u8]) -> io:
 }
 
 pub fn pipe_to_files(label: &str) -> anyhow::Result<(fs::File, fs::File)> {
-    let (reader, writer) =
-        os_pipe::pipe().map_err(|error| anyhow::anyhow!("failed to create {label} pipe: {error}"))?;
+    let (reader, writer) = os_pipe::pipe()
+        .map_err(|error| anyhow::anyhow!("failed to create {label} pipe: {error}"))?;
 
     #[cfg(unix)]
     let (reader, writer): (fs::File, fs::File) = {
         use std::os::unix::io::{FromRawFd, IntoRawFd};
         let reader = reader.into_raw_fd();
         let writer = writer.into_raw_fd();
-        unsafe { (FromRawFd::from_raw_fd(reader), FromRawFd::from_raw_fd(writer)) }
+        unsafe {
+            (
+                FromRawFd::from_raw_fd(reader),
+                FromRawFd::from_raw_fd(writer),
+            )
+        }
     };
 
     #[cfg(windows)]
@@ -174,7 +184,12 @@ pub fn pipe_to_files(label: &str) -> anyhow::Result<(fs::File, fs::File)> {
         use std::os::windows::io::{FromRawHandle, IntoRawHandle};
         let reader = reader.into_raw_handle();
         let writer = writer.into_raw_handle();
-        unsafe { (FromRawHandle::from_raw_handle(reader), FromRawHandle::from_raw_handle(writer)) }
+        unsafe {
+            (
+                FromRawHandle::from_raw_handle(reader),
+                FromRawHandle::from_raw_handle(writer),
+            )
+        }
     };
 
     Ok((reader, writer))

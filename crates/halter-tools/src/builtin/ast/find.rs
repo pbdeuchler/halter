@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::PathLockMap;
 
-use super::language::{canonical_name, parse_strictness, resolve_language};
 use super::collect_candidates;
+use super::language::{canonical_name, parse_strictness, resolve_language};
 use crate::builtin::common::{ensure_not_cancelled, optional_bool, optional_string, optional_u64};
 
 const DEFAULT_FIND_LIMIT: u64 = 50;
@@ -130,10 +130,7 @@ pub(super) fn run(
             ) {
                 Ok(compiled) => compiled,
                 Err(error) => {
-                    parse_errors.push(format!(
-                        "{}: {}: {error}",
-                        candidate.display_path, pattern
-                    ));
+                    parse_errors.push(format!("{}: {}: {error}", candidate.display_path, pattern));
                     continue;
                 }
             };
@@ -171,10 +168,14 @@ pub(super) fn run(
             .then(left.byte_end.cmp(&right.byte_end))
     });
 
-    let offset = config.offset as usize;
-    let limit = config.limit as usize;
-    let limit_reached = matches.len().saturating_sub(offset) > limit;
-    let visible = matches.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+    let offset = usize::try_from(config.offset).unwrap_or(usize::MAX);
+    let limit = usize::try_from(config.limit).unwrap_or(usize::MAX);
+    let limit_reached = matches.len() > offset.saturating_add(limit);
+    let visible = matches
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
 
     Ok(json!({
         "matches": visible.iter().map(|matched| json!({
@@ -202,7 +203,10 @@ fn compile_pattern(
     strictness: MatchStrictness,
     language: ast_grep_language::SupportLang,
 ) -> anyhow::Result<Pattern> {
-    let mut compiled = if let Some(selector) = selector.map(str::trim).filter(|selector| !selector.is_empty()) {
+    let mut compiled = if let Some(selector) = selector
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+    {
         Pattern::contextual(pattern, selector, language)
     } else {
         Pattern::try_new(pattern, language)
@@ -224,7 +228,8 @@ mod tests {
     #[test]
     fn finds_rust_function_matches() {
         let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("main.rs"), "fn alpha() {}\nfn beta() {}\n").expect("write");
+        std::fs::write(temp.path().join("main.rs"), "fn alpha() {}\nfn beta() {}\n")
+            .expect("write");
 
         let value = run(
             FindConfig {

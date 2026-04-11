@@ -1,12 +1,15 @@
 // pattern: Imperative Shell
 
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::time::Duration;
 
 use brush_builtins::{BuiltinSet, default_builtins};
 use brush_core::{
-    CreateOptions, ExecutionControlFlow, ExecutionExitCode, ExecutionResult,
-    ProcessGroupPolicy, Shell as BrushShell, ShellValue, ShellVariable, env::EnvironmentScope,
+    CreateOptions, ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ProcessGroupPolicy,
+    Shell as BrushShell, ShellValue, ShellVariable,
+    env::EnvironmentScope,
     openfiles::{self, OpenFile, OpenFiles},
 };
 use tokio::sync::Mutex as TokioMutex;
@@ -57,7 +60,7 @@ pub async fn run_persistent_shell(
     cancel: CancellationToken,
 ) -> anyhow::Result<ShellRunResult> {
     let run_cancel = CancellationToken::new();
-    let task = tokio::spawn({
+    let mut task = tokio::spawn({
         let session = session.clone();
         let emit = emit.clone();
         let options = ShellRunOptions {
@@ -75,19 +78,20 @@ pub async fn run_persistent_shell(
             };
 
             let result = run_shell_command(shell, &options, emit, run_cancel).await;
-            if !result.as_ref().is_ok_and(|output| session_keepalive(&output.result)) {
+            if !result
+                .as_ref()
+                .is_ok_and(|output| session_keepalive(&output.result))
+            {
                 *guard = None;
             }
             result
         }
     });
-    tokio::pin!(task);
 
     let outcome = tokio::select! {
         joined = &mut task => joined.map_err(|error| anyhow::anyhow!("failed to execute shell session task: {error}"))??,
         _ = cancel.cancelled() => {
-            run_cancel.cancel();
-            let _ = timeout(Duration::from_secs(2), &mut task).await;
+            cancel_shell_task(&session, &run_cancel, &mut task).await;
             return Ok(ShellRunResult {
                 exit_code: None,
                 stdout: String::new(),
@@ -103,8 +107,7 @@ pub async fn run_persistent_shell(
                 std::future::pending::<()>().await;
             }
         } => {
-            run_cancel.cancel();
-            let _ = timeout(Duration::from_secs(2), &mut task).await;
+            cancel_shell_task(&session, &run_cancel, &mut task).await;
             return Ok(ShellRunResult {
                 exit_code: None,
                 stdout: String::new(),
@@ -122,6 +125,27 @@ pub async fn run_persistent_shell(
         timed_out: false,
         cancelled: false,
     })
+}
+
+async fn cancel_shell_task(
+    session: &std::sync::Arc<TokioMutex<Option<ShellSessionCore>>>,
+    run_cancel: &CancellationToken,
+    task: &mut tokio::task::JoinHandle<anyhow::Result<ShellCommandOutput>>,
+) {
+    run_cancel.cancel();
+    if timeout(Duration::from_secs(2), &mut *task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    reset_shell_session(session).await;
+}
+
+async fn reset_shell_session(session: &std::sync::Arc<TokioMutex<Option<ShellSessionCore>>>) {
+    let mut guard = session.lock().await;
+    if let Some(shell) = guard.as_ref() {
+        terminate_background_jobs(&shell.shell);
+    }
+    *guard = None;
 }
 
 async fn create_session() -> anyhow::Result<ShellSessionCore> {
@@ -142,7 +166,7 @@ async fn create_session() -> anyhow::Result<ShellSessionCore> {
     let mut merged_path: Option<String> = None;
     for (key, value) in std::env::vars() {
         let normalized_key = normalize_env_key(&key);
-        if should_skip_env_var(normalized_key) {
+        if should_skip_env_var(normalized_key) || !should_inherit_env_var(normalized_key) {
             continue;
         }
         if normalized_key == "PATH" {
@@ -225,7 +249,10 @@ async fn run_shell_command(
         activity_tx,
     ));
 
-    let result = session.shell.run_string(options.command.clone(), &params).await;
+    let result = session
+        .shell
+        .run_string(options.command.clone(), &params)
+        .await;
 
     if cancel.is_cancelled() {
         terminate_background_jobs(&session.shell);
@@ -274,7 +301,8 @@ async fn run_shell_command(
     let stdout = await_reader(&mut stdout_handle).await;
     let stderr = await_reader(&mut stderr_handle).await;
 
-    let result = result.map_err(|error| anyhow::anyhow!("failed to execute shell command: {error}"))?;
+    let result =
+        result.map_err(|error| anyhow::anyhow!("failed to execute shell command: {error}"))?;
     Ok(ShellCommandOutput {
         result,
         stdout,
@@ -282,9 +310,7 @@ async fn run_shell_command(
     })
 }
 
-async fn await_reader(
-    handle: &mut tokio::task::JoinHandle<anyhow::Result<String>>,
-) -> String {
+async fn await_reader(handle: &mut tokio::task::JoinHandle<anyhow::Result<String>>) -> String {
     match timeout(READER_SHUTDOWN_TIMEOUT, &mut *handle).await {
         Ok(Ok(Ok(output))) => output,
         Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
@@ -332,8 +358,10 @@ fn merge_path_values(existing: &str, incoming: &str) -> String {
     push_unique_paths(&mut merged, &mut seen, existing);
     push_unique_paths(&mut merged, &mut seen, incoming);
 
-    std::env::join_paths(merged.iter())
-        .map_or_else(|_| merged.join(";"), |paths| paths.to_string_lossy().into_owned())
+    std::env::join_paths(merged.iter()).map_or_else(
+        |_| merged.join(";"),
+        |paths| paths.to_string_lossy().into_owned(),
+    )
 }
 
 #[cfg(windows)]
@@ -413,6 +441,39 @@ fn should_skip_env_var(key: &str) -> bool {
     )
 }
 
+fn should_inherit_env_var(key: &str) -> bool {
+    if key == "PATH" {
+        return true;
+    }
+
+    if matches!(
+        key,
+        "HOME"
+            | "USER"
+            | "LOGNAME"
+            | "TERM"
+            | "COLORTERM"
+            | "LANG"
+            | "LC_ALL"
+            | "TMPDIR"
+            | "TEMP"
+            | "TMP"
+            | "USERNAME"
+            | "APPDATA"
+            | "LOCALAPPDATA"
+            | "ProgramData"
+            | "SystemRoot"
+            | "WINDIR"
+            | "ComSpec"
+            | "PATHEXT"
+            | "NUMBER_OF_PROCESSORS"
+    ) {
+        return true;
+    }
+
+    key.starts_with("LC_") || key.starts_with("XDG_")
+}
+
 fn session_keepalive(result: &ExecutionResult) -> bool {
     matches!(result.next_control_flow, ExecutionControlFlow::Normal)
 }
@@ -426,15 +487,15 @@ fn terminate_background_jobs(shell: &BrushShell) {
     let mut pgids = Vec::new();
     let mut pids = Vec::new();
     for job in &shell.jobs.jobs {
-        if let Some(pgid) = job.process_group_id() {
-            if !pgids.contains(&pgid) {
-                pgids.push(pgid);
-            }
+        if let Some(pgid) = job.process_group_id()
+            && !pgids.contains(&pgid)
+        {
+            pgids.push(pgid);
         }
-        if let Some(pid) = job.representative_pid() {
-            if !pids.contains(&pid) {
-                pids.push(pid);
-            }
+        if let Some(pid) = job.representative_pid()
+            && !pids.contains(&pid)
+        {
+            pids.push(pid);
         }
     }
 
@@ -458,3 +519,16 @@ fn terminate_background_jobs(shell: &BrushShell) {
 
 #[cfg(not(unix))]
 fn terminate_background_jobs(_shell: &BrushShell) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inherit_env_var_uses_allowlist() {
+        assert!(should_inherit_env_var("PATH"));
+        assert!(should_inherit_env_var("HOME"));
+        assert!(!should_inherit_env_var("OPENAI_API_KEY"));
+        assert!(!should_inherit_env_var("GITHUB_TOKEN"));
+    }
+}

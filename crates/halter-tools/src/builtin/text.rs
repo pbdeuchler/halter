@@ -96,6 +96,9 @@ mod tests {
 
     #[test]
     fn truncate_to_width_preserves_ansi_sequences() {
-        assert_eq!(truncate_to_width("\u{1b}[31mhello\u{1b}[0m", 3), "\u{1b}[31mhel");
+        assert_eq!(
+            truncate_to_width("\u{1b}[31mhello\u{1b}[0m", 3),
+            "\u{1b}[31mhel"
+        );
     }
 }

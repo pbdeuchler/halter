@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use crate::{Tool, ToolContext};
 
 use self::session::{ShellRunOptions, run_persistent_shell};
-use super::common::{ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string};
+use super::common::{
+    ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string,
+};
 
 #[derive(Debug)]
 pub struct ShellTool;
@@ -60,7 +62,13 @@ impl Tool for ShellTool {
             timeout: optional_u64(&input, "timeout_ms")?.map(Duration::from_millis),
         };
         let session = context.tool_sessions.shell_session(&context.session_id);
-        let result = run_persistent_shell(session, options, context.emit.clone(), context.cancel.clone()).await?;
+        let result = run_persistent_shell(
+            session,
+            options,
+            context.emit.clone(),
+            context.cancel.clone(),
+        )
+        .await?;
 
         Ok(ToolResult::Json {
             value: json!({
@@ -86,9 +94,9 @@ fn parse_env_map(value: Option<&Value>) -> anyhow::Result<Option<HashMap<String,
         .ok_or_else(|| anyhow::anyhow!("invalid tool input: env must be an object"))?;
     let mut env = HashMap::with_capacity(object.len());
     for (key, value) in object {
-        let value = value.as_str().ok_or_else(|| {
-            anyhow::anyhow!("invalid tool input: env values must be strings")
-        })?;
+        let value = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid tool input: env values must be strings"))?;
         env.insert(key.clone(), value.to_owned());
     }
     Ok(Some(env))

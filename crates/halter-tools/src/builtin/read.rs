@@ -45,25 +45,14 @@ impl Tool for ReadTool {
 
         let path_locks = context.path_locks.clone();
         let path_for_read = path.clone();
-        let (text, metadata_len) = tokio::task::spawn_blocking(move || {
+        let text = tokio::task::spawn_blocking(move || {
             let _lock = path_locks.acquire_read(&path_for_read)?;
             let text = std::fs::read_to_string(&path_for_read)?;
-            let metadata_len = std::fs::metadata(&path_for_read)?.len();
-            Ok::<_, anyhow::Error>((text, metadata_len))
+            Ok::<_, anyhow::Error>(text)
         })
         .await??;
         let (content, total_lines) = slice_by_lines(&text, offset, limit);
-        context
-            .policy
-            .check_read(
-                &path,
-                if offset == 1 && limit.is_none() {
-                    metadata_len as usize
-                } else {
-                    content.len()
-                },
-            )
-            .await?;
+        context.policy.check_read(&path, content.len()).await?;
 
         Ok(ToolResult::Json {
             value: json!({
@@ -118,6 +107,16 @@ fn line_start_offsets(text: &str) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{
+        DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolPolicy,
+        ToolSessionStore,
+    };
+
     use super::*;
 
     #[test]
@@ -125,5 +124,49 @@ mod tests {
         let (content, total_lines) = slice_by_lines("a\nb\nc\n", 2, Some(1));
         assert_eq!(content, "b\n");
         assert_eq!(total_lines, 3);
+    }
+
+    fn tool_context(root: &std::path::Path, max_read_bytes: usize) -> ToolContext {
+        ToolContext {
+            session_id: halter_protocol::SessionId::new(),
+            working_dir: root.to_path_buf(),
+            path_locks: Arc::new(PathLockMap::default()),
+            tool_sessions: Arc::new(ToolSessionStore::default()),
+            file_view: Arc::new(Default::default()),
+            snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(NoopToolEventSink),
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings {
+                allowed_write_roots: vec![root.to_path_buf()],
+                max_read_bytes,
+                ..PolicySettings::default()
+            })) as Arc<dyn ToolPolicy>,
+            max_tool_output_bytes: 16_384,
+            shell_timeout_secs: 30,
+            subagent_parent: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_checks_returned_slice_size() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "a\nb\n").expect("write");
+
+        let ToolResult::Json { value } = ReadTool
+            .execute(
+                tool_context(temp.path(), 2),
+                json!({
+                    "path": "note.txt",
+                    "offset": 2,
+                    "limit": 1
+                }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        assert_eq!(value["content"], "b\n");
     }
 }

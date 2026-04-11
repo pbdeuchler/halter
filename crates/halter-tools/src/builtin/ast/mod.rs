@@ -30,8 +30,7 @@ impl Tool for AstGrepTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("ast_grep"),
-            description: "Search or rewrite source files with structural AST patterns"
-                .to_owned(),
+            description: "Search or rewrite source files with structural AST patterns".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -85,26 +84,28 @@ impl Tool for AstGrepTool {
                 let working_dir = context.working_dir.clone();
                 let path_locks = context.path_locks.clone();
                 let cancel = context.cancel.clone();
-                tokio::task::spawn_blocking(move || find::run(config, working_dir, path_locks, cancel))
-                    .await??
+                tokio::task::spawn_blocking(move || {
+                    find::run(config, working_dir, path_locks, cancel)
+                })
+                .await??
             }
             "replace" => {
                 let config = replace::ReplaceConfig::parse(&input)?;
+                let candidates = collect_candidates(
+                    &context.working_dir,
+                    config.path.as_deref(),
+                    config.glob.as_deref(),
+                    config.lang.as_deref(),
+                )?;
                 if !config.dry_run {
-                    for candidate in collect_candidates(
-                        &context.working_dir,
-                        config.path.as_deref(),
-                        config.glob.as_deref(),
-                        config.lang.as_deref(),
-                    )? {
+                    for candidate in &candidates {
                         context.policy.check_write(&candidate.absolute_path).await?;
                     }
                 }
-                let working_dir = context.working_dir.clone();
                 let path_locks = context.path_locks.clone();
                 let cancel = context.cancel.clone();
                 tokio::task::spawn_blocking(move || {
-                    replace::run(config, working_dir, path_locks, cancel)
+                    replace::run(config, candidates, path_locks, cancel)
                 })
                 .await??
             }
@@ -162,10 +163,10 @@ pub(super) fn collect_candidates(
         }
 
         let relative = path.strip_prefix(&search_root).unwrap_or(path);
-        if let Some(matcher) = matcher.as_ref() {
-            if !matcher.is_match(relative) {
-                continue;
-            }
+        if let Some(matcher) = matcher.as_ref()
+            && !matcher.is_match(relative)
+        {
+            continue;
         }
         if explicit_lang.is_none() && language::infer_language_from_path(path).is_none() {
             continue;

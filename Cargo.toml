@@ -12,14 +12,18 @@ members = [
 resolver = "3"
 
 [patch.crates-io]
-brush-core = { path = "../../can1357/oh-my-pi/crates/brush-core-vendored" }
+brush-core = { path = "vendor/brush-core-vendored" }
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
 version = "0.1.0"
 authors = ["pbdeuchler"]
+description = "Local-first agent runtime, protocol, and tool harness"
 repository = "https://github.com/pbdeuchler/halter"
+readme = "README.md"
+keywords = ["ai", "agent", "tools"]
+categories = ["development-tools"]
 rust-version = "1.93"
 
 [workspace.dependencies]
@@ -30,14 +34,17 @@ ast-grep-language = { version = "0.42.1", default-features = false, features = [
 async-openai = { version = "0.34.0", default-features = false, features = ["byot", "chat-completion", "responses", "rustls"] }
 async-trait = "0.1.89"
 base64 = "0.22.1"
-brush-builtins = { version = "0.1.0", path = "../../can1357/oh-my-pi/crates/brush-builtins-vendored" }
-brush-core = { version = "0.4.0", path = "../../can1357/oh-my-pi/crates/brush-core-vendored" }
+brush-builtins = { version = "0.1.0", path = "vendor/brush-builtins-vendored" }
+brush-core = { version = "0.4.0", path = "vendor/brush-core-vendored" }
 bytes = { version = "1.10.1", features = ["serde"] }
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
 clap = { version = "4.5.48", features = ["derive"] }
 dashmap = "6.1.0"
 glob = "0.3.3"
 globset = "0.4.16"
+grep-matcher = "0.1.7"
+grep-regex = "0.1.13"
+grep-searcher = "0.1.14"
 futures = "0.3.31"
 ignore = "0.4.24"
 image = { version = "0.24.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }

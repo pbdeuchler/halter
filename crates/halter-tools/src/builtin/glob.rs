@@ -10,7 +10,11 @@ use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext};
 
-use super::common::{ToolScope, ensure_not_cancelled, optional_bool, optional_string, optional_u64, required_string};
+use super::common::{
+    ToolScope, ensure_not_cancelled, optional_bool, optional_string, optional_u64, required_string,
+};
+
+const MAX_SORTED_CANDIDATES: usize = 10_000;
 
 #[derive(Debug)]
 pub struct GlobTool;
@@ -81,6 +85,9 @@ impl Tool for GlobTool {
                 "file_type": file_type_name(metadata.file_type()),
                 "mtime": mtime,
             }));
+            if sort_by_mtime && matches.len() >= MAX_SORTED_CANDIDATES {
+                break;
+            }
 
             if !sort_by_mtime
                 && max_results.is_some_and(|max_results| matches.len() as u64 >= max_results)
@@ -98,7 +105,7 @@ impl Tool for GlobTool {
                     .then_with(|| left["path"].as_str().cmp(&right["path"].as_str()))
             });
             if let Some(max_results) = max_results {
-                matches.truncate(max_results as usize);
+                matches.truncate(usize::try_from(max_results).unwrap_or(usize::MAX));
             }
         }
 

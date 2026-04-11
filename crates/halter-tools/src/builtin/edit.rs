@@ -20,14 +20,14 @@ impl Tool for EditTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("edit"),
-            description: "Replace an exact string in a UTF-8 file using an atomic write"
-                .to_owned(),
+            description: "Replace an exact string in a UTF-8 file using an atomic write".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
                     "old_string": { "type": "string" },
                     "new_string": { "type": "string" },
+                    "expected_sha256": { "type": "string" },
                     "replace_all": { "type": "boolean" }
                 },
                 "required": ["path", "old_string", "new_string"],
@@ -49,6 +49,10 @@ impl Tool for EditTool {
         let path = resolve_path(&context.working_dir, required_string(&input, "path")?);
         let old_string = required_string(&input, "old_string")?;
         let new_string = required_string(&input, "new_string")?;
+        let expected_sha256 = input
+            .get("expected_sha256")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
         let replace_all = optional_bool(&input, "replace_all")?.unwrap_or(false);
         if old_string.is_empty() {
             anyhow::bail!("failed to execute edit tool: old_string must not be empty");
@@ -65,10 +69,19 @@ impl Tool for EditTool {
         let path_for_edit = path.clone();
         let old = old_string.to_owned();
         let new = new_string.to_owned();
+        let expected_sha256 = expected_sha256.clone();
         let result = tokio::task::spawn_blocking(move || {
             let _lock = path_locks.acquire_write(&path_for_edit)?;
             let original = std::fs::read_to_string(&path_for_edit)?;
             let file_hash_before = hash_text(&original);
+            if let Some(expected_sha256) = expected_sha256.as_deref()
+                && expected_sha256 != file_hash_before
+            {
+                anyhow::bail!(
+                    "failed to execute edit tool: expected_sha256 does not match '{}'",
+                    path_for_edit.display()
+                );
+            }
             let matches = original.match_indices(&old).count();
             if matches == 0 {
                 anyhow::bail!(
@@ -143,6 +156,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("note.txt");
         std::fs::write(&path, "hello world").expect("write");
+        let expected_sha256 = hash_text("hello world");
 
         let ToolResult::Json { value } = EditTool
             .execute(
@@ -150,7 +164,8 @@ mod tests {
                 json!({
                     "path": "note.txt",
                     "old_string": "world",
-                    "new_string": "there"
+                    "new_string": "there",
+                    "expected_sha256": expected_sha256
                 }),
             )
             .await
@@ -180,5 +195,26 @@ mod tests {
             .expect_err("edit should fail");
 
         assert!(error.to_string().contains("replace_all=true"));
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_stale_expected_hash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "hello").expect("write");
+
+        let error = EditTool
+            .execute(
+                tool_context(temp.path()),
+                json!({
+                    "path": "note.txt",
+                    "old_string": "hello",
+                    "new_string": "goodbye",
+                    "expected_sha256": "stale"
+                }),
+            )
+            .await
+            .expect_err("stale hash should fail");
+
+        assert!(error.to_string().contains("expected_sha256"));
     }
 }

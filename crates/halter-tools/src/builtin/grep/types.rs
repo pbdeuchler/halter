@@ -1,17 +1,27 @@
 // pattern: Functional Core
 
 use std::borrow::Cow;
+use std::fs::File;
+use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use globset::{GlobBuilder, GlobSet};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
-use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
+use smallvec::SmallVec;
+use tokio_util::sync::CancellationToken;
+
+use crate::PathLockMap;
 
 use super::super::common::resolve_path;
 use super::super::text::{truncate_to_width, visible_width};
 
 pub const DEFAULT_MAX_MATCHES: u64 = 100;
+const KNOWN_TEXT_BINARY_PROBE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -48,59 +58,543 @@ pub struct SearchConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct FileEntry {
-    pub absolute_path: PathBuf,
-    pub display_path: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ContextLine {
     pub line_number: u64,
     pub line: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct MatchRecord {
-    pub line_number: u64,
-    pub line: String,
-    pub context_before: Vec<ContextLine>,
-    pub context_after: Vec<ContextLine>,
-    pub truncated: bool,
+struct CollectedMatch {
+    line_number: u64,
+    line: String,
+    context_before: SmallVec<[ContextLine; 8]>,
+    context_after: SmallVec<[ContextLine; 8]>,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct FileSearchResult {
-    pub path: String,
-    pub matches: Vec<MatchRecord>,
-    pub total_matches: u64,
+struct SearchResultInternal {
+    matches: Vec<CollectedMatch>,
+    match_count: u64,
+    collected: u64,
+    limit_reached: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct AggregateResult {
-    pub files: Vec<FileSearchResult>,
-    pub files_searched: u64,
-    pub files_with_matches: u64,
-    pub total_matches: u64,
+struct FileSearchResult {
+    path: String,
+    matches: Vec<CollectedMatch>,
+    total_matches: u64,
 }
 
 #[derive(Debug, Clone)]
-struct IndexedLine {
-    start: usize,
-    end_content: usize,
+struct AggregateResult {
+    files: Vec<FileSearchResult>,
+    files_searched: u64,
+    files_with_matches: u64,
+    total_matches: u64,
+    limit_reached: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FileEntry {
+    absolute_path: PathBuf,
+    display_path: String,
+    prefer_text_fast_path: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SearchParams {
+    context_before: usize,
+    context_after: usize,
+    max_columns: Option<usize>,
+    mode: OutputMode,
+    max_matches: Option<u64>,
+    offset: u64,
+    multiline: bool,
+}
+
+enum TypeFilter {
+    Known {
+        exts: &'static [&'static str],
+        names: &'static [&'static str],
+    },
+    Custom(String),
+}
+
+impl TypeFilter {
+    fn match_ext(&self, ext: &str) -> bool {
+        match self {
+            Self::Known { exts, .. } => exts
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate)),
+            Self::Custom(custom_ext) => ext.eq_ignore_ascii_case(custom_ext),
+        }
+    }
+
+    fn match_name(&self, name: &str) -> bool {
+        match self {
+            Self::Known { names, .. } => names
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate)),
+            Self::Custom(custom) => name.eq_ignore_ascii_case(custom),
+        }
+    }
+}
+
+struct MatchCollector {
+    matches: Vec<CollectedMatch>,
+    match_count: u64,
+    collected_count: u64,
+    max_matches: Option<u64>,
+    offset: u64,
+    skipped: u64,
+    limit_reached: bool,
+    max_columns: Option<usize>,
+    collect_matches: bool,
+    before_count: usize,
+    after_count: usize,
+}
+
+impl MatchCollector {
+    const fn new(
+        max_matches: Option<u64>,
+        offset: u64,
+        max_columns: Option<usize>,
+        collect_matches: bool,
+        before_count: usize,
+        after_count: usize,
+    ) -> Self {
+        Self {
+            matches: Vec::new(),
+            match_count: 0,
+            collected_count: 0,
+            max_matches,
+            offset,
+            skipped: 0,
+            limit_reached: false,
+            max_columns,
+            collect_matches,
+            before_count,
+            after_count,
+        }
+    }
+}
+
+impl Sink for MatchCollector {
+    type Error = io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &Searcher,
+        matched: &SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        self.match_count = self.match_count.saturating_add(1);
+
+        if self.limit_reached {
+            return Ok(false);
+        }
+
+        if self.skipped < self.offset {
+            self.skipped = self.skipped.saturating_add(1);
+            return Ok(true);
+        }
+
+        if self.collect_matches {
+            let raw_line = bytes_to_trimmed_string(matched.bytes());
+            let (line, truncated) = truncate_line(&raw_line, self.max_columns);
+            let line_number = matched.line_number().unwrap_or(0);
+
+            let (context_before, context_after) = if self.before_count > 0 || self.after_count > 0 {
+                extract_context_lines(
+                    matched.buffer(),
+                    matched.bytes_range_in_buffer(),
+                    self.before_count,
+                    self.after_count,
+                    line_number,
+                    self.max_columns,
+                )
+            } else {
+                (SmallVec::new(), SmallVec::new())
+            };
+
+            self.matches.push(CollectedMatch {
+                line_number,
+                line,
+                context_before,
+                context_after,
+                truncated,
+            });
+        }
+
+        self.collected_count = self.collected_count.saturating_add(1);
+        if let Some(max_matches) = self.max_matches
+            && self.collected_count >= max_matches
+        {
+            self.limit_reached = true;
+        }
+
+        Ok(true)
+    }
+}
+
+enum FileBytes {
+    #[cfg(feature = "advanced-tools")]
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl FileBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(feature = "advanced-tools")]
+            Self::Mapped(mapped) => mapped.as_ref(),
+            Self::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+#[cfg(not(feature = "advanced-tools"))]
+pub fn run_basic_search(
+    working_dir: PathBuf,
+    path_locks: Arc<PathLockMap>,
+    cancel: CancellationToken,
+    config: SearchConfig,
+) -> anyhow::Result<Value> {
+    execute_search(working_dir, path_locks, cancel, config, false)
+}
+
+#[cfg(feature = "advanced-tools")]
+pub fn run_advanced_search(
+    working_dir: PathBuf,
+    path_locks: Arc<PathLockMap>,
+    cancel: CancellationToken,
+    config: SearchConfig,
+) -> anyhow::Result<Value> {
+    execute_search(working_dir, path_locks, cancel, config, true)
+}
+
+fn execute_search(
+    working_dir: PathBuf,
+    path_locks: Arc<PathLockMap>,
+    cancel: CancellationToken,
+    config: SearchConfig,
+    allow_parallel: bool,
+) -> anyhow::Result<Value> {
+    let search_root = resolve_search_root(&working_dir, &config.path);
+    let entries = collect_entries(
+        &search_root,
+        config.glob.as_deref(),
+        config.type_filter.as_deref(),
+    )?;
+    let matcher = build_matcher(&config.pattern, config.ignore_case, config.multiline)?;
+
+    let result =
+        if allow_parallel && config.offset == 0 && config.output_mode == OutputMode::Content {
+            run_parallel_search(&entries, &matcher, &config, path_locks, cancel)?
+        } else {
+            run_sequential_search(&entries, &matcher, &config, path_locks, cancel)?
+        };
+
+    Ok(build_response(result, &config))
+}
+
+fn run_parallel_search(
+    entries: &[FileEntry],
+    matcher: &RegexMatcher,
+    config: &SearchConfig,
+    path_locks: Arc<PathLockMap>,
+    cancel: CancellationToken,
+) -> anyhow::Result<AggregateResult> {
+    #[cfg(feature = "advanced-tools")]
+    {
+        use rayon::prelude::*;
+
+        #[derive(Default)]
+        struct ParallelFileResult {
+            file: Option<FileSearchResult>,
+            searched: bool,
+        }
+
+        let params = SearchParams {
+            context_before: config.context_before,
+            context_after: config.context_after,
+            max_columns: config.max_columns,
+            mode: config.output_mode,
+            max_matches: None,
+            offset: 0,
+            multiline: config.multiline,
+        };
+
+        let mut results: Vec<ParallelFileResult> = entries
+            .par_iter()
+            .map_init(
+                || build_searcher(params.multiline),
+                |searcher, entry| {
+                    if cancel.is_cancelled() {
+                        return ParallelFileResult::default();
+                    }
+
+                    let Ok(_lock) = path_locks.acquire_read(&entry.absolute_path) else {
+                        return ParallelFileResult::default();
+                    };
+                    let Ok(Some(bytes)) =
+                        read_file_bytes(&entry.absolute_path, entry.prefer_text_fast_path)
+                    else {
+                        return ParallelFileResult::default();
+                    };
+                    let Ok(search) = run_search(searcher, matcher, bytes.as_slice(), params) else {
+                        return ParallelFileResult::default();
+                    };
+
+                    ParallelFileResult {
+                        file: Some(FileSearchResult {
+                            path: entry.display_path.clone(),
+                            matches: if config.output_mode == OutputMode::Content {
+                                search.matches
+                            } else {
+                                Vec::new()
+                            },
+                            total_matches: search.match_count,
+                        }),
+                        searched: true,
+                    }
+                },
+            )
+            .collect();
+
+        if cancel.is_cancelled() {
+            anyhow::bail!("failed to execute grep tool: cancelled");
+        }
+
+        results.sort_by(|left, right| {
+            let left_path = left
+                .file
+                .as_ref()
+                .map(|file| file.path.as_str())
+                .unwrap_or("");
+            let right_path = right
+                .file
+                .as_ref()
+                .map(|file| file.path.as_str())
+                .unwrap_or("");
+            left_path.cmp(right_path)
+        });
+
+        let files_searched = results.iter().filter(|result| result.searched).count() as u64;
+        let mut files = Vec::new();
+        let mut files_with_matches = 0u64;
+        let mut total_matches = 0u64;
+
+        for result in results {
+            let Some(file) = result.file else {
+                continue;
+            };
+            if file.total_matches == 0 {
+                continue;
+            }
+            files_with_matches = files_with_matches.saturating_add(1);
+            total_matches = total_matches.saturating_add(file.total_matches);
+            files.push(file);
+        }
+
+        Ok(AggregateResult {
+            files,
+            files_searched,
+            files_with_matches,
+            total_matches,
+            limit_reached: false,
+        })
+    }
+
+    #[cfg(not(feature = "advanced-tools"))]
+    {
+        let _ = (entries, matcher, config, path_locks, cancel);
+        unreachable!("advanced search is only available with the advanced-tools feature");
+    }
+}
+
+fn run_sequential_search(
+    entries: &[FileEntry],
+    matcher: &RegexMatcher,
+    config: &SearchConfig,
+    path_locks: Arc<PathLockMap>,
+    cancel: CancellationToken,
+) -> anyhow::Result<AggregateResult> {
+    let mut files = Vec::new();
+    let mut files_searched = 0u64;
+    let mut files_with_matches = 0u64;
+    let mut total_matches = 0u64;
+    let mut collected = 0u64;
+    let mut limit_reached = false;
+    let mut searcher = build_searcher(config.multiline);
+
+    let base_params = SearchParams {
+        context_before: config.context_before,
+        context_after: config.context_after,
+        max_columns: config.max_columns,
+        mode: config.output_mode,
+        max_matches: Some(config.max_matches),
+        offset: config.offset,
+        multiline: config.multiline,
+    };
+
+    for entry in entries {
+        if cancel.is_cancelled() {
+            anyhow::bail!("failed to execute grep tool: cancelled");
+        }
+        if base_params.max_matches == Some(0) || collected >= config.max_matches {
+            limit_reached = true;
+            break;
+        }
+
+        let file_offset = config.offset.saturating_sub(total_matches);
+        let remaining = config.max_matches.saturating_sub(collected);
+        if remaining == 0 {
+            limit_reached = true;
+            break;
+        }
+
+        let _lock = path_locks.acquire_read(&entry.absolute_path)?;
+        let Some(bytes) = read_file_bytes(&entry.absolute_path, entry.prefer_text_fast_path)?
+        else {
+            continue;
+        };
+        files_searched = files_searched.saturating_add(1);
+
+        let params = SearchParams {
+            max_matches: Some(remaining),
+            offset: file_offset,
+            ..base_params
+        };
+        let search = run_search(&mut searcher, matcher, bytes.as_slice(), params)?;
+        if search.match_count == 0 {
+            continue;
+        }
+
+        files_with_matches = files_with_matches.saturating_add(1);
+        total_matches = total_matches.saturating_add(search.match_count);
+        collected = collected.saturating_add(search.collected);
+        files.push(FileSearchResult {
+            path: entry.display_path.clone(),
+            matches: if config.output_mode == OutputMode::Content {
+                search.matches
+            } else {
+                Vec::new()
+            },
+            total_matches: search.match_count,
+        });
+
+        if search.limit_reached || collected >= config.max_matches {
+            limit_reached = true;
+            break;
+        }
+    }
+
+    Ok(AggregateResult {
+        files,
+        files_searched,
+        files_with_matches,
+        total_matches,
+        limit_reached,
+    })
+}
+
+fn run_search(
+    searcher: &mut Searcher,
+    matcher: &RegexMatcher,
+    content: &[u8],
+    params: SearchParams,
+) -> io::Result<SearchResultInternal> {
+    let collect_matches = matches!(params.mode, OutputMode::Content);
+    let (before_count, after_count) = if collect_matches {
+        (params.context_before, params.context_after)
+    } else {
+        (0, 0)
+    };
+
+    let mut collector = MatchCollector::new(
+        params.max_matches,
+        params.offset,
+        params.max_columns,
+        collect_matches,
+        before_count,
+        after_count,
+    );
+    searcher.search_slice(matcher, content, &mut collector)?;
+
+    Ok(SearchResultInternal {
+        matches: collector.matches,
+        match_count: collector.match_count,
+        collected: collector.collected_count,
+        limit_reached: collector.limit_reached,
+    })
+}
+
+fn build_searcher(multiline: bool) -> Searcher {
+    SearcherBuilder::new()
+        .line_number(true)
+        .multi_line(multiline)
+        .build()
+}
+
+fn build_regex_matcher(
+    pattern: &str,
+    ignore_case: bool,
+    multiline: bool,
+) -> Result<RegexMatcher, grep_regex::Error> {
+    RegexMatcherBuilder::new()
+        .case_insensitive(ignore_case)
+        .multi_line(multiline)
+        .build(pattern)
+}
+
+pub fn build_matcher(
+    pattern: &str,
+    ignore_case: bool,
+    multiline: bool,
+) -> anyhow::Result<RegexMatcher> {
+    let sanitized = sanitize_braces(pattern);
+    build_regex_matcher(sanitized.as_ref(), ignore_case, multiline)
+        .or_else(|error| {
+            let message = error.to_string();
+            if message.contains("unclosed group") || message.contains("unopened group") {
+                let escaped = escape_unescaped_parentheses(sanitized.as_ref());
+                if escaped.as_ref() != sanitized.as_ref() {
+                    return build_regex_matcher(escaped.as_ref(), ignore_case, multiline);
+                }
+            }
+            Err(error)
+        })
+        .map_err(|error| anyhow::anyhow!("failed to compile grep pattern: {error}"))
 }
 
 pub fn resolve_search_root(working_dir: &Path, path: &str) -> PathBuf {
     resolve_path(working_dir, path)
 }
 
-pub fn collect_entries(
+fn collect_entries(
     search_root: &Path,
     glob: Option<&str>,
     type_filter: Option<&str>,
 ) -> anyhow::Result<Vec<FileEntry>> {
-    let metadata = std::fs::metadata(search_root)?;
+    let metadata = std::fs::symlink_metadata(search_root)?;
+    let type_filter = resolve_type_filter(type_filter);
+    let matcher = compile_glob(glob)?;
+
+    if metadata.file_type().is_symlink() {
+        let resolved = std::fs::metadata(search_root)?;
+        if !resolved.is_file() {
+            return Ok(Vec::new());
+        }
+    } else if !metadata.is_file() && !metadata.is_dir() {
+        return Ok(Vec::new());
+    }
+
     if metadata.is_file() {
-        if !matches_type_filter(search_root, type_filter) {
+        if let Some(type_filter) = type_filter.as_ref()
+            && !matches_type_filter(search_root, type_filter)
+        {
             return Ok(Vec::new());
         }
         let display_path = search_root
@@ -111,14 +605,10 @@ pub fn collect_entries(
         return Ok(vec![FileEntry {
             absolute_path: search_root.to_path_buf(),
             display_path,
+            prefer_text_fast_path: is_known_text_path(search_root),
         }]);
     }
 
-    if !metadata.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let matcher = compile_glob(glob)?;
     let mut entries = Vec::new();
     let mut builder = WalkBuilder::new(search_root);
     builder
@@ -133,106 +623,248 @@ pub fn collect_entries(
         if path == search_root || !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
+
         let relative = path.strip_prefix(search_root).unwrap_or(path);
-        if let Some(matcher) = matcher.as_ref() {
-            if !matcher.is_match(relative) {
-                continue;
-            }
-        }
-        if !matches_type_filter(path, type_filter) {
+        if let Some(matcher) = matcher.as_ref()
+            && !matcher.is_match(relative)
+        {
             continue;
         }
+        if let Some(type_filter) = type_filter.as_ref()
+            && !matches_type_filter(path, type_filter)
+        {
+            continue;
+        }
+
         entries.push(FileEntry {
             absolute_path: path.to_path_buf(),
             display_path: relative.to_string_lossy().into_owned(),
+            prefer_text_fast_path: is_known_text_path(path),
         });
     }
 
     Ok(entries)
 }
 
-pub fn build_matcher(pattern: &str, ignore_case: bool, multiline: bool) -> anyhow::Result<Regex> {
-    let sanitized = sanitize_braces(pattern);
-    build_regex(sanitized.as_ref(), ignore_case, multiline).or_else(|error| {
-        if error.to_string().contains("unclosed group")
-            || error.to_string().contains("unopened group")
-        {
-            let escaped = escape_unescaped_parentheses(sanitized.as_ref());
-            if escaped.as_ref() != sanitized.as_ref() {
-                return build_regex(escaped.as_ref(), ignore_case, multiline);
-            }
-        }
-        Err(error)
-    })
+fn compile_glob(glob: Option<&str>) -> anyhow::Result<Option<GlobSet>> {
+    let Some(glob) = glob.map(str::trim).filter(|glob| !glob.is_empty()) else {
+        return Ok(None);
+    };
+    let pattern = GlobBuilder::new(glob)
+        .literal_separator(false)
+        .build()
+        .map_err(|error| anyhow::anyhow!("invalid grep glob '{glob}': {error}"))?;
+    let mut builder = globset::GlobSetBuilder::new();
+    builder.add(pattern);
+    Ok(Some(builder.build()?))
 }
 
-pub fn build_response(result: AggregateResult, config: &SearchConfig) -> Value {
+fn resolve_type_filter(type_name: Option<&str>) -> Option<TypeFilter> {
+    let normalized = type_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())?;
+
+    let (exts, names): (&[&str], &[&str]) = match normalized.as_str() {
+        "js" | "javascript" => (&["js", "jsx", "mjs", "cjs"], &[]),
+        "ts" | "typescript" => (&["ts", "tsx", "mts", "cts"], &[]),
+        "json" => (&["json", "jsonc", "json5"], &[]),
+        "yaml" | "yml" => (&["yaml", "yml"], &[]),
+        "toml" => (&["toml"], &[]),
+        "md" | "markdown" => (&["md", "markdown", "mdx"], &[]),
+        "py" | "python" => (&["py", "pyi"], &[]),
+        "rs" | "rust" => (&["rs"], &[]),
+        "go" => (&["go"], &[]),
+        "java" => (&["java"], &[]),
+        "kt" | "kotlin" => (&["kt", "kts"], &[]),
+        "c" => (&["c", "h"], &[]),
+        "cpp" | "cxx" => (&["cpp", "cc", "cxx", "hpp", "hxx", "hh"], &[]),
+        "cs" | "csharp" => (&["cs", "csx"], &[]),
+        "php" => (&["php", "phtml"], &[]),
+        "rb" | "ruby" => (&["rb", "rake", "gemspec"], &[]),
+        "sh" | "bash" => (&["sh", "bash", "zsh"], &[]),
+        "zsh" => (&["zsh"], &[]),
+        "fish" => (&["fish"], &[]),
+        "html" => (&["html", "htm"], &[]),
+        "css" => (&["css"], &[]),
+        "scss" => (&["scss"], &[]),
+        "sass" => (&["sass"], &[]),
+        "less" => (&["less"], &[]),
+        "xml" => (&["xml"], &[]),
+        "docker" | "dockerfile" => (&[], &["dockerfile"]),
+        "make" | "makefile" => (&[], &["makefile"]),
+        other => return Some(TypeFilter::Custom(other.to_owned())),
+    };
+
+    Some(TypeFilter::Known { exts, names })
+}
+
+fn matches_type_filter(path: &Path, filter: &TypeFilter) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if filter.match_name(file_name) {
+        return true;
+    }
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    !extension.is_empty() && filter.match_ext(extension)
+}
+
+const KNOWN_TEXT_EXTENSIONS: &[&str] = &[
+    "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "json", "jsonc", "json5", "yaml", "yml",
+    "toml", "md", "markdown", "mdx", "py", "pyi", "rs", "go", "java", "kt", "kts", "c", "h", "cpp",
+    "cc", "cxx", "hpp", "hxx", "hh", "cs", "csx", "php", "phtml", "rb", "rake", "gemspec", "sh",
+    "bash", "zsh", "fish", "html", "htm", "css", "scss", "sass", "less", "xml",
+];
+
+fn is_known_text_path(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name.eq_ignore_ascii_case("dockerfile") || file_name.eq_ignore_ascii_case("makefile") {
+        return true;
+    }
+
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    !extension.is_empty()
+        && KNOWN_TEXT_EXTENSIONS
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+fn read_file_bytes(path: &Path, prefer_text_fast_path: bool) -> io::Result<Option<FileBytes>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let resolved_metadata = if metadata.file_type().is_symlink() {
+        let target_metadata = std::fs::metadata(path)?;
+        if !target_metadata.is_file() {
+            return Ok(None);
+        }
+        target_metadata
+    } else if metadata.is_file() {
+        metadata
+    } else {
+        return Ok(None);
+    };
+
+    if resolved_metadata.len() == 0 {
+        return Ok(Some(FileBytes::Owned(Vec::new())));
+    }
+
+    let file = File::open(path)?;
+    #[cfg(feature = "advanced-tools")]
+    let bytes = match unsafe { memmap2::Mmap::map(&file) } {
+        Ok(mapped) => FileBytes::Mapped(mapped),
+        Err(_) => FileBytes::Owned(std::fs::read(path)?),
+    };
+    #[cfg(not(feature = "advanced-tools"))]
+    let bytes = {
+        let _ = file;
+        FileBytes::Owned(std::fs::read(path)?)
+    };
+
+    if prefer_text_fast_path && is_known_text_path(path) {
+        let slice = bytes.as_slice();
+        let probe_len = slice.len().min(KNOWN_TEXT_BINARY_PROBE_BYTES);
+        if slice[..probe_len].contains(&0) {
+            return Ok(None);
+        }
+    } else if bytes.as_slice().contains(&0) {
+        return Ok(None);
+    }
+
+    Ok(Some(bytes))
+}
+
+fn truncate_line(line: &str, max_columns: Option<usize>) -> (String, bool) {
+    match max_columns {
+        Some(max_columns) if visible_width(line) > max_columns => {
+            (truncate_to_width(line, max_columns), true)
+        }
+        _ => (line.to_owned(), false),
+    }
+}
+
+fn bytes_to_trimmed_string(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.trim_end().to_owned(),
+        Err(_) => String::from_utf8_lossy(bytes).trim_end().to_owned(),
+    }
+}
+
+fn extract_context_lines(
+    buffer: &[u8],
+    match_range: Range<usize>,
+    before: usize,
+    after: usize,
+    match_line_number: u64,
+    max_columns: Option<usize>,
+) -> (SmallVec<[ContextLine; 8]>, SmallVec<[ContextLine; 8]>) {
+    let mut before_lines = SmallVec::new();
+    let mut after_lines = SmallVec::new();
+
+    if before > 0 && match_range.start > 0 {
+        let mut end = match_range.start;
+        let mut line_number = match_line_number;
+
+        for _ in 0..before {
+            if end == 0 || line_number == 0 {
+                break;
+            }
+            let content_end = if buffer[end - 1] == b'\n' {
+                end - 1
+            } else {
+                end
+            };
+            let start = match buffer[..content_end]
+                .iter()
+                .rposition(|&byte| byte == b'\n')
+            {
+                Some(position) => position + 1,
+                None => 0,
+            };
+            line_number = line_number.saturating_sub(1);
+            let raw = bytes_to_trimmed_string(&buffer[start..content_end]);
+            let (line, _) = truncate_line(&raw, max_columns);
+            before_lines.push(ContextLine { line_number, line });
+            end = start;
+        }
+        before_lines.reverse();
+    }
+
+    if after > 0 && match_range.end < buffer.len() {
+        let newline_count = buffer[match_range.clone()]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count() as u64;
+        let mut start = match_range.end;
+        for line_number in
+            (match_line_number + newline_count)..(match_line_number + newline_count + after as u64)
+        {
+            if start >= buffer.len() {
+                break;
+            }
+            let end = match buffer[start..].iter().position(|&byte| byte == b'\n') {
+                Some(position) => start + position,
+                None => buffer.len(),
+            };
+            let raw = bytes_to_trimmed_string(&buffer[start..end]);
+            let (line, _) = truncate_line(&raw, max_columns);
+            after_lines.push(ContextLine { line_number, line });
+            start = end.saturating_add(1);
+        }
+    }
+
+    (before_lines, after_lines)
+}
+
+fn build_response(result: AggregateResult, config: &SearchConfig) -> Value {
     match config.output_mode {
         OutputMode::Content => build_content_response(result, config),
         OutputMode::Count => build_count_response(result),
         OutputMode::FilesWithMatches => build_files_with_matches_response(result),
     }
-}
-
-pub fn search_text(text: &str, matcher: &Regex, config: &SearchConfig) -> FileSearchResult {
-    let indexed_lines = index_lines(text);
-    let mut matches = Vec::new();
-    let mut total_matches = 0u64;
-
-    for matched in matcher.find_iter(text) {
-        total_matches += 1;
-        if config.output_mode != OutputMode::Content {
-            continue;
-        }
-
-        if indexed_lines.is_empty() {
-            continue;
-        }
-
-        let start_line_index = line_index_for_position(&indexed_lines, matched.start());
-        let end_position = matched.end().saturating_sub(1);
-        let end_line_index = line_index_for_position(&indexed_lines, end_position);
-        let line_number = start_line_index as u64 + 1;
-        let line = render_line(
-            &text[indexed_lines[start_line_index].start..indexed_lines[end_line_index].end_content],
-            config.max_columns,
-        );
-        let context_before = render_context_before(
-            text,
-            &indexed_lines,
-            start_line_index,
-            config.context_before,
-            config.max_columns,
-        );
-        let context_after = render_context_after(
-            text,
-            &indexed_lines,
-            end_line_index,
-            config.context_after,
-            config.max_columns,
-        );
-
-        matches.push(MatchRecord {
-            line_number,
-            truncated: line.1,
-            line: line.0,
-            context_before,
-            context_after,
-        });
-    }
-
-    FileSearchResult {
-        path: String::new(),
-        matches,
-        total_matches,
-    }
-}
-
-pub fn decode_searchable_bytes(bytes: &[u8]) -> Option<String> {
-    if bytes.contains(&0) {
-        return None;
-    }
-    Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
 fn build_content_response(result: AggregateResult, config: &SearchConfig) -> Value {
@@ -243,7 +875,7 @@ fn build_content_response(result: AggregateResult, config: &SearchConfig) -> Val
     'files: for file in &result.files {
         for matched in &file.matches {
             if skipped < config.offset {
-                skipped += 1;
+                skipped = skipped.saturating_add(1);
                 continue;
             }
             if emitted >= config.max_matches {
@@ -253,11 +885,25 @@ fn build_content_response(result: AggregateResult, config: &SearchConfig) -> Val
                 "path": file.path,
                 "line_number": matched.line_number,
                 "line": matched.line,
-                "context_before": if matched.context_before.is_empty() { Value::Null } else { json!(matched.context_before.iter().map(|line| json!({"line_number": line.line_number, "line": line.line})).collect::<Vec<_>>()) },
-                "context_after": if matched.context_after.is_empty() { Value::Null } else { json!(matched.context_after.iter().map(|line| json!({"line_number": line.line_number, "line": line.line})).collect::<Vec<_>>()) },
+                "context_before": if matched.context_before.is_empty() {
+                    Value::Null
+                } else {
+                    json!(matched.context_before.iter().map(|line| json!({
+                        "line_number": line.line_number,
+                        "line": line.line,
+                    })).collect::<Vec<_>>())
+                },
+                "context_after": if matched.context_after.is_empty() {
+                    Value::Null
+                } else {
+                    json!(matched.context_after.iter().map(|line| json!({
+                        "line_number": line.line_number,
+                        "line": line.line,
+                    })).collect::<Vec<_>>())
+                },
                 "truncated": matched.truncated,
             }));
-            emitted += 1;
+            emitted = emitted.saturating_add(1);
         }
     }
 
@@ -266,7 +912,8 @@ fn build_content_response(result: AggregateResult, config: &SearchConfig) -> Val
         "total_matches": result.total_matches,
         "files_searched": result.files_searched,
         "files_with_matches": result.files_with_matches,
-        "truncated": result.total_matches > config.offset.saturating_add(emitted),
+        "truncated": result.limit_reached
+            || result.total_matches > config.offset.saturating_add(emitted),
     })
 }
 
@@ -281,7 +928,7 @@ fn build_count_response(result: AggregateResult) -> Value {
         "total_matches": result.total_matches,
         "files_searched": result.files_searched,
         "files_with_matches": result.files_with_matches,
-        "truncated": false,
+        "truncated": result.limit_reached,
     })
 }
 
@@ -295,149 +942,8 @@ fn build_files_with_matches_response(result: AggregateResult) -> Value {
         "total_matches": result.total_matches,
         "files_searched": result.files_searched,
         "files_with_matches": result.files_with_matches,
-        "truncated": false,
+        "truncated": result.limit_reached,
     })
-}
-
-fn build_regex(pattern: &str, ignore_case: bool, multiline: bool) -> anyhow::Result<Regex> {
-    RegexBuilder::new(pattern)
-        .case_insensitive(ignore_case)
-        .multi_line(multiline)
-        .dot_matches_new_line(multiline)
-        .size_limit(10 * 1024 * 1024)
-        .dfa_size_limit(10 * 1024 * 1024)
-        .build()
-        .map_err(|error| anyhow::anyhow!("failed to compile grep pattern: {error}"))
-}
-
-fn compile_glob(glob: Option<&str>) -> anyhow::Result<Option<GlobSet>> {
-    let Some(glob) = glob else {
-        return Ok(None);
-    };
-    let pattern = GlobBuilder::new(glob)
-        .literal_separator(false)
-        .build()
-        .map_err(|error| anyhow::anyhow!("invalid grep glob '{glob}': {error}"))?;
-    let mut builder = globset::GlobSetBuilder::new();
-    builder.add(pattern);
-    Ok(Some(builder.build()?))
-}
-
-fn matches_type_filter(path: &Path, type_filter: Option<&str>) -> bool {
-    let Some(type_filter) = type_filter.map(str::trim).filter(|value| !value.is_empty()) else {
-        return true;
-    };
-    let normalized = type_filter.trim_start_matches('.').to_ascii_lowercase();
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    match normalized.as_str() {
-        "js" | "javascript" => matches!(extension.as_str(), "js" | "jsx" | "mjs" | "cjs"),
-        "ts" | "typescript" => matches!(extension.as_str(), "ts" | "tsx" | "mts" | "cts"),
-        "json" => matches!(extension.as_str(), "json" | "jsonc" | "json5"),
-        "yaml" | "yml" => matches!(extension.as_str(), "yaml" | "yml"),
-        "md" | "markdown" => matches!(extension.as_str(), "md" | "markdown" | "mdx"),
-        "py" | "python" => matches!(extension.as_str(), "py" | "pyi"),
-        "rs" | "rust" => extension == "rs",
-        "go" => extension == "go",
-        "java" => extension == "java",
-        "sh" | "bash" => matches!(extension.as_str(), "sh" | "bash" | "zsh"),
-        "docker" | "dockerfile" => file_name == "dockerfile",
-        "make" | "makefile" => file_name == "makefile",
-        other => extension == other || file_name == other,
-    }
-}
-
-fn index_lines(text: &str) -> Vec<IndexedLine> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-
-    let mut lines = Vec::new();
-    let mut start = 0usize;
-    for (index, byte) in text.bytes().enumerate() {
-        if byte == b'\n' {
-            let end_content = if index > start && text.as_bytes()[index - 1] == b'\r' {
-                index - 1
-            } else {
-                index
-            };
-            lines.push(IndexedLine { start, end_content });
-            start = index + 1;
-        }
-    }
-    if start < text.len() || lines.is_empty() {
-        lines.push(IndexedLine {
-            start,
-            end_content: text.len(),
-        });
-    }
-    lines
-}
-
-fn line_index_for_position(lines: &[IndexedLine], position: usize) -> usize {
-    match lines.binary_search_by_key(&position, |line| line.start) {
-        Ok(index) => index,
-        Err(index) => index.saturating_sub(1),
-    }
-}
-
-fn render_line(line: &str, max_columns: Option<usize>) -> (String, bool) {
-    let trimmed = line.trim_end_matches(['\r', '\n']);
-    match max_columns {
-        Some(max_columns) if visible_width(trimmed) > max_columns => {
-            (truncate_to_width(trimmed, max_columns), true)
-        }
-        _ => (trimmed.to_owned(), false),
-    }
-}
-
-fn render_context_before(
-    text: &str,
-    lines: &[IndexedLine],
-    start_line_index: usize,
-    count: usize,
-    max_columns: Option<usize>,
-) -> Vec<ContextLine> {
-    let start = start_line_index.saturating_sub(count);
-    (start..start_line_index)
-        .map(|index| {
-            let line = &text[lines[index].start..lines[index].end_content];
-            let (line, _) = render_line(line, max_columns);
-            ContextLine {
-                line_number: index as u64 + 1,
-                line,
-            }
-        })
-        .collect()
-}
-
-fn render_context_after(
-    text: &str,
-    lines: &[IndexedLine],
-    end_line_index: usize,
-    count: usize,
-    max_columns: Option<usize>,
-) -> Vec<ContextLine> {
-    let end = (end_line_index + count + 1).min(lines.len());
-    ((end_line_index + 1)..end)
-        .map(|index| {
-            let line = &text[lines[index].start..lines[index].end_content];
-            let (line, _) = render_line(line, max_columns);
-            ContextLine {
-                line_number: index as u64 + 1,
-                line,
-            }
-        })
-        .collect()
 }
 
 fn sanitize_braces(pattern: &str) -> Cow<'_, str> {
@@ -572,25 +1078,20 @@ mod tests {
     }
 
     #[test]
-    fn search_text_returns_context() {
-        let config = SearchConfig {
-            pattern: "beta".to_owned(),
-            path: ".".to_owned(),
-            glob: None,
-            type_filter: None,
-            ignore_case: false,
-            multiline: false,
-            context_before: 1,
-            context_after: 1,
-            max_matches: DEFAULT_MAX_MATCHES,
-            offset: 0,
-            max_columns: None,
-            output_mode: OutputMode::Content,
-        };
-        let matcher = build_matcher("beta", false, false).expect("matcher");
-        let result = search_text("alpha\nbeta\ngamma\n", &matcher, &config);
-        assert_eq!(result.total_matches, 1);
-        assert_eq!(result.matches[0].context_before[0].line, "alpha");
-        assert_eq!(result.matches[0].context_after[0].line, "gamma");
+    fn extract_context_lines_returns_expected_lines() {
+        let buffer = b"alpha\nbeta\ngamma\ndelta\n";
+        let match_start = buffer
+            .windows(6)
+            .position(|window| window == b"gamma\n")
+            .unwrap();
+        let match_end = match_start + 6;
+        let (before, after) = extract_context_lines(buffer, match_start..match_end, 1, 1, 3, None);
+
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].line_number, 2);
+        assert_eq!(before[0].line, "beta");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].line_number, 4);
+        assert_eq!(after[0].line, "delta");
     }
 }

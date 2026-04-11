@@ -10,20 +10,58 @@ use super::common::{ToolScope, ensure_not_cancelled, optional_u64, required_stri
 
 #[cfg(target_os = "linux")]
 mod platform {
+    use std::collections::{HashMap, VecDeque};
     use std::fs;
+    use std::path::Path;
 
     pub fn collect_descendants(pid: i32, pids: &mut Vec<i32>) {
-        let children_path = format!("/proc/{pid}/task/{pid}/children");
-        let Ok(content) = fs::read_to_string(&children_path) else {
-            return;
+        let tree = build_process_tree(Path::new("/proc"));
+        collect_descendants_from_tree(pid, &tree, pids);
+    }
+
+    fn build_process_tree(root: &Path) -> HashMap<i32, Vec<i32>> {
+        let mut tree = HashMap::<i32, Vec<i32>>::new();
+        let Ok(entries) = fs::read_dir(root) else {
+            return tree;
         };
 
-        for part in content.split_whitespace() {
-            if let Ok(child_pid) = part.parse::<i32>() {
-                pids.push(child_pid);
-                collect_descendants(child_pid, pids);
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(pid) = file_name
+                .to_str()
+                .and_then(|value| value.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+                continue;
+            };
+            if let Some(ppid) = parse_status_ppid(&status) {
+                tree.entry(ppid).or_default().push(pid);
             }
         }
+        tree
+    }
+
+    fn collect_descendants_from_tree(pid: i32, tree: &HashMap<i32, Vec<i32>>, pids: &mut Vec<i32>) {
+        let mut queue = VecDeque::new();
+        if let Some(children) = tree.get(&pid) {
+            queue.extend(children.iter().copied());
+        }
+
+        while let Some(child_pid) = queue.pop_front() {
+            pids.push(child_pid);
+            if let Some(children) = tree.get(&child_pid) {
+                queue.extend(children.iter().copied());
+            }
+        }
+    }
+
+    fn parse_status_ppid(status: &str) -> Option<i32> {
+        status.lines().find_map(|line| {
+            let value = line.strip_prefix("PPid:")?.trim();
+            value.parse::<i32>().ok()
+        })
     }
 
     pub fn kill_pid(pid: i32, signal: i32) -> bool {
@@ -37,6 +75,20 @@ mod platform {
 
     pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
         unsafe { libc::kill(-pgid, signal) == 0 }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_status_parent_pid() {
+            assert_eq!(
+                parse_status_ppid("Name:\tbash\nState:\tS\nPPid:\t42\n"),
+                Some(42)
+            );
+            assert_eq!(parse_status_ppid("Name:\tbash\n"), None);
+        }
     }
 }
 
@@ -58,7 +110,11 @@ mod platform {
 
         let mut buffer = vec![0i32; count as usize];
         let actual = unsafe {
-            proc_listchildpids(pid, buffer.as_mut_ptr(), (buffer.len() * size_of::<i32>()) as i32)
+            proc_listchildpids(
+                pid,
+                buffer.as_mut_ptr(),
+                (buffer.len() * size_of::<i32>()) as i32,
+            )
         };
         if actual <= 0 {
             return;
@@ -261,6 +317,7 @@ impl Tool for ProcessTool {
 
         let value = match action {
             "kill_tree" => {
+                context.policy.check_shell("process").await?;
                 let signal = optional_u64(&input, "signal")?.unwrap_or(9);
                 let signal = i32::try_from(signal).map_err(|_| {
                     anyhow::anyhow!("failed to execute process tool: signal is out of range")
@@ -279,5 +336,59 @@ impl Tool for ProcessTool {
         };
 
         Ok(ToolResult::Json { value })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{
+        DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolPolicy,
+        ToolSessionStore,
+    };
+
+    use super::*;
+
+    fn tool_context(root: &std::path::Path, allowed_shell_commands: Vec<String>) -> ToolContext {
+        ToolContext {
+            session_id: halter_protocol::SessionId::new(),
+            working_dir: root.to_path_buf(),
+            path_locks: Arc::new(PathLockMap::default()),
+            tool_sessions: Arc::new(ToolSessionStore::default()),
+            file_view: Arc::new(Default::default()),
+            snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(NoopToolEventSink),
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings {
+                allowed_write_roots: vec![root.to_path_buf()],
+                allowed_shell_commands,
+                ..PolicySettings::default()
+            })) as Arc<dyn ToolPolicy>,
+            max_tool_output_bytes: 16_384,
+            shell_timeout_secs: 30,
+            subagent_parent: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_tree_requires_process_allowlist_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let error = ProcessTool
+            .execute(
+                tool_context(temp.path(), vec!["rg".to_owned()]),
+                json!({
+                    "action": "kill_tree",
+                    "pid": 1
+                }),
+            )
+            .await
+            .expect_err("kill_tree should be denied");
+
+        assert!(error.to_string().contains("allowlist"));
+        assert!(error.to_string().contains("process"));
     }
 }

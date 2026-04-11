@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -27,6 +28,7 @@ thread_local! {
 
 #[derive(Clone)]
 struct ProfileSample {
+    session_id: String,
     stack: SmallVec<[&'static str; 4]>,
     duration_us: u64,
     timestamp_us: u64,
@@ -57,26 +59,35 @@ impl CircularBuffer {
         self.write_pos = (self.write_pos + 1) % self.capacity;
     }
 
-    fn get_since(&self, cutoff_us: u64) -> Vec<ProfileSample> {
+    fn get_since(&self, cutoff_us: u64, session_id: Option<&str>) -> Vec<ProfileSample> {
         self.samples
             .iter()
-            .filter(|sample| sample.timestamp_us >= cutoff_us)
+            .filter(|sample| {
+                sample.timestamp_us >= cutoff_us
+                    && session_id.is_none_or(|session_id| sample.session_id == session_id)
+            })
             .cloned()
             .collect()
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ProfileGuard {
     region: &'static str,
+    session_id: String,
     start: Instant,
+    _not_send: PhantomData<*const ()>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl ProfileGuard {
-    fn new(region: &'static str) -> Self {
+    fn new(region: &'static str, session_id: impl Into<String>) -> Self {
         REGION_STACK.with(|stack| stack.borrow_mut().push(region));
         Self {
             region,
+            session_id: session_id.into(),
             start: Instant::now(),
+            _not_send: PhantomData,
         }
     }
 }
@@ -89,6 +100,7 @@ impl Drop for ProfileGuard {
         REGION_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
             let sample = ProfileSample {
+                session_id: self.session_id.clone(),
                 stack: stack.iter().copied().collect(),
                 duration_us,
                 timestamp_us,
@@ -104,11 +116,47 @@ impl Drop for ProfileGuard {
 }
 
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn profile_region(region: &'static str) -> ProfileGuard {
-    ProfileGuard::new(region)
+    ProfileGuard::new(region, "test")
 }
 
-#[cfg_attr(not(any(test, feature = "profiling")), allow(dead_code))]
+pub struct FlatProfileGuard {
+    region: &'static str,
+    session_id: String,
+    start: Instant,
+}
+
+impl FlatProfileGuard {
+    fn new(region: &'static str, session_id: impl Into<String>) -> Self {
+        Self {
+            region,
+            session_id: session_id.into(),
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for FlatProfileGuard {
+    fn drop(&mut self) {
+        let duration_us = self.start.elapsed().as_micros() as u64;
+        let timestamp_us = PROCESS_START.elapsed().as_micros() as u64;
+        let mut stack = SmallVec::new();
+        stack.push(self.region);
+        PROFILE_BUFFER.lock().push(ProfileSample {
+            session_id: self.session_id.clone(),
+            stack,
+            duration_us,
+            timestamp_us,
+        });
+    }
+}
+
+#[must_use]
+pub(crate) fn profile_flat_region(region: &'static str, session_id: &str) -> FlatProfileGuard {
+    FlatProfileGuard::new(region, session_id)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkProfile {
     pub folded: String,
@@ -118,13 +166,13 @@ pub struct WorkProfile {
     pub sample_count: u32,
 }
 
-#[cfg_attr(not(any(test, feature = "profiling")), allow(dead_code))]
 #[must_use]
-pub fn get_work_profile(last_seconds: f64) -> WorkProfile {
+#[cfg(any(test, feature = "profiling"))]
+pub fn get_work_profile_for_session(last_seconds: f64, session_id: Option<&str>) -> WorkProfile {
     let window_us = (last_seconds * 1_000_000.0).max(0.0) as u64;
     let now_us = PROCESS_START.elapsed().as_micros() as u64;
     let cutoff_us = now_us.saturating_sub(window_us);
-    let samples = PROFILE_BUFFER.lock().get_since(cutoff_us);
+    let samples = PROFILE_BUFFER.lock().get_since(cutoff_us, session_id);
     let folded = generate_folded(&samples);
     let summary = generate_summary(&samples, last_seconds * 1000.0);
     let total_us: u64 = samples.iter().map(|sample| sample.duration_us).sum();
@@ -138,10 +186,11 @@ pub fn get_work_profile(last_seconds: f64) -> WorkProfile {
     }
 }
 
-#[cfg_attr(not(feature = "profiling"), allow(dead_code))]
+#[cfg(feature = "profiling")]
 #[derive(Debug)]
 pub struct ProfilingTool;
 
+#[cfg(feature = "profiling")]
 #[async_trait]
 impl Tool for ProfilingTool {
     fn spec(&self) -> ToolSpec {
@@ -162,14 +211,14 @@ impl Tool for ProfilingTool {
 
     async fn execute(
         &self,
-        _context: ToolContext,
+        context: ToolContext,
         input: serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
         let last_seconds = input
             .get("last_seconds")
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(30.0);
-        let profile = get_work_profile(last_seconds);
+        let profile = get_work_profile_for_session(last_seconds, Some(&context.session_id.0));
         Ok(ToolResult::Json {
             value: json!({
                 "folded": profile.folded,
@@ -182,7 +231,7 @@ impl Tool for ProfilingTool {
     }
 }
 
-#[cfg_attr(not(any(test, feature = "profiling")), allow(dead_code))]
+#[cfg(any(test, feature = "profiling"))]
 fn generate_folded(samples: &[ProfileSample]) -> String {
     let mut aggregated: HashMap<String, u64> = HashMap::new();
     for sample in samples {
@@ -206,7 +255,7 @@ fn generate_folded(samples: &[ProfileSample]) -> String {
     output
 }
 
-#[cfg_attr(not(any(test, feature = "profiling")), allow(dead_code))]
+#[cfg(any(test, feature = "profiling"))]
 fn generate_summary(samples: &[ProfileSample], window_ms: f64) -> String {
     let mut by_region: HashMap<&'static str, (u64, usize)> = HashMap::new();
     for sample in samples {
@@ -219,7 +268,10 @@ fn generate_summary(samples: &[ProfileSample], window_ms: f64) -> String {
 
     let mut sorted: Vec<_> = by_region.into_iter().collect();
     sorted.sort_by_key(|(_, (duration_us, _))| Reverse(*duration_us));
-    let total_us: u64 = sorted.iter().map(|(_, (duration_us, _))| *duration_us).sum();
+    let total_us: u64 = sorted
+        .iter()
+        .map(|(_, (duration_us, _))| *duration_us)
+        .sum();
 
     let mut lines = vec![
         "# Work Profile Summary".to_owned(),
@@ -280,9 +332,19 @@ mod tests {
             let _inner = profile_region("inner");
         }
 
-        let profile = get_work_profile(10.0);
+        let profile = get_work_profile_for_session(10.0, None);
         assert!(profile.sample_count >= 2);
         assert!(profile.folded.contains("outer"));
         assert!(profile.summary.contains("outer"));
+    }
+
+    #[test]
+    fn filters_profile_by_session() {
+        drop(FlatProfileGuard::new("alpha", "session-a"));
+        drop(FlatProfileGuard::new("beta", "session-b"));
+
+        let profile = get_work_profile_for_session(10.0, Some("session-a"));
+        assert!(profile.folded.contains("alpha"));
+        assert!(!profile.folded.contains("beta"));
     }
 }

@@ -9,9 +9,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::PathLockMap;
 
+use super::FileCandidate;
 use super::language::{parse_strictness, resolve_language};
-use super::collect_candidates;
-use crate::builtin::common::{atomic_write_blocking, ensure_not_cancelled, optional_bool, optional_string, optional_u64};
+use crate::builtin::common::{
+    atomic_write_blocking, ensure_not_cancelled, optional_bool, optional_string, optional_u64,
+};
 
 #[derive(Clone)]
 pub(super) struct ReplaceConfig {
@@ -32,9 +34,7 @@ impl ReplaceConfig {
         let rewrites = input
             .get("rewrites")
             .and_then(Value::as_object)
-            .ok_or_else(|| {
-                anyhow::anyhow!("invalid tool input: missing object field 'rewrites'")
-            })?
+            .ok_or_else(|| anyhow::anyhow!("invalid tool input: missing object field 'rewrites'"))?
             .iter()
             .map(|(pattern, replacement)| {
                 let replacement = replacement.as_str().ok_or_else(|| {
@@ -80,16 +80,10 @@ struct ReplaceChange {
 
 pub(super) fn run(
     config: ReplaceConfig,
-    working_dir: std::path::PathBuf,
+    candidates: Vec<FileCandidate>,
     path_locks: Arc<PathLockMap>,
     cancel: CancellationToken,
 ) -> anyhow::Result<Value> {
-    let candidates = collect_candidates(
-        &working_dir,
-        config.path.as_deref(),
-        config.glob.as_deref(),
-        config.lang.as_deref(),
-    )?;
     let mut changes = Vec::new();
     let mut file_counts = BTreeMap::<String, u64>::new();
     let mut parse_errors = Vec::new();
@@ -157,7 +151,7 @@ pub(super) fn run(
 
             for matched in ast.root().find_all(compiled.clone()) {
                 ensure_not_cancelled(&cancel)?;
-                if changes.len() as u64 + file_changes.len() as u64 >= config.max_replacements {
+                if changes.len() as u64 + file_changes.len() as u64 == config.max_replacements {
                     limit_reached = true;
                     break 'rules;
                 }
@@ -228,7 +222,10 @@ fn compile_pattern(
     strictness: MatchStrictness,
     language: ast_grep_language::SupportLang,
 ) -> anyhow::Result<Pattern> {
-    let mut compiled = if let Some(selector) = selector.map(str::trim).filter(|selector| !selector.is_empty()) {
+    let mut compiled = if let Some(selector) = selector
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+    {
         Pattern::contextual(pattern, selector, language)
     } else {
         Pattern::try_new(pattern, language)
@@ -245,9 +242,7 @@ fn apply_edits(content: &str, edits: &[Edit<String>]) -> anyhow::Result<String> 
     let mut previous_end = 0usize;
     for edit in &edits {
         if edit.position < previous_end {
-            anyhow::bail!(
-                "failed to execute ast_grep tool: overlapping replacements detected"
-            );
+            anyhow::bail!("failed to execute ast_grep tool: overlapping replacements detected");
         }
         previous_end = edit.position.saturating_add(edit.deleted_length);
     }
@@ -314,20 +309,63 @@ mod tests {
                 glob: None,
                 lang: None,
                 selector: None,
-                rewrites: vec![("fn $NAME() {}".to_owned(), "fn $NAME() -> i32 { 0 }".to_owned())],
+                rewrites: vec![(
+                    "fn $NAME() {}".to_owned(),
+                    "fn $NAME() -> i32 { 0 }".to_owned(),
+                )],
                 strictness: MatchStrictness::Smart,
                 dry_run: true,
                 max_replacements: u64::MAX,
                 max_files: u64::MAX,
                 fail_on_parse_error: false,
             },
-            temp.path().to_path_buf(),
+            vec![FileCandidate {
+                absolute_path: path.clone(),
+                display_path: "main.rs".to_owned(),
+            }],
             Arc::new(PathLockMap::default()),
             CancellationToken::new(),
         )
         .expect("replace should succeed");
 
         assert_eq!(value["total_replacements"], 1);
-        assert_eq!(std::fs::read_to_string(path).expect("read"), "fn alpha() {}\n");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read"),
+            "fn alpha() {}\n"
+        );
+    }
+
+    #[test]
+    fn max_replacements_allows_exact_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("main.rs");
+        std::fs::write(&path, "fn alpha() {}\nfn beta() {}\n").expect("write");
+
+        let value = run(
+            ReplaceConfig {
+                path: Some(temp.path().to_string_lossy().into_owned()),
+                glob: None,
+                lang: None,
+                selector: None,
+                rewrites: vec![(
+                    "fn $NAME() {}".to_owned(),
+                    "fn $NAME() -> i32 { 0 }".to_owned(),
+                )],
+                strictness: MatchStrictness::Smart,
+                dry_run: true,
+                max_replacements: 2,
+                max_files: u64::MAX,
+                fail_on_parse_error: false,
+            },
+            vec![FileCandidate {
+                absolute_path: path,
+                display_path: "main.rs".to_owned(),
+            }],
+            Arc::new(PathLockMap::default()),
+            CancellationToken::new(),
+        )
+        .expect("replace should succeed");
+
+        assert_eq!(value["total_replacements"], 2);
     }
 }

@@ -11,12 +11,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ToolContext, ToolEventSink, ToolRuntimeEvent};
 
-use super::profiling::{ProfileGuard, profile_region};
+use super::profiling::{FlatProfileGuard, profile_flat_region};
 
 pub struct ToolScope {
     emit: Arc<dyn ToolEventSink>,
     tool_name: &'static str,
-    _profile: ProfileGuard,
+    _profile: FlatProfileGuard,
 }
 
 impl ToolScope {
@@ -28,7 +28,7 @@ impl ToolScope {
         Self {
             emit: context.emit.clone(),
             tool_name,
-            _profile: profile_region(tool_name),
+            _profile: profile_flat_region(tool_name, &context.session_id.0),
         }
     }
 }
@@ -99,16 +99,6 @@ pub fn hash_text(text: &str) -> String {
     hash_bytes(text.as_bytes())
 }
 
-#[allow(dead_code)]
-pub async fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let path = path.to_path_buf();
-    let bytes = bytes.to_vec();
-    tokio::task::spawn_blocking(move || atomic_write_blocking(&path, &bytes))
-        .await
-        .context("failed to join atomic write task")??;
-    Ok(())
-}
-
 pub(crate) fn atomic_write_blocking(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = path.parent().with_context(|| {
         format!(
@@ -117,11 +107,15 @@ pub(crate) fn atomic_write_blocking(path: &Path, bytes: &[u8]) -> anyhow::Result
         )
     })?;
     std::fs::create_dir_all(parent)?;
-    let mut temp =
-        NamedTempFile::new_in(parent).with_context(|| format!("failed to create temp file"))?;
+    let mut temp = NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temp file in '{}'", parent.display()))?;
     std::io::Write::write_all(&mut temp, bytes)?;
     std::io::Write::flush(&mut temp)?;
-    temp.persist(path)
-        .map(|_| ())
-        .map_err(|error| error.error.into())
+    temp.persist(path).map(|_| ()).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to persist temp file to '{}': {}",
+            path.display(),
+            error.error
+        )
+    })
 }

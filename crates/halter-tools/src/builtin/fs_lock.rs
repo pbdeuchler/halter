@@ -25,24 +25,16 @@ impl PathLockMap {
     pub fn acquire_read(&self, path: &Path) -> anyhow::Result<PathReadGuard> {
         let key = canonical_lock_path(path)?;
         let entry = self.entry_for(&key);
-        let guard = entry.read_arc();
         Ok(PathReadGuard {
-            key,
-            entry,
-            guard: Some(guard),
-            entries: self.entries.clone(),
+            _guard: entry.read_arc(),
         })
     }
 
     pub fn acquire_write(&self, path: &Path) -> anyhow::Result<PathWriteGuard> {
         let key = canonical_lock_path(path)?;
         let entry = self.entry_for(&key);
-        let guard = entry.write_arc();
         Ok(PathWriteGuard {
-            key,
-            entry,
-            guard: Some(guard),
-            entries: self.entries.clone(),
+            _guard: entry.write_arc(),
         })
     }
 
@@ -55,43 +47,11 @@ impl PathLockMap {
 }
 
 pub struct PathReadGuard {
-    key: PathBuf,
-    entry: Arc<RwLock<()>>,
-    guard: Option<ArcRwLockReadGuard<RawRwLock, ()>>,
-    entries: PathGuardMap,
-}
-
-impl Drop for PathReadGuard {
-    fn drop(&mut self) {
-        self.guard.take();
-        evict_if_unused(&self.entries, &self.key, &self.entry);
-    }
+    _guard: ArcRwLockReadGuard<RawRwLock, ()>,
 }
 
 pub struct PathWriteGuard {
-    key: PathBuf,
-    entry: Arc<RwLock<()>>,
-    guard: Option<ArcRwLockWriteGuard<RawRwLock, ()>>,
-    entries: PathGuardMap,
-}
-
-impl Drop for PathWriteGuard {
-    fn drop(&mut self) {
-        self.guard.take();
-        evict_if_unused(&self.entries, &self.key, &self.entry);
-    }
-}
-
-fn evict_if_unused(entries: &PathGuardMap, key: &Path, entry: &Arc<RwLock<()>>) {
-    if Arc::strong_count(entry) != 2 {
-        return;
-    }
-    let remove = entries
-        .get(key)
-        .is_some_and(|existing| Arc::ptr_eq(existing.value(), entry));
-    if remove {
-        entries.remove(key);
-    }
+    _guard: ArcRwLockWriteGuard<RawRwLock, ()>,
 }
 
 fn canonical_lock_path(path: &Path) -> anyhow::Result<PathBuf> {

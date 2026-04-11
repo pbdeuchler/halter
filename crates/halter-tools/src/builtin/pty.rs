@@ -13,11 +13,14 @@ use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext, ToolRuntimeEvent};
 
-use super::common::{ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string};
+use super::common::{
+    ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string,
+};
 use super::process::{kill_process_group, kill_tree, process_group_id};
 
 const TERM_SIGNAL: i32 = 15;
 const KILL_SIGNAL: i32 = 9;
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub struct PtySessionHandle {
     control_tx: mpsc::Sender<ControlMessage>,
@@ -40,6 +43,11 @@ enum ControlMessage {
     Input(String),
     Resize { cols: u16, rows: u16 },
     Kill,
+}
+
+enum ReaderEvent {
+    Output(String),
+    Closed,
 }
 
 #[async_trait]
@@ -92,22 +100,30 @@ impl Tool for PtyTool {
                     rows: optional_u64(&input, "rows")?.unwrap_or(40) as u16,
                 };
                 start_session(session, config, context.emit.clone());
-                Ok(ToolResult::Json { value: json!({ "started": true }) })
+                Ok(ToolResult::Json {
+                    value: json!({ "started": true }),
+                })
             }
             "write" => {
                 let input = required_string(&input, "input")?.to_owned();
                 send_control(&session, ControlMessage::Input(input))?;
-                Ok(ToolResult::Json { value: json!({ "ok": true }) })
+                Ok(ToolResult::Json {
+                    value: json!({ "ok": true }),
+                })
             }
             "resize" => {
                 let cols = optional_u64(&input, "cols")?.unwrap_or(120) as u16;
                 let rows = optional_u64(&input, "rows")?.unwrap_or(40) as u16;
                 send_control(&session, ControlMessage::Resize { cols, rows })?;
-                Ok(ToolResult::Json { value: json!({ "ok": true }) })
+                Ok(ToolResult::Json {
+                    value: json!({ "ok": true }),
+                })
             }
             "kill" => {
                 send_control(&session, ControlMessage::Kill)?;
-                Ok(ToolResult::Json { value: json!({ "ok": true }) })
+                Ok(ToolResult::Json {
+                    value: json!({ "ok": true }),
+                })
             }
             _ => anyhow::bail!("failed to execute pty tool: unknown action '{action}'"),
         }
@@ -194,16 +210,20 @@ fn run_pty(
     let child_pid = child.process_id().map(|pid| pid as i32);
     let process_group = child_pid.and_then(process_group_id);
 
-    let mut reader = pair.master.try_clone_reader()?;
+    let reader = pair.master.try_clone_reader()?;
     let mut writer = pair.master.take_writer()?;
     let master = pair.master;
     let start = Instant::now();
     let timeout = config.timeout;
-    let mut buffer = [0u8; 8192];
+    let (reader_tx, reader_rx) = mpsc::channel();
+    let reader_thread = spawn_reader_thread(reader, reader_tx);
+    let mut reader_closed = false;
 
     loop {
-        while let Ok(message) = control_rx.try_recv() {
-            match message {
+        drain_reader_output(&reader_rx, &emit, &mut reader_closed);
+
+        match control_rx.recv_timeout(CONTROL_POLL_INTERVAL) {
+            Ok(message) => match message {
                 ControlMessage::Input(input) => {
                     let _ = writer.write_all(input.as_bytes());
                     let _ = writer.flush();
@@ -218,36 +238,74 @@ fn run_pty(
                 }
                 ControlMessage::Kill => {
                     terminate_pty(&mut child, child_pid, process_group);
-                    return Ok(());
+                    break;
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if child.try_wait()?.is_some() {
+                    break;
                 }
             }
         }
 
+        drain_reader_output(&reader_rx, &emit, &mut reader_closed);
+
         if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
             terminate_pty(&mut child, child_pid, process_group);
-            return Ok(());
+            break;
         }
 
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                let chunk = String::from_utf8_lossy(&buffer[..count]).into_owned();
-                emit.emit(ToolRuntimeEvent::ToolOutput {
-                    tool_name: "pty".to_owned(),
-                    chunk,
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        }
-
-        if child.try_wait()?.is_some() {
+        if reader_closed && child.try_wait()?.is_some() {
             break;
         }
     }
 
+    drop(writer);
+    drop(master);
     let _ = child.wait();
+    let _ = reader_thread.join();
+    drain_reader_output(&reader_rx, &emit, &mut reader_closed);
     Ok(())
+}
+
+fn spawn_reader_thread(
+    mut reader: Box<dyn Read + Send>,
+    tx: mpsc::Sender<ReaderEvent>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let chunk = String::from_utf8_lossy(&buffer[..count]).into_owned();
+                    if tx.send(ReaderEvent::Output(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(ReaderEvent::Closed);
+    })
+}
+
+fn drain_reader_output(
+    reader_rx: &mpsc::Receiver<ReaderEvent>,
+    emit: &Arc<dyn crate::ToolEventSink>,
+    reader_closed: &mut bool,
+) {
+    while let Ok(event) = reader_rx.try_recv() {
+        match event {
+            ReaderEvent::Output(chunk) => emit.emit(ToolRuntimeEvent::ToolOutput {
+                tool_name: "pty".to_owned(),
+                chunk,
+            }),
+            ReaderEvent::Closed => *reader_closed = true,
+        }
+    }
 }
 
 #[cfg(unix)]

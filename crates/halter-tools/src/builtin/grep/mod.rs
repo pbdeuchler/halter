@@ -1,8 +1,9 @@
 // pattern: Imperative Shell
 
-mod basic;
 #[cfg(feature = "advanced-tools")]
 mod advanced;
+#[cfg(not(feature = "advanced-tools"))]
+mod basic;
 mod types;
 
 use async_trait::async_trait;
@@ -11,9 +12,11 @@ use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext};
 
-use super::common::{ToolScope, ensure_not_cancelled, optional_bool, optional_string, optional_u64, required_string};
+use super::common::{
+    ToolScope, ensure_not_cancelled, optional_bool, optional_string, optional_u64, required_string,
+};
 
-use self::types::{OutputMode, SearchConfig, DEFAULT_MAX_MATCHES};
+use self::types::{DEFAULT_MAX_MATCHES, OutputMode, SearchConfig};
 
 #[derive(Debug)]
 pub struct GrepTool;
@@ -35,7 +38,11 @@ impl Tool for GrepTool {
                     "multiline": { "type": "boolean" },
                     "context_before": { "type": "integer", "minimum": 0 },
                     "context_after": { "type": "integer", "minimum": 0 },
-                    "max_matches": { "type": "integer", "minimum": 1 },
+                    "max_matches": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum number of matches to return (default: 100)"
+                    },
                     "offset": { "type": "integer", "minimum": 0 },
                     "max_columns": { "type": "integer", "minimum": 1 },
                     "output_mode": {
@@ -73,11 +80,11 @@ impl Tool for GrepTool {
             type_filter: optional_string(&input, "type").map(ToOwned::to_owned),
             ignore_case: optional_bool(&input, "ignore_case")?.unwrap_or(false),
             multiline: optional_bool(&input, "multiline")?.unwrap_or(false),
-            context_before: optional_u64(&input, "context_before")?.unwrap_or(0) as usize,
-            context_after: optional_u64(&input, "context_after")?.unwrap_or(0) as usize,
+            context_before: optional_usize(&input, "context_before")?.unwrap_or(0),
+            context_after: optional_usize(&input, "context_after")?.unwrap_or(0),
             max_matches: optional_u64(&input, "max_matches")?.unwrap_or(DEFAULT_MAX_MATCHES),
             offset: optional_u64(&input, "offset")?.unwrap_or(0),
-            max_columns: optional_u64(&input, "max_columns")?.map(|value| value as usize),
+            max_columns: optional_usize(&input, "max_columns")?,
             output_mode: OutputMode::from_str(optional_string(&input, "output_mode")),
         };
 
@@ -99,4 +106,13 @@ impl Tool for GrepTool {
 
         Ok(ToolResult::Json { value: response })
     }
+}
+
+fn optional_usize(input: &Value, key: &str) -> anyhow::Result<Option<usize>> {
+    optional_u64(input, key)?
+        .map(|value| {
+            usize::try_from(value)
+                .map_err(|_| anyhow::anyhow!("invalid tool input: field '{key}' is out of range"))
+        })
+        .transpose()
 }

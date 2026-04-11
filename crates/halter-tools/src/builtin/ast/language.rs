@@ -6,9 +6,32 @@ use ast_grep_core::MatchStrictness;
 use ast_grep_language::SupportLang;
 
 const SUPPORTED_LANGUAGES: &[&str] = &[
-    "bash", "c", "cpp", "csharp", "css", "elixir", "go", "haskell", "hcl", "html", "java",
-    "javascript", "json", "kotlin", "lua", "nix", "php", "python", "ruby", "rust", "scala",
-    "solidity", "swift", "tsx", "typescript", "yaml",
+    "bash",
+    "c",
+    "cpp",
+    "csharp",
+    "css",
+    "elixir",
+    "go",
+    "haskell",
+    "hcl",
+    "html",
+    "java",
+    "javascript",
+    "json",
+    "kotlin",
+    "lua",
+    "nix",
+    "php",
+    "python",
+    "ruby",
+    "rust",
+    "scala",
+    "solidity",
+    "swift",
+    "tsx",
+    "typescript",
+    "yaml",
 ];
 
 pub(super) fn parse_strictness(value: Option<&str>) -> anyhow::Result<MatchStrictness> {
@@ -19,9 +42,7 @@ pub(super) fn parse_strictness(value: Option<&str>) -> anyhow::Result<MatchStric
         "relaxed" => Ok(MatchStrictness::Relaxed),
         "signature" => Ok(MatchStrictness::Signature),
         "template" => Ok(MatchStrictness::Template),
-        other => anyhow::bail!(
-            "failed to execute ast_grep tool: unsupported strictness '{other}'"
-        ),
+        other => anyhow::bail!("failed to execute ast_grep tool: unsupported strictness '{other}'"),
     }
 }
 

@@ -10,12 +10,16 @@ use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, T
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
+#[allow(deprecated)]
 use image::{DynamicImage, ImageOutputFormat, io::Reader as ImageReader};
 use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext};
 
-use super::common::{ToolScope, atomic_write_blocking, ensure_not_cancelled, optional_string, optional_u64, required_string, resolve_path};
+use super::common::{
+    ToolScope, atomic_write_blocking, ensure_not_cancelled, optional_string, optional_u64,
+    required_string, resolve_path,
+};
 
 #[derive(Debug)]
 pub struct ImageTool;
@@ -61,29 +65,42 @@ impl Tool for ImageTool {
         let input_path = resolve_path(&context.working_dir, required_string(&input, "path")?);
         let output_path = optional_string(&input, "output_path")
             .map(|path| resolve_path(&context.working_dir, path));
-        let width = optional_u64(&input, "width")?.map(u32::try_from).transpose().map_err(|_| {
-            anyhow::anyhow!("failed to execute image tool: width is out of range")
+        let width = optional_u64(&input, "width")?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("failed to execute image tool: width is out of range"))?;
+        let height = optional_u64(&input, "height")?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("failed to execute image tool: height is out of range"))?;
+        let quality = optional_u64(&input, "quality")?.unwrap_or(80).clamp(1, 100);
+        let quality = u8::try_from(quality).map_err(|_| {
+            anyhow::anyhow!("failed to execute image tool: quality is out of range")
         })?;
-        let height = optional_u64(&input, "height")?.map(u32::try_from).transpose().map_err(|_| {
-            anyhow::anyhow!("failed to execute image tool: height is out of range")
-        })?;
-        let quality = optional_u64(&input, "quality")?
-            .unwrap_or(80)
-            .clamp(1, 100) as u8;
         let filter = parse_filter(optional_string(&input, "filter"))?;
         let requested_format = optional_string(&input, "format")
             .map(parse_format)
             .transpose()?
-            .or_else(|| output_path.as_ref().and_then(|path| infer_format_from_path(path)));
+            .or_else(|| {
+                output_path
+                    .as_ref()
+                    .and_then(|path| infer_format_from_path(path))
+            });
 
-        context.policy.check_read(&input_path, 0).await?;
+        let input_len = std::fs::metadata(&input_path)
+            .ok()
+            .and_then(|metadata| usize::try_from(metadata.len()).ok())
+            .unwrap_or(usize::MAX);
+        context.policy.check_read(&input_path, input_len).await?;
         if let Some(output_path) = output_path.as_ref() {
             context.policy.check_write(output_path).await?;
         }
 
         let path_locks = context.path_locks.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let bytes = if output_path.as_ref().is_some_and(|output_path| output_path == &input_path)
+            let bytes = if output_path
+                .as_ref()
+                .is_some_and(|output_path| output_path == &input_path)
             {
                 let _lock = path_locks.acquire_write(&input_path)?;
                 std::fs::read(&input_path)?
@@ -91,8 +108,7 @@ impl Tool for ImageTool {
                 let _lock = path_locks.acquire_read(&input_path)?;
                 std::fs::read(&input_path)?
             };
-            let detected_format =
-                image::guess_format(&bytes).ok().map(ImageFormat::from);
+            let detected_format = image::guess_format(&bytes).ok().map(ImageFormat::from);
             let image = decode_image(&bytes)?;
             match action.as_str() {
                 "info" => Ok(json!({
@@ -222,7 +238,9 @@ fn render_output(
 fn encode_image(image: &DynamicImage, format: ImageFormat, quality: u8) -> anyhow::Result<Vec<u8>> {
     let mut buffer = Vec::new();
     match format {
-        ImageFormat::Png => image.write_to(&mut Cursor::new(&mut buffer), ImageOutputFormat::Png)?,
+        ImageFormat::Png => {
+            image.write_to(&mut Cursor::new(&mut buffer), ImageOutputFormat::Png)?
+        }
         ImageFormat::Jpeg => {
             let encoder = JpegEncoder::new_with_quality(&mut buffer, quality);
             image.write_with_encoder(encoder)?;
@@ -231,7 +249,9 @@ fn encode_image(image: &DynamicImage, format: ImageFormat, quality: u8) -> anyho
             let encoder = WebPEncoder::new_lossless(&mut buffer);
             image.write_with_encoder(encoder)?;
         }
-        ImageFormat::Gif => image.write_to(&mut Cursor::new(&mut buffer), ImageOutputFormat::Gif)?,
+        ImageFormat::Gif => {
+            image.write_to(&mut Cursor::new(&mut buffer), ImageOutputFormat::Gif)?
+        }
     }
     Ok(buffer)
 }
@@ -257,13 +277,23 @@ mod tests {
         .expect("render output");
 
         assert_eq!(value["width"], 1);
-        assert!(value["data_base64"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(
+            value["data_base64"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
     }
 
     #[test]
     fn infer_format_from_path_uses_extension() {
-        assert_eq!(infer_format_from_path(Path::new("out.jpg")), Some(ImageFormat::Jpeg));
-        assert_eq!(infer_format_from_path(Path::new("out.webp")), Some(ImageFormat::Webp));
+        assert_eq!(
+            infer_format_from_path(Path::new("out.jpg")),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(
+            infer_format_from_path(Path::new("out.webp")),
+            Some(ImageFormat::Webp)
+        );
         assert_eq!(infer_format_from_path(Path::new("out.txt")), None);
     }
 }
