@@ -109,7 +109,8 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
                 .or_else(|| Some("hook requested stop".to_owned()));
         }
 
-        if matches!(input.output.decision, Some(HookDecision::Block)) && merged.block_reason.is_none()
+        if matches!(input.output.decision, Some(HookDecision::Block))
+            && merged.block_reason.is_none()
         {
             merged.block_reason = input.output.reason.clone();
         }
@@ -212,7 +213,11 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
 
 pub fn summary_entries(output: &HookOutput) -> Vec<HookOutputEntry> {
     let mut entries = Vec::new();
-    if let Some(reason) = output.reason.clone().filter(|value| !value.trim().is_empty()) {
+    if let Some(reason) = output
+        .reason
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    {
         let kind = if matches!(output.decision, Some(HookDecision::Block)) {
             HookOutputKind::Stop
         } else {

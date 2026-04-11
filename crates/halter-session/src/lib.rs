@@ -4,6 +4,7 @@ mod memory;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -34,4 +35,8 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<Vec<SessionEvent>>;
     async fn replay(&self, session_id: &SessionId) -> Result<Vec<SessionEvent>>;
     async fn list_sessions(&self) -> Result<Vec<SessionBlueprint>>;
+
+    fn transcript_path(&self, _session_id: &SessionId) -> Option<PathBuf> {
+        None
+    }
 }

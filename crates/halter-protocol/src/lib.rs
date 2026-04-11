@@ -135,6 +135,11 @@ impl ModelRole {
     pub fn subagent() -> Self {
         Self("subagent".to_owned())
     }
+
+    #[must_use]
+    pub fn small() -> Self {
+        Self("small".to_owned())
+    }
 }
 
 impl Default for ModelRole {
@@ -588,6 +593,9 @@ pub struct HookRunSummary {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventPayload {
     SessionStarted,
+    Warning {
+        message: String,
+    },
     TurnStarted {
         turn_id: TurnId,
     },
@@ -825,6 +833,7 @@ pub struct SessionState {
     pub lineage: Vec<SubagentRef>,
     pub fired_hook_ids: Vec<String>,
     pub pending_session_start_source: Option<HookSessionStartSource>,
+    pub pending_warning_messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

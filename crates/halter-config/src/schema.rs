@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MODEL_ID: &str = "default";
+pub const SMALL_MODEL_ID: &str = "small";
 pub const SUBAGENT_MODEL_ID: &str = "subagent";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -66,6 +67,9 @@ impl HarnessConfig {
 
         let model = self.default_model()?;
         validate_model_config("models.default", model)?;
+        if let Some(model) = self.small_model() {
+            validate_model_config("models.small", model)?;
+        }
         if let Some(model) = self.subagent_model() {
             validate_model_config("models.subagent", model)?;
         }
@@ -91,6 +95,11 @@ impl HarnessConfig {
     #[must_use]
     pub fn subagent_model(&self) -> Option<&ModelConfig> {
         self.models.subagent.as_ref()
+    }
+
+    #[must_use]
+    pub fn small_model(&self) -> Option<&ModelConfig> {
+        self.models.small.as_ref()
     }
 
     #[must_use]
@@ -140,6 +149,8 @@ impl ProvidersConfig {
 pub struct ModelsConfig {
     #[serde(default)]
     pub default: Option<ModelConfig>,
+    #[serde(default)]
+    pub small: Option<ModelConfig>,
     #[serde(default)]
     pub subagent: Option<ModelConfig>,
 }

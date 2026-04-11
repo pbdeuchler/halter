@@ -6,11 +6,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use halter_hooks::Hooks;
 use halter_config::{
     ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, PolicyConfig, ResolvedProviderConfig,
-    SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, load_path, resolve_provider_runtime_config,
+    SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, load_path,
+    resolve_provider_runtime_config,
 };
+use halter_hooks::Hooks;
 use halter_protocol::{ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot};
 use halter_providers::{AnthropicProvider, ModelRegistry, OpenAiProvider, OpenRouterProvider};
 use halter_runtime::{
@@ -34,6 +35,7 @@ pub struct HalterBuilder {
     config: HarnessConfig,
     resource_snapshot: Option<ResourceSnapshot>,
     resource_hooks: Option<Arc<Hooks>>,
+    resource_hook_warnings: Vec<String>,
     loaded_skills: Vec<LoadedSkill>,
     loaded_plugins: Vec<LoadedPlugin>,
     tools: Vec<Arc<dyn Tool>>,
@@ -62,6 +64,7 @@ impl HalterBuilder {
     pub fn with_compiled_resources(mut self, resources: CompiledResources) -> Self {
         self.resource_snapshot = Some(resources.snapshot);
         self.resource_hooks = Some(resources.hooks);
+        self.resource_hook_warnings = resources.hook_warnings;
         self
     }
 
@@ -106,6 +109,7 @@ impl HalterBuilder {
         let hooks = self
             .resource_hooks
             .unwrap_or_else(|| Arc::new(Hooks::default()));
+        let hook_warnings = self.resource_hook_warnings;
 
         let models = Arc::new(build_model_registry(&config)?);
         let tools = Arc::new(ToolRuntime::new());
@@ -125,7 +129,7 @@ impl HalterBuilder {
             None => build_session_store(&config.sessions)?,
         };
         let services = Arc::new(RuntimeServices {
-            resources: Arc::new(ResourceHandle::new(snapshot, hooks)),
+            resources: Arc::new(ResourceHandle::new(snapshot, hooks, hook_warnings)),
             models,
             tools,
             path_locks: Arc::new(PathLockMap::default()),
@@ -215,8 +219,11 @@ impl Halter {
     }
 
     pub fn replace_resources(&self, resources: CompiledResources) {
-        self.runtime
-            .replace_resources(resources.snapshot, resources.hooks);
+        self.runtime.replace_resources(
+            resources.snapshot,
+            resources.hooks,
+            resources.hook_warnings,
+        );
     }
 
     #[must_use]
@@ -275,6 +282,7 @@ fn describe_session_backend(config: &SessionsConfig) -> &'static str {
 fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry> {
     let mut registry = ModelRegistry::new();
     let default_config = config.default_model()?;
+    let small_config = config.small_model().unwrap_or(default_config);
     let subagent_config = config.subagent_model().unwrap_or(default_config);
     let default_model = ResolvedModel {
         role: ModelRole::default(),
@@ -286,6 +294,17 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         max_input_tokens: default_config.max_input_tokens,
         max_output_tokens: default_config.max_output_tokens,
         reasoning: default_config.reasoning,
+    };
+    let small_model = ResolvedModel {
+        role: ModelRole::small(),
+        id: ModelId::from(SMALL_MODEL_ID),
+        provider: ProviderName::from(small_config.provider.to_string()),
+        provider_kind: small_config.provider.provider_kind(),
+        api_kind: small_config.provider.api_kind(),
+        model: small_config.model.clone(),
+        max_input_tokens: small_config.max_input_tokens,
+        max_output_tokens: small_config.max_output_tokens,
+        reasoning: small_config.reasoning,
     };
     let subagent_model = ResolvedModel {
         role: ModelRole::subagent(),
@@ -302,6 +321,8 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
     debug!(
         default_provider = %default_model.provider,
         default_model = %default_model.model,
+        small_provider = %small_model.provider,
+        small_model = %small_model.model,
         subagent_provider = %subagent_model.provider,
         subagent_model = %subagent_model.model,
         "building model registry"
@@ -310,6 +331,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
     let mut registered_providers = HashSet::new();
     for (provider_name, configured_provider) in [
         (&default_model.provider, default_config.provider),
+        (&small_model.provider, small_config.provider),
         (&subagent_model.provider, subagent_config.provider),
     ] {
         if !registered_providers.insert(provider_name.0.clone()) {
@@ -319,6 +341,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         registry.register_provider(provider_name.clone(), build_provider(&resolved)?);
     }
     registry.set_default_model(default_model);
+    registry.set_small_model(small_model);
     registry.set_subagent_model(subagent_model);
 
     Ok(registry)

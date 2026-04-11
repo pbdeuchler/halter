@@ -98,6 +98,7 @@ pub struct LoadedPlugin {
 pub struct CompiledResources {
     pub snapshot: ResourceSnapshot,
     pub hooks: Arc<Hooks>,
+    pub hook_warnings: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -132,8 +133,7 @@ impl PluginLoader {
                 debug!(root = %root.display(), "skipping missing plugin root");
                 continue;
             }
-            let mut entries = fs::read_dir(&root)?
-                .collect::<Result<Vec<_>, std::io::Error>>()?;
+            let mut entries = fs::read_dir(&root)?.collect::<Result<Vec<_>, std::io::Error>>()?;
             entries.sort_by_key(|entry| entry.path());
             for entry in entries {
                 if entry.file_type()?.is_dir() {
@@ -269,8 +269,25 @@ fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<CompiledResou
                     plugin_id: hooks_file.plugin_id,
                     plugin_root: hooks_file.plugin_root,
                     source_path: hooks_file.source_path,
+                    allowed_http_hosts: plugin.manifest.allowed_http_hosts.clone(),
+                    allowed_env_vars: plugin.manifest.allowed_env_vars.clone(),
                     file: hooks_file.parsed,
                 })
+        })
+        .collect::<Vec<_>>();
+    let hook_warnings = plugins
+        .iter()
+        .flat_map(|plugin| {
+            plugin.hooks.iter().flat_map(move |hooks_file| {
+                hooks_file.warnings.iter().map(move |warning| {
+                    format!(
+                        "plugin '{}' hook warning at {}: {}",
+                        plugin.manifest.name,
+                        hooks_file.source_path.display(),
+                        warning.message
+                    )
+                })
+            })
         })
         .collect::<Vec<_>>();
 
@@ -303,6 +320,7 @@ fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<CompiledResou
     Ok(CompiledResources {
         snapshot,
         hooks: Arc::new(Hooks::from_sources(hook_sources)),
+        hook_warnings,
     })
 }
 
@@ -673,7 +691,12 @@ description: says hello
             .await
             .expect("compile resources");
 
-        assert!(resources.snapshot.skills.contains_key(&SkillName::from("hello")));
+        assert!(
+            resources
+                .snapshot
+                .skills
+                .contains_key(&SkillName::from("hello"))
+        );
     }
 
     #[tokio::test]
@@ -717,8 +740,18 @@ description: reviews code
             .await
             .expect("compile resources");
 
-        assert!(resources.snapshot.skills.contains_key(&SkillName::from("reviewer")));
-        assert!(resources.snapshot.agents.contains_key(&AgentName::from("helper")));
+        assert!(
+            resources
+                .snapshot
+                .skills
+                .contains_key(&SkillName::from("reviewer"))
+        );
+        assert!(
+            resources
+                .snapshot
+                .agents
+                .contains_key(&AgentName::from("helper"))
+        );
     }
 
     #[tokio::test]

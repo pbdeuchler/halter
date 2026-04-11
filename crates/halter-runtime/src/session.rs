@@ -15,7 +15,7 @@ use halter_protocol::{
     PromptSegment, PromptSegmentId, ProviderError, ProviderRequest, ReplayMeta, ResourceSnapshot,
     SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
     StreamEvent, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult,
-    ToolResultMessage, Turn, Usage, Volatility,
+    ToolResultMessage, Turn, TurnId, Usage, Volatility,
 };
 use halter_providers::ModelRegistry;
 use halter_session::{SessionStore, StoredSession};
@@ -33,8 +33,9 @@ use tracing::{debug, error, info, warn};
 use crate::DefaultContextManager;
 use crate::model_selection::select_models;
 use crate::{
-    ContextManager, EventBus, HookInvocationContext, PromptAssembler, ExecutedHookDispatch,
-    run_post_tool_use, run_post_tool_use_failure, run_pre_tool_use, run_session_start, run_stop,
+    ContextManager, EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler,
+    run_notification, run_post_compact, run_post_tool_use, run_post_tool_use_failure,
+    run_pre_compact, run_pre_tool_use, run_session_end, run_session_start, run_stop,
     run_user_prompt_submit,
 };
 
@@ -64,13 +65,18 @@ pub struct ResourceHandle {
 struct ResourceState {
     snapshot: ResourceSnapshot,
     hooks: Arc<Hooks>,
+    hook_warnings: Arc<Vec<String>>,
 }
 
 impl ResourceHandle {
     #[must_use]
-    pub fn new(snapshot: ResourceSnapshot, hooks: Arc<Hooks>) -> Self {
+    pub fn new(snapshot: ResourceSnapshot, hooks: Arc<Hooks>, hook_warnings: Vec<String>) -> Self {
         Self {
-            current: Arc::new(ArcSwap::from_pointee(ResourceState { snapshot, hooks })),
+            current: Arc::new(ArcSwap::from_pointee(ResourceState {
+                snapshot,
+                hooks,
+                hook_warnings: Arc::new(hook_warnings),
+            })),
         }
     }
 
@@ -84,9 +90,23 @@ impl ResourceHandle {
         self.current.load().hooks.clone()
     }
 
-    pub fn replace(&self, snapshot: ResourceSnapshot, hooks: Arc<Hooks>) {
+    #[must_use]
+    pub fn hook_warnings(&self) -> Arc<Vec<String>> {
+        self.current.load().hook_warnings.clone()
+    }
+
+    pub fn replace(
+        &self,
+        snapshot: ResourceSnapshot,
+        hooks: Arc<Hooks>,
+        hook_warnings: Vec<String>,
+    ) {
         info!(revision = %snapshot.revision, "replaced resource snapshot");
-        self.current.store(Arc::new(ResourceState { snapshot, hooks }));
+        self.current.store(Arc::new(ResourceState {
+            snapshot,
+            hooks,
+            hook_warnings: Arc::new(hook_warnings),
+        }));
     }
 }
 
@@ -280,8 +300,15 @@ impl SessionRuntime {
         Ok(sessions)
     }
 
-    pub fn replace_resources(&self, snapshot: ResourceSnapshot, hooks: Arc<Hooks>) {
-        self.services.resources.replace(snapshot, hooks);
+    pub fn replace_resources(
+        &self,
+        snapshot: ResourceSnapshot,
+        hooks: Arc<Hooks>,
+        hook_warnings: Vec<String>,
+    ) {
+        self.services
+            .resources
+            .replace(snapshot, hooks, hook_warnings);
     }
 }
 
@@ -423,6 +450,143 @@ impl HalterSession {
         self.services.sessions.replay(&self.session_id).await
     }
 
+    pub async fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
+        let stored = self
+            .services
+            .sessions
+            .load_session(&self.session_id)
+            .await?
+            .with_context(|| {
+                format!(
+                    "failed to shut down session: unknown session '{}'",
+                    self.session_id.0
+                )
+            })?;
+        let mut state = stored.state;
+        let mut events = Vec::new();
+        let turn_id = TurnId::new();
+        let hook_ctx = HookInvocationContext {
+            turn_id: &turn_id,
+            model: &stored.blueprint.default_model,
+            working_dir: &stored.blueprint.working_dir,
+        };
+        let dispatch = run_session_end(self, &state, hook_ctx, reason).await?;
+        self.record_hook_dispatch(&mut events, &dispatch, None);
+        if dispatch.merged.block_reason.is_some() || dispatch.merged.stop_reason.is_some() {
+            warn!(session_id = %self.session_id, reason, "hooks.ignored_block");
+        }
+        for message in apply_hook_side_effects(&mut state, &dispatch) {
+            self.push_event(
+                &mut events,
+                SessionEventPayload::MessageItem { message },
+                None,
+            );
+        }
+        self.push_event(
+            &mut events,
+            SessionEventPayload::SessionShutdownComplete,
+            None,
+        );
+        let _ = self.commit_and_publish(None, Some(state), events).await?;
+        Ok(())
+    }
+
+    pub async fn notify(&self, notification_type: &str, message: &str) -> anyhow::Result<()> {
+        let stored = self
+            .services
+            .sessions
+            .load_session(&self.session_id)
+            .await?
+            .with_context(|| {
+                format!(
+                    "failed to emit notification: unknown session '{}'",
+                    self.session_id.0
+                )
+            })?;
+        let mut state = stored.state;
+        let turn_id = TurnId::new();
+        let hook_ctx = HookInvocationContext {
+            turn_id: &turn_id,
+            model: &stored.blueprint.default_model,
+            working_dir: &stored.blueprint.working_dir,
+        };
+        let dispatch = run_notification(self, &state, hook_ctx, notification_type, message).await?;
+        let mut events = Vec::new();
+        self.record_hook_dispatch(&mut events, &dispatch, None);
+        for message in apply_hook_side_effects(&mut state, &dispatch) {
+            self.push_event(
+                &mut events,
+                SessionEventPayload::MessageItem { message },
+                None,
+            );
+        }
+        let _ = self.commit_and_publish(None, Some(state), events).await?;
+        Ok(())
+    }
+
+    pub async fn compact(
+        &self,
+        trigger: &str,
+        custom_instructions: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let stored = self
+            .services
+            .sessions
+            .load_session(&self.session_id)
+            .await?
+            .with_context(|| {
+                format!(
+                    "failed to compact session: unknown session '{}'",
+                    self.session_id.0
+                )
+            })?;
+        let mut state = stored.state;
+        let mut events = Vec::new();
+        let turn_id = TurnId::new();
+        let hook_ctx = HookInvocationContext {
+            turn_id: &turn_id,
+            model: &stored.blueprint.default_model,
+            working_dir: &stored.blueprint.working_dir,
+        };
+        let pre_dispatch =
+            run_pre_compact(self, &state, hook_ctx, trigger, custom_instructions).await?;
+        self.record_hook_dispatch(&mut events, &pre_dispatch, None);
+        for message in apply_hook_side_effects(&mut state, &pre_dispatch) {
+            self.push_event(
+                &mut events,
+                SessionEventPayload::MessageItem { message },
+                None,
+            );
+        }
+        if pre_dispatch.merged.block_reason.is_some() {
+            let _ = self.commit_and_publish(None, Some(state), events).await?;
+            return Ok(());
+        }
+
+        let summary = compact_session_state(&mut state, custom_instructions);
+        state.pending_session_start_source = Some(HookSessionStartSource::Compact);
+        self.push_event(
+            &mut events,
+            SessionEventPayload::ContextCompacted {
+                summary: summary.clone(),
+            },
+            None,
+        );
+
+        let post_dispatch = run_post_compact(self, &state, hook_ctx, trigger, &summary).await?;
+        self.record_hook_dispatch(&mut events, &post_dispatch, None);
+        for message in apply_hook_side_effects(&mut state, &post_dispatch) {
+            self.push_event(
+                &mut events,
+                SessionEventPayload::MessageItem { message },
+                None,
+            );
+        }
+
+        let _ = self.commit_and_publish(None, Some(state), events).await?;
+        Ok(())
+    }
+
     async fn run_turn(
         &self,
         stored: StoredSession,
@@ -450,16 +614,45 @@ impl HalterSession {
             working_dir: &stored.blueprint.working_dir,
         };
 
+        for warning in std::mem::take(&mut state.pending_warning_messages) {
+            self.push_event(
+                &mut events,
+                SessionEventPayload::Warning { message: warning },
+                live.as_ref(),
+            );
+        }
+
         if let Some(source) = state.pending_session_start_source.take() {
             let hook_dispatch = run_session_start(self, &state, hook_ctx, source).await?;
             self.record_hook_dispatch(&mut events, &hook_dispatch, live.as_ref());
-            apply_hook_side_effects(&mut state, &hook_dispatch);
+            if hook_dispatch.merged.block_reason.is_some()
+                || hook_dispatch.merged.stop_reason.is_some()
+            {
+                warn!(
+                    session_id = %self.session_id,
+                    turn_id = %turn.id,
+                    "hooks.ignored_block"
+                );
+            }
+            for message in apply_hook_side_effects(&mut state, &hook_dispatch) {
+                self.push_event(
+                    &mut events,
+                    SessionEventPayload::MessageItem { message },
+                    live.as_ref(),
+                );
+            }
         }
 
         let prompt_dispatch =
             run_user_prompt_submit(self, &state, hook_ctx, &turn.user_message.plain_text()).await?;
         self.record_hook_dispatch(&mut events, &prompt_dispatch, live.as_ref());
-        apply_hook_side_effects(&mut state, &prompt_dispatch);
+        for message in apply_hook_side_effects(&mut state, &prompt_dispatch) {
+            self.push_event(
+                &mut events,
+                SessionEventPayload::MessageItem { message },
+                live.as_ref(),
+            );
+        }
 
         if let Some(reason) = prompt_dispatch
             .merged
@@ -492,7 +685,9 @@ impl HalterSession {
             });
         }
 
-        state.messages.push(Message::User(turn.user_message.clone()));
+        state
+            .messages
+            .push(Message::User(turn.user_message.clone()));
 
         loop {
             let observed = observe_state(stored.blueprint.working_dir.clone());
@@ -574,7 +769,13 @@ impl HalterSession {
                 )
                 .await?;
                 self.record_hook_dispatch(&mut events, &stop_dispatch, live.as_ref());
-                apply_hook_side_effects(&mut state, &stop_dispatch);
+                for message in apply_hook_side_effects(&mut state, &stop_dispatch) {
+                    self.push_event(
+                        &mut events,
+                        SessionEventPayload::MessageItem { message },
+                        live.as_ref(),
+                    );
+                }
                 if let Some(reason) = stop_dispatch.merged.block_reason.clone() {
                     let continuation = Message::User(halter_protocol::UserMessage::text(
                         if reason.trim().is_empty() {
@@ -675,7 +876,13 @@ impl HalterSession {
             )
             .await?;
             self.record_hook_dispatch(&mut events, &pre_dispatch, live.as_ref());
-            apply_hook_side_effects(state, &pre_dispatch);
+            for message in apply_hook_side_effects(state, &pre_dispatch) {
+                self.push_event(
+                    &mut events,
+                    SessionEventPayload::MessageItem { message },
+                    live.as_ref(),
+                );
+            }
             if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
                 call.arguments = updated_input;
             }
@@ -796,7 +1003,13 @@ impl HalterSession {
                 )
                 .await?;
                 self.record_hook_dispatch(&mut events, &post_dispatch, live.as_ref());
-                apply_hook_side_effects(state, &post_dispatch);
+                for message in apply_hook_side_effects(state, &post_dispatch) {
+                    self.push_event(
+                        &mut events,
+                        SessionEventPayload::MessageItem { message },
+                        live.as_ref(),
+                    );
+                }
                 if let Some(updated_output) = post_dispatch.merged.updated_output {
                     content = tool_result_from_hook_value(updated_output);
                 }
@@ -814,7 +1027,13 @@ impl HalterSession {
                 )
                 .await?;
                 self.record_hook_dispatch(&mut events, &post_dispatch, live.as_ref());
-                apply_hook_side_effects(state, &post_dispatch);
+                for message in apply_hook_side_effects(state, &post_dispatch) {
+                    self.push_event(
+                        &mut events,
+                        SessionEventPayload::MessageItem { message },
+                        live.as_ref(),
+                    );
+                }
             }
             let outcome = ToolExecutionOutcome {
                 call: call.clone(),
@@ -975,13 +1194,13 @@ struct PendingToolCallBlock {
 }
 
 #[derive(Debug)]
-struct MaterializedAssistantMessage {
-    message: AssistantMessage,
-    usage: Usage,
-    events: Vec<SessionEventPayload>,
+pub(crate) struct MaterializedAssistantMessage {
+    pub(crate) message: AssistantMessage,
+    pub(crate) usage: Usage,
+    pub(crate) events: Vec<SessionEventPayload>,
 }
 
-async fn materialize_assistant_message(
+pub(crate) async fn materialize_assistant_message(
     mut provider_stream: BoxStream<'static, Result<StreamEvent, ProviderError>>,
     model: &halter_protocol::ResolvedModel,
 ) -> anyhow::Result<MaterializedAssistantMessage> {
@@ -1153,9 +1372,16 @@ fn tool_result_kind(result: &ToolResult) -> &'static str {
     }
 }
 
-fn apply_hook_side_effects(state: &mut SessionState, dispatch: &ExecutedHookDispatch) {
+pub(crate) fn apply_hook_side_effects(
+    state: &mut SessionState,
+    dispatch: &ExecutedHookDispatch,
+) -> Vec<Message> {
     for fired_hook_id in &dispatch.fired_hook_ids {
-        if !state.fired_hook_ids.iter().any(|seen| seen == fired_hook_id) {
+        if !state
+            .fired_hook_ids
+            .iter()
+            .any(|seen| seen == fired_hook_id)
+        {
             state.fired_hook_ids.push(fired_hook_id.clone());
         }
     }
@@ -1165,6 +1391,19 @@ fn apply_hook_side_effects(state: &mut SessionState, dispatch: &ExecutedHookDisp
             .appended_prompt_segments
             .push(build_hook_prompt_segment(context));
     }
+
+    let mut messages = Vec::new();
+    for text in &dispatch.merged.system_messages {
+        let message = Message::System(SystemMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            text: text.clone(),
+        });
+        state.messages.push(message.clone());
+        messages.push(message);
+    }
+
+    messages
 }
 
 fn build_hook_prompt_segment(text: &str) -> PromptSegment {
@@ -1189,6 +1428,63 @@ fn tool_result_from_hook_value(value: serde_json::Value) -> ToolResult {
         serde_json::Value::String(text) => ToolResult::Text { text },
         other => ToolResult::Json { value: other },
     }
+}
+
+fn compact_session_state(state: &mut SessionState, custom_instructions: Option<&str>) -> String {
+    const RETAINED_MESSAGES: usize = 8;
+
+    if state.messages.len() <= RETAINED_MESSAGES {
+        return "No compaction needed.".to_owned();
+    }
+
+    let split_index = state.messages.len() - RETAINED_MESSAGES;
+    let summary_body = state.messages[..split_index]
+        .iter()
+        .map(render_message_for_summary)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let summary =
+        if let Some(instructions) = custom_instructions.filter(|value| !value.trim().is_empty()) {
+            format!("{instructions}\n\n{summary_body}")
+        } else {
+            summary_body
+        };
+
+    state.summaries.push(halter_protocol::SummarySlice {
+        id: MessageId::new().0,
+        text: summary.clone(),
+    });
+    state.messages = state.messages.split_off(split_index);
+
+    summary
+}
+
+fn render_message_for_summary(message: &Message) -> String {
+    match message {
+        Message::System(message) => format!("system: {}", message.text),
+        Message::User(message) => format!("user: {}", message.plain_text()),
+        Message::Assistant(message) => {
+            format!("assistant: {}", render_assistant_summary_text(message))
+        }
+        Message::Tool(message) => match &message.content {
+            ToolResult::Empty => "tool: empty".to_owned(),
+            ToolResult::Text { text } => format!("tool: {text}"),
+            ToolResult::Json { value } => format!("tool: {value}"),
+        },
+    }
+}
+
+fn render_assistant_summary_text(message: &AssistantMessage) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            AssistantPart::Text { text } => Some(text.as_str()),
+            AssistantPart::Thinking(_) | AssistantPart::ToolCall(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(crate) async fn create_session_seeded(
@@ -1232,6 +1528,10 @@ pub(crate) async fn create_session_seeded(
     if initial_state.pending_session_start_source.is_none() {
         initial_state.pending_session_start_source = Some(HookSessionStartSource::Startup);
     }
+    if initial_state.pending_warning_messages.is_empty() {
+        initial_state.pending_warning_messages =
+            services.resources.hook_warnings().as_ref().clone();
+    }
 
     services
         .sessions
@@ -1274,7 +1574,11 @@ impl Default for RuntimeServices {
     fn default() -> Self {
         let snapshot = ResourceSnapshot::empty();
         Self {
-            resources: Arc::new(ResourceHandle::new(snapshot, Arc::new(Hooks::default()))),
+            resources: Arc::new(ResourceHandle::new(
+                snapshot,
+                Arc::new(Hooks::default()),
+                Vec::new(),
+            )),
             models: Arc::new(ModelRegistry::new()),
             tools: Arc::new(ToolRuntime::new()),
             path_locks: Arc::new(PathLockMap::default()),
@@ -1301,8 +1605,8 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use halter_hooks::{HookRegistrySource, HooksFile};
     use halter_protocol::{
-        ApiKind, BlockId, HookRunStatus, Message, ModelId, ModelRole, PluginId,
-        ProviderCapabilities, ProviderError, ProviderKind, ProviderName, ProviderRequest,
+        ApiKind, BlockId, HookRunStatus, HookSessionStartSource, Message, ModelId, ModelRole,
+        PluginId, ProviderCapabilities, ProviderError, ProviderKind, ProviderName, ProviderRequest,
         ResolvedModel, StopReason, StreamEvent, ToolCallId, ToolCapabilities, ToolConcurrency,
         ToolName, ToolResult, ToolSpec, Turn,
     };
@@ -1438,8 +1742,11 @@ mod tests {
                 plugin_id: PluginId::from("test-plugin"),
                 plugin_root: temp.path().to_path_buf(),
                 source_path: temp.path().join("hooks/hooks.json"),
+                allowed_http_hosts: Vec::new(),
+                allowed_env_vars: Vec::new(),
                 file: hooks_file,
             }])),
+            Vec::new(),
         );
 
         let runtime = SessionRuntime::new(services.clone());
@@ -1460,10 +1767,11 @@ mod tests {
             .expect("collect events");
 
         assert!(!temp.path().join("note.txt").exists());
-        assert!(events.iter().any(|event| matches!(
-            event.payload,
-            SessionEventPayload::HookStarted { .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::HookStarted { .. }))
+        );
         assert!(events.iter().any(|event| matches!(
             &event.payload,
             SessionEventPayload::HookCompleted { run } if run.status == HookRunStatus::Blocked
@@ -1477,6 +1785,240 @@ mod tests {
                 .as_ref()
                 .is_some_and(|error| error.message.contains("blocked by hook"))
         )));
+    }
+
+    #[tokio::test]
+    async fn prompt_hook_uses_small_model_and_blocks_turn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(Mutex::new(Vec::<ProviderRequest>::new()));
+        let mut services = RuntimeServices::default();
+        let mut models = ModelRegistry::new();
+        models.set_default_model(resolved_test_model("default", "fake", "default/model"));
+        models.set_small_model(ResolvedModel {
+            role: ModelRole::small(),
+            id: ModelId::from("small"),
+            provider: ProviderName::from("fake"),
+            provider_kind: ProviderKind::Fake,
+            api_kind: ApiKind::Fake,
+            model: "small/model".to_owned(),
+            max_input_tokens: Some(32_000),
+            max_output_tokens: Some(4_096),
+            reasoning: None,
+        });
+        models.set_subagent_model(resolved_test_model("subagent", "fake", "subagent/model"));
+        models.register_provider(
+            ProviderName::from("fake"),
+            Arc::new(JsonHookProvider::new(requests.clone())),
+        );
+        services.models = Arc::new(models);
+        services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
+            allowed_write_roots: vec![temp.path().to_path_buf()],
+            ..PolicySettings::default()
+        }));
+
+        let (hooks_file, warnings) = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "prompt",
+                                    "prompt": "HOOK_PROMPT $ARGUMENTS"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parse hooks");
+        assert!(warnings.is_empty());
+        services.resources.replace(
+            ResourceSnapshot::empty(),
+            Arc::new(Hooks::from_sources(vec![HookRegistrySource {
+                plugin_id: PluginId::from("test-plugin"),
+                plugin_root: temp.path().to_path_buf(),
+                source_path: temp.path().join("hooks/hooks.json"),
+                allowed_http_hosts: Vec::new(),
+                allowed_env_vars: Vec::new(),
+                file: hooks_file,
+            }])),
+            Vec::new(),
+        );
+
+        let runtime = SessionRuntime::new(Arc::new(services));
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+
+        let events = session
+            .submit_turn(Turn::user("blocked prompt"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model.id, ModelId::from("small"));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::HookCompleted { run } if run.status == HookRunStatus::Blocked
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::MessageItem {
+                message: Message::System(system),
+            } if system.text.contains("blocked by prompt hook")
+        )));
+    }
+
+    #[tokio::test]
+    async fn hook_warnings_emit_warning_events_on_next_turn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        services.resources.replace(
+            ResourceSnapshot::empty(),
+            Arc::new(Hooks::default()),
+            vec!["hook warning".to_owned()],
+        );
+        let runtime = SessionRuntime::new(services);
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+
+        let events = session
+            .submit_turn(Turn::user("hello"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::Warning { message } if message == "hook warning"
+        )));
+    }
+
+    #[tokio::test]
+    async fn notify_runs_notification_hooks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let (hooks_file, warnings) = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "Notification": [
+                        {
+                            "matcher": "policy",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "printf '{\"systemMessage\":\"notification seen\"}'"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parse hooks");
+        assert!(warnings.is_empty());
+        services.resources.replace(
+            ResourceSnapshot::empty(),
+            Arc::new(Hooks::from_sources(vec![HookRegistrySource {
+                plugin_id: PluginId::from("test-plugin"),
+                plugin_root: temp.path().to_path_buf(),
+                source_path: temp.path().join("hooks/hooks.json"),
+                allowed_http_hosts: Vec::new(),
+                allowed_env_vars: Vec::new(),
+                file: hooks_file,
+            }])),
+            Vec::new(),
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+
+        session
+            .notify("policy", "denied")
+            .await
+            .expect("notify succeeds");
+
+        let replay = session.replay().await.expect("replay");
+        assert!(replay.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::HookCompleted { run } if run.event_name == "Notification"
+        )));
+    }
+
+    #[tokio::test]
+    async fn compact_summarizes_older_messages_and_sets_session_start_latch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+
+        let mut stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        stored.state.messages = (0..12)
+            .map(|index| Message::User(halter_protocol::UserMessage::text(format!("msg {index}"))))
+            .collect();
+        let _ = services
+            .sessions
+            .commit(session.session_id(), None, Some(stored.state), Vec::new())
+            .await
+            .expect("commit state");
+
+        session
+            .compact("manual", Some("Focus on decisions"))
+            .await
+            .expect("compact succeeds");
+
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load compacted session")
+            .expect("session exists");
+        assert!(!stored.state.summaries.is_empty());
+        assert!(stored.state.messages.len() <= 8);
+        assert_eq!(
+            stored.state.pending_session_start_source,
+            Some(HookSessionStartSource::Compact)
+        );
+
+        let replay = session.replay().await.expect("replay");
+        assert!(
+            replay
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
+        );
     }
 
     #[tokio::test]
@@ -1545,7 +2087,7 @@ mod tests {
 
         let mut reloaded = ResourceSnapshot::empty();
         reloaded.revision = halter_protocol::Revision::from("reloaded");
-        runtime.replace_resources(reloaded, Arc::new(Hooks::default()));
+        runtime.replace_resources(reloaded, Arc::new(Hooks::default()), Vec::new());
 
         session
             .submit_turn(Turn::user("after reload"))
@@ -1757,6 +2299,17 @@ mod tests {
             max_output_tokens: Some(4_096),
             reasoning: None,
         });
+        models.set_small_model(ResolvedModel {
+            role: ModelRole::small(),
+            id: ModelId::from("small"),
+            provider: ProviderName::from("fake"),
+            provider_kind: ProviderKind::Fake,
+            api_kind: ApiKind::Fake,
+            model: "halter/fake-small".to_owned(),
+            max_input_tokens: Some(32_000),
+            max_output_tokens: Some(4_096),
+            reasoning: None,
+        });
         models.register_provider(ProviderName::from("fake"), provider);
         services.models = Arc::new(models);
         services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
@@ -1786,6 +2339,77 @@ mod tests {
 
     #[derive(Debug)]
     struct ToolLoopProvider;
+
+    #[derive(Debug)]
+    struct JsonHookProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
+    impl JsonHookProvider {
+        fn new(requests: Arc<Mutex<Vec<ProviderRequest>>>) -> Self {
+            Self { requests }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for JsonHookProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
+            let latest_user_text = request
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::User(user) => Some(user.plain_text()),
+                    Message::System(_) | Message::Assistant(_) | Message::Tool(_) => None,
+                })
+                .unwrap_or_default();
+            let reply = if latest_user_text.starts_with("HOOK_PROMPT ") {
+                "{\"decision\":\"block\",\"reason\":\"blocked by prompt hook\"}".to_owned()
+            } else {
+                "normal reply".to_owned()
+            };
+            let message_id = halter_protocol::MessageId::new();
+            let block_id = BlockId::new();
+            Ok(stream::iter(vec![
+                Ok(StreamEvent::MessageStart {
+                    id: message_id.clone(),
+                }),
+                Ok(StreamEvent::TextStart {
+                    id: block_id.clone(),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    id: block_id.clone(),
+                    delta: reply,
+                }),
+                Ok(StreamEvent::TextEnd { id: block_id }),
+                Ok(StreamEvent::UsageUpdate {
+                    usage: Usage {
+                        input_tokens: 4,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                }),
+                Ok(StreamEvent::MessageEnd {
+                    id: message_id,
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ])
+            .boxed())
+        }
+    }
 
     #[async_trait]
     impl Provider for ToolLoopProvider {

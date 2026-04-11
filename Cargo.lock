@@ -1314,6 +1314,7 @@ dependencies = [
  "halter-providers",
  "halter-session",
  "halter-tools",
+ "reqwest",
  "serde_json",
  "sha2",
  "tempfile",

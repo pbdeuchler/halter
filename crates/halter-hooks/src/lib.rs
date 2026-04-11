@@ -5,10 +5,14 @@ mod engine;
 mod merge;
 
 pub use config::{
-    CommandHookConfig, HookEventName, HookHandler, HookHandlerConfig, HookMatcherGroup,
-    HookShell, HooksFile, HooksLoadWarning,
+    AgentHookConfig, CommandHookConfig, HookEventName, HookHandler, HookHandlerConfig,
+    HookMatcherGroup, HookShell, HooksFile, HooksLoadWarning, HttpHookConfig, PromptHookConfig,
 };
 pub use engine::{
-    HookDispatchOutcome, HookDispatchRequest, HookRegistrySource, Hooks, PreparedHookDispatch,
+    ConfiguredHandler, HOOK_PROTOCOL_VERSION, HookDispatchOutcome, HookDispatchRequest,
+    HookRegistrySource, Hooks, PreparedHookDispatch,
 };
-pub use merge::{HookMergedOutcome, PermissionDecision};
+pub use merge::{
+    HandlerPriority, HookDecision, HookMergedOutcome, HookOutput, HookSpecificOutput, MergeInput,
+    PermissionDecision, merge_outputs, summary_entries,
+};

@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use halter_protocol::{
     AgentId, AgentName, CloseSubagentRequest, CloseSubagentResponse, SendSubagentInputRequest,
-    SessionId, SpawnSubagentRequest, SubagentState, SubagentStatus, Turn, Usage,
-    WaitSubagentRequest, WaitSubagentResponse,
+    SessionEvent, SessionEventPayload, SessionId, SpawnSubagentRequest, SubagentState,
+    SubagentStatus, Turn, TurnId, Usage, WaitSubagentRequest, WaitSubagentResponse,
 };
 use halter_tools::{SubagentControl, SubagentParentContext};
 use tokio::sync::{Mutex, Notify};
@@ -20,12 +20,14 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::session::create_session_seeded;
+use crate::session::{apply_hook_side_effects, create_session_seeded};
 use crate::subagent_session::{
     build_subagent_session_init, build_subagent_state, extract_subagent_output,
     extract_subagent_usage,
 };
-use crate::{HalterSession, RuntimeServices};
+use crate::{
+    HalterSession, HookInvocationContext, RuntimeServices, run_subagent_start, run_subagent_stop,
+};
 
 #[derive(Clone)]
 pub struct RuntimeSubagentControl {
@@ -87,6 +89,13 @@ impl RuntimeSubagentControl {
         agent_type: Option<AgentName>,
         message: String,
     ) -> anyhow::Result<SubagentStatus> {
+        let parent_session_id = self
+            .inner
+            .services
+            .sessions
+            .load_session(session_id)
+            .await?
+            .and_then(|stored| stored.blueprint.parent_session_id);
         let cancel = CancellationToken::new();
         let (generation, status) = {
             let mut registry = self.inner.registry.lock().await;
@@ -110,8 +119,8 @@ impl RuntimeSubagentControl {
             }
             entry.generation = entry.generation.saturating_add(1);
             entry.status.task = message.clone();
-            if let Some(agent_type) = agent_type {
-                entry.status.agent_type = Some(agent_type);
+            if let Some(ref agent_type) = agent_type {
+                entry.status.agent_type = Some(agent_type.clone());
             }
             entry.status.state = SubagentState::Running;
             entry.status.last_message = None;
@@ -132,6 +141,8 @@ impl RuntimeSubagentControl {
                 .run_turn_task(
                     task_agent_id,
                     task_session_id,
+                    parent_session_id,
+                    agent_type.clone(),
                     generation,
                     task_message,
                     task_cancel,
@@ -167,48 +178,98 @@ impl RuntimeSubagentControl {
     async fn run_turn_task(
         &self,
         agent_id: AgentId,
-        _session_id: SessionId,
+        session_id: SessionId,
+        parent_session_id: Option<SessionId>,
+        agent_type: Option<AgentName>,
         generation: u64,
         message: String,
         cancel: CancellationToken,
         session: HalterSession,
     ) {
-        let outcome = match session
-            .submit_turn_with_cancel(Turn::user(message.clone()), cancel.clone())
-            .await
-        {
-            Ok(events) => match events.try_collect::<Vec<_>>().await {
-                Ok(events) => TurnOutcome {
-                    state: if cancel.is_cancelled() {
-                        SubagentState::Cancelled
-                    } else {
-                        SubagentState::Completed
-                    },
-                    last_message: extract_subagent_output(&events),
-                    usage: extract_subagent_usage(&events),
-                    error: None,
+        let mut next_input = message;
+        let outcome = loop {
+            let turn_events = match session
+                .submit_turn_with_cancel(Turn::user(next_input.clone()), cancel.clone())
+                .await
+            {
+                Ok(events) => match events.try_collect::<Vec<_>>().await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        break TurnOutcome {
+                            state: if cancel.is_cancelled() {
+                                SubagentState::Cancelled
+                            } else {
+                                SubagentState::Failed
+                            },
+                            last_message: None,
+                            usage: None,
+                            error: Some(error.to_string()),
+                        };
+                    }
                 },
-                Err(error) => TurnOutcome {
-                    state: if cancel.is_cancelled() {
-                        SubagentState::Cancelled
-                    } else {
-                        SubagentState::Failed
-                    },
+                Err(error) => {
+                    break TurnOutcome {
+                        state: if cancel.is_cancelled() {
+                            SubagentState::Cancelled
+                        } else {
+                            SubagentState::Failed
+                        },
+                        last_message: None,
+                        usage: None,
+                        error: Some(error.to_string()),
+                    };
+                }
+            };
+
+            if cancel.is_cancelled() {
+                break TurnOutcome {
+                    state: SubagentState::Cancelled,
                     last_message: None,
                     usage: None,
-                    error: Some(error.to_string()),
-                },
-            },
-            Err(error) => TurnOutcome {
-                state: if cancel.is_cancelled() {
-                    SubagentState::Cancelled
-                } else {
-                    SubagentState::Failed
-                },
-                last_message: None,
-                usage: None,
-                error: Some(error.to_string()),
-            },
+                    error: None,
+                };
+            }
+
+            let Some(parent_session_id) = parent_session_id.as_ref() else {
+                break TurnOutcome {
+                    state: SubagentState::Completed,
+                    last_message: extract_subagent_output(&turn_events),
+                    usage: extract_subagent_usage(&turn_events),
+                    error: None,
+                };
+            };
+
+            let continuation = match self
+                .run_subagent_stop_hooks(
+                    parent_session_id,
+                    &agent_id,
+                    agent_type.as_ref(),
+                    &session_id,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    break TurnOutcome {
+                        state: SubagentState::Failed,
+                        last_message: None,
+                        usage: None,
+                        error: Some(error.to_string()),
+                    };
+                }
+            };
+
+            if let Some(next_message) = continuation {
+                next_input = next_message;
+                continue;
+            }
+
+            break TurnOutcome {
+                state: SubagentState::Completed,
+                last_message: extract_subagent_output(&turn_events),
+                usage: extract_subagent_usage(&turn_events),
+                error: None,
+            };
         };
 
         self.finish_turn(agent_id, generation, outcome).await;
@@ -239,6 +300,161 @@ impl RuntimeSubagentControl {
         );
         drop(registry);
         self.signal_change();
+    }
+
+    async fn run_parent_hook_dispatch(
+        &self,
+        parent_session_id: &SessionId,
+        dispatch: crate::ExecutedHookDispatch,
+        block_is_ignored: bool,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(mut stored) = self
+            .inner
+            .services
+            .sessions
+            .load_session(parent_session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let mut events = Vec::new();
+        events.extend(
+            dispatch
+                .preview_runs
+                .iter()
+                .cloned()
+                .map(|run| SessionEvent {
+                    session_id: parent_session_id.clone(),
+                    sequence: 0,
+                    delivery: halter_protocol::Delivery::Lossless,
+                    payload: SessionEventPayload::HookStarted { run },
+                }),
+        );
+        events.extend(
+            dispatch
+                .completed_runs
+                .iter()
+                .cloned()
+                .map(|run| SessionEvent {
+                    session_id: parent_session_id.clone(),
+                    sequence: 0,
+                    delivery: halter_protocol::Delivery::Lossless,
+                    payload: SessionEventPayload::HookCompleted { run },
+                }),
+        );
+
+        if block_is_ignored
+            && (dispatch.merged.block_reason.is_some() || dispatch.merged.stop_reason.is_some())
+        {
+            warn!(
+                session_id = %parent_session_id,
+                "hooks.ignored_block"
+            );
+        }
+
+        for message in apply_hook_side_effects(&mut stored.state, &dispatch) {
+            events.push(SessionEvent {
+                session_id: parent_session_id.clone(),
+                sequence: 0,
+                delivery: halter_protocol::Delivery::Lossless,
+                payload: SessionEventPayload::MessageItem { message },
+            });
+        }
+
+        let continuation = dispatch.merged.block_reason.clone();
+        let committed = self
+            .inner
+            .services
+            .sessions
+            .commit(parent_session_id, None, Some(stored.state), events)
+            .await?;
+        for event in committed {
+            self.inner.services.event_bus.publish(event);
+        }
+
+        Ok(continuation)
+    }
+
+    async fn run_subagent_start_hooks(
+        &self,
+        parent: &SubagentParentContext,
+        status: &SubagentStatus,
+    ) -> anyhow::Result<()> {
+        let Some(stored) = self
+            .inner
+            .services
+            .sessions
+            .load_session(&parent.blueprint.session_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let turn_id = TurnId::new();
+        let session = HalterSession::new(
+            self.inner.services.clone(),
+            parent.blueprint.session_id.clone(),
+        );
+        let dispatch = run_subagent_start(
+            &session,
+            &stored.state,
+            HookInvocationContext {
+                turn_id: &turn_id,
+                model: &stored.blueprint.default_model,
+                working_dir: &stored.blueprint.working_dir,
+            },
+            &status.agent_id,
+            status
+                .agent_type
+                .as_ref()
+                .map_or("default", |agent_type| agent_type.0.as_str()),
+            &parent.blueprint.session_id,
+        )
+        .await?;
+        let _ = self
+            .run_parent_hook_dispatch(&parent.blueprint.session_id, dispatch, true)
+            .await?;
+        Ok(())
+    }
+
+    async fn run_subagent_stop_hooks(
+        &self,
+        parent_session_id: &SessionId,
+        agent_id: &AgentId,
+        agent_type: Option<&AgentName>,
+        child_session_id: &SessionId,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(stored) = self
+            .inner
+            .services
+            .sessions
+            .load_session(parent_session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let turn_id = TurnId::new();
+        let session = HalterSession::new(self.inner.services.clone(), parent_session_id.clone());
+        let transcript_path = self
+            .inner
+            .services
+            .sessions
+            .transcript_path(child_session_id);
+        let dispatch = run_subagent_stop(
+            &session,
+            &stored.state,
+            HookInvocationContext {
+                turn_id: &turn_id,
+                model: &stored.blueprint.default_model,
+                working_dir: &stored.blueprint.working_dir,
+            },
+            agent_id,
+            agent_type.map_or("default", |agent_type| agent_type.0.as_str()),
+            transcript_path.as_deref(),
+        )
+        .await?;
+        self.run_parent_hook_dispatch(parent_session_id, dispatch, false)
+            .await
     }
 
     async fn terminal_status_for_targets(
@@ -310,6 +526,8 @@ impl SubagentControl for RuntimeSubagentControl {
                 },
             );
         }
+
+        self.run_subagent_start_hooks(parent, &status).await?;
 
         self.start_turn(
             &agent_id,
@@ -630,6 +848,7 @@ mod tests {
             resources: Arc::new(ResourceHandle::new(
                 halter_protocol::ResourceSnapshot::empty(),
                 Arc::new(halter_hooks::Hooks::default()),
+                Vec::new(),
             )),
             models: Arc::new(models),
             tools: Arc::new(ToolRuntime::new()),

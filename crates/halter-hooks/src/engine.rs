@@ -1,27 +1,16 @@
-// pattern: Imperative Shell
+// pattern: Functional Core
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::Context;
 use chrono::Utc;
-use futures::future::join_all;
-use halter_protocol::{
-    HookHandlerType, HookOutputEntry, HookOutputKind, HookRunStatus, HookRunSummary, PluginId,
-};
+use halter_protocol::{HookHandlerType, HookRunStatus, HookRunSummary, PluginId};
 use regex::Regex;
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
-use tokio::time::timeout;
-use tracing::warn;
 
-use crate::config::{CommandHookConfig, HookEventName, HookHandlerConfig, HookShell, HooksFile};
-use crate::merge::{
-    HookDecision, HookMergedOutcome, HookOutput, HandlerPriority, MergeConflict, MergeInput,
-    merge_outputs, summary_entries,
-};
+use crate::config::{HookEventName, HookHandlerConfig, HooksFile};
+use crate::merge::{HandlerPriority, HookMergedOutcome};
 
 pub const HOOK_PROTOCOL_VERSION: u32 = 1;
 
@@ -30,21 +19,24 @@ pub struct HookRegistrySource {
     pub plugin_id: PluginId,
     pub plugin_root: PathBuf,
     pub source_path: PathBuf,
+    pub allowed_http_hosts: Vec<String>,
+    pub allowed_env_vars: Vec<String>,
     pub file: HooksFile,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Hooks {
-    handlers_by_event: std::collections::BTreeMap<HookEventName, Vec<ConfiguredHandler>>,
+    handlers_by_event: BTreeMap<HookEventName, Vec<ConfiguredHandler>>,
 }
 
 impl Hooks {
     #[must_use]
     pub fn from_sources(sources: impl IntoIterator<Item = HookRegistrySource>) -> Self {
-        let mut handlers_by_event = std::collections::BTreeMap::new();
+        let mut handlers_by_event = BTreeMap::new();
 
         for (plugin_index, source) in sources.into_iter().enumerate() {
-            for (event_index, (event_name, matcher_groups)) in source.file.hooks.iter().enumerate() {
+            for (event_index, (event_name, matcher_groups)) in source.file.hooks.iter().enumerate()
+            {
                 for (matcher_index, matcher_group) in matcher_groups.iter().enumerate() {
                     for (hook_index, hook) in matcher_group.hooks.iter().enumerate() {
                         let matcher = matcher_group
@@ -70,10 +62,13 @@ impl Hooks {
                                 plugin_id: source.plugin_id.clone(),
                                 plugin_root: source.plugin_root.clone(),
                                 source_path: source.source_path.clone(),
+                                allowed_http_hosts: source.allowed_http_hosts.clone(),
+                                allowed_env_vars: source.allowed_env_vars.clone(),
                                 event_name: *event_name,
                                 handler_type: hook.handler_type,
                                 timeout: hook.timeout,
                                 status_message: hook.status_message.clone(),
+                                if_condition: hook.if_condition.clone(),
                                 once: hook.once,
                                 matcher,
                                 config: hook.config.clone(),
@@ -106,12 +101,16 @@ impl Hooks {
             if handler.once && request.fired_hook_ids.contains(&handler.handler_id) {
                 continue;
             }
-            if !handler.matches(request.matcher_value.as_deref()) {
+            if !handler.matches(&request) {
                 continue;
             }
 
             previews.push(HookRunSummary {
-                run_id: format!("{}:{}", handler.handler_id, Utc::now().timestamp_nanos_opt().unwrap_or_default()),
+                run_id: format!(
+                    "{}:{}",
+                    handler.handler_id,
+                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ),
                 event_name: request.event_name.canonical_name().to_owned(),
                 handler_type: handler.handler_type,
                 plugin_id: handler.plugin_id.clone(),
@@ -151,45 +150,18 @@ pub struct PreparedHookDispatch {
 
 impl PreparedHookDispatch {
     #[must_use]
+    pub fn request(&self) -> &HookDispatchRequest {
+        &self.request
+    }
+
+    #[must_use]
     pub fn preview_runs(&self) -> &[HookRunSummary] {
         &self.previews
     }
 
-    pub async fn run(self) -> HookDispatchOutcome {
-        let results = join_all(
-            self.matched_handlers
-                .iter()
-                .zip(self.previews.iter())
-                .map(|(handler, preview)| run_handler(handler, preview, &self.request)),
-        )
-        .await;
-
-        let mut completed_runs = Vec::with_capacity(results.len());
-        let mut merge_inputs = Vec::new();
-        let mut fired_hook_ids = Vec::new();
-
-        for (handler, result) in self.matched_handlers.iter().zip(results) {
-            if handler.once {
-                fired_hook_ids.push(handler.handler_id.clone());
-            }
-            completed_runs.push(result.summary);
-            if let Some(output) = result.output {
-                merge_inputs.push(MergeInput {
-                    handler_id: handler.handler_id.clone(),
-                    priority: handler.priority.clone(),
-                    output,
-                });
-            }
-        }
-
-        let (merged, conflicts) = merge_outputs(&merge_inputs);
-        log_conflicts(&conflicts);
-
-        HookDispatchOutcome {
-            merged,
-            runs: completed_runs,
-            fired_hook_ids,
-        }
+    #[must_use]
+    pub fn matched_handlers(&self) -> &[ConfiguredHandler] {
+        &self.matched_handlers
     }
 }
 
@@ -201,23 +173,36 @@ pub struct HookDispatchOutcome {
 }
 
 #[derive(Debug, Clone)]
-struct ConfiguredHandler {
-    handler_id: String,
-    plugin_id: PluginId,
-    plugin_root: PathBuf,
-    source_path: PathBuf,
-    event_name: HookEventName,
-    handler_type: HookHandlerType,
-    timeout: std::time::Duration,
-    status_message: Option<String>,
-    once: bool,
-    matcher: Option<Regex>,
-    config: HookHandlerConfig,
-    priority: HandlerPriority,
+pub struct ConfiguredHandler {
+    pub handler_id: String,
+    pub plugin_id: PluginId,
+    pub plugin_root: PathBuf,
+    pub source_path: PathBuf,
+    pub allowed_http_hosts: Vec<String>,
+    pub allowed_env_vars: Vec<String>,
+    pub event_name: HookEventName,
+    pub handler_type: HookHandlerType,
+    pub timeout: Duration,
+    pub status_message: Option<String>,
+    pub if_condition: Option<String>,
+    pub once: bool,
+    pub matcher: Option<Regex>,
+    pub config: HookHandlerConfig,
+    pub priority: HandlerPriority,
 }
 
 impl ConfiguredHandler {
-    fn matches(&self, candidate: Option<&str>) -> bool {
+    fn matches(&self, request: &HookDispatchRequest) -> bool {
+        if !self.matches_matcher(request.matcher_value.as_deref()) {
+            return false;
+        }
+
+        self.if_condition
+            .as_deref()
+            .is_none_or(|condition| matches_if_condition(condition, request))
+    }
+
+    fn matches_matcher(&self, candidate: Option<&str>) -> bool {
         match (&self.matcher, self.event_name.matcher_field()) {
             (Some(regex), Some(_)) => candidate.is_some_and(|value| regex.is_match(value)),
             (Some(_), None) => true,
@@ -226,238 +211,222 @@ impl ConfiguredHandler {
     }
 }
 
-struct HandlerRunResult {
-    summary: HookRunSummary,
-    output: Option<HookOutput>,
-}
+fn matches_if_condition(condition: &str, request: &HookDispatchRequest) -> bool {
+    let trimmed = condition.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return true;
+    }
 
-async fn run_handler(
-    handler: &ConfiguredHandler,
-    preview: &HookRunSummary,
-    request: &HookDispatchRequest,
-) -> HandlerRunResult {
-    let started_at = preview.started_at;
-    let execution = match &handler.config {
-        HookHandlerConfig::Command(command) => run_command(handler, command, request).await,
+    let Some(tool_name) = request.payload.get("tool_name").and_then(Value::as_str) else {
+        return false;
     };
 
-    match execution {
-        Ok(output) => {
-            let completed_at = Utc::now();
-            let duration_ms = completed_at
-                .signed_duration_since(started_at)
-                .num_milliseconds()
-                .max(0) as u64;
-            let status = if matches!(output.continue_execution, Some(false)) {
-                HookRunStatus::Stopped
-            } else if matches!(output.decision, Some(HookDecision::Block))
-                || output
-                    .hook_specific_output
-                    .as_ref()
-                    .and_then(|hook| hook.permission_decision)
-                    .is_some_and(|decision| {
-                        matches!(
-                            decision,
-                            crate::merge::PermissionDecision::Deny
-                                | crate::merge::PermissionDecision::Ask
-                        )
-                    })
-            {
-                HookRunStatus::Blocked
-            } else {
-                HookRunStatus::Completed
-            };
-            HandlerRunResult {
-                summary: HookRunSummary {
-                    status,
-                    completed_at: Some(completed_at),
-                    duration_ms: Some(duration_ms),
-                    entries: summary_entries(&output),
-                    ..preview.clone()
-                },
-                output: Some(output),
-            }
+    if let Some((tool_pattern, input_pattern)) = parse_if_condition(trimmed) {
+        if !matches_text_pattern(tool_pattern, tool_name, true) {
+            return false;
         }
-        Err(error) => {
-            let completed_at = Utc::now();
-            let duration_ms = completed_at
-                .signed_duration_since(started_at)
-                .num_milliseconds()
-                .max(0) as u64;
-            HandlerRunResult {
-                summary: HookRunSummary {
-                    status: HookRunStatus::Failed,
-                    completed_at: Some(completed_at),
-                    duration_ms: Some(duration_ms),
-                    entries: vec![HookOutputEntry {
-                        kind: HookOutputKind::Error,
-                        text: error.to_string(),
+
+        let input_text = request
+            .payload
+            .get("tool_input")
+            .and_then(render_if_input_text)
+            .unwrap_or_default();
+        return matches_text_pattern(input_pattern, &input_text, false);
+    }
+
+    matches_text_pattern(trimmed, tool_name, true)
+}
+
+fn parse_if_condition(condition: &str) -> Option<(&str, &str)> {
+    let open = condition.find('(')?;
+    let close = condition.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    Some((condition[..open].trim(), condition[open + 1..close].trim()))
+}
+
+fn render_if_input_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => map
+            .get("command")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| Some(Value::Object(map.clone()).to_string())),
+        Value::String(text) => Some(text.clone()),
+        Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+fn matches_text_pattern(pattern: &str, candidate: &str, case_insensitive: bool) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern == "*" {
+        return true;
+    }
+
+    if looks_like_regex(pattern)
+        && let Ok(regex) = Regex::new(pattern)
+    {
+        return regex.is_match(candidate);
+    }
+
+    wildcard_match(pattern, candidate, case_insensitive)
+}
+
+fn looks_like_regex(pattern: &str) -> bool {
+    pattern.chars().any(|ch| {
+        matches!(
+            ch,
+            '[' | ']' | '(' | ')' | '{' | '}' | '+' | '?' | '^' | '$' | '\\' | '|'
+        )
+    })
+}
+
+fn wildcard_match(pattern: &str, candidate: &str, case_insensitive: bool) -> bool {
+    let (pattern, candidate) = if case_insensitive {
+        (pattern.to_ascii_lowercase(), candidate.to_ascii_lowercase())
+    } else {
+        (pattern.to_owned(), candidate.to_owned())
+    };
+
+    wildcard_match_impl(pattern.as_bytes(), candidate.as_bytes())
+}
+
+fn wildcard_match_impl(pattern: &[u8], candidate: &[u8]) -> bool {
+    let mut pattern_index = 0usize;
+    let mut candidate_index = 0usize;
+    let mut last_star = None;
+    let mut backtrack_candidate = 0usize;
+
+    while candidate_index < candidate.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'*'
+                || pattern[pattern_index] == candidate[candidate_index])
+        {
+            if pattern[pattern_index] == b'*' {
+                last_star = Some(pattern_index);
+                pattern_index += 1;
+                backtrack_candidate = candidate_index;
+            } else {
+                pattern_index += 1;
+                candidate_index += 1;
+            }
+            continue;
+        }
+
+        if let Some(star_index) = last_star {
+            pattern_index = star_index + 1;
+            backtrack_candidate += 1;
+            candidate_index = backtrack_candidate;
+            continue;
+        }
+
+        return false;
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::config::{HookHandler, HookMatcherGroup, HooksFile, PromptHookConfig};
+
+    #[test]
+    fn wildcard_match_supports_globs() {
+        assert!(wildcard_match("git *", "git status", false));
+        assert!(wildcard_match("shell", "Shell", true));
+        assert!(!wildcard_match("git *", "cargo test", false));
+    }
+
+    #[test]
+    fn if_condition_matches_tool_name_and_command() {
+        let handler = ConfiguredHandler {
+            handler_id: "hook".to_owned(),
+            plugin_id: PluginId::from("plugin"),
+            plugin_root: PathBuf::from("/tmp/plugin"),
+            source_path: PathBuf::from("/tmp/plugin/hooks.json"),
+            allowed_http_hosts: Vec::new(),
+            allowed_env_vars: Vec::new(),
+            event_name: HookEventName::PreToolUse,
+            handler_type: HookHandlerType::Prompt,
+            timeout: Duration::from_secs(1),
+            status_message: None,
+            if_condition: Some("Shell(git *)".to_owned()),
+            once: false,
+            matcher: None,
+            config: HookHandlerConfig::Prompt(PromptHookConfig {
+                prompt: "noop".to_owned(),
+                model: None,
+            }),
+            priority: HandlerPriority {
+                plugin_load_order: 0,
+                event_declaration_index: 0,
+                matcher_group_index: 0,
+                hook_index_within_group: 0,
+            },
+        };
+
+        let request = HookDispatchRequest {
+            event_name: HookEventName::PreToolUse,
+            matcher_value: Some("Shell".to_owned()),
+            payload: json!({
+                "tool_name": "Shell",
+                "tool_input": { "command": "git status" },
+            }),
+            fired_hook_ids: BTreeSet::new(),
+        };
+
+        assert!(handler.matches(&request));
+    }
+
+    #[test]
+    fn prepare_filters_once_handlers() {
+        let hooks = Hooks::from_sources([HookRegistrySource {
+            plugin_id: PluginId::from("plugin"),
+            plugin_root: PathBuf::from("/tmp/plugin"),
+            source_path: PathBuf::from("/tmp/plugin/hooks.json"),
+            allowed_http_hosts: Vec::new(),
+            allowed_env_vars: Vec::new(),
+            file: HooksFile {
+                hooks: [(
+                    HookEventName::UserPromptSubmit,
+                    vec![HookMatcherGroup {
+                        matcher: None,
+                        hooks: vec![HookHandler {
+                            handler_type: HookHandlerType::Prompt,
+                            timeout: Duration::from_secs(1),
+                            status_message: None,
+                            if_condition: None,
+                            once: true,
+                            config: HookHandlerConfig::Prompt(PromptHookConfig {
+                                prompt: "noop".to_owned(),
+                                model: None,
+                            }),
+                        }],
                     }],
-                    ..preview.clone()
-                },
-                output: None,
-            }
-        }
-    }
-}
+                )]
+                .into_iter()
+                .collect(),
+            },
+        }]);
 
-async fn run_command(
-    handler: &ConfiguredHandler,
-    command: &CommandHookConfig,
-    request: &HookDispatchRequest,
-) -> anyhow::Result<HookOutput> {
-    let expanded_command = expand_placeholders(&command.command, &handler.plugin_root);
-    let mut child = build_command(handler, command.shell, &expanded_command, request)?;
-    let payload = build_payload(handler, request)?;
-    let mut body = serde_json::to_vec(&payload)?;
-    body.push(b'\n');
+        let prepared = hooks.prepare(HookDispatchRequest {
+            event_name: HookEventName::UserPromptSubmit,
+            matcher_value: None,
+            payload: json!({}),
+            fired_hook_ids: ["plugin:UserPromptSubmit:0:0:0".to_owned()]
+                .into_iter()
+                .collect(),
+        });
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("failed to run hook command: missing stdin")?;
-    stdin
-        .write_all(&body)
-        .await
-        .context("failed to write hook stdin")?;
-    stdin
-        .shutdown()
-        .await
-        .context("failed to close hook stdin")?;
-
-    let output = timeout(handler.timeout, child.wait_with_output())
-        .await
-        .context("hook timed out")?
-        .context("failed to wait for hook command")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-
-    match output.status.code() {
-        Some(0) => {
-            if stdout.is_empty() {
-                return Ok(HookOutput::default());
-            }
-            serde_json::from_slice(&output.stdout)
-                .or_else(|_| Ok::<HookOutput, serde_json::Error>(HookOutput::default()))
-                .context("failed to decode hook stdout")
-        }
-        Some(2) => Ok(HookOutput {
-            decision: Some(HookDecision::Block),
-            reason: (!stderr.is_empty()).then_some(stderr),
-            ..HookOutput::default()
-        }),
-        Some(code) => {
-            let detail = if stderr.is_empty() {
-                format!("hook command exited with status {code}")
-            } else {
-                format!("hook command exited with status {code}: {stderr}")
-            };
-            anyhow::bail!(detail)
-        }
-        None => anyhow::bail!("hook command terminated by signal"),
-    }
-}
-
-fn build_command(
-    handler: &ConfiguredHandler,
-    shell: HookShell,
-    expanded_command: &str,
-    request: &HookDispatchRequest,
-) -> anyhow::Result<tokio::process::Child> {
-    let (program, args) = shell_invocation(shell, expanded_command);
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let cwd = request
-        .payload
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or(".");
-    command.current_dir(cwd);
-    command.env("PLUGIN_ROOT", &handler.plugin_root);
-    command.env("CLAUDE_PLUGIN_ROOT", &handler.plugin_root);
-    command.env("PLUGIN_ID", handler.plugin_id.0.as_str());
-    command.env("HOOK_EVENT", handler.event_name.canonical_name());
-    command.env("HOOK_VERSION", HOOK_PROTOCOL_VERSION.to_string());
-    command.env("HOOK_SOURCE_PATH", &handler.source_path);
-    if let Some(session_id) = request.payload.get("session_id").and_then(Value::as_str) {
-        command.env("SESSION_ID", session_id);
-    }
-    if let Some(turn_id) = request.payload.get("turn_id").and_then(Value::as_str) {
-        command.env("TURN_ID", turn_id);
-    }
-    if let Some(project_dir) = request.payload.get("cwd").and_then(Value::as_str) {
-        command.env("PROJECT_DIR", project_dir);
-        command.env("CLAUDE_PROJECT_DIR", project_dir);
-    }
-
-    let HookHandlerConfig::Command(command_config) = &handler.config;
-    for (key, value) in &command_config.env {
-        command.env(key, expand_placeholders(value, &handler.plugin_root));
-    }
-
-    command
-        .spawn()
-        .context("failed to spawn hook command process")
-}
-
-fn build_payload(handler: &ConfiguredHandler, request: &HookDispatchRequest) -> anyhow::Result<Value> {
-    let mut payload = request
-        .payload
-        .as_object()
-        .cloned()
-        .context("failed to build hook payload: expected object")?;
-    payload.insert(
-        "plugin_id".to_owned(),
-        Value::String(handler.plugin_id.0.clone()),
-    );
-    payload.insert(
-        "plugin_root".to_owned(),
-        Value::String(handler.plugin_root.display().to_string()),
-    );
-    Ok(Value::Object(payload))
-}
-
-fn shell_invocation(shell: HookShell, command: &str) -> (String, Vec<String>) {
-    match shell {
-        HookShell::Bash => (
-            std::env::var("SHELL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "/bin/sh".to_owned()),
-            vec!["-lc".to_owned(), command.to_owned()],
-        ),
-        HookShell::Pwsh => (
-            "pwsh".to_owned(),
-            vec!["-Command".to_owned(), command.to_owned()],
-        ),
-    }
-}
-
-fn expand_placeholders(value: &str, plugin_root: &Path) -> String {
-    let plugin_root = plugin_root.display().to_string();
-    let plugin_data = plugin_root.clone() + "/.data";
-    value
-        .replace("${PLUGIN_ROOT}", &plugin_root)
-        .replace("${CLAUDE_PLUGIN_ROOT}", &plugin_root)
-        .replace("${HALTER_PLUGIN_ROOT}", &plugin_root)
-        .replace("${PLUGIN_DATA}", &plugin_data)
-        .replace("${CLAUDE_PLUGIN_DATA}", &plugin_data)
-        .replace("${HALTER_PLUGIN_DATA}", &plugin_data)
-}
-
-fn log_conflicts(conflicts: &[MergeConflict]) {
-    for conflict in conflicts {
-        warn!(
-            field = conflict.field,
-            winner = %conflict.winner,
-            loser = %conflict.loser,
-            "hooks.merge_conflict"
-        );
+        assert!(prepared.matched_handlers().is_empty());
     }
 }

@@ -101,18 +101,13 @@ pub struct HookHandler {
     pub handler_type: HookHandlerType,
     pub timeout: Duration,
     pub status_message: Option<String>,
+    pub if_condition: Option<String>,
     pub once: bool,
     pub config: HookHandlerConfig,
 }
 
 impl HookHandler {
     fn from_raw(raw: HookHandlerRaw, warnings: &mut Vec<HooksLoadWarning>) -> Option<Self> {
-        if raw.if_condition.is_some() {
-            warnings.push(HooksLoadWarning::new(
-                "ignoring hook handler with unsupported 'if' filter".to_owned(),
-            ));
-            return None;
-        }
         if raw.r#async {
             warnings.push(HooksLoadWarning::new(
                 "ignoring reserved async=true hook flag in v1".to_owned(),
@@ -136,6 +131,7 @@ impl HookHandler {
                     handler_type: HookHandlerType::Command,
                     timeout: Duration::from_secs(timeout_secs),
                     status_message: raw.status_message.and_then(trimmed_non_empty),
+                    if_condition: raw.if_condition.and_then(trimmed_non_empty),
                     once: raw.once,
                     config: HookHandlerConfig::Command(CommandHookConfig {
                         command,
@@ -145,22 +141,68 @@ impl HookHandler {
                 })
             }
             RawHookHandlerType::Http => {
-                warnings.push(HooksLoadWarning::new(
-                    "ignoring unsupported http hook backend".to_owned(),
-                ));
-                None
+                let url = raw.url.and_then(trimmed_non_empty).or_else(|| {
+                    warnings.push(HooksLoadWarning::new(
+                        "http hook is missing the 'url' field".to_owned(),
+                    ));
+                    None
+                })?;
+                Some(Self {
+                    handler_type: HookHandlerType::Http,
+                    timeout: Duration::from_secs(timeout_secs),
+                    status_message: raw.status_message.and_then(trimmed_non_empty),
+                    if_condition: raw.if_condition.and_then(trimmed_non_empty),
+                    once: raw.once,
+                    config: HookHandlerConfig::Http(HttpHookConfig {
+                        url,
+                        headers: raw.headers,
+                        allowed_env_vars: raw.allowed_env_vars,
+                    }),
+                })
             }
             RawHookHandlerType::Prompt => {
-                warnings.push(HooksLoadWarning::new(
-                    "ignoring unsupported prompt hook backend".to_owned(),
-                ));
-                None
+                let prompt = raw.prompt.and_then(trimmed_non_empty).or_else(|| {
+                    warnings.push(HooksLoadWarning::new(
+                        "prompt hook is missing the 'prompt' field".to_owned(),
+                    ));
+                    None
+                })?;
+                Some(Self {
+                    handler_type: HookHandlerType::Prompt,
+                    timeout: Duration::from_secs(timeout_secs),
+                    status_message: raw.status_message.and_then(trimmed_non_empty),
+                    if_condition: raw.if_condition.and_then(trimmed_non_empty),
+                    once: raw.once,
+                    config: HookHandlerConfig::Prompt(PromptHookConfig {
+                        prompt,
+                        model: raw.model.and_then(trimmed_non_empty),
+                    }),
+                })
             }
             RawHookHandlerType::Agent => {
-                warnings.push(HooksLoadWarning::new(
-                    "ignoring unsupported agent hook backend".to_owned(),
-                ));
-                None
+                let prompt = raw.prompt.and_then(trimmed_non_empty).or_else(|| {
+                    warnings.push(HooksLoadWarning::new(
+                        "agent hook is missing the 'prompt' field".to_owned(),
+                    ));
+                    None
+                })?;
+                Some(Self {
+                    handler_type: HookHandlerType::Agent,
+                    timeout: Duration::from_secs(timeout_secs),
+                    status_message: raw.status_message.and_then(trimmed_non_empty),
+                    if_condition: raw.if_condition.and_then(trimmed_non_empty),
+                    once: raw.once,
+                    config: HookHandlerConfig::Agent(AgentHookConfig {
+                        prompt,
+                        model: raw.model.and_then(trimmed_non_empty),
+                        allowed_tools: raw
+                            .allowed_tools
+                            .into_iter()
+                            .filter_map(trimmed_non_empty)
+                            .collect(),
+                        max_turns: raw.max_turns,
+                    }),
+                })
             }
             RawHookHandlerType::Callback | RawHookHandlerType::Function => {
                 warnings.push(HooksLoadWarning::new(
@@ -175,6 +217,9 @@ impl HookHandler {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookHandlerConfig {
     Command(CommandHookConfig),
+    Http(HttpHookConfig),
+    Prompt(PromptHookConfig),
+    Agent(AgentHookConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +227,27 @@ pub struct CommandHookConfig {
     pub command: String,
     pub shell: HookShell,
     pub env: IndexMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpHookConfig {
+    pub url: String,
+    pub headers: IndexMap<String, String>,
+    pub allowed_env_vars: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptHookConfig {
+    pub prompt: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentHookConfig {
+    pub prompt: String,
+    pub model: Option<String>,
+    pub allowed_tools: Vec<String>,
+    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -385,6 +451,20 @@ struct HookHandlerRaw {
     once: bool,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    headers: IndexMap<String, String>,
+    #[serde(default, rename = "allowedEnvVars")]
+    allowed_env_vars: Vec<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default, rename = "allowedTools")]
+    allowed_tools: Vec<String>,
+    #[serde(default, rename = "maxTurns")]
+    max_turns: Option<u32>,
     #[serde(default)]
     shell: Option<HookShell>,
     #[serde(default)]
