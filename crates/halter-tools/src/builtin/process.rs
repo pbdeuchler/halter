@@ -1,0 +1,283 @@
+// pattern: Imperative Shell
+
+use async_trait::async_trait;
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use serde_json::{Value, json};
+
+use crate::{Tool, ToolContext};
+
+use super::common::{ToolScope, ensure_not_cancelled, optional_u64, required_string};
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::fs;
+
+    pub fn collect_descendants(pid: i32, pids: &mut Vec<i32>) {
+        let children_path = format!("/proc/{pid}/task/{pid}/children");
+        let Ok(content) = fs::read_to_string(&children_path) else {
+            return;
+        };
+
+        for part in content.split_whitespace() {
+            if let Ok(child_pid) = part.parse::<i32>() {
+                pids.push(child_pid);
+                collect_descendants(child_pid, pids);
+            }
+        }
+    }
+
+    pub fn kill_pid(pid: i32, signal: i32) -> bool {
+        unsafe { libc::kill(pid, signal) == 0 }
+    }
+
+    pub fn process_group_id(pid: i32) -> Option<i32> {
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid < 0 { None } else { Some(pgid) }
+    }
+
+    pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
+        unsafe { libc::kill(-pgid, signal) == 0 }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::mem::size_of;
+    use std::ptr;
+
+    #[link(name = "proc", kind = "dylib")]
+    unsafe extern "C" {
+        fn proc_listchildpids(ppid: i32, buffer: *mut i32, buffersize: i32) -> i32;
+    }
+
+    pub fn collect_descendants(pid: i32, pids: &mut Vec<i32>) {
+        let count = unsafe { proc_listchildpids(pid, ptr::null_mut(), 0) };
+        if count <= 0 {
+            return;
+        }
+
+        let mut buffer = vec![0i32; count as usize];
+        let actual = unsafe {
+            proc_listchildpids(pid, buffer.as_mut_ptr(), (buffer.len() * size_of::<i32>()) as i32)
+        };
+        if actual <= 0 {
+            return;
+        }
+
+        let child_count = actual as usize / size_of::<i32>();
+        for &child_pid in &buffer[..child_count] {
+            if child_pid > 0 {
+                pids.push(child_pid);
+                collect_descendants(child_pid, pids);
+            }
+        }
+    }
+
+    pub fn kill_pid(pid: i32, signal: i32) -> bool {
+        unsafe { libc::kill(pid, signal) == 0 }
+    }
+
+    pub fn process_group_id(pid: i32) -> Option<i32> {
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid < 0 { None } else { Some(pgid) }
+    }
+
+    pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
+        unsafe { libc::kill(-pgid, signal) == 0 }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod platform {
+    use std::collections::HashMap;
+    use std::mem;
+
+    use smallvec::SmallVec;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESSENTRY32W {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ProcessID: u32,
+        th32DefaultHeapID: usize,
+        th32ModuleID: u32,
+        cntThreads: u32,
+        th32ParentProcessID: u32,
+        pcPriClassBase: i32,
+        dwFlags: u32,
+        szExeFile: [u16; 260],
+    }
+
+    type Handle = *mut std::ffi::c_void;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> Handle;
+        fn Process32FirstW(hSnapshot: Handle, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn Process32NextW(hSnapshot: Handle, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn CloseHandle(hObject: Handle) -> i32;
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
+        fn TerminateProcess(hProcess: Handle, uExitCode: u32) -> i32;
+    }
+
+    fn build_process_tree() -> HashMap<u32, SmallVec<[u32; 4]>> {
+        let mut tree = HashMap::<u32, SmallVec<[u32; 4]>>::new();
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return tree;
+            }
+
+            let mut entry: PROCESSENTRY32W = mem::zeroed();
+            entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+
+            if Process32FirstW(snapshot, &raw mut entry) != 0 {
+                loop {
+                    tree.entry(entry.th32ParentProcessID)
+                        .or_default()
+                        .push(entry.th32ProcessID);
+                    if Process32NextW(snapshot, &raw mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+
+            CloseHandle(snapshot);
+        }
+        tree
+    }
+
+    pub fn collect_descendants(pid: i32, pids: &mut Vec<i32>) {
+        collect_descendants_from_tree(pid as u32, &build_process_tree(), pids);
+    }
+
+    fn collect_descendants_from_tree(
+        pid: u32,
+        tree: &HashMap<u32, SmallVec<[u32; 4]>>,
+        pids: &mut Vec<i32>,
+    ) {
+        if let Some(children) = tree.get(&pid) {
+            for &child_pid in children {
+                pids.push(child_pid as i32);
+                collect_descendants_from_tree(child_pid, tree, pids);
+            }
+        }
+    }
+
+    pub fn kill_pid(pid: i32, _signal: i32) -> bool {
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            let result = TerminateProcess(handle, 1);
+            CloseHandle(handle);
+            result != 0
+        }
+    }
+
+    pub const fn process_group_id(_pid: i32) -> Option<i32> {
+        None
+    }
+
+    pub const fn kill_process_group(_pgid: i32, _signal: i32) -> bool {
+        false
+    }
+}
+
+pub fn kill_tree(pid: i32, signal: i32) -> u32 {
+    let mut descendants = Vec::new();
+    platform::collect_descendants(pid, &mut descendants);
+
+    let mut killed = 0u32;
+    for &child_pid in descendants.iter().rev() {
+        if platform::kill_pid(child_pid, signal) {
+            killed += 1;
+        }
+    }
+    if platform::kill_pid(pid, signal) {
+        killed += 1;
+    }
+    killed
+}
+
+#[cfg_attr(not(feature = "pty"), allow(dead_code))]
+pub fn process_group_id(pid: i32) -> Option<i32> {
+    platform::process_group_id(pid)
+}
+
+#[cfg_attr(not(feature = "pty"), allow(dead_code))]
+pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
+    platform::kill_process_group(pgid, signal)
+}
+
+pub fn list_descendants(pid: i32) -> Vec<i32> {
+    let mut descendants = Vec::new();
+    platform::collect_descendants(pid, &mut descendants);
+    descendants
+}
+
+#[derive(Debug)]
+pub struct ProcessTool;
+
+#[async_trait]
+impl Tool for ProcessTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: ToolName::from("process"),
+            description: "Inspect or terminate a process tree".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["kill_tree", "list_descendants"] },
+                    "pid": { "type": "integer", "minimum": 1 },
+                    "signal": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["action", "pid"],
+            }),
+            concurrency: ToolConcurrency::Exclusive,
+            capabilities: ToolCapabilities {
+                mutating: true,
+                requires_approval: true,
+                cancellable: false,
+                long_running: false,
+            },
+            provider_aliases: Default::default(),
+        }
+    }
+
+    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+        let _scope = ToolScope::new(&context, "process");
+        ensure_not_cancelled(&context.cancel)?;
+        let action = required_string(&input, "action")?;
+        let pid = optional_u64(&input, "pid")?
+            .ok_or_else(|| anyhow::anyhow!("invalid tool input: missing u64 field 'pid'"))?;
+        let pid = i32::try_from(pid)
+            .map_err(|_| anyhow::anyhow!("failed to execute process tool: pid is out of range"))?;
+
+        let value = match action {
+            "kill_tree" => {
+                let signal = optional_u64(&input, "signal")?.unwrap_or(9);
+                let signal = i32::try_from(signal).map_err(|_| {
+                    anyhow::anyhow!("failed to execute process tool: signal is out of range")
+                })?;
+                json!({
+                    "pid": pid,
+                    "signal": signal,
+                    "killed": kill_tree(pid, signal),
+                })
+            }
+            "list_descendants" => json!({
+                "pid": pid,
+                "descendants": list_descendants(pid),
+            }),
+            _ => anyhow::bail!("failed to execute process tool: unknown action '{action}'"),
+        };
+
+        Ok(ToolResult::Json { value })
+    }
+}

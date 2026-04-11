@@ -471,7 +471,9 @@ mod tests {
     };
     use halter_providers::{ModelRegistry, Provider};
     use halter_session::InMemorySessionStore;
-    use halter_tools::{DefaultToolPolicy, PolicySettings, ToolRuntime};
+    use halter_tools::{
+        DefaultToolPolicy, PathLockMap, PolicySettings, ToolRuntime, ToolSessionStore,
+    };
 
     use super::*;
     use crate::{DefaultContextManager, DefaultPromptAssembler, EventBus, ResourceHandle};
@@ -630,6 +632,8 @@ mod tests {
             )),
             models: Arc::new(models),
             tools: Arc::new(ToolRuntime::new()),
+            path_locks: Arc::new(PathLockMap::default()),
+            tool_sessions: Arc::new(ToolSessionStore::default()),
             sessions: Arc::new(InMemorySessionStore::default()),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default())),
             prompt_assembler: Arc::new(DefaultPromptAssembler),

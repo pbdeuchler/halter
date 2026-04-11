@@ -18,8 +18,8 @@ use halter_runtime::{
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
-    DefaultToolPolicy, PolicySettings, Tool, ToolRuntime, register_builtin_tools,
-    register_subagent_tools,
+    DefaultToolPolicy, PathLockMap, PolicySettings, Tool, ToolRuntime, ToolSessionStore,
+    register_builtin_tools, register_subagent_tools,
 };
 use tracing::{debug, info};
 
@@ -116,6 +116,8 @@ impl HalterBuilder {
             resources: Arc::new(ResourceHandle::new(snapshot)),
             models,
             tools,
+            path_locks: Arc::new(PathLockMap::default()),
+            tool_sessions: Arc::new(ToolSessionStore::default()),
             sessions,
             policy: policy.clone(),
             prompt_assembler: Arc::new(DefaultPromptAssembler),

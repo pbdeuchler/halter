@@ -1,7 +1,7 @@
 // pattern: Imperative Shell
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -17,7 +17,8 @@ use halter_protocol::{
 use halter_providers::ModelRegistry;
 use halter_session::{SessionStore, StoredSession};
 use halter_tools::{
-    NoopToolEventSink, SubagentControl, SubagentParentContext, ToolPolicy, ToolRuntime,
+    PathLockMap, SubagentControl, SubagentParentContext, ToolEventSink, ToolPolicy,
+    ToolRuntime, ToolRuntimeEvent, ToolSessionStore,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -33,6 +34,8 @@ pub struct RuntimeServices {
     pub resources: Arc<ResourceHandle>,
     pub models: Arc<ModelRegistry>,
     pub tools: Arc<ToolRuntime>,
+    pub path_locks: Arc<PathLockMap>,
+    pub tool_sessions: Arc<ToolSessionStore>,
     pub sessions: Arc<dyn SessionStore>,
     pub policy: Arc<dyn ToolPolicy>,
     pub prompt_assembler: Arc<dyn PromptAssembler>,
@@ -113,6 +116,30 @@ impl SessionInit {
 pub struct HalterSession {
     services: Arc<RuntimeServices>,
     session_id: SessionId,
+}
+
+struct SessionToolEventSink {
+    events: Arc<Mutex<Vec<ToolRuntimeEvent>>>,
+}
+
+impl ToolEventSink for SessionToolEventSink {
+    fn emit(&self, event: ToolRuntimeEvent) {
+        self.events.lock().expect("tool event lock poisoned").push(event);
+    }
+}
+
+struct ToolEventDrain {
+    events: Arc<Mutex<Vec<ToolRuntimeEvent>>>,
+}
+
+impl ToolEventDrain {
+    fn into_events(self) -> Vec<ToolRuntimeEvent> {
+        self.events
+            .lock()
+            .expect("tool event lock poisoned")
+            .drain(..)
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -411,13 +438,16 @@ impl HalterSession {
         let mut events = Vec::new();
 
         for call in tool_calls {
+            let (emit, tool_event_drain) = self.spawn_tool_event_sink(&call);
             let context = halter_tools::ToolContext {
                 session_id: self.session_id.clone(),
                 working_dir: blueprint.working_dir.clone(),
+                path_locks: self.services.path_locks.clone(),
+                tool_sessions: self.services.tool_sessions.clone(),
                 file_view: Arc::new(state.file_view_cache.clone()),
                 snapshot: snapshot.clone(),
                 cancel: cancel.child_token(),
-                emit: Arc::new(NoopToolEventSink),
+                emit,
                 policy: self.services.policy.clone(),
                 max_tool_output_bytes: self.services.max_tool_output_bytes,
                 shell_timeout_secs: self.services.shell_timeout_secs,
@@ -451,6 +481,14 @@ impl HalterSession {
                 .tools
                 .execute(&call.name.0, context.clone(), call.arguments.clone())
                 .await;
+            drop(context);
+            events.extend(
+                tool_event_drain
+                    .into_events()
+                    .into_iter()
+                    .filter_map(|event| tool_runtime_event_payload(&call.id, event))
+                    .map(|payload| self.make_event(0, payload)),
+            );
 
             let (content, error) = match execution {
                 Ok(result) => {
@@ -530,6 +568,17 @@ impl HalterSession {
         Ok(committed)
     }
 
+    fn spawn_tool_event_sink(&self, call: &ToolCall) -> (Arc<dyn ToolEventSink>, ToolEventDrain) {
+        let _ = call;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(SessionToolEventSink {
+                events: events.clone(),
+            }) as Arc<dyn ToolEventSink>,
+            ToolEventDrain { events },
+        )
+    }
+
     fn make_event(&self, sequence: u64, payload: SessionEventPayload) -> SessionEvent {
         SessionEvent {
             session_id: self.session_id.clone(),
@@ -537,6 +586,20 @@ impl HalterSession {
             delivery: Delivery::Lossless,
             payload,
         }
+    }
+}
+
+fn tool_runtime_event_payload(
+    call_id: &halter_protocol::ToolCallId,
+    event: ToolRuntimeEvent,
+) -> Option<SessionEventPayload> {
+    match event {
+        ToolRuntimeEvent::ToolOutput { tool_name, chunk } => Some(SessionEventPayload::ToolOutput {
+            call_id: call_id.clone(),
+            tool_name: tool_name.into(),
+            chunk,
+        }),
+        ToolRuntimeEvent::Started { .. } | ToolRuntimeEvent::Completed { .. } => None,
     }
 }
 
@@ -821,6 +884,8 @@ impl Default for RuntimeServices {
             resources: Arc::new(ResourceHandle::new(snapshot)),
             models: Arc::new(ModelRegistry::new()),
             tools: Arc::new(ToolRuntime::new()),
+            path_locks: Arc::new(PathLockMap::default()),
+            tool_sessions: Arc::new(ToolSessionStore::default()),
             sessions: Arc::new(halter_session::InMemorySessionStore::default()),
             policy: Arc::new(halter_tools::DefaultToolPolicy::new(Default::default())),
             prompt_assembler: Arc::new(crate::DefaultPromptAssembler),

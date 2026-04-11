@@ -530,6 +530,11 @@ pub enum SessionEventPayload {
     MessageItem { message: Message },
     DeltaItem { delta: DeltaItem },
     ToolExecutionStarted { call: ToolCall },
+    ToolOutput {
+        call_id: ToolCallId,
+        tool_name: ToolName,
+        chunk: SharedStr,
+    },
     ToolExecutionCompleted { outcome: ToolExecutionOutcome },
     ApprovalRequested { tool_name: ToolName, reason: String },
     ContextCompacted { summary: String },

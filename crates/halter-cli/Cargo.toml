@@ -15,6 +15,14 @@ path = "src/main.rs"
 name = "halter-cli"
 path = "src/main.rs"
 
+[features]
+advanced-tools = ["halter/advanced-tools"]
+ast-tools = ["halter/ast-tools"]
+image-tools = ["halter/image-tools"]
+pty = ["halter/pty"]
+profiling = ["halter/profiling"]
+full = ["halter/full"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
