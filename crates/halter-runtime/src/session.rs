@@ -8,12 +8,14 @@ use anyhow::Context;
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
+use halter_hooks::Hooks;
 use halter_protocol::{
-    AssistantMessage, AssistantPart, BlockId, Delivery, Message, MessageId, ModelId, ObservedState,
-    PendingToolCall, PromptSegment, ProviderError, ProviderRequest, ReplayMeta, ResourceSnapshot,
+    AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash, Delivery,
+    HookSessionStartSource, Message, MessageId, ModelId, ObservedState, PendingToolCall,
+    PromptSegment, PromptSegmentId, ProviderError, ProviderRequest, ReplayMeta, ResourceSnapshot,
     SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
-    StreamEvent, ToolCall, ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn,
-    Usage,
+    StreamEvent, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult,
+    ToolResultMessage, Turn, Usage, Volatility,
 };
 use halter_providers::ModelRegistry;
 use halter_session::{SessionStore, StoredSession};
@@ -21,6 +23,7 @@ use halter_tools::{
     PathLockMap, SubagentControl, SubagentParentContext, ToolEventSink, ToolPolicy, ToolRuntime,
     ToolRuntimeEvent, ToolSessionStore,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -29,7 +32,11 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 use crate::DefaultContextManager;
 use crate::model_selection::select_models;
-use crate::{ContextManager, EventBus, PromptAssembler};
+use crate::{
+    ContextManager, EventBus, HookInvocationContext, PromptAssembler, ExecutedHookDispatch,
+    run_post_tool_use, run_post_tool_use_failure, run_pre_tool_use, run_session_start, run_stop,
+    run_user_prompt_submit,
+};
 
 pub type SessionEventStream = BoxStream<'static, anyhow::Result<SessionEvent>>;
 
@@ -50,25 +57,36 @@ pub struct RuntimeServices {
 
 #[derive(Debug, Clone)]
 pub struct ResourceHandle {
-    current: Arc<ArcSwap<ResourceSnapshot>>,
+    current: Arc<ArcSwap<ResourceState>>,
+}
+
+#[derive(Clone, Debug)]
+struct ResourceState {
+    snapshot: ResourceSnapshot,
+    hooks: Arc<Hooks>,
 }
 
 impl ResourceHandle {
     #[must_use]
-    pub fn new(snapshot: ResourceSnapshot) -> Self {
+    pub fn new(snapshot: ResourceSnapshot, hooks: Arc<Hooks>) -> Self {
         Self {
-            current: Arc::new(ArcSwap::from_pointee(snapshot)),
+            current: Arc::new(ArcSwap::from_pointee(ResourceState { snapshot, hooks })),
         }
     }
 
     #[must_use]
     pub fn snapshot(&self) -> Arc<ResourceSnapshot> {
-        self.current.load_full()
+        Arc::new(self.current.load().snapshot.clone())
     }
 
-    pub fn replace(&self, snapshot: ResourceSnapshot) {
+    #[must_use]
+    pub fn hooks(&self) -> Arc<Hooks> {
+        self.current.load().hooks.clone()
+    }
+
+    pub fn replace(&self, snapshot: ResourceSnapshot, hooks: Arc<Hooks>) {
         info!(revision = %snapshot.revision, "replaced resource snapshot");
-        self.current.store(Arc::new(snapshot));
+        self.current.store(Arc::new(ResourceState { snapshot, hooks }));
     }
 }
 
@@ -242,7 +260,18 @@ impl SessionRuntime {
     pub async fn resume(&self, session_id: &SessionId) -> anyhow::Result<Option<HalterSession>> {
         let existing = self.services.sessions.load_session(session_id).await?;
         debug!(session_id = %session_id, found = existing.is_some(), "resuming session");
-        Ok(existing.map(|_| HalterSession::new(self.services.clone(), session_id.clone())))
+        if let Some(mut stored) = existing {
+            stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
+            self.services
+                .sessions
+                .commit(session_id, None, Some(stored.state), Vec::new())
+                .await?;
+            return Ok(Some(HalterSession::new(
+                self.services.clone(),
+                session_id.clone(),
+            )));
+        }
+        Ok(None)
     }
 
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionBlueprint>> {
@@ -251,8 +280,8 @@ impl SessionRuntime {
         Ok(sessions)
     }
 
-    pub fn replace_resources(&self, snapshot: ResourceSnapshot) {
-        self.services.resources.replace(snapshot);
+    pub fn replace_resources(&self, snapshot: ResourceSnapshot, hooks: Arc<Hooks>) {
+        self.services.resources.replace(snapshot, hooks);
     }
 }
 
@@ -267,6 +296,10 @@ impl HalterSession {
     #[must_use]
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub(crate) fn services(&self) -> &Arc<RuntimeServices> {
+        &self.services
     }
 
     pub async fn submit_turn(&self, turn: Turn) -> anyhow::Result<SessionEventStream> {
@@ -407,10 +440,59 @@ impl HalterSession {
         )];
         let mut turn_usage = Usage::default();
         let mut tool_calls_executed = 0u32;
+        let hook_model = turn
+            .default_model
+            .clone()
+            .unwrap_or_else(|| stored.blueprint.default_model.clone());
+        let hook_ctx = HookInvocationContext {
+            turn_id: &turn.id,
+            model: &hook_model,
+            working_dir: &stored.blueprint.working_dir,
+        };
 
-        state
-            .messages
-            .push(Message::User(turn.user_message.clone()));
+        if let Some(source) = state.pending_session_start_source.take() {
+            let hook_dispatch = run_session_start(self, &state, hook_ctx, source).await?;
+            self.record_hook_dispatch(&mut events, &hook_dispatch, live.as_ref());
+            apply_hook_side_effects(&mut state, &hook_dispatch);
+        }
+
+        let prompt_dispatch =
+            run_user_prompt_submit(self, &state, hook_ctx, &turn.user_message.plain_text()).await?;
+        self.record_hook_dispatch(&mut events, &prompt_dispatch, live.as_ref());
+        apply_hook_side_effects(&mut state, &prompt_dispatch);
+
+        if let Some(reason) = prompt_dispatch
+            .merged
+            .stop_reason
+            .clone()
+            .or_else(|| prompt_dispatch.merged.block_reason.clone())
+        {
+            let blocked = Message::System(SystemMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                text: reason,
+            });
+            state.messages.push(blocked.clone());
+            self.push_event(
+                &mut events,
+                SessionEventPayload::MessageItem { message: blocked },
+                live.as_ref(),
+            );
+            events.push(self.make_event(
+                0,
+                SessionEventPayload::TurnCompleted {
+                    turn_id: turn.id,
+                    usage: turn_usage,
+                },
+            ));
+            return Ok(TurnCommit {
+                snapshot,
+                state,
+                events,
+            });
+        }
+
+        state.messages.push(Message::User(turn.user_message.clone()));
 
         loop {
             let observed = observe_state(stored.blueprint.working_dir.clone());
@@ -479,6 +561,39 @@ impl HalterSession {
 
             let tool_calls = assistant_tool_calls(&materialized.message);
             if tool_calls.is_empty() {
+                let stop_dispatch = run_stop(
+                    self,
+                    &state,
+                    HookInvocationContext {
+                        turn_id: &turn.id,
+                        model: &model.id,
+                        working_dir: &stored.blueprint.working_dir,
+                    },
+                    Some(&materialized.message),
+                    true,
+                )
+                .await?;
+                self.record_hook_dispatch(&mut events, &stop_dispatch, live.as_ref());
+                apply_hook_side_effects(&mut state, &stop_dispatch);
+                if let Some(reason) = stop_dispatch.merged.block_reason.clone() {
+                    let continuation = Message::User(halter_protocol::UserMessage::text(
+                        if reason.trim().is_empty() {
+                            "Continue."
+                        } else {
+                            &reason
+                        },
+                    ));
+                    state.messages.push(continuation.clone());
+                    self.push_event(
+                        &mut events,
+                        SessionEventPayload::MessageItem {
+                            message: continuation,
+                        },
+                        live.as_ref(),
+                    );
+                    continue;
+                }
+
                 info!(
                     session_id = %self.session_id,
                     turn_id = %turn.id,
@@ -521,7 +636,9 @@ impl HalterSession {
                     &stored.blueprint,
                     snapshot.clone(),
                     turn_cancel.child_token(),
+                    &selected_models.default_model,
                     &selected_models.subagent_model,
+                    &turn.id,
                     &mut state,
                     tool_calls,
                     live.clone(),
@@ -536,14 +653,71 @@ impl HalterSession {
         blueprint: &SessionBlueprint,
         snapshot: Arc<ResourceSnapshot>,
         cancel: CancellationToken,
+        effective_model: &ModelId,
         effective_subagent_model: &ModelId,
+        turn_id: &halter_protocol::TurnId,
         state: &mut SessionState,
         tool_calls: Vec<ToolCall>,
         live: Option<LiveTurnStream>,
     ) -> anyhow::Result<Vec<SessionEvent>> {
         let mut events = Vec::new();
 
-        for call in tool_calls {
+        for mut call in tool_calls {
+            let pre_dispatch = run_pre_tool_use(
+                self,
+                state,
+                HookInvocationContext {
+                    turn_id,
+                    model: effective_model,
+                    working_dir: &blueprint.working_dir,
+                },
+                &call,
+            )
+            .await?;
+            self.record_hook_dispatch(&mut events, &pre_dispatch, live.as_ref());
+            apply_hook_side_effects(state, &pre_dispatch);
+            if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
+                call.arguments = updated_input;
+            }
+            info!(
+                session_id = %self.session_id,
+                tool_call_id = %call.id,
+                tool_name = %call.name,
+                "executing tool call"
+            );
+            self.push_event(
+                &mut events,
+                SessionEventPayload::ToolExecutionStarted { call: call.clone() },
+                live.as_ref(),
+            );
+
+            if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
+                let error = ToolError::new(reason);
+                let outcome = ToolExecutionOutcome {
+                    call: call.clone(),
+                    result: Err(error.clone()),
+                };
+                let message = Message::Tool(ToolResultMessage {
+                    id: MessageId::new(),
+                    call_id: call.id.clone(),
+                    content: ToolResult::Empty,
+                    error: Some(error),
+                    created_at: Utc::now(),
+                });
+                state.messages.push(message.clone());
+                self.push_event(
+                    &mut events,
+                    SessionEventPayload::ToolExecutionCompleted { outcome },
+                    live.as_ref(),
+                );
+                self.push_event(
+                    &mut events,
+                    SessionEventPayload::MessageItem { message },
+                    live.as_ref(),
+                );
+                continue;
+            }
+
             let (emit, tool_event_drain) = self.spawn_tool_event_sink(&call, live.clone());
             let context = halter_tools::ToolContext {
                 session_id: self.session_id.clone(),
@@ -564,23 +738,12 @@ impl HalterSession {
                     subagent_model: effective_subagent_model.clone(),
                 })),
             };
-            info!(
-                session_id = %self.session_id,
-                tool_call_id = %call.id,
-                tool_name = %call.name,
-                "executing tool call"
-            );
             state.pending_tool_calls.insert(
                 call.id.clone(),
                 PendingToolCall {
                     call: call.clone(),
                     submitted_at: Utc::now(),
                 },
-            );
-            self.push_event(
-                &mut events,
-                SessionEventPayload::ToolExecutionStarted { call: call.clone() },
-                live.as_ref(),
             );
 
             let execution = self
@@ -597,7 +760,7 @@ impl HalterSession {
                 self.push_event(&mut events, payload, live.as_ref());
             }
 
-            let (content, error) = match execution {
+            let (mut content, error) = match execution {
                 Ok(result) => {
                     debug!(
                         session_id = %self.session_id,
@@ -619,6 +782,40 @@ impl HalterSession {
                     (ToolResult::Empty, Some(ToolError::new(error.to_string())))
                 }
             };
+            if error.is_none() {
+                let post_dispatch = run_post_tool_use(
+                    self,
+                    state,
+                    HookInvocationContext {
+                        turn_id,
+                        model: effective_model,
+                        working_dir: &blueprint.working_dir,
+                    },
+                    &call,
+                    &content,
+                )
+                .await?;
+                self.record_hook_dispatch(&mut events, &post_dispatch, live.as_ref());
+                apply_hook_side_effects(state, &post_dispatch);
+                if let Some(updated_output) = post_dispatch.merged.updated_output {
+                    content = tool_result_from_hook_value(updated_output);
+                }
+            } else if let Some(tool_error) = error.as_ref() {
+                let post_dispatch = run_post_tool_use_failure(
+                    self,
+                    state,
+                    HookInvocationContext {
+                        turn_id,
+                        model: effective_model,
+                        working_dir: &blueprint.working_dir,
+                    },
+                    &call,
+                    tool_error,
+                )
+                .await?;
+                self.record_hook_dispatch(&mut events, &post_dispatch, live.as_ref());
+                apply_hook_side_effects(state, &post_dispatch);
+            }
             let outcome = ToolExecutionOutcome {
                 call: call.clone(),
                 result: error.clone().map_or_else(|| Ok(content.clone()), Err),
@@ -698,6 +895,28 @@ impl HalterSession {
             live.emit_payload(payload.clone());
         }
         events.push(self.make_event(0, payload));
+    }
+
+    fn record_hook_dispatch(
+        &self,
+        events: &mut Vec<SessionEvent>,
+        dispatch: &ExecutedHookDispatch,
+        live: Option<&LiveTurnStream>,
+    ) {
+        for run in &dispatch.preview_runs {
+            self.push_event(
+                events,
+                SessionEventPayload::HookStarted { run: run.clone() },
+                live,
+            );
+        }
+        for run in &dispatch.completed_runs {
+            self.push_event(
+                events,
+                SessionEventPayload::HookCompleted { run: run.clone() },
+                live,
+            );
+        }
     }
 
     fn make_event(&self, sequence: u64, payload: SessionEventPayload) -> SessionEvent {
@@ -934,10 +1153,48 @@ fn tool_result_kind(result: &ToolResult) -> &'static str {
     }
 }
 
+fn apply_hook_side_effects(state: &mut SessionState, dispatch: &ExecutedHookDispatch) {
+    for fired_hook_id in &dispatch.fired_hook_ids {
+        if !state.fired_hook_ids.iter().any(|seen| seen == fired_hook_id) {
+            state.fired_hook_ids.push(fired_hook_id.clone());
+        }
+    }
+
+    for context in &dispatch.merged.additional_context {
+        state
+            .appended_prompt_segments
+            .push(build_hook_prompt_segment(context));
+    }
+}
+
+fn build_hook_prompt_segment(text: &str) -> PromptSegment {
+    PromptSegment {
+        id: PromptSegmentId::new(),
+        text: text.to_owned(),
+        volatility: Volatility::TurnDynamic,
+        cache_scope: CacheScope::Dynamic,
+        content_hash: hash_text(text),
+    }
+}
+
+fn hash_text(text: &str) -> ContentHash {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn tool_result_from_hook_value(value: serde_json::Value) -> ToolResult {
+    match value {
+        serde_json::Value::Null => ToolResult::Empty,
+        serde_json::Value::String(text) => ToolResult::Text { text },
+        other => ToolResult::Json { value: other },
+    }
+}
+
 pub(crate) async fn create_session_seeded(
     services: Arc<RuntimeServices>,
     init: SessionInit,
-    initial_state: SessionState,
+    mut initial_state: SessionState,
     snapshot: Arc<ResourceSnapshot>,
 ) -> anyhow::Result<HalterSession> {
     let default_registry_model = services.models.default_model()?;
@@ -971,6 +1228,10 @@ pub(crate) async fn create_session_seeded(
         snapshot_revision = %blueprint.snapshot_revision,
         "created session blueprint"
     );
+
+    if initial_state.pending_session_start_source.is_none() {
+        initial_state.pending_session_start_source = Some(HookSessionStartSource::Startup);
+    }
 
     services
         .sessions
@@ -1013,7 +1274,7 @@ impl Default for RuntimeServices {
     fn default() -> Self {
         let snapshot = ResourceSnapshot::empty();
         Self {
-            resources: Arc::new(ResourceHandle::new(snapshot)),
+            resources: Arc::new(ResourceHandle::new(snapshot, Arc::new(Hooks::default()))),
             models: Arc::new(ModelRegistry::new()),
             tools: Arc::new(ToolRuntime::new()),
             path_locks: Arc::new(PathLockMap::default()),
@@ -1038,10 +1299,12 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream::{self, BoxStream};
     use futures::{StreamExt, TryStreamExt};
+    use halter_hooks::{HookRegistrySource, HooksFile};
     use halter_protocol::{
-        ApiKind, BlockId, Message, ModelId, ModelRole, ProviderCapabilities, ProviderError,
-        ProviderKind, ProviderName, ProviderRequest, ResolvedModel, StopReason, StreamEvent,
-        ToolCallId, ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec, Turn,
+        ApiKind, BlockId, HookRunStatus, Message, ModelId, ModelRole, PluginId,
+        ProviderCapabilities, ProviderError, ProviderKind, ProviderName, ProviderRequest,
+        ResolvedModel, StopReason, StreamEvent, ToolCallId, ToolCapabilities, ToolConcurrency,
+        ToolName, ToolResult, ToolSpec, Turn,
     };
     use halter_providers::{FakeProvider, Provider};
     use halter_tools::{
@@ -1146,6 +1409,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_tool_use_hook_can_block_tool_execution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(ToolLoopProvider), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        let (hooks_file, warnings) = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "write",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "echo blocked by hook >&2; exit 2"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parse hooks");
+        assert!(warnings.is_empty());
+        services.resources.replace(
+            ResourceSnapshot::empty(),
+            Arc::new(Hooks::from_sources(vec![HookRegistrySource {
+                plugin_id: PluginId::from("test-plugin"),
+                plugin_root: temp.path().to_path_buf(),
+                source_path: temp.path().join("hooks/hooks.json"),
+                file: hooks_file,
+            }])),
+        );
+
+        let runtime = SessionRuntime::new(services.clone());
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+
+        let events = session
+            .submit_turn(Turn::user("write a note"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(!temp.path().join("note.txt").exists());
+        assert!(events.iter().any(|event| matches!(
+            event.payload,
+            SessionEventPayload::HookStarted { .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::HookCompleted { run } if run.status == HookRunStatus::Blocked
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::MessageItem {
+                message: Message::Tool(tool),
+            } if tool
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("blocked by hook"))
+        )));
+    }
+
+    #[tokio::test]
     async fn submit_turn_failure_preserves_valid_transcript() {
         let temp = tempfile::tempdir().expect("tempdir");
         let services = configured_services(Arc::new(FailingProvider), temp.path());
@@ -1211,7 +1545,7 @@ mod tests {
 
         let mut reloaded = ResourceSnapshot::empty();
         reloaded.revision = halter_protocol::Revision::from("reloaded");
-        runtime.replace_resources(reloaded);
+        runtime.replace_resources(reloaded, Arc::new(Hooks::default()));
 
         session
             .submit_turn(Turn::user("after reload"))

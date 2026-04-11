@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
+use halter_hooks::Hooks;
 use halter_config::{
     ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, PolicyConfig, ResolvedProviderConfig,
     SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, load_path, resolve_provider_runtime_config,
@@ -23,7 +24,7 @@ use halter_tools::{
 };
 use tracing::{debug, info};
 
-use crate::{LoadedPlugin, LoadedSkill, ResourceCompiler};
+use crate::{CompiledResources, LoadedPlugin, LoadedSkill, ResourceCompiler};
 
 #[cfg(feature = "sqlite")]
 use halter_session::SqliteSessionStore;
@@ -32,6 +33,7 @@ use halter_session::SqliteSessionStore;
 pub struct HalterBuilder {
     config: HarnessConfig,
     resource_snapshot: Option<ResourceSnapshot>,
+    resource_hooks: Option<Arc<Hooks>>,
     loaded_skills: Vec<LoadedSkill>,
     loaded_plugins: Vec<LoadedPlugin>,
     tools: Vec<Arc<dyn Tool>>,
@@ -53,6 +55,13 @@ impl HalterBuilder {
     #[must_use]
     pub fn with_resource_snapshot(mut self, snapshot: ResourceSnapshot) -> Self {
         self.resource_snapshot = Some(snapshot);
+        self
+    }
+
+    #[must_use]
+    pub fn with_compiled_resources(mut self, resources: CompiledResources) -> Self {
+        self.resource_snapshot = Some(resources.snapshot);
+        self.resource_hooks = Some(resources.hooks);
         self
     }
 
@@ -94,6 +103,9 @@ impl HalterBuilder {
         let snapshot = self.resource_snapshot.with_context(|| {
             "failed to build halter runtime: missing resource snapshot; use Halter::from_config_file or HalterBuilder::with_resource_snapshot"
         })?;
+        let hooks = self
+            .resource_hooks
+            .unwrap_or_else(|| Arc::new(Hooks::default()));
 
         let models = Arc::new(build_model_registry(&config)?);
         let tools = Arc::new(ToolRuntime::new());
@@ -113,7 +125,7 @@ impl HalterBuilder {
             None => build_session_store(&config.sessions)?,
         };
         let services = Arc::new(RuntimeServices {
-            resources: Arc::new(ResourceHandle::new(snapshot)),
+            resources: Arc::new(ResourceHandle::new(snapshot, hooks)),
             models,
             tools,
             path_locks: Arc::new(PathLockMap::default()),
@@ -166,8 +178,8 @@ impl Halter {
     pub async fn from_config_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         debug!(path = %path.as_ref().display(), "building halter from config file");
         let config = load_path(path).await?;
-        let snapshot = ResourceCompiler::from_config(&config).compile().await?;
-        Self::from_config(config, snapshot).await
+        let resources = ResourceCompiler::from_config(&config).compile().await?;
+        Self::from_compiled_resources(config, resources).await
     }
 
     pub async fn from_config(
@@ -177,6 +189,17 @@ impl Halter {
         HalterBuilder::default()
             .with_config(config)
             .with_resource_snapshot(snapshot)
+            .build()
+            .await
+    }
+
+    pub async fn from_compiled_resources(
+        config: HarnessConfig,
+        resources: CompiledResources,
+    ) -> anyhow::Result<Self> {
+        HalterBuilder::default()
+            .with_config(config)
+            .with_compiled_resources(resources)
             .build()
             .await
     }
@@ -191,8 +214,9 @@ impl Halter {
         self.runtime.new_session(init).await
     }
 
-    pub fn replace_resources(&self, snapshot: ResourceSnapshot) {
-        self.runtime.replace_resources(snapshot);
+    pub fn replace_resources(&self, resources: CompiledResources) {
+        self.runtime
+            .replace_resources(resources.snapshot, resources.hooks);
     }
 
     #[must_use]

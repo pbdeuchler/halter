@@ -629,6 +629,7 @@ mod tests {
         Arc::new(RuntimeServices {
             resources: Arc::new(ResourceHandle::new(
                 halter_protocol::ResourceSnapshot::empty(),
+                Arc::new(halter_hooks::Hooks::default()),
             )),
             models: Arc::new(models),
             tools: Arc::new(ToolRuntime::new()),

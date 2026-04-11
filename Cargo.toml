@@ -2,6 +2,7 @@
 members = [
     "crates/halter-protocol",
     "crates/halter-config",
+    "crates/halter-hooks",
     "crates/halter-runtime",
     "crates/halter-providers",
     "crates/halter-tools",

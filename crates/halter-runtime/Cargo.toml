@@ -24,6 +24,7 @@ arc-swap.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
+halter-hooks = { path = "../halter-hooks" }
 halter-protocol = { path = "../halter-protocol" }
 halter-providers = { path = "../halter-providers" }
 halter-session = { path = "../halter-session" }

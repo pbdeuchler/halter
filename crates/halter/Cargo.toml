@@ -23,6 +23,7 @@ sqlite = ["halter-session/sqlite"]
 anyhow.workspace = true
 async-trait.workspace = true
 halter-config = { path = "../halter-config" }
+halter-hooks = { path = "../halter-hooks" }
 halter-protocol = { path = "../halter-protocol" }
 halter-providers = { path = "../halter-providers" }
 halter-runtime = { path = "../halter-runtime" }

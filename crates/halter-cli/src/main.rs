@@ -98,11 +98,11 @@ async fn validate(path: &Path) -> anyhow::Result<()> {
 async fn show_resources(path: &Path) -> anyhow::Result<()> {
     info!(path = %path.display(), "compiling resources");
     let config = load_path(path).await?;
-    let snapshot = ResourceCompiler::from_config(&config).compile().await?;
-    println!("revision: {}", snapshot.revision.0);
-    println!("skills: {}", snapshot.skills.len());
-    println!("agents: {}", snapshot.agents.len());
-    println!("plugins: {}", snapshot.plugins.len());
+    let resources = ResourceCompiler::from_config(&config).compile().await?;
+    println!("revision: {}", resources.snapshot.revision.0);
+    println!("skills: {}", resources.snapshot.skills.len());
+    println!("agents: {}", resources.snapshot.agents.len());
+    println!("plugins: {}", resources.snapshot.plugins.len());
     Ok(())
 }
 
