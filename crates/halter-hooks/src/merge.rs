@@ -4,8 +4,16 @@ use halter_protocol::{HookOutputEntry, HookOutputKind};
 use serde::Deserialize;
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HandlerPriorityGroup {
+    SdkBeforePlugins,
+    PluginFiles,
+    SdkAfterPlugins,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HandlerPriority {
+    pub group: HandlerPriorityGroup,
     pub plugin_load_order: usize,
     pub event_declaration_index: usize,
     pub matcher_group_index: usize,
@@ -280,6 +288,7 @@ mod tests {
             MergeInput {
                 handler_id: "plugin-a".to_owned(),
                 priority: HandlerPriority {
+                    group: HandlerPriorityGroup::PluginFiles,
                     plugin_load_order: 0,
                     event_declaration_index: 0,
                     matcher_group_index: 0,
@@ -296,6 +305,7 @@ mod tests {
             MergeInput {
                 handler_id: "plugin-b".to_owned(),
                 priority: HandlerPriority {
+                    group: HandlerPriorityGroup::PluginFiles,
                     plugin_load_order: 1,
                     event_declaration_index: 0,
                     matcher_group_index: 0,

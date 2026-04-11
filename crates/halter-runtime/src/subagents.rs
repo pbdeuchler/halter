@@ -135,8 +135,8 @@ impl RuntimeSubagentControl {
         let task_message = message.clone();
         let task_cancel = cancel.clone();
         let controller = self.clone();
+        let session = HalterSession::new(services.clone(), task_session_id.clone())?;
         let mut join_handle = Some(tokio::spawn(async move {
-            let session = HalterSession::new(services, task_session_id.clone());
             controller
                 .run_turn_task(
                     task_agent_id,
@@ -394,7 +394,7 @@ impl RuntimeSubagentControl {
         let session = HalterSession::new(
             self.inner.services.clone(),
             parent.blueprint.session_id.clone(),
-        );
+        )?;
         let dispatch = run_subagent_start(
             &session,
             &stored.state,
@@ -434,7 +434,7 @@ impl RuntimeSubagentControl {
             return Ok(None);
         };
         let turn_id = TurnId::new();
-        let session = HalterSession::new(self.inner.services.clone(), parent_session_id.clone());
+        let session = HalterSession::new(self.inner.services.clone(), parent_session_id.clone())?;
         let transcript_path = self
             .inner
             .services
@@ -850,6 +850,8 @@ mod tests {
                 Arc::new(halter_hooks::Hooks::default()),
                 Vec::new(),
             )),
+            registered_hooks: Arc::new(halter_hooks::RegisteredHooks::default()),
+            session_hook_store: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             models: Arc::new(models),
             tools: Arc::new(ToolRuntime::new()),
             path_locks: Arc::new(PathLockMap::default()),

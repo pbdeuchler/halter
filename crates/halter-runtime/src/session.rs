@@ -1,5 +1,6 @@
 // pattern: Imperative Shell
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,7 +9,7 @@ use anyhow::Context;
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
-use halter_hooks::Hooks;
+use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
     AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash, Delivery,
     HookSessionStartSource, Message, MessageId, ModelId, ObservedState, PendingToolCall,
@@ -43,6 +44,8 @@ pub type SessionEventStream = BoxStream<'static, anyhow::Result<SessionEvent>>;
 
 pub struct RuntimeServices {
     pub resources: Arc<ResourceHandle>,
+    pub registered_hooks: Arc<RegisteredHooks>,
+    pub session_hook_store: Arc<Mutex<HashMap<SessionId, Arc<Hooks>>>>,
     pub models: Arc<ModelRegistry>,
     pub tools: Arc<ToolRuntime>,
     pub path_locks: Arc<PathLockMap>,
@@ -157,6 +160,7 @@ impl SessionInit {
 pub struct HalterSession {
     services: Arc<RuntimeServices>,
     session_id: SessionId,
+    session_hooks: Arc<Hooks>,
 }
 
 struct SessionToolEventSink {
@@ -289,7 +293,7 @@ impl SessionRuntime {
             return Ok(Some(HalterSession::new(
                 self.services.clone(),
                 session_id.clone(),
-            )));
+            )?));
         }
         Ok(None)
     }
@@ -313,11 +317,16 @@ impl SessionRuntime {
 }
 
 impl HalterSession {
-    pub(crate) fn new(services: Arc<RuntimeServices>, session_id: SessionId) -> Self {
-        Self {
+    pub(crate) fn new(
+        services: Arc<RuntimeServices>,
+        session_id: SessionId,
+    ) -> anyhow::Result<Self> {
+        let session_hooks = lookup_or_create_session_hooks(&services, &session_id)?;
+        Ok(Self {
             services,
             session_id,
-        }
+            session_hooks,
+        })
     }
 
     #[must_use]
@@ -327,6 +336,10 @@ impl HalterSession {
 
     pub(crate) fn services(&self) -> &Arc<RuntimeServices> {
         &self.services
+    }
+
+    pub(crate) fn session_hooks(&self) -> &Arc<Hooks> {
+        &self.session_hooks
     }
 
     pub async fn submit_turn(&self, turn: Turn) -> anyhow::Result<SessionEventStream> {
@@ -1556,7 +1569,24 @@ pub(crate) async fn create_session_seeded(
         services.event_bus.publish(event);
     }
 
-    Ok(HalterSession::new(services, session_id))
+    Ok(HalterSession::new(services, session_id)?)
+}
+
+fn lookup_or_create_session_hooks(
+    services: &Arc<RuntimeServices>,
+    session_id: &SessionId,
+) -> anyhow::Result<Arc<Hooks>> {
+    let mut store = services
+        .session_hook_store
+        .lock()
+        .expect("session hook store lock poisoned");
+    if let Some(existing) = store.get(session_id) {
+        return Ok(existing.clone());
+    }
+
+    let hooks = Arc::new(services.registered_hooks.instantiate()?);
+    store.insert(session_id.clone(), hooks.clone());
+    Ok(hooks)
 }
 
 fn observe_state(working_dir: PathBuf) -> ObservedState {
@@ -1579,6 +1609,8 @@ impl Default for RuntimeServices {
                 Arc::new(Hooks::default()),
                 Vec::new(),
             )),
+            registered_hooks: Arc::new(RegisteredHooks::default()),
+            session_hook_store: Arc::new(Mutex::new(HashMap::new())),
             models: Arc::new(ModelRegistry::new()),
             tools: Arc::new(ToolRuntime::new()),
             path_locks: Arc::new(PathLockMap::default()),
@@ -1603,12 +1635,15 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream::{self, BoxStream};
     use futures::{StreamExt, TryStreamExt};
-    use halter_hooks::{HookRegistrySource, HooksFile};
+    use halter_hooks::{
+        Hook, HookEventName, HookRegistrySource, HookResponse, HooksFile, RegisteredHookPriority,
+        RegisteredHooks,
+    };
     use halter_protocol::{
-        ApiKind, BlockId, HookRunStatus, HookSessionStartSource, Message, ModelId, ModelRole,
-        PluginId, ProviderCapabilities, ProviderError, ProviderKind, ProviderName, ProviderRequest,
-        ResolvedModel, StopReason, StreamEvent, ToolCallId, ToolCapabilities, ToolConcurrency,
-        ToolName, ToolResult, ToolSpec, Turn,
+        ApiKind, BlockId, HookHandlerType, HookRunStatus, HookSessionStartSource, Message, ModelId,
+        ModelRole, PluginId, ProviderCapabilities, ProviderError, ProviderKind, ProviderName,
+        ProviderRequest, ResolvedModel, StopReason, StreamEvent, ToolCallId, ToolCapabilities,
+        ToolConcurrency, ToolName, ToolResult, ToolSpec, Turn,
     };
     use halter_providers::{FakeProvider, Provider};
     use halter_tools::{
@@ -1788,6 +1823,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_callback_hook_can_block_tool_execution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(ToolLoopProvider), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+
+        let mut registered = RegisteredHooks::default();
+        registered.register(
+            PluginId::from("internal"),
+            RegisteredHookPriority::AfterPlugins,
+            Hook::callback(HookEventName::PreToolUse, |input| async move {
+                if input.tool_name() == Some("write") {
+                    HookResponse::block("blocked by callback hook")
+                } else {
+                    HookResponse::passthrough()
+                }
+            }),
+        );
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .registered_hooks = Arc::new(registered);
+
+        let runtime = SessionRuntime::new(services.clone());
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+
+        let events = session
+            .submit_turn(Turn::user("write a note"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(!temp.path().join("note.txt").exists());
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::HookCompleted { run }
+                if run.status == HookRunStatus::Blocked
+                    && run.handler_type == HookHandlerType::Callback
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::MessageItem {
+                message: Message::Tool(tool),
+            } if tool
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("blocked by callback hook"))
+        )));
+    }
+
+    #[tokio::test]
     async fn prompt_hook_uses_small_model_and_blocks_turn() {
         let temp = tempfile::tempdir().expect("tempdir");
         let requests = Arc::new(Mutex::new(Vec::<ProviderRequest>::new()));
@@ -1876,6 +1968,94 @@ mod tests {
             SessionEventPayload::MessageItem {
                 message: Message::System(system),
             } if system.text.contains("blocked by prompt hook")
+        )));
+    }
+
+    #[tokio::test]
+    async fn sdk_function_hooks_keep_state_per_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let mut registered = RegisteredHooks::default();
+        registered.register(
+            PluginId::from("internal"),
+            RegisteredHookPriority::AfterPlugins,
+            Hook::function(HookEventName::UserPromptSubmit, || {
+                let seen = Arc::new(Mutex::new(0usize));
+                move |_input| {
+                    let seen = seen.clone();
+                    async move {
+                        let mut seen = seen.lock().expect("seen");
+                        *seen += 1;
+                        HookResponse::passthrough()
+                            .with_system_message(format!("function count {}", *seen))
+                    }
+                }
+            }),
+        );
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .registered_hooks = Arc::new(registered);
+
+        let runtime = SessionRuntime::new(services.clone());
+        let session_a = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session a");
+        let session_b = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session b");
+
+        let events_a1 = session_a
+            .submit_turn(Turn::user("first"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        let events_a2 = session_a
+            .submit_turn(Turn::user("second"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        let events_b1 = session_b
+            .submit_turn(Turn::user("third"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(events_a1.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::HookCompleted { run }
+                if run.handler_type == HookHandlerType::Function
+        )));
+        assert!(events_a1.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::MessageItem {
+                message: Message::System(system),
+            } if system.text.contains("function count 1")
+        )));
+        assert!(events_a2.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::MessageItem {
+                message: Message::System(system),
+            } if system.text.contains("function count 2")
+        )));
+        assert!(events_b1.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::MessageItem {
+                message: Message::System(system),
+            } if system.text.contains("function count 1")
         )));
     }
 

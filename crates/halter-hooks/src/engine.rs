@@ -1,16 +1,19 @@
 // pattern: Functional Core
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::Utc;
 use halter_protocol::{HookHandlerType, HookRunStatus, HookRunSummary, PluginId};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::config::{HookEventName, HookHandlerConfig, HooksFile};
-use crate::merge::{HandlerPriority, HookMergedOutcome};
+use crate::config::{HookEventName, HookHandlerConfig as FileHookHandlerConfig, HooksFile};
+use crate::merge::{HandlerPriority, HandlerPriorityGroup, HookMergedOutcome};
+use crate::sdk::{HookCallback, HookKind, RegisteredHook, RegisteredHookPriority};
 
 pub const HOOK_PROTOCOL_VERSION: u32 = 1;
 
@@ -71,8 +74,9 @@ impl Hooks {
                                 if_condition: hook.if_condition.clone(),
                                 once: hook.once,
                                 matcher,
-                                config: hook.config.clone(),
+                                config: ConfiguredHandlerConfig::File(hook.config.clone()),
                                 priority: HandlerPriority {
+                                    group: HandlerPriorityGroup::PluginFiles,
                                     plugin_load_order: plugin_index,
                                     event_declaration_index: event_index,
                                     matcher_group_index: matcher_index,
@@ -87,43 +91,107 @@ impl Hooks {
         Self { handlers_by_event }
     }
 
+    pub fn from_registered(
+        hooks: impl IntoIterator<Item = RegisteredHook>,
+    ) -> anyhow::Result<Self> {
+        let mut handlers_by_event = BTreeMap::new();
+
+        for (hook_index, registered) in hooks.into_iter().enumerate() {
+            let matcher = registered
+                .hook
+                .matcher
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(Regex::new)
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "failed to compile sdk hook matcher for plugin '{}' event '{}'",
+                        registered.plugin_id,
+                        registered.hook.event.canonical_name()
+                    )
+                })?;
+            let priority_group = match registered.priority {
+                RegisteredHookPriority::BeforePlugins => HandlerPriorityGroup::SdkBeforePlugins,
+                RegisteredHookPriority::AfterPlugins => HandlerPriorityGroup::SdkAfterPlugins,
+            };
+            let handler_type = registered.hook.kind.handler_type();
+            let config = match registered.hook.kind {
+                HookKind::Callback(callback) => ConfiguredHandlerConfig::Callback(callback),
+                HookKind::Function(factory) => ConfiguredHandlerConfig::Function(factory()),
+            };
+            handlers_by_event
+                .entry(registered.hook.event)
+                .or_insert_with(Vec::new)
+                .push(ConfiguredHandler {
+                    handler_id: format!(
+                        "{}:{}:sdk:{}",
+                        registered.plugin_id,
+                        registered.hook.event.canonical_name(),
+                        hook_index
+                    ),
+                    plugin_id: registered.plugin_id.clone(),
+                    plugin_root: registered.plugin_root.clone(),
+                    source_path: PathBuf::from(format!(
+                        "<sdk-hook:{}:{}>",
+                        registered.plugin_id, hook_index
+                    )),
+                    allowed_http_hosts: Vec::new(),
+                    allowed_env_vars: Vec::new(),
+                    event_name: registered.hook.event,
+                    handler_type,
+                    timeout: registered.hook.timeout,
+                    status_message: registered.hook.status_message.clone(),
+                    if_condition: registered.hook.if_condition.clone(),
+                    once: registered.hook.once,
+                    matcher,
+                    config,
+                    priority: HandlerPriority {
+                        group: priority_group,
+                        plugin_load_order: hook_index,
+                        event_declaration_index: 0,
+                        matcher_group_index: 0,
+                        hook_index_within_group: 0,
+                    },
+                });
+        }
+
+        Ok(Self { handlers_by_event })
+    }
+
     #[must_use]
     pub fn prepare(&self, request: HookDispatchRequest) -> PreparedHookDispatch {
-        let mut previews = Vec::new();
+        Self::prepare_many([self], request)
+    }
+
+    #[must_use]
+    pub fn prepare_many<'a>(
+        hook_sets: impl IntoIterator<Item = &'a Hooks>,
+        request: HookDispatchRequest,
+    ) -> PreparedHookDispatch {
         let mut matched_handlers = Vec::new();
 
-        for handler in self
-            .handlers_by_event
-            .get(&request.event_name)
-            .into_iter()
-            .flatten()
-        {
-            if handler.once && request.fired_hook_ids.contains(&handler.handler_id) {
-                continue;
-            }
-            if !handler.matches(&request) {
-                continue;
-            }
+        for hooks in hook_sets {
+            for handler in hooks
+                .handlers_by_event
+                .get(&request.event_name)
+                .into_iter()
+                .flatten()
+            {
+                if handler.once && request.fired_hook_ids.contains(&handler.handler_id) {
+                    continue;
+                }
+                if !handler.matches(&request) {
+                    continue;
+                }
 
-            previews.push(HookRunSummary {
-                run_id: format!(
-                    "{}:{}",
-                    handler.handler_id,
-                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                ),
-                event_name: request.event_name.canonical_name().to_owned(),
-                handler_type: handler.handler_type,
-                plugin_id: handler.plugin_id.clone(),
-                plugin_root: handler.plugin_root.clone(),
-                status: HookRunStatus::Running,
-                status_message: handler.status_message.clone(),
-                started_at: Utc::now(),
-                completed_at: None,
-                duration_ms: None,
-                entries: Vec::new(),
-            });
-            matched_handlers.push(handler.clone());
+                matched_handlers.push(handler.clone());
+            }
         }
+
+        matched_handlers.sort_by(|left, right| left.priority.cmp(&right.priority));
+        let previews = matched_handlers.iter().map(build_preview_run).collect();
 
         PreparedHookDispatch {
             request,
@@ -187,7 +255,7 @@ pub struct ConfiguredHandler {
     pub if_condition: Option<String>,
     pub once: bool,
     pub matcher: Option<Regex>,
-    pub config: HookHandlerConfig,
+    pub config: ConfiguredHandlerConfig,
     pub priority: HandlerPriority,
 }
 
@@ -208,6 +276,43 @@ impl ConfiguredHandler {
             (Some(_), None) => true,
             (None, _) => true,
         }
+    }
+}
+
+#[derive(Clone)]
+pub enum ConfiguredHandlerConfig {
+    File(FileHookHandlerConfig),
+    Callback(HookCallback),
+    Function(HookCallback),
+}
+
+impl fmt::Debug for ConfiguredHandlerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File(config) => f.debug_tuple("File").field(config).finish(),
+            Self::Callback(_) => f.write_str("Callback(..)"),
+            Self::Function(_) => f.write_str("Function(..)"),
+        }
+    }
+}
+
+fn build_preview_run(handler: &ConfiguredHandler) -> HookRunSummary {
+    HookRunSummary {
+        run_id: format!(
+            "{}:{}",
+            handler.handler_id,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ),
+        event_name: handler.event_name.canonical_name().to_owned(),
+        handler_type: handler.handler_type,
+        plugin_id: handler.plugin_id.clone(),
+        plugin_root: handler.plugin_root.clone(),
+        status: HookRunStatus::Running,
+        status_message: handler.status_message.clone(),
+        started_at: Utc::now(),
+        completed_at: None,
+        duration_ms: None,
+        entries: Vec::new(),
     }
 }
 
@@ -362,11 +467,14 @@ mod tests {
             if_condition: Some("Shell(git *)".to_owned()),
             once: false,
             matcher: None,
-            config: HookHandlerConfig::Prompt(PromptHookConfig {
-                prompt: "noop".to_owned(),
-                model: None,
-            }),
+            config: ConfiguredHandlerConfig::File(FileHookHandlerConfig::Prompt(
+                PromptHookConfig {
+                    prompt: "noop".to_owned(),
+                    model: None,
+                },
+            )),
             priority: HandlerPriority {
+                group: HandlerPriorityGroup::PluginFiles,
                 plugin_load_order: 0,
                 event_declaration_index: 0,
                 matcher_group_index: 0,
@@ -406,7 +514,7 @@ mod tests {
                             status_message: None,
                             if_condition: None,
                             once: true,
-                            config: HookHandlerConfig::Prompt(PromptHookConfig {
+                            config: FileHookHandlerConfig::Prompt(PromptHookConfig {
                                 prompt: "noop".to_owned(),
                                 model: None,
                             }),

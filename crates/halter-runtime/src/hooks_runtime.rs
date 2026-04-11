@@ -1,7 +1,7 @@
 // pattern: Imperative Shell
 
 use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -9,9 +9,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures::stream::{FuturesUnordered, StreamExt};
 use halter_hooks::{
-    AgentHookConfig, CommandHookConfig, ConfiguredHandler, HOOK_PROTOCOL_VERSION,
-    HookDispatchRequest, HookEventName, HookHandlerConfig, HookMergedOutcome, HookOutput,
-    HttpHookConfig, MergeInput, PromptHookConfig, merge_outputs, summary_entries,
+    AgentHookConfig, CommandHookConfig, ConfiguredHandler, ConfiguredHandlerConfig,
+    HOOK_PROTOCOL_VERSION, HookDispatchRequest, HookEventName, HookInput, HookMergedOutcome,
+    HookOutput, Hooks, HttpHookConfig, MergeInput, PromptHookConfig, merge_outputs,
+    summary_entries,
 };
 use halter_protocol::{
     AssembledPrompt, AssistantMessage, AssistantPart, CacheScope, HookOutputEntry, HookOutputKind,
@@ -21,6 +22,7 @@ use halter_protocol::{
 };
 use halter_session::InMemorySessionStore;
 use reqwest::Url;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::net::lookup_host;
@@ -402,7 +404,7 @@ async fn execute_hooks(
     request: HookDispatchRequest,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     let hooks = sess.services().resources.hooks();
-    let prepared = hooks.prepare(request);
+    let prepared = Hooks::prepare_many([hooks.as_ref(), sess.session_hooks().as_ref()], request);
     let preview_runs = prepared.preview_runs().to_vec();
     let matched_handlers = prepared.matched_handlers().to_vec();
     let request = prepared.request().clone();
@@ -561,13 +563,25 @@ async fn execute_handler(
     }
 
     match &handler.config {
-        HookHandlerConfig::Command(command) => run_command(handler, command, request, cancel).await,
-        HookHandlerConfig::Http(http) => run_http(handler, http, request, cancel).await,
-        HookHandlerConfig::Prompt(prompt) => {
-            run_prompt(sess, handler.timeout, prompt, request, cancel).await
+        ConfiguredHandlerConfig::File(config) => match config {
+            halter_hooks::HookHandlerConfig::Command(command) => {
+                run_command(handler, command, request, cancel).await
+            }
+            halter_hooks::HookHandlerConfig::Http(http) => {
+                run_http(handler, http, request, cancel).await
+            }
+            halter_hooks::HookHandlerConfig::Prompt(prompt) => {
+                run_prompt(sess, handler.timeout, prompt, request, cancel).await
+            }
+            halter_hooks::HookHandlerConfig::Agent(agent) => {
+                run_agent(sess, handler.timeout, agent, request, cancel).await
+            }
+        },
+        ConfiguredHandlerConfig::Callback(callback) => {
+            run_sdk_hook(handler, request, cancel, callback.clone()).await
         }
-        HookHandlerConfig::Agent(agent) => {
-            run_agent(sess, handler.timeout, agent, request, cancel).await
+        ConfiguredHandlerConfig::Function(callback) => {
+            run_sdk_hook(handler, request, cancel, callback.clone()).await
         }
     }
 }
@@ -632,6 +646,29 @@ async fn run_command(
     }
 }
 
+async fn run_sdk_hook(
+    handler: &ConfiguredHandler,
+    request: &HookDispatchRequest,
+    cancel: CancellationToken,
+    callback: halter_hooks::HookCallback,
+) -> anyhow::Result<HandlerExecution> {
+    let payload = build_payload(handler, request)?;
+    let input = HookInput {
+        event_name: request.event_name,
+        matcher_value: request.matcher_value.clone(),
+        payload,
+    };
+
+    let response = tokio::select! {
+        _ = cancel.cancelled() => return Ok(HandlerExecution::Cancelled),
+        result = timeout(handler.timeout, callback(input)) => {
+            result.context("hook timed out")??
+        }
+    };
+
+    Ok(HandlerExecution::Completed(response.into_output()))
+}
+
 async fn run_http(
     handler: &ConfiguredHandler,
     config: &HttpHookConfig,
@@ -649,10 +686,13 @@ async fn run_http(
     }
 
     let url = Url::parse(&config.url).context("failed to parse hook url")?;
-    validate_http_url(handler, &url).await?;
+    validate_http_url(handler, &url)?;
     let payload = build_payload(handler, request)?;
     let headers = build_http_headers(handler, config)?;
     let client = reqwest::Client::builder()
+        .dns_resolver(Arc::new(HttpHookResolver::new(
+            url.host_str().unwrap_or_default().to_owned(),
+        )))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to construct http hook client")?;
@@ -731,6 +771,8 @@ async fn run_agent(
             Arc::new(halter_hooks::Hooks::default()),
             Vec::new(),
         )),
+        registered_hooks: Arc::new(halter_hooks::RegisteredHooks::default()),
+        session_hook_store: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         models: sess.services().models.clone(),
         tools,
         path_locks: sess.services().path_locks.clone(),
@@ -1070,23 +1112,69 @@ fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n', '\0'], "")
 }
 
-async fn validate_http_url(handler: &ConfiguredHandler, url: &Url) -> anyhow::Result<()> {
+fn validate_http_url(handler: &ConfiguredHandler, url: &Url) -> anyhow::Result<()> {
     let host = url
         .host_str()
         .context("http hook url must include a host")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("http hook url must use http or https");
+    }
     if !matches_allowed_host(host, &handler.allowed_http_hosts) {
         anyhow::bail!("http hook host '{host}' is not allowed by plugin manifest");
     }
 
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addrs = lookup_host((host, port))
-        .await
-        .with_context(|| format!("failed to resolve http hook host '{host}'"))?
-        .collect::<Vec<_>>();
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && !is_allowed_http_ip(ip)
+    {
+        anyhow::bail!("http hook host '{host}' resolves to a disallowed literal ip");
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct HttpHookResolver {
+    expected_host: String,
+}
+
+impl HttpHookResolver {
+    fn new(expected_host: String) -> Self {
+        Self { expected_host }
+    }
+}
+
+impl Resolve for HttpHookResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        let expected_host = self.expected_host.clone();
+        Box::pin(async move {
+            if !expected_host.eq_ignore_ascii_case(&host) {
+                return Err(anyhow::anyhow!(
+                    "http hook attempted to resolve unexpected host '{host}'"
+                )
+                .into());
+            }
+
+            let addrs = lookup_host((host.as_str(), 0))
+                .await
+                .with_context(|| format!("failed to resolve http hook host '{host}'"))?
+                .collect::<Vec<_>>();
+            let validated = validate_resolved_http_addrs(&host, addrs)?;
+            let addrs: Addrs = Box::new(validated.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+fn validate_resolved_http_addrs(
+    host: &str,
+    addrs: Vec<SocketAddr>,
+) -> anyhow::Result<Vec<SocketAddr>> {
     if addrs.is_empty() {
         anyhow::bail!("failed to resolve http hook host '{host}'");
     }
-    for addr in addrs {
+
+    for addr in &addrs {
         if !is_allowed_http_ip(addr.ip()) {
             anyhow::bail!(
                 "http hook host '{host}' resolved to disallowed address '{}'",
@@ -1095,7 +1183,7 @@ async fn validate_http_url(handler: &ConfiguredHandler, url: &Url) -> anyhow::Re
         }
     }
 
-    Ok(())
+    Ok(addrs)
 }
 
 fn matches_allowed_host(host: &str, patterns: &[String]) -> bool {
@@ -1178,4 +1266,79 @@ fn hash_text(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_handler(allowed_http_hosts: Vec<String>) -> ConfiguredHandler {
+        ConfiguredHandler {
+            handler_id: "handler".to_owned(),
+            plugin_id: halter_protocol::PluginId::from("plugin"),
+            plugin_root: PathBuf::new(),
+            source_path: PathBuf::from("<sdk>"),
+            allowed_http_hosts,
+            allowed_env_vars: Vec::new(),
+            event_name: HookEventName::Notification,
+            handler_type: halter_protocol::HookHandlerType::Http,
+            timeout: std::time::Duration::from_secs(1),
+            status_message: None,
+            if_condition: None,
+            once: false,
+            matcher: None,
+            config: ConfiguredHandlerConfig::File(halter_hooks::HookHandlerConfig::Http(
+                HttpHookConfig {
+                    url: "https://example.com/hook".to_owned(),
+                    headers: Default::default(),
+                    allowed_env_vars: Vec::new(),
+                },
+            )),
+            priority: halter_hooks::HandlerPriority {
+                group: halter_hooks::HandlerPriorityGroup::PluginFiles,
+                plugin_load_order: 0,
+                event_declaration_index: 0,
+                matcher_group_index: 0,
+                hook_index_within_group: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn resolved_http_addrs_reject_private_ranges() {
+        let addrs = vec![SocketAddr::from((Ipv4Addr::new(10, 0, 0, 5), 0))];
+        let error =
+            validate_resolved_http_addrs("policy.example", addrs).expect_err("reject private ip");
+        assert!(error.to_string().contains("disallowed address"));
+    }
+
+    #[test]
+    fn resolved_http_addrs_reject_mixed_sets() {
+        let addrs = vec![
+            SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 0)),
+            SocketAddr::from((Ipv6Addr::from([0xfc00, 0, 0, 0, 0, 0, 0, 1]), 0)),
+        ];
+        let error =
+            validate_resolved_http_addrs("policy.example", addrs).expect_err("reject mixed set");
+        assert!(error.to_string().contains("disallowed address"));
+    }
+
+    #[test]
+    fn resolved_http_addrs_allow_loopback() {
+        let addrs = vec![
+            SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 0)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+        ];
+        let validated =
+            validate_resolved_http_addrs("policy.example", addrs.clone()).expect("allow loopback");
+        assert_eq!(validated, addrs);
+    }
+
+    #[test]
+    fn validate_http_url_rejects_disallowed_literal_ip() {
+        let handler = test_handler(vec!["10.0.0.1".to_owned()]);
+        let url = Url::parse("https://10.0.0.1/hook").expect("url");
+        let error = validate_http_url(&handler, &url).expect_err("reject literal private ip");
+        assert!(error.to_string().contains("disallowed literal ip"));
+    }
 }

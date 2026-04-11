@@ -11,7 +11,7 @@ use halter_config::{
     SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, load_path,
     resolve_provider_runtime_config,
 };
-use halter_hooks::Hooks;
+use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot};
 use halter_providers::{AnthropicProvider, ModelRegistry, OpenAiProvider, OpenRouterProvider};
 use halter_runtime::{
@@ -36,6 +36,7 @@ pub struct HalterBuilder {
     resource_snapshot: Option<ResourceSnapshot>,
     resource_hooks: Option<Arc<Hooks>>,
     resource_hook_warnings: Vec<String>,
+    registered_hooks: RegisteredHooks,
     loaded_skills: Vec<LoadedSkill>,
     loaded_plugins: Vec<LoadedPlugin>,
     tools: Vec<Arc<dyn Tool>>,
@@ -81,6 +82,24 @@ impl HalterBuilder {
     }
 
     #[must_use]
+    pub fn with_plugin_hook(mut self, plugin_id: halter_protocol::PluginId, hook: Hook) -> Self {
+        self.registered_hooks
+            .register(plugin_id, RegisteredHookPriority::AfterPlugins, hook);
+        self
+    }
+
+    #[must_use]
+    pub fn with_plugin_hook_priority(
+        mut self,
+        plugin_id: halter_protocol::PluginId,
+        priority: RegisteredHookPriority,
+        hook: Hook,
+    ) -> Self {
+        self.registered_hooks.register(plugin_id, priority, hook);
+        self
+    }
+
+    #[must_use]
     pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
@@ -96,6 +115,7 @@ impl HalterBuilder {
         let config = self.config;
         debug!("validating halter builder config");
         config.validate()?;
+        self.registered_hooks.validate()?;
 
         if !self.loaded_skills.is_empty() || !self.loaded_plugins.is_empty() {
             anyhow::bail!(
@@ -130,6 +150,8 @@ impl HalterBuilder {
         };
         let services = Arc::new(RuntimeServices {
             resources: Arc::new(ResourceHandle::new(snapshot, hooks, hook_warnings)),
+            registered_hooks: Arc::new(self.registered_hooks),
+            session_hook_store: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             models,
             tools,
             path_locks: Arc::new(PathLockMap::default()),
