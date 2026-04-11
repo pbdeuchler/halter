@@ -1,12 +1,13 @@
 // pattern: Imperative Shell
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{BoxStream, StreamExt};
 use halter_protocol::{
     AssistantMessage, AssistantPart, BlockId, Delivery, Message, MessageId, ModelId, ObservedState,
     PendingToolCall, PromptSegment, ProviderError, ProviderRequest, ReplayMeta, ResourceSnapshot,
@@ -17,8 +18,11 @@ use halter_protocol::{
 use halter_providers::ModelRegistry;
 use halter_session::{SessionStore, StoredSession};
 use halter_tools::{
-    NoopToolEventSink, SubagentControl, SubagentParentContext, ToolPolicy, ToolRuntime,
+    PathLockMap, SubagentControl, SubagentParentContext, ToolEventSink, ToolPolicy, ToolRuntime,
+    ToolRuntimeEvent, ToolSessionStore,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -33,6 +37,8 @@ pub struct RuntimeServices {
     pub resources: Arc<ResourceHandle>,
     pub models: Arc<ModelRegistry>,
     pub tools: Arc<ToolRuntime>,
+    pub path_locks: Arc<PathLockMap>,
+    pub tool_sessions: Arc<ToolSessionStore>,
     pub sessions: Arc<dyn SessionStore>,
     pub policy: Arc<dyn ToolPolicy>,
     pub prompt_assembler: Arc<dyn PromptAssembler>,
@@ -113,6 +119,82 @@ impl SessionInit {
 pub struct HalterSession {
     services: Arc<RuntimeServices>,
     session_id: SessionId,
+}
+
+struct SessionToolEventSink {
+    call_id: halter_protocol::ToolCallId,
+    events: Arc<Mutex<Vec<ToolRuntimeEvent>>>,
+    live: Option<LiveTurnStream>,
+}
+
+impl ToolEventSink for SessionToolEventSink {
+    fn emit(&self, event: ToolRuntimeEvent) {
+        if let Some(live) = self.live.as_ref()
+            && let Some(payload) = tool_runtime_event_payload(&self.call_id, event.clone())
+        {
+            live.emit_payload(payload);
+        }
+        self.events
+            .lock()
+            .expect("tool event lock poisoned")
+            .push(event);
+    }
+}
+
+struct ToolEventDrain {
+    events: Arc<Mutex<Vec<ToolRuntimeEvent>>>,
+}
+
+impl ToolEventDrain {
+    fn into_events(self) -> Vec<ToolRuntimeEvent> {
+        self.events
+            .lock()
+            .expect("tool event lock poisoned")
+            .drain(..)
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+struct LiveTurnStream {
+    session_id: SessionId,
+    tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>,
+    next_sequence: Arc<AtomicU64>,
+}
+
+impl LiveTurnStream {
+    fn new(
+        session_id: SessionId,
+        tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>,
+        next_sequence: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            tx,
+            next_sequence: Arc::new(AtomicU64::new(next_sequence)),
+        }
+    }
+
+    fn emit_payload(&self, payload: SessionEventPayload) {
+        if !should_emit_live_payload(&payload) {
+            return;
+        }
+        let event = SessionEvent {
+            session_id: self.session_id.clone(),
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+            delivery: Delivery::Lossless,
+            payload,
+        };
+        let _ = self.tx.send(Ok(event));
+    }
+
+    fn emit_committed(&self, event: SessionEvent) {
+        let _ = self.tx.send(Ok(event));
+    }
+
+    fn emit_error(&self, error: anyhow::Error) {
+        let _ = self.tx.send(Err(error));
+    }
 }
 
 #[derive(Clone)]
@@ -214,44 +296,94 @@ impl HalterSession {
                     self.session_id.0
                 )
             })?;
+        let base_sequence = self.services.sessions.replay(&self.session_id).await?.len() as u64 + 1;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let live = LiveTurnStream::new(self.session_id.clone(), tx, base_sequence);
+        let session = self.clone();
 
-        match self.run_turn(stored, turn.clone(), turn_cancel).await {
-            Ok(turn_commit) => {
-                self.commit_and_stream(
-                    Some(turn_commit.snapshot),
-                    Some(turn_commit.state),
-                    turn_commit.events,
-                )
+        tokio::spawn(async move {
+            live.emit_payload(SessionEventPayload::TurnStarted {
+                turn_id: turn.id.clone(),
+            });
+
+            match session
+                .run_turn(stored, turn.clone(), turn_cancel, Some(live.clone()))
                 .await
+            {
+                Ok(turn_commit) => match session
+                    .commit_and_publish(
+                        Some(turn_commit.snapshot),
+                        Some(turn_commit.state),
+                        turn_commit.events,
+                    )
+                    .await
+                {
+                    Ok(committed) => {
+                        for event in committed {
+                            if matches!(event.payload, SessionEventPayload::TurnCompleted { .. }) {
+                                live.emit_committed(event);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        error!(
+                            session_id = %session.session_id,
+                            turn_id = %turn.id,
+                            error = %error,
+                            "failed to commit successful turn"
+                        );
+                        live.emit_error(error);
+                    }
+                },
+                Err(error) => {
+                    error!(
+                        session_id = %session.session_id,
+                        turn_id = %turn.id,
+                        error = %error,
+                        "turn failed before commit"
+                    );
+                    let turn_snapshot = session.services.resources.snapshot();
+                    let failure_events = vec![
+                        session.make_event(
+                            0,
+                            SessionEventPayload::TurnStarted {
+                                turn_id: turn.id.clone(),
+                            },
+                        ),
+                        session.make_event(
+                            0,
+                            SessionEventPayload::TurnFailed {
+                                turn_id: turn.id.clone(),
+                                error: error.to_string(),
+                            },
+                        ),
+                    ];
+                    match session
+                        .commit_and_publish(Some(turn_snapshot), None, failure_events)
+                        .await
+                    {
+                        Ok(committed) => {
+                            for event in committed {
+                                if matches!(event.payload, SessionEventPayload::TurnFailed { .. }) {
+                                    live.emit_committed(event);
+                                }
+                            }
+                        }
+                        Err(commit_error) => {
+                            error!(
+                                session_id = %session.session_id,
+                                turn_id = %turn.id,
+                                error = %commit_error,
+                                "failed to commit failed turn"
+                            );
+                            live.emit_error(commit_error);
+                        }
+                    }
+                }
             }
-            Err(error) => {
-                error!(
-                    session_id = %self.session_id,
-                    turn_id = %turn.id,
-                    error = %error,
-                    "turn failed before commit"
-                );
-                let turn_snapshot = self.services.resources.snapshot();
-                let failure_events = vec![
-                    self.make_event(
-                        0,
-                        SessionEventPayload::TurnStarted {
-                            turn_id: turn.id.clone(),
-                        },
-                    ),
-                    self.make_event(
-                        0,
-                        SessionEventPayload::TurnFailed {
-                            turn_id: turn.id,
-                            error: error.to_string(),
-                        },
-                    ),
-                ];
-                self.commit_and_publish(Some(turn_snapshot), None, failure_events)
-                    .await?;
-                Err(error)
-            }
-        }
+        });
+
+        Ok(UnboundedReceiverStream::new(rx).boxed())
     }
 
     pub async fn replay(&self) -> anyhow::Result<Vec<SessionEvent>> {
@@ -263,6 +395,7 @@ impl HalterSession {
         stored: StoredSession,
         turn: Turn,
         turn_cancel: CancellationToken,
+        live: Option<LiveTurnStream>,
     ) -> anyhow::Result<TurnCommit> {
         let snapshot = self.services.resources.snapshot();
         let mut state = stored.state;
@@ -333,18 +466,16 @@ impl HalterSession {
 
             let assistant_message = Message::Assistant(materialized.message.clone());
             state.messages.push(assistant_message.clone());
-            events.extend(
-                materialized
-                    .events
-                    .into_iter()
-                    .map(|payload| self.make_event(0, payload)),
-            );
-            events.push(self.make_event(
-                0,
+            for payload in materialized.events {
+                self.push_event(&mut events, payload, live.as_ref());
+            }
+            self.push_event(
+                &mut events,
                 SessionEventPayload::MessageItem {
                     message: assistant_message,
                 },
-            ));
+                live.as_ref(),
+            );
 
             let tool_calls = assistant_tool_calls(&materialized.message);
             if tool_calls.is_empty() {
@@ -393,6 +524,7 @@ impl HalterSession {
                     &selected_models.subagent_model,
                     &mut state,
                     tool_calls,
+                    live.clone(),
                 )
                 .await?;
             events.extend(tool_events);
@@ -407,17 +539,21 @@ impl HalterSession {
         effective_subagent_model: &ModelId,
         state: &mut SessionState,
         tool_calls: Vec<ToolCall>,
+        live: Option<LiveTurnStream>,
     ) -> anyhow::Result<Vec<SessionEvent>> {
         let mut events = Vec::new();
 
         for call in tool_calls {
+            let (emit, tool_event_drain) = self.spawn_tool_event_sink(&call, live.clone());
             let context = halter_tools::ToolContext {
                 session_id: self.session_id.clone(),
                 working_dir: blueprint.working_dir.clone(),
+                path_locks: self.services.path_locks.clone(),
+                tool_sessions: self.services.tool_sessions.clone(),
                 file_view: Arc::new(state.file_view_cache.clone()),
                 snapshot: snapshot.clone(),
                 cancel: cancel.child_token(),
-                emit: Arc::new(NoopToolEventSink),
+                emit,
                 policy: self.services.policy.clone(),
                 max_tool_output_bytes: self.services.max_tool_output_bytes,
                 shell_timeout_secs: self.services.shell_timeout_secs,
@@ -441,16 +577,25 @@ impl HalterSession {
                     submitted_at: Utc::now(),
                 },
             );
-            events.push(self.make_event(
-                0,
+            self.push_event(
+                &mut events,
                 SessionEventPayload::ToolExecutionStarted { call: call.clone() },
-            ));
+                live.as_ref(),
+            );
 
             let execution = self
                 .services
                 .tools
                 .execute(&call.name.0, context.clone(), call.arguments.clone())
                 .await;
+            drop(context);
+            for payload in tool_event_drain
+                .into_events()
+                .into_iter()
+                .filter_map(|event| tool_runtime_event_payload(&call.id, event))
+            {
+                self.push_event(&mut events, payload, live.as_ref());
+            }
 
             let (content, error) = match execution {
                 Ok(result) => {
@@ -488,22 +633,19 @@ impl HalterSession {
 
             state.pending_tool_calls.shift_remove(&call.id);
             state.messages.push(message.clone());
-            events
-                .push(self.make_event(0, SessionEventPayload::ToolExecutionCompleted { outcome }));
-            events.push(self.make_event(0, SessionEventPayload::MessageItem { message }));
+            self.push_event(
+                &mut events,
+                SessionEventPayload::ToolExecutionCompleted { outcome },
+                live.as_ref(),
+            );
+            self.push_event(
+                &mut events,
+                SessionEventPayload::MessageItem { message },
+                live.as_ref(),
+            );
         }
 
         Ok(events)
-    }
-
-    async fn commit_and_stream(
-        &self,
-        snapshot: Option<Arc<ResourceSnapshot>>,
-        state: Option<SessionState>,
-        events: Vec<SessionEvent>,
-    ) -> anyhow::Result<SessionEventStream> {
-        let committed = self.commit_and_publish(snapshot, state, events).await?;
-        Ok(stream::iter(committed.into_iter().map(Ok)).boxed())
     }
 
     async fn commit_and_publish(
@@ -530,6 +672,34 @@ impl HalterSession {
         Ok(committed)
     }
 
+    fn spawn_tool_event_sink(
+        &self,
+        call: &ToolCall,
+        live: Option<LiveTurnStream>,
+    ) -> (Arc<dyn ToolEventSink>, ToolEventDrain) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(SessionToolEventSink {
+                call_id: call.id.clone(),
+                events: events.clone(),
+                live,
+            }) as Arc<dyn ToolEventSink>,
+            ToolEventDrain { events },
+        )
+    }
+
+    fn push_event(
+        &self,
+        events: &mut Vec<SessionEvent>,
+        payload: SessionEventPayload,
+        live: Option<&LiveTurnStream>,
+    ) {
+        if let Some(live) = live {
+            live.emit_payload(payload.clone());
+        }
+        events.push(self.make_event(0, payload));
+    }
+
     fn make_event(&self, sequence: u64, payload: SessionEventPayload) -> SessionEvent {
         SessionEvent {
             session_id: self.session_id.clone(),
@@ -538,6 +708,31 @@ impl HalterSession {
             payload,
         }
     }
+}
+
+fn tool_runtime_event_payload(
+    call_id: &halter_protocol::ToolCallId,
+    event: ToolRuntimeEvent,
+) -> Option<SessionEventPayload> {
+    match event {
+        ToolRuntimeEvent::ToolOutput { tool_name, chunk } => {
+            Some(SessionEventPayload::ToolOutput {
+                call_id: call_id.clone(),
+                tool_name: tool_name.into(),
+                chunk,
+            })
+        }
+        ToolRuntimeEvent::Started { .. } | ToolRuntimeEvent::Completed { .. } => None,
+    }
+}
+
+fn should_emit_live_payload(payload: &SessionEventPayload) -> bool {
+    !matches!(
+        payload,
+        SessionEventPayload::TurnStarted { .. }
+            | SessionEventPayload::TurnCompleted { .. }
+            | SessionEventPayload::TurnFailed { .. }
+    )
 }
 
 #[derive(Debug)]
@@ -821,6 +1016,8 @@ impl Default for RuntimeServices {
             resources: Arc::new(ResourceHandle::new(snapshot)),
             models: Arc::new(ModelRegistry::new()),
             tools: Arc::new(ToolRuntime::new()),
+            path_locks: Arc::new(PathLockMap::default()),
+            tool_sessions: Arc::new(ToolSessionStore::default()),
             sessions: Arc::new(halter_session::InMemorySessionStore::default()),
             policy: Arc::new(halter_tools::DefaultToolPolicy::new(Default::default())),
             prompt_assembler: Arc::new(crate::DefaultPromptAssembler),
@@ -836,17 +1033,21 @@ impl Default for RuntimeServices {
 mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
-    use futures::TryStreamExt;
     use futures::stream::{self, BoxStream};
+    use futures::{StreamExt, TryStreamExt};
     use halter_protocol::{
         ApiKind, BlockId, Message, ModelId, ModelRole, ProviderCapabilities, ProviderError,
         ProviderKind, ProviderName, ProviderRequest, ResolvedModel, StopReason, StreamEvent,
-        ToolCallId, Turn,
+        ToolCallId, ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec, Turn,
     };
     use halter_providers::{FakeProvider, Provider};
-    use halter_tools::{DefaultToolPolicy, PolicySettings, register_builtin_tools};
+    use halter_tools::{
+        DefaultToolPolicy, PolicySettings, Tool, ToolContext, register_builtin_tools,
+    };
+    use serde_json::json;
 
     use super::*;
 
@@ -957,11 +1158,13 @@ mod tests {
             .await
             .expect("session");
 
-        let error = match session.submit_turn(Turn::user("will fail")).await {
-            Ok(_) => panic!("submit turn should fail"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("provider exploded"));
+        let events = session
+            .submit_turn(Turn::user("will fail"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
 
         let stored = services
             .sessions
@@ -970,6 +1173,11 @@ mod tests {
             .expect("load session")
             .expect("session exists");
         assert!(stored.state.messages.is_empty());
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnFailed { .. }))
+        );
 
         let events = services
             .sessions
@@ -1129,14 +1337,62 @@ mod tests {
             .await
             .expect("session");
 
-        let error = match session
+        let events = session
             .submit_turn(Turn::user("hello").with_subagent_model("missing"))
             .await
-        {
-            Ok(_) => panic!("submit turn should fail"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("unknown model 'missing'"));
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::TurnFailed { error, .. } if error.contains("unknown model 'missing'")
+        )));
+    }
+
+    #[tokio::test]
+    async fn submit_turn_streams_tool_output_before_tool_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(StreamingToolProvider), temp.path());
+        services.tools.register(Arc::new(StreamingTestTool));
+        let runtime = SessionRuntime::new(services);
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+
+        let mut events = session
+            .submit_turn(Turn::user("stream tool output"))
+            .await
+            .expect("submit turn");
+
+        let tool_output = tokio::time::timeout(Duration::from_millis(150), async {
+            while let Some(event) = events.next().await {
+                let event = event.expect("stream event");
+                if let SessionEventPayload::ToolOutput { chunk, .. } = event.payload {
+                    return chunk;
+                }
+            }
+            panic!("tool output never arrived");
+        })
+        .await
+        .expect("tool output should stream before tool completion");
+
+        assert_eq!(tool_output, "streamed chunk");
+
+        let remaining = events
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect remaining events");
+        assert!(
+            remaining
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        );
     }
 
     fn configured_services(
@@ -1339,6 +1595,107 @@ mod tests {
                 }),
             ])
             .boxed())
+        }
+    }
+
+    #[derive(Debug)]
+    struct StreamingToolProvider;
+
+    #[async_trait]
+    impl Provider for StreamingToolProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            if request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool(_)))
+            {
+                return Ok(stream::iter(vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: halter_protocol::MessageId::new(),
+                    }),
+                    Ok(StreamEvent::TextStart { id: BlockId::new() }),
+                    Ok(StreamEvent::TextDelta {
+                        id: BlockId::new(),
+                        delta: "stream done".to_owned(),
+                    }),
+                    Ok(StreamEvent::TextEnd { id: BlockId::new() }),
+                    Ok(StreamEvent::MessageEnd {
+                        id: halter_protocol::MessageId::new(),
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ])
+                .boxed());
+            }
+
+            let block_id = BlockId::new();
+            Ok(stream::iter(vec![
+                Ok(StreamEvent::MessageStart {
+                    id: halter_protocol::MessageId::new(),
+                }),
+                Ok(StreamEvent::ToolCallStart {
+                    id: block_id.clone(),
+                    tool_call_id: ToolCallId::new(),
+                    name: ToolName::from("stream_test"),
+                }),
+                Ok(StreamEvent::ToolArgsDelta {
+                    id: block_id.clone(),
+                    delta: json!({}).to_string(),
+                }),
+                Ok(StreamEvent::ToolCallEnd { id: block_id }),
+                Ok(StreamEvent::MessageEnd {
+                    id: halter_protocol::MessageId::new(),
+                    stop_reason: StopReason::ToolUse,
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[derive(Debug)]
+    struct StreamingTestTool;
+
+    #[async_trait]
+    impl Tool for StreamingTestTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: ToolName::from("stream_test"),
+                description: "Emit output before completing".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                concurrency: ToolConcurrency::Exclusive,
+                capabilities: ToolCapabilities {
+                    mutating: false,
+                    requires_approval: false,
+                    cancellable: false,
+                    long_running: true,
+                },
+                provider_aliases: Default::default(),
+            }
+        }
+
+        async fn execute(
+            &self,
+            context: ToolContext,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<ToolResult> {
+            context.emit.emit(ToolRuntimeEvent::ToolOutput {
+                tool_name: "stream_test".to_owned(),
+                chunk: "streamed chunk".to_owned(),
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(ToolResult::Json {
+                value: json!({ "ok": true }),
+            })
         }
     }
 }

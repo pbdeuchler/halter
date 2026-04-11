@@ -163,6 +163,10 @@ async fn chat(path: &Path) -> anyhow::Result<()> {
                     write!(stdout, "{}", delta.text).context("failed to write stdout")?;
                     stdout.flush().context("failed to flush stdout")?;
                 }
+                SessionEventPayload::ToolOutput { chunk, .. } => {
+                    write!(stdout, "{}", chunk).context("failed to write stdout")?;
+                    stdout.flush().context("failed to flush stdout")?;
+                }
                 SessionEventPayload::TurnCompleted { .. } => {
                     writeln!(stdout).context("failed to write newline")?;
                     break;

@@ -526,16 +526,44 @@ pub struct ToolExecutionOutcome {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventPayload {
     SessionStarted,
-    TurnStarted { turn_id: TurnId },
-    MessageItem { message: Message },
-    DeltaItem { delta: DeltaItem },
-    ToolExecutionStarted { call: ToolCall },
-    ToolExecutionCompleted { outcome: ToolExecutionOutcome },
-    ApprovalRequested { tool_name: ToolName, reason: String },
-    ContextCompacted { summary: String },
-    TurnCompleted { turn_id: TurnId, usage: Usage },
-    TurnFailed { turn_id: TurnId, error: String },
-    Lagged { dropped_events: u64 },
+    TurnStarted {
+        turn_id: TurnId,
+    },
+    MessageItem {
+        message: Message,
+    },
+    DeltaItem {
+        delta: DeltaItem,
+    },
+    ToolExecutionStarted {
+        call: ToolCall,
+    },
+    ToolOutput {
+        call_id: ToolCallId,
+        tool_name: ToolName,
+        chunk: SharedStr,
+    },
+    ToolExecutionCompleted {
+        outcome: ToolExecutionOutcome,
+    },
+    ApprovalRequested {
+        tool_name: ToolName,
+        reason: String,
+    },
+    ContextCompacted {
+        summary: String,
+    },
+    TurnCompleted {
+        turn_id: TurnId,
+        usage: Usage,
+    },
+    TurnFailed {
+        turn_id: TurnId,
+        error: String,
+    },
+    Lagged {
+        dropped_events: u64,
+    },
     SessionShutdownComplete,
 }
 

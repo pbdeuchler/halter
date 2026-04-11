@@ -108,6 +108,10 @@ impl ToolPolicy for DefaultToolPolicy {
             anyhow::bail!("failed to execute shell tool: shell usage is disabled by policy");
         }
 
+        if program == "shell" {
+            return Ok(());
+        }
+
         if !self
             .settings
             .allowed_shell_commands

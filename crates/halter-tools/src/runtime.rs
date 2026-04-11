@@ -14,12 +14,14 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::ToolPolicy;
+use crate::builtin::fs_lock::PathLockMap;
+use crate::{ToolPolicy, ToolSessionStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolRuntimeEvent {
     Started { tool_name: String },
     Completed { tool_name: String },
+    ToolOutput { tool_name: String, chunk: String },
 }
 
 pub trait ToolEventSink: Send + Sync {
@@ -87,6 +89,8 @@ impl SubagentControl for NoopSubagentControl {
 pub struct ToolContext {
     pub session_id: SessionId,
     pub working_dir: PathBuf,
+    pub path_locks: Arc<PathLockMap>,
+    pub tool_sessions: Arc<ToolSessionStore>,
     pub file_view: Arc<FileViewCache>,
     pub snapshot: Arc<ResourceSnapshot>,
     pub cancel: CancellationToken,

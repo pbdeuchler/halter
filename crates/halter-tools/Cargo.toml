@@ -3,19 +3,53 @@ name = "halter-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version.workspace = true
+
+[features]
+default = []
+advanced-tools = ["dep:memmap2", "dep:rayon"]
+ast-tools = ["dep:ast-grep-core", "dep:ast-grep-language"]
+image-tools = ["dep:image"]
+pty = ["dep:portable-pty"]
+profiling = ["dep:inferno"]
+full = ["advanced-tools", "ast-tools", "image-tools", "pty", "profiling"]
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+ast-grep-core = { workspace = true, optional = true }
+ast-grep-language = { workspace = true, optional = true }
+base64.workspace = true
+brush-builtins.workspace = true
+brush-core.workspace = true
+dashmap.workspace = true
 globset.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
 halter-protocol = { path = "../halter-protocol" }
 ignore.workspace = true
+image = { workspace = true, optional = true }
+inferno = { workspace = true, optional = true }
+libc.workspace = true
+memmap2 = { workspace = true, optional = true }
+os_pipe.workspace = true
+parking_lot.workspace = true
+portable-pty = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
 serde_json.workspace = true
 sha2.workspace = true
+smallvec.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

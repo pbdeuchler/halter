@@ -322,6 +322,8 @@ mod tests {
         let context = ToolContext {
             session_id: SessionId::new(),
             working_dir: ".".into(),
+            path_locks: Arc::new(crate::PathLockMap::default()),
+            tool_sessions: Arc::new(crate::ToolSessionStore::default()),
             file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
@@ -379,6 +381,8 @@ mod tests {
         let context = ToolContext {
             session_id: SessionId::new(),
             working_dir: ".".into(),
+            path_locks: Arc::new(crate::PathLockMap::default()),
+            tool_sessions: Arc::new(crate::ToolSessionStore::default()),
             file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
