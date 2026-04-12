@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use halter_protocol::{ResourceSnapshot, SessionBlueprint, SessionEvent, SessionId, SessionState};
+use thiserror::Error;
 
 pub use memory::InMemorySessionStore;
 #[cfg(feature = "sqlite")]
@@ -22,6 +23,12 @@ pub struct StoredSession {
     pub snapshot: Arc<ResourceSnapshot>,
 }
 
+#[derive(Debug, Clone, Error)]
+#[error("failed to commit session '{session_id}': session state changed concurrently")]
+pub struct SessionCommitConflict {
+    pub session_id: SessionId,
+}
+
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn create_session(&self, session: StoredSession) -> Result<()>;
@@ -30,6 +37,7 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &SessionId,
         snapshot: Option<Arc<ResourceSnapshot>>,
+        expected_state: Option<SessionState>,
         state: Option<SessionState>,
         events: Vec<SessionEvent>,
     ) -> Result<Vec<SessionEvent>>;

@@ -211,6 +211,23 @@ pub struct ReplayMeta {
     pub model: Option<ModelId>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HookWarningSeverity {
+    #[default]
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct HookWarning {
+    pub severity: HookWarningSeverity,
+    pub category: SharedStr,
+    pub plugin_id: Option<PluginId>,
+    pub plugin_name: Option<SharedStr>,
+    pub source_path: Option<PathBuf>,
+    pub message: SharedStr,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SystemMessage {
     pub id: MessageId,
@@ -833,7 +850,7 @@ pub struct SessionState {
     pub lineage: Vec<SubagentRef>,
     pub fired_hook_ids: Vec<String>,
     pub pending_session_start_source: Option<HookSessionStartSource>,
-    pub pending_warning_messages: Vec<String>,
+    pub pending_warning_messages: Vec<HookWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

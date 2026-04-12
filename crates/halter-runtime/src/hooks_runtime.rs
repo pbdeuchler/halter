@@ -1,12 +1,13 @@
 // pattern: Imperative Shell
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
+use futures::TryStreamExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use halter_hooks::{
     AgentHookConfig, CommandHookConfig, ConfiguredHandler, ConfiguredHandlerConfig,
@@ -20,7 +21,6 @@ use halter_protocol::{
     PromptSegmentId, SessionId, SessionState, ToolCall, ToolError, ToolResult, Turn, TurnId,
     UserMessage, Volatility,
 };
-use halter_session::InMemorySessionStore;
 use reqwest::Url;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::{Value, json};
@@ -34,7 +34,7 @@ use tracing::warn;
 use crate::session::{
     MaterializedAssistantMessage, create_session_seeded, materialize_assistant_message,
 };
-use crate::{EventBus, HalterSession, ResourceHandle, RuntimeServices, SessionInit};
+use crate::{HalterSession, ResourceHandle, RuntimeServices, SessionInit};
 
 #[derive(Clone, Copy)]
 pub struct HookInvocationContext<'a> {
@@ -50,15 +50,17 @@ pub struct ExecutedHookDispatch {
     pub fired_hook_ids: Vec<String>,
 }
 
+pub(crate) type HookEventReporter = Arc<dyn Fn(halter_protocol::SessionEventPayload) + Send + Sync>;
+
 pub async fn run_session_start(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     source: HookSessionStartSource,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::SessionStart,
             matcher_value: Some(session_start_source_name(source).to_owned()),
@@ -71,21 +73,22 @@ pub async fn run_session_start(
                     "working_dir": ctx.working_dir.display().to_string(),
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_session_end(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     reason: &str,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::SessionEnd,
             matcher_value: Some(reason.to_owned()),
@@ -97,21 +100,22 @@ pub async fn run_session_end(
                     "reason": reason,
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_user_prompt_submit(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     prompt: &str,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::UserPromptSubmit,
             matcher_value: None,
@@ -123,21 +127,22 @@ pub async fn run_user_prompt_submit(
                     "prompt": prompt,
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_pre_tool_use(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     call: &ToolCall,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::PreToolUse,
             matcher_value: Some(call.name.0.clone()),
@@ -151,22 +156,23 @@ pub async fn run_pre_tool_use(
                     "tool_use_id": call.id,
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_post_tool_use(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     call: &ToolCall,
     result: &ToolResult,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::PostToolUse,
             matcher_value: Some(call.name.0.clone()),
@@ -181,22 +187,23 @@ pub async fn run_post_tool_use(
                     "tool_response": result,
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_post_tool_use_failure(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     call: &ToolCall,
     error: &ToolError,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::PostToolUseFailure,
             matcher_value: Some(call.name.0.clone()),
@@ -211,22 +218,23 @@ pub async fn run_post_tool_use_failure(
                     "error": error.message,
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_stop(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     last_message: Option<&AssistantMessage>,
     stop_hook_active: bool,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::Stop,
             matcher_value: None,
@@ -239,23 +247,24 @@ pub async fn run_stop(
                     "last_assistant_message": last_message.map(render_assistant_text),
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_subagent_start(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     agent_id: &halter_protocol::AgentId,
     agent_type: &str,
     parent_session_id: &halter_protocol::SessionId,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::SubagentStart,
             matcher_value: Some(agent_type.to_owned()),
@@ -269,19 +278,21 @@ pub async fn run_subagent_start(
                     "parent_session_id": parent_session_id,
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_subagent_stop(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     agent_id: &halter_protocol::AgentId,
     agent_type: &str,
     transcript_path: Option<&Path>,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     let mut extra = serde_json::Map::new();
     extra.insert("agent_id".to_owned(), serde_json::to_value(agent_id)?);
@@ -298,7 +309,6 @@ pub async fn run_subagent_stop(
 
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::SubagentStop,
             matcher_value: Some(agent_type.to_owned()),
@@ -308,22 +318,23 @@ pub async fn run_subagent_stop(
                 HookEventName::SubagentStop,
                 Value::Object(extra),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_pre_compact(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     trigger: &str,
     custom_instructions: Option<&str>,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::PreCompact,
             matcher_value: Some(trigger.to_owned()),
@@ -336,22 +347,23 @@ pub async fn run_pre_compact(
                     "custom_instructions": custom_instructions,
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_post_compact(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     trigger: &str,
     summary: &str,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::PostCompact,
             matcher_value: Some(trigger.to_owned()),
@@ -364,22 +376,23 @@ pub async fn run_post_compact(
                     "compact_summary": summary,
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 pub async fn run_notification(
     sess: &HalterSession,
-    state: &SessionState,
+    fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     notification_type: &str,
     message: &str,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
-        state,
         HookDispatchRequest {
             event_name: HookEventName::Notification,
             matcher_value: Some(notification_type.to_owned()),
@@ -392,20 +405,21 @@ pub async fn run_notification(
                     "message": message,
                 }),
             ),
-            fired_hook_ids: fired_hook_ids(state),
+            fired_hook_ids: fired_hook_ids.clone(),
         },
+        reporter,
     )
     .await
 }
 
 async fn execute_hooks(
     sess: &HalterSession,
-    _state: &SessionState,
     request: HookDispatchRequest,
+    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     let hooks = sess.services().resources.hooks();
     let prepared = Hooks::prepare_many([hooks.as_ref(), sess.session_hooks().as_ref()], request);
-    let preview_runs = prepared.preview_runs().to_vec();
+    let mut preview_runs = prepared.preview_runs().to_vec();
     let matched_handlers = prepared.matched_handlers().to_vec();
     let request = prepared.request().clone();
 
@@ -418,14 +432,28 @@ async fn execute_hooks(
     for (handler, preview) in matched_handlers
         .iter()
         .cloned()
-        .zip(preview_runs.iter().cloned())
+        .zip(preview_runs.iter_mut())
     {
+        preview.started_at = chrono::Utc::now();
+        emit_hook_event(
+            &reporter,
+            halter_protocol::SessionEventPayload::HookStarted {
+                run: preview.clone(),
+            },
+        );
         let token = cancel.child_token();
         let request = request.clone();
+        let preview = preview.clone();
         running.push(async move { run_handler(sess, &request, handler, preview, token).await });
     }
 
     while let Some(result) = running.next().await {
+        emit_hook_event(
+            &reporter,
+            halter_protocol::SessionEventPayload::HookCompleted {
+                run: result.summary.clone(),
+            },
+        );
         if result.handler.once {
             fired_hook_ids.push(result.handler.handler_id.clone());
         }
@@ -458,6 +486,15 @@ async fn execute_hooks(
         merged,
         fired_hook_ids,
     })
+}
+
+fn emit_hook_event(
+    reporter: &Option<HookEventReporter>,
+    payload: halter_protocol::SessionEventPayload,
+) {
+    if let Some(reporter) = reporter {
+        reporter(payload);
+    }
 }
 
 struct HandlerRunResult {
@@ -689,13 +726,7 @@ async fn run_http(
     validate_http_url(handler, &url)?;
     let payload = build_payload(handler, request)?;
     let headers = build_http_headers(handler, config)?;
-    let client = reqwest::Client::builder()
-        .dns_resolver(Arc::new(HttpHookResolver::new(
-            url.host_str().unwrap_or_default().to_owned(),
-        )))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("failed to construct http hook client")?;
+    let client = cached_http_hook_client(handler, &url)?;
 
     let response = tokio::select! {
         _ = cancel.cancelled() => return Ok(HandlerExecution::Cancelled),
@@ -777,11 +808,11 @@ async fn run_agent(
         tools,
         path_locks: sess.services().path_locks.clone(),
         tool_sessions: Arc::new(halter_tools::ToolSessionStore::default()),
-        sessions: Arc::new(InMemorySessionStore::default()),
+        sessions: sess.services().sessions.clone(),
         policy: sess.services().policy.clone(),
         prompt_assembler: sess.services().prompt_assembler.clone(),
         context_manager: sess.services().context_manager.clone(),
-        event_bus: Arc::new(EventBus::default()),
+        event_bus: sess.services().event_bus.clone(),
         max_tool_output_bytes: sess.services().max_tool_output_bytes,
         shell_timeout_secs: sess.services().shell_timeout_secs,
     });
@@ -806,23 +837,33 @@ async fn run_agent(
     let agent_session = create_session_seeded(services, init, initial_state, resources).await?;
     let payload_json = serde_json::to_string_pretty(&request.payload)?;
     let agent_cancel = cancel.child_token();
-    let events = tokio::select! {
-        _ = cancel.cancelled() => return Ok(HandlerExecution::Cancelled),
-        result = timeout(
-            timeout_limit,
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("failed to build hook agent runtime")?;
-                runtime.block_on(async move {
-                    let stream = agent_session
-                        .submit_turn_with_cancel(Turn::user(payload_json), agent_cancel)
-                        .await?;
-                    stream.collect::<Vec<_>>().await.into_iter().collect::<anyhow::Result<Vec<_>>>()
-                })
+    let turn_cancel = agent_cancel.clone();
+    let runtime_handle = tokio::runtime::Handle::current();
+    let mut agent_task = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
+            runtime_handle.block_on(async move {
+                let stream = agent_session
+                    .submit_turn_with_cancel(Turn::user(payload_json), turn_cancel)
+                    .await?;
+                stream.try_collect::<Vec<_>>().await
             })
-        ) => result.context("hook agent timed out")???,
+        },
+    );
+    let events = tokio::select! {
+        _ = cancel.cancelled() => {
+            agent_cancel.cancel();
+            agent_task.abort();
+            return Ok(HandlerExecution::Cancelled);
+        }
+        result = timeout(timeout_limit, &mut agent_task) => match result {
+            Ok(events) => events
+                .context("failed to join hook agent task")?
+                .context("failed to execute hook agent")?,
+            Err(_) => {
+                agent_cancel.cancel();
+                anyhow::bail!("hook agent timed out");
+            }
+        },
     };
     let output = crate::subagent_session::extract_subagent_output(&events)
         .context("hook agent did not produce a final assistant message")?;
@@ -897,8 +938,11 @@ fn build_command(
         .and_then(Value::as_str)
         .unwrap_or(".");
     child.current_dir(cwd);
-    child.env("PLUGIN_ROOT", &handler.plugin_root);
-    child.env("CLAUDE_PLUGIN_ROOT", &handler.plugin_root);
+    set_alias_envs(
+        &mut child,
+        &["PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT", "HALTER_PLUGIN_ROOT"],
+        handler.plugin_root.display().to_string(),
+    );
     child.env("PLUGIN_ID", handler.plugin_id.0.as_str());
     child.env("HOOK_EVENT", handler.event_name.canonical_name());
     child.env("HOOK_VERSION", HOOK_PROTOCOL_VERSION.to_string());
@@ -910,8 +954,11 @@ fn build_command(
         child.env("TURN_ID", turn_id);
     }
     if let Some(project_dir) = request.payload.get("cwd").and_then(Value::as_str) {
-        child.env("PROJECT_DIR", project_dir);
-        child.env("CLAUDE_PROJECT_DIR", project_dir);
+        set_alias_envs(
+            &mut child,
+            &["PROJECT_DIR", "CLAUDE_PROJECT_DIR", "HALTER_PROJECT_DIR"],
+            project_dir.to_owned(),
+        );
     }
 
     for (key, value) in &command.env {
@@ -945,13 +992,7 @@ fn build_payload(
 
 fn shell_invocation(shell: halter_hooks::HookShell, command: &str) -> (String, Vec<String>) {
     match shell {
-        halter_hooks::HookShell::Bash => (
-            std::env::var("SHELL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "/bin/sh".to_owned()),
-            vec!["-lc".to_owned(), command.to_owned()],
-        ),
+        halter_hooks::HookShell::Bash => posix_shell_invocation(command),
         halter_hooks::HookShell::Pwsh => (
             "pwsh".to_owned(),
             vec!["-Command".to_owned(), command.to_owned()],
@@ -962,13 +1003,27 @@ fn shell_invocation(shell: halter_hooks::HookShell, command: &str) -> (String, V
 fn expand_placeholders(value: &str, plugin_root: &Path) -> String {
     let plugin_root = plugin_root.display().to_string();
     let plugin_data = plugin_root.clone() + "/.data";
-    value
-        .replace("${PLUGIN_ROOT}", &plugin_root)
-        .replace("${CLAUDE_PLUGIN_ROOT}", &plugin_root)
-        .replace("${HALTER_PLUGIN_ROOT}", &plugin_root)
-        .replace("${PLUGIN_DATA}", &plugin_data)
-        .replace("${CLAUDE_PLUGIN_DATA}", &plugin_data)
-        .replace("${HALTER_PLUGIN_DATA}", &plugin_data)
+    replace_alias_placeholders(
+        value,
+        &[
+            (
+                &[
+                    "${PLUGIN_ROOT}",
+                    "${CLAUDE_PLUGIN_ROOT}",
+                    "${HALTER_PLUGIN_ROOT}",
+                ],
+                plugin_root.as_str(),
+            ),
+            (
+                &[
+                    "${PLUGIN_DATA}",
+                    "${CLAUDE_PLUGIN_DATA}",
+                    "${HALTER_PLUGIN_DATA}",
+                ],
+                plugin_data.as_str(),
+            ),
+        ],
+    )
 }
 
 fn base_payload(
@@ -1009,10 +1064,6 @@ fn base_payload(
     }
 
     Value::Object(payload)
-}
-
-fn fired_hook_ids(state: &SessionState) -> BTreeSet<String> {
-    state.fired_hook_ids.iter().cloned().collect()
 }
 
 fn session_start_source_name(source: HookSessionStartSource) -> &'static str {
@@ -1065,6 +1116,50 @@ fn build_http_headers(
     Ok(headers)
 }
 
+fn replace_alias_placeholders(value: &str, groups: &[(&[&str], &str)]) -> String {
+    let mut expanded = value.to_owned();
+    for (aliases, replacement) in groups {
+        for alias in *aliases {
+            expanded = expanded.replace(alias, replacement);
+        }
+    }
+    expanded
+}
+
+fn set_alias_envs(child: &mut Command, aliases: &[&str], value: String) {
+    for alias in aliases {
+        child.env(alias, &value);
+    }
+}
+
+fn posix_shell_invocation(command: &str) -> (String, Vec<String>) {
+    if let Some(shell) = preferred_posix_login_shell() {
+        return (shell, vec!["-lc".to_owned(), command.to_owned()]);
+    }
+
+    (
+        "/bin/sh".to_owned(),
+        vec!["-c".to_owned(), command.to_owned()],
+    )
+}
+
+fn preferred_posix_login_shell() -> Option<String> {
+    preferred_posix_login_shell_from(std::env::var("SHELL").ok().as_deref())
+}
+
+fn preferred_posix_login_shell_from(shell: Option<&str>) -> Option<String> {
+    let trimmed = shell?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let basename = Path::new(trimmed)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(trimmed);
+    matches!(basename, "bash" | "zsh" | "ksh").then(|| trimmed.to_owned())
+}
+
 fn expand_env_placeholders(value: &str, allowed: &BTreeSet<String>) -> String {
     let mut expanded = String::with_capacity(value.len());
     let chars = value.as_bytes();
@@ -1110,6 +1205,47 @@ fn expanded_env(name: &str, allowed: &BTreeSet<String>) -> String {
 
 fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n', '\0'], "")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HttpHookClientCacheKey {
+    plugin_id: String,
+    host: String,
+}
+
+static HTTP_HOOK_CLIENTS: OnceLock<Mutex<HashMap<HttpHookClientCacheKey, reqwest::Client>>> =
+    OnceLock::new();
+
+fn cached_http_hook_client(
+    handler: &ConfiguredHandler,
+    url: &Url,
+) -> anyhow::Result<reqwest::Client> {
+    let key = HttpHookClientCacheKey {
+        plugin_id: handler.plugin_id.0.clone(),
+        host: url.host_str().unwrap_or_default().to_owned(),
+    };
+    let cache = HTTP_HOOK_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(client) = guard.get(&key) {
+            return Ok(client.clone());
+        }
+    } else {
+        warn!("http hook client cache lock poisoned; rebuilding uncached client");
+    }
+
+    let client = reqwest::Client::builder()
+        .dns_resolver(Arc::new(HttpHookResolver::new(key.host.clone())))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to construct http hook client")?;
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, client.clone());
+    } else {
+        warn!("http hook client cache lock poisoned; skipping cache insert");
+    }
+
+    Ok(client)
 }
 
 fn validate_http_url(handler: &ConfiguredHandler, url: &Url) -> anyhow::Result<()> {
@@ -1340,5 +1476,28 @@ mod tests {
         let url = Url::parse("https://10.0.0.1/hook").expect("url");
         let error = validate_http_url(&handler, &url).expect_err("reject literal private ip");
         assert!(error.to_string().contains("disallowed literal ip"));
+    }
+
+    #[test]
+    fn shell_invocation_falls_back_to_sh_for_non_posix_user_shells() {
+        assert_eq!(
+            preferred_posix_login_shell_from(Some("/opt/homebrew/bin/fish")),
+            None
+        );
+    }
+
+    #[test]
+    fn shell_invocation_uses_supported_login_shells() {
+        assert_eq!(
+            preferred_posix_login_shell_from(Some("/bin/zsh")),
+            Some("/bin/zsh".to_owned())
+        );
+        assert_eq!(
+            shell_invocation(halter_hooks::HookShell::Pwsh, "echo hi"),
+            (
+                "pwsh".to_owned(),
+                vec!["-Command".to_owned(), "echo hi".to_owned()]
+            )
+        );
     }
 }

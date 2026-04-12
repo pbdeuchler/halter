@@ -9,7 +9,7 @@ use halter_protocol::{SessionBlueprint, SessionEvent, SessionId, SessionState};
 use tokio::sync::RwLock;
 use tracing::debug;
 
-use crate::{SessionStore, StoredSession};
+use crate::{SessionCommitConflict, SessionStore, StoredSession};
 
 #[derive(Debug, Default)]
 struct MemoryStoreState {
@@ -49,6 +49,7 @@ impl SessionStore for InMemorySessionStore {
         &self,
         session_id: &SessionId,
         snapshot: Option<Arc<halter_protocol::ResourceSnapshot>>,
+        expected_state: Option<SessionState>,
         state: Option<SessionState>,
         mut events: Vec<SessionEvent>,
     ) -> anyhow::Result<Vec<SessionEvent>> {
@@ -56,6 +57,7 @@ impl SessionStore for InMemorySessionStore {
             session_id = %session_id,
             event_count = events.len(),
             replace_snapshot = snapshot.is_some(),
+            check_expected_state = expected_state.is_some(),
             replace_state = state.is_some(),
             "committing in-memory session state"
         );
@@ -66,6 +68,15 @@ impl SessionStore for InMemorySessionStore {
                 session_id.0
             )
         })?;
+
+        if let Some(expected_state) = expected_state.as_ref()
+            && session.state != *expected_state
+        {
+            return Err(SessionCommitConflict {
+                session_id: session_id.clone(),
+            }
+            .into());
+        }
 
         if let Some(snapshot) = snapshot {
             session.blueprint.snapshot_revision = snapshot.revision.clone();
@@ -146,5 +157,69 @@ mod tests {
             .expect("session exists");
 
         assert_eq!(loaded.blueprint, blueprint);
+    }
+
+    #[tokio::test]
+    async fn memory_store_rejects_stale_state_commit() {
+        let store = InMemorySessionStore::default();
+        let blueprint = SessionBlueprint {
+            session_id: SessionId::new(),
+            parent_session_id: None,
+            default_model: ModelId::from("default"),
+            subagent_model: ModelId::from("subagent"),
+            snapshot_revision: Revision::from("revision-1"),
+            working_dir: PathBuf::from("."),
+            system_prompt_seed: Vec::new(),
+            max_turns: None,
+            subagent_depth: 0,
+        };
+        let original_state = SessionState::default();
+
+        store
+            .create_session(StoredSession {
+                blueprint: blueprint.clone(),
+                state: original_state.clone(),
+                snapshot: Arc::new(ResourceSnapshot::empty()),
+            })
+            .await
+            .expect("create session");
+
+        let updated_state = SessionState {
+            pending_warning_messages: vec![halter_protocol::HookWarning {
+                category: "test".to_owned(),
+                message: "first".to_owned(),
+                ..halter_protocol::HookWarning::default()
+            }],
+            ..SessionState::default()
+        };
+        store
+            .commit(
+                &blueprint.session_id,
+                None,
+                Some(original_state.clone()),
+                Some(updated_state.clone()),
+                Vec::new(),
+            )
+            .await
+            .expect("commit updated state");
+
+        let error = store
+            .commit(
+                &blueprint.session_id,
+                None,
+                Some(original_state),
+                Some(SessionState::default()),
+                Vec::new(),
+            )
+            .await
+            .expect_err("stale commit should fail");
+        assert!(error.downcast_ref::<SessionCommitConflict>().is_some());
+
+        let reloaded = store
+            .load_session(&blueprint.session_id)
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert_eq!(reloaded.state, updated_state);
     }
 }

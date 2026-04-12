@@ -12,7 +12,9 @@ use halter_config::{
     resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
-use halter_protocol::{ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot};
+use halter_protocol::{
+    HookWarning, ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot,
+};
 use halter_providers::{AnthropicProvider, ModelRegistry, OpenAiProvider, OpenRouterProvider};
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
@@ -35,7 +37,7 @@ pub struct HalterBuilder {
     config: HarnessConfig,
     resource_snapshot: Option<ResourceSnapshot>,
     resource_hooks: Option<Arc<Hooks>>,
-    resource_hook_warnings: Vec<String>,
+    resource_hook_warnings: Vec<HookWarning>,
     registered_hooks: RegisteredHooks,
     loaded_skills: Vec<LoadedSkill>,
     loaded_plugins: Vec<LoadedPlugin>,
@@ -598,11 +600,14 @@ mod tests {
             &self,
             session_id: &halter_protocol::SessionId,
             snapshot: Option<Arc<halter_protocol::ResourceSnapshot>>,
+            expected_state: Option<halter_protocol::SessionState>,
             state: Option<halter_protocol::SessionState>,
             events: Vec<halter_protocol::SessionEvent>,
         ) -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
             self.commit_calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.commit(session_id, snapshot, state, events).await
+            self.inner
+                .commit(session_id, snapshot, expected_state, state, events)
+                .await
         }
 
         async fn replay(

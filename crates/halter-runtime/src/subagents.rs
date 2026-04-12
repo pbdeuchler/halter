@@ -13,6 +13,7 @@ use halter_protocol::{
     SessionEvent, SessionEventPayload, SessionId, SpawnSubagentRequest, SubagentState,
     SubagentStatus, Turn, TurnId, Usage, WaitSubagentRequest, WaitSubagentResponse,
 };
+use halter_session::SessionCommitConflict;
 use halter_tools::{SubagentControl, SubagentParentContext};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -63,6 +64,8 @@ struct TurnOutcome {
     usage: Option<Usage>,
     error: Option<String>,
 }
+
+const PARENT_HOOK_DISPATCH_MAX_RETRIES: usize = 3;
 
 impl RuntimeSubagentControl {
     #[must_use]
@@ -308,69 +311,95 @@ impl RuntimeSubagentControl {
         dispatch: crate::ExecutedHookDispatch,
         block_is_ignored: bool,
     ) -> anyhow::Result<Option<String>> {
-        let Some(mut stored) = self
-            .inner
-            .services
-            .sessions
-            .load_session(parent_session_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        let mut events = Vec::new();
-        events.extend(
-            dispatch
-                .preview_runs
-                .iter()
-                .cloned()
-                .map(|run| SessionEvent {
-                    session_id: parent_session_id.clone(),
-                    sequence: 0,
-                    delivery: halter_protocol::Delivery::Lossless,
-                    payload: SessionEventPayload::HookStarted { run },
-                }),
-        );
-        events.extend(
-            dispatch
-                .completed_runs
-                .iter()
-                .cloned()
-                .map(|run| SessionEvent {
-                    session_id: parent_session_id.clone(),
-                    sequence: 0,
-                    delivery: halter_protocol::Delivery::Lossless,
-                    payload: SessionEventPayload::HookCompleted { run },
-                }),
-        );
-
-        if block_is_ignored
-            && (dispatch.merged.block_reason.is_some() || dispatch.merged.stop_reason.is_some())
-        {
-            warn!(
-                session_id = %parent_session_id,
-                "hooks.ignored_block"
-            );
-        }
-
-        for message in apply_hook_side_effects(&mut stored.state, &dispatch) {
-            events.push(SessionEvent {
-                session_id: parent_session_id.clone(),
-                sequence: 0,
-                delivery: halter_protocol::Delivery::Lossless,
-                payload: SessionEventPayload::MessageItem { message },
-            });
-        }
-
         let continuation = dispatch.merged.block_reason.clone();
-        let committed = self
-            .inner
-            .services
-            .sessions
-            .commit(parent_session_id, None, Some(stored.state), events)
-            .await?;
-        for event in committed {
-            self.inner.services.event_bus.publish(event);
+        for attempt in 0..=PARENT_HOOK_DISPATCH_MAX_RETRIES {
+            let Some(stored) = self
+                .inner
+                .services
+                .sessions
+                .load_session(parent_session_id)
+                .await?
+            else {
+                return Ok(None);
+            };
+
+            let expected_state = stored.state.clone();
+            let mut next_state = expected_state.clone();
+            let mut events = Vec::new();
+            events.extend(
+                dispatch
+                    .preview_runs
+                    .iter()
+                    .cloned()
+                    .map(|run| SessionEvent {
+                        session_id: parent_session_id.clone(),
+                        sequence: 0,
+                        delivery: halter_protocol::Delivery::Lossless,
+                        payload: SessionEventPayload::HookStarted { run },
+                    }),
+            );
+            events.extend(
+                dispatch
+                    .completed_runs
+                    .iter()
+                    .cloned()
+                    .map(|run| SessionEvent {
+                        session_id: parent_session_id.clone(),
+                        sequence: 0,
+                        delivery: halter_protocol::Delivery::Lossless,
+                        payload: SessionEventPayload::HookCompleted { run },
+                    }),
+            );
+            for message in apply_hook_side_effects(&mut next_state, &dispatch) {
+                events.push(SessionEvent {
+                    session_id: parent_session_id.clone(),
+                    sequence: 0,
+                    delivery: halter_protocol::Delivery::Lossless,
+                    payload: SessionEventPayload::MessageItem { message },
+                });
+            }
+
+            match self
+                .inner
+                .services
+                .sessions
+                .commit(
+                    parent_session_id,
+                    None,
+                    Some(expected_state),
+                    Some(next_state),
+                    events,
+                )
+                .await
+            {
+                Ok(committed) => {
+                    if block_is_ignored
+                        && (dispatch.merged.block_reason.is_some()
+                            || dispatch.merged.stop_reason.is_some())
+                    {
+                        warn!(
+                            session_id = %parent_session_id,
+                            "hooks.ignored_block"
+                        );
+                    }
+                    for event in committed {
+                        self.inner.services.event_bus.publish(event);
+                    }
+                    return Ok(continuation);
+                }
+                Err(error)
+                    if error.downcast_ref::<SessionCommitConflict>().is_some()
+                        && attempt < PARENT_HOOK_DISPATCH_MAX_RETRIES =>
+                {
+                    warn!(
+                        session_id = %parent_session_id,
+                        attempt = attempt + 1,
+                        "hooks.parent_state_conflict_retry"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         Ok(continuation)
@@ -395,9 +424,15 @@ impl RuntimeSubagentControl {
             self.inner.services.clone(),
             parent.blueprint.session_id.clone(),
         )?;
+        let fired_hook_ids = stored
+            .state
+            .fired_hook_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         let dispatch = run_subagent_start(
             &session,
-            &stored.state,
+            &fired_hook_ids,
             HookInvocationContext {
                 turn_id: &turn_id,
                 model: &stored.blueprint.default_model,
@@ -409,6 +444,7 @@ impl RuntimeSubagentControl {
                 .as_ref()
                 .map_or("default", |agent_type| agent_type.0.as_str()),
             &parent.blueprint.session_id,
+            None,
         )
         .await?;
         let _ = self
@@ -440,9 +476,15 @@ impl RuntimeSubagentControl {
             .services
             .sessions
             .transcript_path(child_session_id);
+        let fired_hook_ids = stored
+            .state
+            .fired_hook_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         let dispatch = run_subagent_stop(
             &session,
-            &stored.state,
+            &fired_hook_ids,
             HookInvocationContext {
                 turn_id: &turn_id,
                 model: &stored.blueprint.default_model,
@@ -451,6 +493,7 @@ impl RuntimeSubagentControl {
             agent_id,
             agent_type.map_or("default", |agent_type| agent_type.0.as_str()),
             transcript_path.as_deref(),
+            None,
         )
         .await?;
         self.run_parent_hook_dispatch(parent_session_id, dispatch, false)

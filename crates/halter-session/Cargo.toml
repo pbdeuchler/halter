@@ -19,6 +19,7 @@ async-trait.workspace = true
 halter-protocol = { path = "../halter-protocol" }
 rusqlite = { workspace = true, optional = true }
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

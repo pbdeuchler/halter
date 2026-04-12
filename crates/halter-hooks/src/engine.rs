@@ -297,11 +297,12 @@ impl fmt::Debug for ConfiguredHandlerConfig {
 }
 
 fn build_preview_run(handler: &ConfiguredHandler) -> HookRunSummary {
+    let started_at = Utc::now();
     HookRunSummary {
         run_id: format!(
             "{}:{}",
             handler.handler_id,
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            started_at.timestamp_nanos_opt().unwrap_or_default()
         ),
         event_name: handler.event_name.canonical_name().to_owned(),
         handler_type: handler.handler_type,
@@ -309,7 +310,7 @@ fn build_preview_run(handler: &ConfiguredHandler) -> HookRunSummary {
         plugin_root: handler.plugin_root.clone(),
         status: HookRunStatus::Running,
         status_message: handler.status_message.clone(),
-        started_at: Utc::now(),
+        started_at,
         completed_at: None,
         duration_ms: None,
         entries: Vec::new(),
@@ -493,6 +494,38 @@ mod tests {
         };
 
         assert!(handler.matches(&request));
+    }
+
+    #[test]
+    fn if_condition_matches_regex_patterns_and_string_inputs() {
+        let request = HookDispatchRequest {
+            event_name: HookEventName::PreToolUse,
+            matcher_value: Some("Read".to_owned()),
+            payload: json!({
+                "tool_name": "Read",
+                "tool_input": "src/lib.rs",
+            }),
+            fired_hook_ids: BTreeSet::new(),
+        };
+
+        assert!(matches_if_condition("^Read$", &request));
+        assert!(matches_if_condition("Read(^src/.*\\.rs$)", &request));
+        assert!(!matches_if_condition("Write(src/.*)", &request));
+    }
+
+    #[test]
+    fn if_condition_rejects_non_tool_payloads_and_unbalanced_groups() {
+        let request = HookDispatchRequest {
+            event_name: HookEventName::Notification,
+            matcher_value: None,
+            payload: json!({
+                "message": "hello"
+            }),
+            fired_hook_ids: BTreeSet::new(),
+        };
+
+        assert!(!matches_if_condition("Shell(git *)", &request));
+        assert!(!matches_if_condition("Shell(", &request));
     }
 
     #[test]

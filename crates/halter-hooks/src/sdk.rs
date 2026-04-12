@@ -348,3 +348,115 @@ impl RegisteredHooks {
         crate::Hooks::from_registered(self.hooks.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::{ConfiguredHandlerConfig, HookDispatchRequest, Hooks};
+
+    #[test]
+    fn registered_hooks_validate_rejects_invalid_matcher() {
+        let mut hooks = RegisteredHooks::default();
+        hooks.register(
+            PluginId::from("plugin"),
+            RegisteredHookPriority::AfterPlugins,
+            Hook::callback(HookEventName::Stop, |_input| async {
+                HookResponse::passthrough()
+            })
+            .with_matcher("["),
+        );
+
+        let error = hooks.validate().expect_err("invalid matcher should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to compile sdk hook matcher")
+        );
+    }
+
+    #[test]
+    fn hook_response_builders_populate_output() {
+        let output = HookResponse::block("blocked")
+            .with_system_message("system")
+            .with_additional_context("context")
+            .with_updated_input(json!({"command": "echo hi"}))
+            .with_updated_output(json!({"ok": true}))
+            .with_permission(PermissionDecision::Deny, Some("nope"))
+            .with_suppress_output(true)
+            .into_output();
+
+        assert_eq!(output.decision, Some(HookDecision::Block));
+        assert_eq!(output.reason.as_deref(), Some("blocked"));
+        assert_eq!(output.system_message.as_deref(), Some("system"));
+        assert_eq!(output.suppress_output, Some(true));
+
+        let specific = output.hook_specific_output.expect("hook specific output");
+        assert_eq!(specific.additional_context.as_deref(), Some("context"));
+        assert_eq!(specific.updated_input, Some(json!({"command": "echo hi"})));
+        assert_eq!(specific.updated_mcp_tool_output, Some(json!({"ok": true})));
+        assert_eq!(specific.permission_decision, Some(PermissionDecision::Deny));
+        assert_eq!(specific.permission_decision_reason.as_deref(), Some("nope"));
+    }
+
+    #[tokio::test]
+    async fn hook_function_factory_creates_fresh_callback_per_instantiate() {
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let counter = factory_calls.clone();
+        let hook = Hook::function(HookEventName::Stop, move || {
+            let instance = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            move |_input| async move {
+                Ok(HookResponse::passthrough()
+                    .with_system_message(format!("factory-instance-{instance}")))
+            }
+        });
+
+        let mut registered = RegisteredHooks::default();
+        registered.register(
+            PluginId::from("plugin"),
+            RegisteredHookPriority::AfterPlugins,
+            hook,
+        );
+
+        let first_output =
+            invoke_function_handler(&registered.instantiate().expect("instantiate")).await;
+        let second_output =
+            invoke_function_handler(&registered.instantiate().expect("instantiate")).await;
+
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(first_output.as_deref(), Some("factory-instance-1"));
+        assert_eq!(second_output.as_deref(), Some("factory-instance-2"));
+    }
+
+    async fn invoke_function_handler(hooks: &Hooks) -> Option<String> {
+        let prepared = hooks.prepare(HookDispatchRequest {
+            event_name: HookEventName::Stop,
+            matcher_value: None,
+            payload: json!({}),
+            fired_hook_ids: BTreeSet::new(),
+        });
+        let handler = prepared
+            .matched_handlers()
+            .first()
+            .cloned()
+            .expect("function handler");
+
+        let ConfiguredHandlerConfig::Function(callback) = handler.config else {
+            panic!("expected function handler");
+        };
+        let response = callback(HookInput {
+            event_name: HookEventName::Stop,
+            matcher_value: None,
+            payload: json!({}),
+        })
+        .await
+        .expect("callback response");
+
+        response.into_output().system_message
+    }
+}

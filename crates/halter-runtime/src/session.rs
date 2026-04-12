@@ -1,6 +1,6 @@
 // pattern: Imperative Shell
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,10 +12,10 @@ use futures::stream::{BoxStream, StreamExt};
 use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
     AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash, Delivery,
-    HookSessionStartSource, Message, MessageId, ModelId, ObservedState, PendingToolCall,
-    PromptSegment, PromptSegmentId, ProviderError, ProviderRequest, ReplayMeta, ResourceSnapshot,
-    SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
-    StreamEvent, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult,
+    HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState,
+    PendingToolCall, PromptSegment, PromptSegmentId, ProviderError, ProviderRequest, ReplayMeta,
+    ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState,
+    StopReason, StreamEvent, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult,
     ToolResultMessage, Turn, TurnId, Usage, Volatility,
 };
 use halter_providers::ModelRegistry;
@@ -68,12 +68,16 @@ pub struct ResourceHandle {
 struct ResourceState {
     snapshot: ResourceSnapshot,
     hooks: Arc<Hooks>,
-    hook_warnings: Arc<Vec<String>>,
+    hook_warnings: Arc<Vec<HookWarning>>,
 }
 
 impl ResourceHandle {
     #[must_use]
-    pub fn new(snapshot: ResourceSnapshot, hooks: Arc<Hooks>, hook_warnings: Vec<String>) -> Self {
+    pub fn new(
+        snapshot: ResourceSnapshot,
+        hooks: Arc<Hooks>,
+        hook_warnings: Vec<HookWarning>,
+    ) -> Self {
         Self {
             current: Arc::new(ArcSwap::from_pointee(ResourceState {
                 snapshot,
@@ -94,7 +98,7 @@ impl ResourceHandle {
     }
 
     #[must_use]
-    pub fn hook_warnings(&self) -> Arc<Vec<String>> {
+    pub fn hook_warnings(&self) -> Arc<Vec<HookWarning>> {
         self.current.load().hook_warnings.clone()
     }
 
@@ -102,7 +106,7 @@ impl ResourceHandle {
         &self,
         snapshot: ResourceSnapshot,
         hooks: Arc<Hooks>,
-        hook_warnings: Vec<String>,
+        hook_warnings: Vec<HookWarning>,
     ) {
         info!(revision = %snapshot.revision, "replaced resource snapshot");
         self.current.store(Arc::new(ResourceState {
@@ -239,6 +243,22 @@ impl LiveTurnStream {
     }
 }
 
+fn live_hook_reporter(
+    live: Option<LiveTurnStream>,
+) -> Option<crate::hooks_runtime::HookEventReporter> {
+    live.map(|live| {
+        Arc::new(move |payload| {
+            live.emit_payload(payload);
+        }) as crate::hooks_runtime::HookEventReporter
+    })
+}
+
+fn track_fired_hook_ids(fired_hook_ids: &mut BTreeSet<String>, dispatch: &ExecutedHookDispatch) {
+    for fired_hook_id in &dispatch.fired_hook_ids {
+        fired_hook_ids.insert(fired_hook_id.clone());
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionRuntime {
     services: Arc<RuntimeServices>,
@@ -288,7 +308,7 @@ impl SessionRuntime {
             stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
             self.services
                 .sessions
-                .commit(session_id, None, Some(stored.state), Vec::new())
+                .commit(session_id, None, None, Some(stored.state), Vec::new())
                 .await?;
             return Ok(Some(HalterSession::new(
                 self.services.clone(),
@@ -308,7 +328,7 @@ impl SessionRuntime {
         &self,
         snapshot: ResourceSnapshot,
         hooks: Arc<Hooks>,
-        hook_warnings: Vec<String>,
+        hook_warnings: Vec<HookWarning>,
     ) {
         self.services
             .resources
@@ -483,7 +503,12 @@ impl HalterSession {
             model: &stored.blueprint.default_model,
             working_dir: &stored.blueprint.working_dir,
         };
-        let dispatch = run_session_end(self, &state, hook_ctx, reason).await?;
+        let fired_hook_ids = state
+            .fired_hook_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let dispatch = run_session_end(self, &fired_hook_ids, hook_ctx, reason, None).await?;
         self.record_hook_dispatch(&mut events, &dispatch, None);
         if dispatch.merged.block_reason.is_some() || dispatch.merged.stop_reason.is_some() {
             warn!(session_id = %self.session_id, reason, "hooks.ignored_block");
@@ -501,6 +526,7 @@ impl HalterSession {
             None,
         );
         let _ = self.commit_and_publish(None, Some(state), events).await?;
+        evict_session_hooks(&self.services, &self.session_id);
         Ok(())
     }
 
@@ -523,7 +549,20 @@ impl HalterSession {
             model: &stored.blueprint.default_model,
             working_dir: &stored.blueprint.working_dir,
         };
-        let dispatch = run_notification(self, &state, hook_ctx, notification_type, message).await?;
+        let fired_hook_ids = state
+            .fired_hook_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let dispatch = run_notification(
+            self,
+            &fired_hook_ids,
+            hook_ctx,
+            notification_type,
+            message,
+            None,
+        )
+        .await?;
         let mut events = Vec::new();
         self.record_hook_dispatch(&mut events, &dispatch, None);
         for message in apply_hook_side_effects(&mut state, &dispatch) {
@@ -561,8 +600,21 @@ impl HalterSession {
             model: &stored.blueprint.default_model,
             working_dir: &stored.blueprint.working_dir,
         };
-        let pre_dispatch =
-            run_pre_compact(self, &state, hook_ctx, trigger, custom_instructions).await?;
+        let mut fired_hook_ids = state
+            .fired_hook_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let pre_dispatch = run_pre_compact(
+            self,
+            &fired_hook_ids,
+            hook_ctx,
+            trigger,
+            custom_instructions,
+            None,
+        )
+        .await?;
+        track_fired_hook_ids(&mut fired_hook_ids, &pre_dispatch);
         self.record_hook_dispatch(&mut events, &pre_dispatch, None);
         for message in apply_hook_side_effects(&mut state, &pre_dispatch) {
             self.push_event(
@@ -586,7 +638,8 @@ impl HalterSession {
             None,
         );
 
-        let post_dispatch = run_post_compact(self, &state, hook_ctx, trigger, &summary).await?;
+        let post_dispatch =
+            run_post_compact(self, &fired_hook_ids, hook_ctx, trigger, &summary, None).await?;
         self.record_hook_dispatch(&mut events, &post_dispatch, None);
         for message in apply_hook_side_effects(&mut state, &post_dispatch) {
             self.push_event(
@@ -617,6 +670,12 @@ impl HalterSession {
         )];
         let mut turn_usage = Usage::default();
         let mut tool_calls_executed = 0u32;
+        let mut fired_hook_ids = state
+            .fired_hook_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let hook_reporter = live_hook_reporter(live.clone());
         let hook_model = turn
             .default_model
             .clone()
@@ -630,14 +689,24 @@ impl HalterSession {
         for warning in std::mem::take(&mut state.pending_warning_messages) {
             self.push_event(
                 &mut events,
-                SessionEventPayload::Warning { message: warning },
+                SessionEventPayload::Warning {
+                    message: format_hook_warning(&warning),
+                },
                 live.as_ref(),
             );
         }
 
         if let Some(source) = state.pending_session_start_source.take() {
-            let hook_dispatch = run_session_start(self, &state, hook_ctx, source).await?;
-            self.record_hook_dispatch(&mut events, &hook_dispatch, live.as_ref());
+            let hook_dispatch = run_session_start(
+                self,
+                &fired_hook_ids,
+                hook_ctx,
+                source,
+                hook_reporter.clone(),
+            )
+            .await?;
+            track_fired_hook_ids(&mut fired_hook_ids, &hook_dispatch);
+            self.record_hook_dispatch(&mut events, &hook_dispatch, None);
             if hook_dispatch.merged.block_reason.is_some()
                 || hook_dispatch.merged.stop_reason.is_some()
             {
@@ -656,9 +725,16 @@ impl HalterSession {
             }
         }
 
-        let prompt_dispatch =
-            run_user_prompt_submit(self, &state, hook_ctx, &turn.user_message.plain_text()).await?;
-        self.record_hook_dispatch(&mut events, &prompt_dispatch, live.as_ref());
+        let prompt_dispatch = run_user_prompt_submit(
+            self,
+            &fired_hook_ids,
+            hook_ctx,
+            &turn.user_message.plain_text(),
+            hook_reporter.clone(),
+        )
+        .await?;
+        track_fired_hook_ids(&mut fired_hook_ids, &prompt_dispatch);
+        self.record_hook_dispatch(&mut events, &prompt_dispatch, None);
         for message in apply_hook_side_effects(&mut state, &prompt_dispatch) {
             self.push_event(
                 &mut events,
@@ -771,7 +847,7 @@ impl HalterSession {
             if tool_calls.is_empty() {
                 let stop_dispatch = run_stop(
                     self,
-                    &state,
+                    &fired_hook_ids,
                     HookInvocationContext {
                         turn_id: &turn.id,
                         model: &model.id,
@@ -779,9 +855,11 @@ impl HalterSession {
                     },
                     Some(&materialized.message),
                     true,
+                    hook_reporter.clone(),
                 )
                 .await?;
-                self.record_hook_dispatch(&mut events, &stop_dispatch, live.as_ref());
+                track_fired_hook_ids(&mut fired_hook_ids, &stop_dispatch);
+                self.record_hook_dispatch(&mut events, &stop_dispatch, None);
                 for message in apply_hook_side_effects(&mut state, &stop_dispatch) {
                     self.push_event(
                         &mut events,
@@ -853,6 +931,8 @@ impl HalterSession {
                     &selected_models.default_model,
                     &selected_models.subagent_model,
                     &turn.id,
+                    &mut fired_hook_ids,
+                    hook_reporter.clone(),
                     &mut state,
                     tool_calls,
                     live.clone(),
@@ -870,6 +950,8 @@ impl HalterSession {
         effective_model: &ModelId,
         effective_subagent_model: &ModelId,
         turn_id: &halter_protocol::TurnId,
+        fired_hook_ids: &mut BTreeSet<String>,
+        hook_reporter: Option<crate::hooks_runtime::HookEventReporter>,
         state: &mut SessionState,
         tool_calls: Vec<ToolCall>,
         live: Option<LiveTurnStream>,
@@ -879,16 +961,18 @@ impl HalterSession {
         for mut call in tool_calls {
             let pre_dispatch = run_pre_tool_use(
                 self,
-                state,
+                fired_hook_ids,
                 HookInvocationContext {
                     turn_id,
                     model: effective_model,
                     working_dir: &blueprint.working_dir,
                 },
                 &call,
+                hook_reporter.clone(),
             )
             .await?;
-            self.record_hook_dispatch(&mut events, &pre_dispatch, live.as_ref());
+            track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
+            self.record_hook_dispatch(&mut events, &pre_dispatch, None);
             for message in apply_hook_side_effects(state, &pre_dispatch) {
                 self.push_event(
                     &mut events,
@@ -1005,7 +1089,7 @@ impl HalterSession {
             if error.is_none() {
                 let post_dispatch = run_post_tool_use(
                     self,
-                    state,
+                    fired_hook_ids,
                     HookInvocationContext {
                         turn_id,
                         model: effective_model,
@@ -1013,9 +1097,11 @@ impl HalterSession {
                     },
                     &call,
                     &content,
+                    hook_reporter.clone(),
                 )
                 .await?;
-                self.record_hook_dispatch(&mut events, &post_dispatch, live.as_ref());
+                track_fired_hook_ids(fired_hook_ids, &post_dispatch);
+                self.record_hook_dispatch(&mut events, &post_dispatch, None);
                 for message in apply_hook_side_effects(state, &post_dispatch) {
                     self.push_event(
                         &mut events,
@@ -1029,7 +1115,7 @@ impl HalterSession {
             } else if let Some(tool_error) = error.as_ref() {
                 let post_dispatch = run_post_tool_use_failure(
                     self,
-                    state,
+                    fired_hook_ids,
                     HookInvocationContext {
                         turn_id,
                         model: effective_model,
@@ -1037,9 +1123,11 @@ impl HalterSession {
                     },
                     &call,
                     tool_error,
+                    hook_reporter.clone(),
                 )
                 .await?;
-                self.record_hook_dispatch(&mut events, &post_dispatch, live.as_ref());
+                track_fired_hook_ids(fired_hook_ids, &post_dispatch);
+                self.record_hook_dispatch(&mut events, &post_dispatch, None);
                 for message in apply_hook_side_effects(state, &post_dispatch) {
                     self.push_event(
                         &mut events,
@@ -1093,7 +1181,7 @@ impl HalterSession {
         let committed = self
             .services
             .sessions
-            .commit(&self.session_id, snapshot, state, events)
+            .commit(&self.session_id, snapshot, None, state, events)
             .await?;
         for event in &committed {
             self.services.event_bus.publish(event.clone());
@@ -1563,7 +1651,7 @@ pub(crate) async fn create_session_seeded(
     };
     let committed = services
         .sessions
-        .commit(&session_id, None, None, vec![started])
+        .commit(&session_id, None, None, None, vec![started])
         .await?;
     for event in committed {
         services.event_bus.publish(event);
@@ -1576,17 +1664,58 @@ fn lookup_or_create_session_hooks(
     services: &Arc<RuntimeServices>,
     session_id: &SessionId,
 ) -> anyhow::Result<Arc<Hooks>> {
-    let mut store = services
-        .session_hook_store
-        .lock()
-        .expect("session hook store lock poisoned");
-    if let Some(existing) = store.get(session_id) {
-        return Ok(existing.clone());
-    }
-
     let hooks = Arc::new(services.registered_hooks.instantiate()?);
-    store.insert(session_id.clone(), hooks.clone());
-    Ok(hooks)
+    match services.session_hook_store.lock() {
+        Ok(mut store) => {
+            if let Some(existing) = store.get(session_id) {
+                return Ok(existing.clone());
+            }
+            store.insert(session_id.clone(), hooks.clone());
+            Ok(hooks)
+        }
+        Err(_) => {
+            error!(
+                session_id = %session_id,
+                "session hook store lock poisoned; rebuilding uncached session hooks"
+            );
+            Ok(hooks)
+        }
+    }
+}
+
+fn evict_session_hooks(services: &Arc<RuntimeServices>, session_id: &SessionId) {
+    match services.session_hook_store.lock() {
+        Ok(mut store) => {
+            store.remove(session_id);
+        }
+        Err(_) => {
+            error!(
+                session_id = %session_id,
+                "session hook store lock poisoned; skipping session hook eviction"
+            );
+        }
+    }
+}
+
+fn format_hook_warning(warning: &HookWarning) -> String {
+    let mut prefix = String::new();
+    if let Some(plugin_name) = warning.plugin_name.as_deref() {
+        prefix.push_str(&format!("plugin '{plugin_name}' "));
+    }
+    prefix.push_str("hook warning");
+    if !warning.category.trim().is_empty() {
+        prefix.push_str(&format!(" [{}]", warning.category));
+    }
+    if let Some(source_path) = warning.source_path.as_ref() {
+        prefix.push_str(&format!(" at {}", source_path.display()));
+    }
+    format!("{prefix}: {}", warning.message)
+}
+
+impl Drop for HalterSession {
+    fn drop(&mut self) {
+        evict_session_hooks(&self.services, &self.session_id);
+    }
 }
 
 fn observe_state(working_dir: PathBuf) -> ObservedState {
@@ -1628,7 +1757,6 @@ impl Default for RuntimeServices {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1636,8 +1764,7 @@ mod tests {
     use futures::stream::{self, BoxStream};
     use futures::{StreamExt, TryStreamExt};
     use halter_hooks::{
-        Hook, HookEventName, HookRegistrySource, HookResponse, HooksFile, RegisteredHookPriority,
-        RegisteredHooks,
+        Hook, HookEventName, HookResponse, HooksFile, RegisteredHookPriority, RegisteredHooks,
     };
     use halter_protocol::{
         ApiKind, BlockId, HookHandlerType, HookRunStatus, HookSessionStartSource, Message, ModelId,
@@ -1650,8 +1777,129 @@ mod tests {
         DefaultToolPolicy, PolicySettings, Tool, ToolContext, register_builtin_tools,
     };
     use serde_json::json;
+    use tokio::sync::Notify;
 
     use super::*;
+    use test_support::{
+        configured_services, empty_hooks, install_file_hooks, new_session, resolved_test_model,
+    };
+
+    mod test_support {
+        use std::path::Path;
+        use std::sync::Arc;
+
+        use halter_hooks::{HookRegistrySource, Hooks, HooksFile};
+        use halter_protocol::{
+            ApiKind, ModelId, ModelRole, PluginId, ProviderKind, ProviderName, ResolvedModel,
+            ResourceSnapshot,
+        };
+        use halter_providers::Provider;
+        use halter_tools::{DefaultToolPolicy, PolicySettings};
+
+        use super::{HalterSession, ModelRegistry, RuntimeServices, SessionInit, SessionRuntime};
+
+        pub(super) fn configured_services(
+            provider: Arc<dyn Provider>,
+            working_dir: &Path,
+        ) -> Arc<RuntimeServices> {
+            let mut services = RuntimeServices::default();
+            let mut models = ModelRegistry::new();
+            models.set_default_model(ResolvedModel {
+                role: ModelRole::default(),
+                id: ModelId::from("default"),
+                provider: ProviderName::from("fake"),
+                provider_kind: ProviderKind::Fake,
+                api_kind: ApiKind::Fake,
+                model: "halter/fake".to_owned(),
+                max_input_tokens: Some(32_000),
+                max_output_tokens: Some(4_096),
+                reasoning: None,
+            });
+            models.set_subagent_model(ResolvedModel {
+                role: ModelRole::subagent(),
+                id: ModelId::from("subagent"),
+                provider: ProviderName::from("fake"),
+                provider_kind: ProviderKind::Fake,
+                api_kind: ApiKind::Fake,
+                model: "halter/fake".to_owned(),
+                max_input_tokens: Some(32_000),
+                max_output_tokens: Some(4_096),
+                reasoning: None,
+            });
+            models.set_small_model(ResolvedModel {
+                role: ModelRole::small(),
+                id: ModelId::from("small"),
+                provider: ProviderName::from("fake"),
+                provider_kind: ProviderKind::Fake,
+                api_kind: ApiKind::Fake,
+                model: "halter/fake-small".to_owned(),
+                max_input_tokens: Some(32_000),
+                max_output_tokens: Some(4_096),
+                reasoning: None,
+            });
+            models.register_provider(ProviderName::from("fake"), provider);
+            services.models = Arc::new(models);
+            services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
+                allowed_write_roots: vec![working_dir.to_path_buf()],
+                ..PolicySettings::default()
+            }));
+            Arc::new(services)
+        }
+
+        pub(super) async fn new_session(
+            runtime: &SessionRuntime,
+            working_dir: &Path,
+        ) -> HalterSession {
+            runtime
+                .new_session(SessionInit {
+                    working_dir: working_dir.to_path_buf(),
+                    ..SessionInit::default()
+                })
+                .await
+                .expect("session")
+        }
+
+        pub(super) fn install_file_hooks(
+            services: &Arc<RuntimeServices>,
+            working_dir: &Path,
+            hooks_file: HooksFile,
+        ) {
+            services.resources.replace(
+                ResourceSnapshot::empty(),
+                Arc::new(Hooks::from_sources(vec![HookRegistrySource {
+                    plugin_id: PluginId::from("test-plugin"),
+                    plugin_root: working_dir.to_path_buf(),
+                    source_path: working_dir.join("hooks/hooks.json"),
+                    allowed_http_hosts: Vec::new(),
+                    allowed_env_vars: Vec::new(),
+                    file: hooks_file,
+                }])),
+                Vec::new(),
+            );
+        }
+
+        pub(super) fn empty_hooks() -> Arc<Hooks> {
+            Arc::new(Hooks::default())
+        }
+
+        pub(super) fn resolved_test_model(id: &str, provider: &str, model: &str) -> ResolvedModel {
+            ResolvedModel {
+                role: if id == "subagent" {
+                    ModelRole::subagent()
+                } else {
+                    ModelRole::default()
+                },
+                id: ModelId::from(id),
+                provider: ProviderName::from(provider),
+                provider_kind: ProviderKind::Fake,
+                api_kind: ApiKind::Fake,
+                model: model.to_owned(),
+                max_input_tokens: Some(32_000),
+                max_output_tokens: Some(4_096),
+                reasoning: None,
+            }
+        }
+    }
 
     #[tokio::test]
     async fn fake_provider_turn_produces_canonical_events() {
@@ -1711,13 +1959,7 @@ mod tests {
         let services = configured_services(Arc::new(ToolLoopProvider), temp.path());
         register_builtin_tools(&services.tools, &[]);
         let runtime = SessionRuntime::new(services.clone());
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let events = session
             .submit_turn(Turn::user("write a note"))
@@ -1771,27 +2013,10 @@ mod tests {
         )
         .expect("parse hooks");
         assert!(warnings.is_empty());
-        services.resources.replace(
-            ResourceSnapshot::empty(),
-            Arc::new(Hooks::from_sources(vec![HookRegistrySource {
-                plugin_id: PluginId::from("test-plugin"),
-                plugin_root: temp.path().to_path_buf(),
-                source_path: temp.path().join("hooks/hooks.json"),
-                allowed_http_hosts: Vec::new(),
-                allowed_env_vars: Vec::new(),
-                file: hooks_file,
-            }])),
-            Vec::new(),
-        );
+        install_file_hooks(&services, temp.path(), hooks_file);
 
         let runtime = SessionRuntime::new(services.clone());
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let events = session
             .submit_turn(Turn::user("write a note"))
@@ -1845,13 +2070,7 @@ mod tests {
             .registered_hooks = Arc::new(registered);
 
         let runtime = SessionRuntime::new(services.clone());
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let events = session
             .submit_turn(Turn::user("write a note"))
@@ -1926,27 +2145,11 @@ mod tests {
         )
         .expect("parse hooks");
         assert!(warnings.is_empty());
-        services.resources.replace(
-            ResourceSnapshot::empty(),
-            Arc::new(Hooks::from_sources(vec![HookRegistrySource {
-                plugin_id: PluginId::from("test-plugin"),
-                plugin_root: temp.path().to_path_buf(),
-                source_path: temp.path().join("hooks/hooks.json"),
-                allowed_http_hosts: Vec::new(),
-                allowed_env_vars: Vec::new(),
-                file: hooks_file,
-            }])),
-            Vec::new(),
-        );
+        let services = Arc::new(services);
+        install_file_hooks(&services, temp.path(), hooks_file);
 
-        let runtime = SessionRuntime::new(Arc::new(services));
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let runtime = SessionRuntime::new(services);
+        let session = new_session(&runtime, temp.path()).await;
 
         let events = session
             .submit_turn(Turn::user("blocked prompt"))
@@ -1997,20 +2200,8 @@ mod tests {
             .registered_hooks = Arc::new(registered);
 
         let runtime = SessionRuntime::new(services.clone());
-        let session_a = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session a");
-        let session_b = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session b");
+        let session_a = new_session(&runtime, temp.path()).await;
+        let session_b = new_session(&runtime, temp.path()).await;
 
         let events_a1 = session_a
             .submit_turn(Turn::user("first"))
@@ -2065,17 +2256,15 @@ mod tests {
         let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
         services.resources.replace(
             ResourceSnapshot::empty(),
-            Arc::new(Hooks::default()),
-            vec!["hook warning".to_owned()],
+            empty_hooks(),
+            vec![halter_protocol::HookWarning {
+                category: "test".to_owned(),
+                message: "hook warning".to_owned(),
+                ..halter_protocol::HookWarning::default()
+            }],
         );
         let runtime = SessionRuntime::new(services);
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let events = session
             .submit_turn(Turn::user("hello"))
@@ -2087,8 +2276,77 @@ mod tests {
 
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::Warning { message } if message == "hook warning"
+            SessionEventPayload::Warning { message } if message.contains("hook warning")
         )));
+    }
+
+    #[tokio::test]
+    async fn hook_started_events_stream_before_hook_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let notify = Arc::new(Notify::new());
+        let mut services = RuntimeServices::default();
+        let mut hooks = RegisteredHooks::default();
+        hooks.register(
+            PluginId::from("test-plugin"),
+            RegisteredHookPriority::AfterPlugins,
+            Hook::callback(HookEventName::UserPromptSubmit, {
+                let notify = notify.clone();
+                move |_input| {
+                    let notify = notify.clone();
+                    async move {
+                        notify.notified().await;
+                        HookResponse::passthrough()
+                    }
+                }
+            }),
+        );
+        services.registered_hooks = Arc::new(hooks);
+        let mut models = ModelRegistry::new();
+        models.set_default_model(resolved_test_model("default", "fake", "default/model"));
+        models.set_subagent_model(resolved_test_model("subagent", "fake", "subagent/model"));
+        models.register_provider(
+            ProviderName::from("fake"),
+            Arc::new(FakeProvider::default()),
+        );
+        services.models = Arc::new(models);
+        services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
+            allowed_write_roots: vec![temp.path().to_path_buf()],
+            ..PolicySettings::default()
+        }));
+
+        let runtime = SessionRuntime::new(Arc::new(services));
+        let session = new_session(&runtime, temp.path()).await;
+
+        let mut stream = session
+            .submit_turn(Turn::user("hello"))
+            .await
+            .expect("submit turn");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.try_next())
+            .await
+            .expect("first event timeout")
+            .expect("first event result")
+            .expect("first event");
+        assert!(matches!(
+            first.payload,
+            SessionEventPayload::HookStarted { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.try_next())
+                .await
+                .is_err()
+        );
+
+        notify.notify_waiters();
+        let events = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::HookCompleted { .. }))
+        );
     }
 
     #[tokio::test]
@@ -2114,26 +2372,9 @@ mod tests {
         )
         .expect("parse hooks");
         assert!(warnings.is_empty());
-        services.resources.replace(
-            ResourceSnapshot::empty(),
-            Arc::new(Hooks::from_sources(vec![HookRegistrySource {
-                plugin_id: PluginId::from("test-plugin"),
-                plugin_root: temp.path().to_path_buf(),
-                source_path: temp.path().join("hooks/hooks.json"),
-                allowed_http_hosts: Vec::new(),
-                allowed_env_vars: Vec::new(),
-                file: hooks_file,
-            }])),
-            Vec::new(),
-        );
+        install_file_hooks(&services, temp.path(), hooks_file);
         let runtime = SessionRuntime::new(services.clone());
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         session
             .notify("policy", "denied")
@@ -2152,13 +2393,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
         let runtime = SessionRuntime::new(services.clone());
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let mut stored = services
             .sessions
@@ -2171,7 +2406,13 @@ mod tests {
             .collect();
         let _ = services
             .sessions
-            .commit(session.session_id(), None, Some(stored.state), Vec::new())
+            .commit(
+                session.session_id(),
+                None,
+                None,
+                Some(stored.state),
+                Vec::new(),
+            )
             .await
             .expect("commit state");
 
@@ -2206,13 +2447,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let services = configured_services(Arc::new(FailingProvider), temp.path());
         let runtime = SessionRuntime::new(services.clone());
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let events = session
             .submit_turn(Turn::user("will fail"))
@@ -2257,17 +2492,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
         let runtime = SessionRuntime::new(services.clone());
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let mut reloaded = ResourceSnapshot::empty();
         reloaded.revision = halter_protocol::Revision::from("reloaded");
-        runtime.replace_resources(reloaded, Arc::new(Hooks::default()), Vec::new());
+        runtime.replace_resources(reloaded, empty_hooks(), Vec::new());
 
         session
             .submit_turn(Turn::user("after reload"))
@@ -2345,13 +2574,7 @@ mod tests {
         }));
 
         let runtime = SessionRuntime::new(Arc::new(services));
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let events = session
             .submit_turn(Turn::user("hello").with_default_model("subagent"))
@@ -2385,13 +2608,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
         let runtime = SessionRuntime::new(services.clone());
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let events = session
             .submit_turn(Turn::user("hello").with_subagent_model("missing"))
@@ -2413,13 +2630,7 @@ mod tests {
         let services = configured_services(Arc::new(StreamingToolProvider), temp.path());
         services.tools.register(Arc::new(StreamingTestTool));
         let runtime = SessionRuntime::new(services);
-        let session = runtime
-            .new_session(SessionInit {
-                working_dir: temp.path().to_path_buf(),
-                ..SessionInit::default()
-            })
-            .await
-            .expect("session");
+        let session = new_session(&runtime, temp.path()).await;
 
         let mut events = session
             .submit_turn(Turn::user("stream tool output"))
@@ -2449,72 +2660,6 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
         );
-    }
-
-    fn configured_services(
-        provider: Arc<dyn Provider>,
-        working_dir: &Path,
-    ) -> Arc<RuntimeServices> {
-        let mut services = RuntimeServices::default();
-        let mut models = ModelRegistry::new();
-        models.set_default_model(ResolvedModel {
-            role: ModelRole::default(),
-            id: ModelId::from("default"),
-            provider: ProviderName::from("fake"),
-            provider_kind: ProviderKind::Fake,
-            api_kind: ApiKind::Fake,
-            model: "halter/fake".to_owned(),
-            max_input_tokens: Some(32_000),
-            max_output_tokens: Some(4_096),
-            reasoning: None,
-        });
-        models.set_subagent_model(ResolvedModel {
-            role: ModelRole::subagent(),
-            id: ModelId::from("subagent"),
-            provider: ProviderName::from("fake"),
-            provider_kind: ProviderKind::Fake,
-            api_kind: ApiKind::Fake,
-            model: "halter/fake".to_owned(),
-            max_input_tokens: Some(32_000),
-            max_output_tokens: Some(4_096),
-            reasoning: None,
-        });
-        models.set_small_model(ResolvedModel {
-            role: ModelRole::small(),
-            id: ModelId::from("small"),
-            provider: ProviderName::from("fake"),
-            provider_kind: ProviderKind::Fake,
-            api_kind: ApiKind::Fake,
-            model: "halter/fake-small".to_owned(),
-            max_input_tokens: Some(32_000),
-            max_output_tokens: Some(4_096),
-            reasoning: None,
-        });
-        models.register_provider(ProviderName::from("fake"), provider);
-        services.models = Arc::new(models);
-        services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
-            allowed_write_roots: vec![working_dir.to_path_buf()],
-            ..PolicySettings::default()
-        }));
-        Arc::new(services)
-    }
-
-    fn resolved_test_model(id: &str, provider: &str, model: &str) -> ResolvedModel {
-        ResolvedModel {
-            role: if id == "subagent" {
-                ModelRole::subagent()
-            } else {
-                ModelRole::default()
-            },
-            id: ModelId::from(id),
-            provider: ProviderName::from(provider),
-            provider_kind: ProviderKind::Fake,
-            api_kind: ApiKind::Fake,
-            model: model.to_owned(),
-            max_input_tokens: Some(32_000),
-            max_output_tokens: Some(4_096),
-            reasoning: None,
-        }
     }
 
     #[derive(Debug)]

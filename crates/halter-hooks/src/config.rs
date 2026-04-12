@@ -27,24 +27,29 @@ impl HooksFile {
 
         for (event_alias, matcher_groups) in raw.hooks {
             let Some(event) = HookEventName::from_alias(&event_alias) else {
-                warnings.push(HooksLoadWarning::new(format!(
-                    "unknown hook event '{event_alias}'"
-                )));
+                warnings.push(HooksLoadWarning::new(
+                    "unknown_event",
+                    format!("unknown hook event '{event_alias}'"),
+                ));
                 continue;
             };
             if !seen.insert(event) {
-                warnings.push(HooksLoadWarning::new(format!(
-                    "duplicate hook alias '{event_alias}' resolved to '{}'",
-                    event.canonical_name()
-                )));
+                warnings.push(HooksLoadWarning::new(
+                    "duplicate_alias",
+                    format!(
+                        "duplicate hook alias '{event_alias}' resolved to '{}'",
+                        event.canonical_name()
+                    ),
+                ));
                 continue;
             }
 
             let mut parsed_groups = Vec::new();
             for matcher_group in matcher_groups {
-                match HookMatcherGroup::from_raw(event, matcher_group, &mut warnings) {
-                    Some(group) if !group.hooks.is_empty() => parsed_groups.push(group),
-                    Some(_) | None => {}
+                if let Some(group) = HookMatcherGroup::from_raw(event, matcher_group, &mut warnings)
+                    && !group.hooks.is_empty()
+                {
+                    parsed_groups.push(group);
                 }
             }
 
@@ -77,10 +82,13 @@ impl HookMatcherGroup {
         if let Some(pattern) = matcher.as_deref()
             && Regex::new(pattern).is_err()
         {
-            warnings.push(HooksLoadWarning::new(format!(
-                "invalid matcher regex for '{}': {pattern}",
-                event.canonical_name()
-            )));
+            warnings.push(HooksLoadWarning::new(
+                "invalid_matcher",
+                format!(
+                    "invalid matcher regex for '{}': {pattern}",
+                    event.canonical_name()
+                ),
+            ));
             return None;
         }
 
@@ -110,6 +118,7 @@ impl HookHandler {
     fn from_raw(raw: HookHandlerRaw, warnings: &mut Vec<HooksLoadWarning>) -> Option<Self> {
         if raw.r#async {
             warnings.push(HooksLoadWarning::new(
+                "reserved_async_flag",
                 "ignoring reserved async=true hook flag in v1".to_owned(),
             ));
         }
@@ -123,6 +132,7 @@ impl HookHandler {
             RawHookHandlerType::Command => {
                 let command = raw.command.and_then(trimmed_non_empty).or_else(|| {
                     warnings.push(HooksLoadWarning::new(
+                        "missing_field",
                         "command hook is missing the 'command' field".to_owned(),
                     ));
                     None
@@ -143,6 +153,7 @@ impl HookHandler {
             RawHookHandlerType::Http => {
                 let url = raw.url.and_then(trimmed_non_empty).or_else(|| {
                     warnings.push(HooksLoadWarning::new(
+                        "missing_field",
                         "http hook is missing the 'url' field".to_owned(),
                     ));
                     None
@@ -163,6 +174,7 @@ impl HookHandler {
             RawHookHandlerType::Prompt => {
                 let prompt = raw.prompt.and_then(trimmed_non_empty).or_else(|| {
                     warnings.push(HooksLoadWarning::new(
+                        "missing_field",
                         "prompt hook is missing the 'prompt' field".to_owned(),
                     ));
                     None
@@ -182,6 +194,7 @@ impl HookHandler {
             RawHookHandlerType::Agent => {
                 let prompt = raw.prompt.and_then(trimmed_non_empty).or_else(|| {
                     warnings.push(HooksLoadWarning::new(
+                        "missing_field",
                         "agent hook is missing the 'prompt' field".to_owned(),
                     ));
                     None
@@ -206,6 +219,7 @@ impl HookHandler {
             }
             RawHookHandlerType::Callback | RawHookHandlerType::Function => {
                 warnings.push(HooksLoadWarning::new(
+                    "sdk_only_backend",
                     "ignoring sdk-only hook backend in hooks.json".to_owned(),
                 ));
                 None
@@ -398,13 +412,17 @@ impl HookEventName {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HooksLoadWarning {
+    pub category: String,
     pub message: String,
 }
 
 impl HooksLoadWarning {
     #[must_use]
-    pub fn new(message: String) -> Self {
-        Self { message }
+    pub fn new(category: impl Into<String>, message: String) -> Self {
+        Self {
+            category: category.into(),
+            message,
+        }
     }
 }
 
@@ -434,14 +452,15 @@ enum RawHookHandlerType {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 struct HookHandlerRaw {
     #[serde(rename = "type")]
     handler_type: RawHookHandlerType,
     #[serde(default)]
     timeout: Option<u64>,
-    #[serde(default, rename = "timeoutSec")]
+    #[serde(default, alias = "timeoutSec")]
     timeout_sec: Option<u64>,
-    #[serde(default, rename = "statusMessage")]
+    #[serde(default, alias = "statusMessage")]
     status_message: Option<String>,
     #[serde(default, rename = "if")]
     if_condition: Option<String>,
@@ -455,15 +474,15 @@ struct HookHandlerRaw {
     url: Option<String>,
     #[serde(default)]
     headers: IndexMap<String, String>,
-    #[serde(default, rename = "allowedEnvVars")]
+    #[serde(default, alias = "allowedEnvVars")]
     allowed_env_vars: Vec<String>,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default, rename = "allowedTools")]
+    #[serde(default, alias = "allowedTools")]
     allowed_tools: Vec<String>,
-    #[serde(default, rename = "maxTurns")]
+    #[serde(default, alias = "maxTurns")]
     max_turns: Option<u32>,
     #[serde(default)]
     shell: Option<HookShell>,
@@ -532,5 +551,168 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn hooks_file_warns_on_unknown_events() {
+        let (parsed, warnings) = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "UnknownEvent": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "echo ignored"
+                                }
+                            ]
+                        }
+                    ],
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "echo kept"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parse hooks");
+
+        assert!(parsed.hooks.contains_key(&HookEventName::Stop));
+        assert_eq!(parsed.hooks.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("unknown hook event"));
+    }
+
+    #[test]
+    fn hooks_file_rejects_malformed_json() {
+        let error = HooksFile::from_json_bytes(br#"{ "hooks": { "Stop": [ }"#)
+            .expect_err("malformed hooks should fail");
+
+        assert!(error.to_string().contains("failed to parse hooks.json"));
+    }
+
+    #[test]
+    fn hooks_file_warns_on_reserved_async_flag() {
+        let (parsed, warnings) = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "echo keep",
+                                    "async": true
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parse hooks");
+
+        let groups = parsed.hooks.get(&HookEventName::Stop).expect("stop hooks");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hooks.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("async=true"));
+    }
+
+    #[test]
+    fn hooks_file_ignores_sdk_only_backends() {
+        let (parsed, warnings) = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "callback"
+                                },
+                                {
+                                    "type": "function"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parse hooks");
+
+        assert!(parsed.hooks.is_empty());
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.message.contains("sdk-only hook backend"))
+        );
+    }
+
+    #[test]
+    fn hooks_file_accepts_snake_case_and_camel_case_handler_fields() {
+        let (parsed, warnings) = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "agent",
+                                    "prompt": "first",
+                                    "status_message": "snake case",
+                                    "allowed_tools": ["read"],
+                                    "max_turns": 2,
+                                    "timeout_sec": 7
+                                },
+                                {
+                                    "type": "agent",
+                                    "prompt": "second",
+                                    "statusMessage": "camel case",
+                                    "allowedTools": ["write"],
+                                    "maxTurns": 3,
+                                    "timeoutSec": 9
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parse hooks");
+
+        assert!(warnings.is_empty());
+        let groups = parsed.hooks.get(&HookEventName::Stop).expect("stop hooks");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hooks.len(), 2);
+
+        let HookHandlerConfig::Agent(first) = &groups[0].hooks[0].config else {
+            panic!("expected first hook to be an agent");
+        };
+        assert_eq!(
+            groups[0].hooks[0].status_message.as_deref(),
+            Some("snake case")
+        );
+        assert_eq!(groups[0].hooks[0].timeout, Duration::from_secs(7));
+        assert_eq!(first.allowed_tools, vec!["read".to_owned()]);
+        assert_eq!(first.max_turns, Some(2));
+
+        let HookHandlerConfig::Agent(second) = &groups[0].hooks[1].config else {
+            panic!("expected second hook to be an agent");
+        };
+        assert_eq!(
+            groups[0].hooks[1].status_message.as_deref(),
+            Some("camel case")
+        );
+        assert_eq!(groups[0].hooks[1].timeout, Duration::from_secs(9));
+        assert_eq!(second.allowed_tools, vec!["write".to_owned()]);
+        assert_eq!(second.max_turns, Some(3));
     }
 }
