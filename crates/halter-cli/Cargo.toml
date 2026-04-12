@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "halter-cli"
-path = "src/bin/halter-cli.rs"
+path = "src/main.rs"
 
 [features]
 advanced-tools = ["halter/advanced-tools"]
