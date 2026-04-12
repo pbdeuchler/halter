@@ -515,6 +515,7 @@ async fn run_handler(
 
     match execution {
         Ok(HandlerExecution::Completed(output)) => {
+            let output = *output;
             let completed_at = chrono::Utc::now();
             let duration_ms = completed_at
                 .signed_duration_since(started_at)
@@ -585,8 +586,14 @@ async fn run_handler(
 }
 
 enum HandlerExecution {
-    Completed(HookOutput),
+    Completed(Box<HookOutput>),
     Cancelled,
+}
+
+impl HandlerExecution {
+    fn completed(output: HookOutput) -> Self {
+        Self::Completed(Box::new(output))
+    }
 }
 
 async fn execute_handler(
@@ -665,8 +672,8 @@ async fn run_command(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
 
     match output.status.code() {
-        Some(0) => Ok(HandlerExecution::Completed(parse_command_output(&stdout)?)),
-        Some(2) => Ok(HandlerExecution::Completed(HookOutput {
+        Some(0) => Ok(HandlerExecution::completed(parse_command_output(&stdout)?)),
+        Some(2) => Ok(HandlerExecution::completed(HookOutput {
             decision: Some(halter_hooks::HookDecision::Block),
             reason: (!stderr.is_empty()).then_some(stderr),
             ..HookOutput::default()
@@ -703,7 +710,7 @@ async fn run_sdk_hook(
         }
     };
 
-    Ok(HandlerExecution::Completed(response.into_output()))
+    Ok(HandlerExecution::completed(response.into_output()))
 }
 
 async fn run_http(
@@ -743,7 +750,7 @@ async fn run_http(
         .text()
         .await
         .context("failed to read http hook response body")?;
-    Ok(HandlerExecution::Completed(parse_json_hook_output(&body)?))
+    Ok(HandlerExecution::completed(parse_json_hook_output(&body)?))
 }
 
 async fn run_prompt(
@@ -784,7 +791,7 @@ async fn run_prompt(
     };
     let MaterializedAssistantMessage { message, .. } = materialized;
     let text = render_assistant_text(&message);
-    Ok(HandlerExecution::Completed(parse_json_hook_output(&text)?))
+    Ok(HandlerExecution::completed(parse_json_hook_output(&text)?))
 }
 
 async fn run_agent(
@@ -867,7 +874,7 @@ async fn run_agent(
     };
     let output = crate::subagent_session::extract_subagent_output(&events)
         .context("hook agent did not produce a final assistant message")?;
-    Ok(HandlerExecution::Completed(parse_json_hook_output(
+    Ok(HandlerExecution::completed(parse_json_hook_output(
         &output,
     )?))
 }
@@ -1172,13 +1179,14 @@ fn expand_env_placeholders(value: &str, allowed: &BTreeSet<String>) -> String {
             continue;
         }
 
-        if index + 1 < chars.len() && chars[index + 1] == b'{' {
-            if let Some(close) = value[index + 2..].find('}') {
-                let name = &value[index + 2..index + 2 + close];
-                expanded.push_str(&expanded_env(name, allowed));
-                index += close + 3;
-                continue;
-            }
+        if index + 1 < chars.len()
+            && chars[index + 1] == b'{'
+            && let Some(close) = value[index + 2..].find('}')
+        {
+            let name = &value[index + 2..index + 2 + close];
+            expanded.push_str(&expanded_env(name, allowed));
+            index += close + 3;
+            continue;
         }
 
         let start = index + 1;

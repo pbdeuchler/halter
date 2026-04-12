@@ -178,6 +178,7 @@ impl RuntimeSubagentControl {
         Ok(status)
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn run_turn_task(
         &self,
         agent_id: AgentId,

@@ -942,6 +942,7 @@ impl HalterSession {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn execute_tool_calls(
         &self,
         blueprint: &SessionBlueprint,
@@ -1657,7 +1658,7 @@ pub(crate) async fn create_session_seeded(
         services.event_bus.publish(event);
     }
 
-    Ok(HalterSession::new(services, session_id)?)
+    HalterSession::new(services, session_id)
 }
 
 fn lookup_or_create_session_hooks(

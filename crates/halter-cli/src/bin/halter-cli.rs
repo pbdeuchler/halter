@@ -1,5 +1,6 @@
 // pattern: Imperative Shell
 
+#[path = "../cli_app.rs"]
 mod cli_app;
 
 #[tokio::main]

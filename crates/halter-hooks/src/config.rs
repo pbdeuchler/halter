@@ -94,9 +94,8 @@ impl HookMatcherGroup {
 
         let mut hooks = Vec::new();
         for handler in raw.hooks {
-            match HookHandler::from_raw(handler, warnings) {
-                Some(parsed) => hooks.push(parsed),
-                None => {}
+            if let Some(parsed) = HookHandler::from_raw(handler, warnings) {
+                hooks.push(parsed);
             }
         }
 

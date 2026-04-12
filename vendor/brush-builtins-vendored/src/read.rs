@@ -1,3 +1,6 @@
+// pattern: Mixed (needs refactoring)
+// Reason: This builtin module currently combines I/O orchestration, parsing helpers, and tests.
+
 use std::{collections::VecDeque, io::Read};
 
 use brush_core::{ErrorKind, builtins, env, error, variables};
@@ -490,9 +493,14 @@ mod tests {
         let command = test_command();
         let is_cancelled = || true;
 
-        let err = command
-            .ensure_not_cancelled(&is_cancelled)
-            .expect_err("cancelled state must interrupt read builtin");
+        let result = command.ensure_not_cancelled(&is_cancelled);
+        assert!(
+            result.is_err(),
+            "cancelled state must interrupt read builtin"
+        );
+        let Err(err) = result else {
+            unreachable!("asserted err result above");
+        };
         assert_eq!(err.to_string(), "interrupted");
     }
 
@@ -500,13 +508,22 @@ mod tests {
     #[test]
     fn test_wait_for_input_returns_interrupted_when_cancelled() {
         let command = test_command();
-        let (reader, _writer) = std::io::pipe().expect("pipe creation must succeed");
+        let pipe_result = std::io::pipe();
+        assert!(
+            pipe_result.is_ok(),
+            "pipe creation must succeed: {pipe_result:?}"
+        );
+        let Ok((reader, _writer)) = pipe_result else {
+            unreachable!("asserted successful pipe creation above");
+        };
         let input_file = brush_core::openfiles::OpenFile::from(reader);
         let is_cancelled = || true;
 
-        let err = command
-            .wait_for_input(&input_file, &is_cancelled)
-            .expect_err("cancelled state must interrupt input wait");
+        let result = command.wait_for_input(&input_file, &is_cancelled);
+        assert!(result.is_err(), "cancelled state must interrupt input wait");
+        let Err(err) = result else {
+            unreachable!("asserted err result above");
+        };
         assert_eq!(err.to_string(), "interrupted");
     }
 }
