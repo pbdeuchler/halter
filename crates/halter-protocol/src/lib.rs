@@ -135,6 +135,11 @@ impl ModelRole {
     pub fn subagent() -> Self {
         Self("subagent".to_owned())
     }
+
+    #[must_use]
+    pub fn small() -> Self {
+        Self("small".to_owned())
+    }
 }
 
 impl Default for ModelRole {
@@ -204,6 +209,23 @@ pub enum StopReason {
 pub struct ReplayMeta {
     pub provider_name: Option<ProviderName>,
     pub model: Option<ModelId>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HookWarningSeverity {
+    #[default]
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct HookWarning {
+    pub severity: HookWarningSeverity,
+    pub category: SharedStr,
+    pub plugin_id: Option<PluginId>,
+    pub plugin_name: Option<SharedStr>,
+    pub source_path: Option<PathBuf>,
+    pub message: SharedStr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -522,10 +544,75 @@ pub struct ToolExecutionOutcome {
     pub result: Result<ToolResult, ToolError>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HookHandlerType {
+    Command,
+    Http,
+    Prompt,
+    Agent,
+    Callback,
+    Function,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HookRunStatus {
+    Running,
+    Completed,
+    Failed,
+    Blocked,
+    Stopped,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HookOutputKind {
+    Warning,
+    Stop,
+    Feedback,
+    Context,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct HookOutputEntry {
+    pub kind: HookOutputKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HookSessionStartSource {
+    Startup,
+    Resume,
+    Clear,
+    Compact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct HookRunSummary {
+    pub run_id: String,
+    pub event_name: String,
+    pub handler_type: HookHandlerType,
+    pub plugin_id: PluginId,
+    pub plugin_root: PathBuf,
+    pub status: HookRunStatus,
+    pub status_message: Option<String>,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
+    pub duration_ms: Option<u64>,
+    pub entries: Vec<HookOutputEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventPayload {
     SessionStarted,
+    Warning {
+        message: String,
+    },
     TurnStarted {
         turn_id: TurnId,
     },
@@ -542,6 +629,12 @@ pub enum SessionEventPayload {
         call_id: ToolCallId,
         tool_name: ToolName,
         chunk: SharedStr,
+    },
+    HookStarted {
+        run: HookRunSummary,
+    },
+    HookCompleted {
+        run: HookRunSummary,
     },
     ToolExecutionCompleted {
         outcome: ToolExecutionOutcome,
@@ -755,6 +848,9 @@ pub struct SessionState {
     pub usage_so_far: Usage,
     pub summaries: Vec<SummarySlice>,
     pub lineage: Vec<SubagentRef>,
+    pub fired_hook_ids: Vec<String>,
+    pub pending_session_start_source: Option<HookSessionStartSource>,
+    pub pending_warning_messages: Vec<HookWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -796,6 +892,8 @@ pub struct PluginManifest {
     pub hooks: Option<String>,
     pub mcp_servers: Option<String>,
     pub lsp_servers: Option<String>,
+    pub allowed_http_hosts: Vec<String>,
+    pub allowed_env_vars: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]

@@ -2,13 +2,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::{env, fs};
 
 use anyhow::Context;
 use halter_config::HarnessConfig;
+use halter_hooks::{HookRegistrySource, Hooks, HooksFile, HooksLoadWarning};
 use halter_protocol::{
-    AgentDef, AgentId, AgentName, ContentHash, InstructionFile, PluginId, PluginManifest,
-    PromptRegistry, ResourceSnapshot, Revision, SkillDef, SkillId, SkillName,
+    AgentDef, AgentId, AgentName, ContentHash, HookWarning, HookWarningSeverity, InstructionFile,
+    PluginId, PluginManifest, PromptRegistry, ResourceSnapshot, Revision, SkillDef, SkillId,
+    SkillName,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -46,8 +49,13 @@ pub struct LoadedAgent {
 }
 
 #[derive(Debug, Clone)]
-pub struct LoadedHook {
-    pub path: PathBuf,
+pub struct LoadedHooksFile {
+    pub plugin_id: PluginId,
+    pub plugin_root: PathBuf,
+    pub source_path: PathBuf,
+    pub revision: ContentHash,
+    pub parsed: HooksFile,
+    pub warnings: Vec<HooksLoadWarning>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,12 +87,19 @@ pub struct LoadedPlugin {
     pub manifest: PluginManifest,
     pub skills: Vec<LoadedSkill>,
     pub agents: Vec<LoadedAgent>,
-    pub hooks: Vec<LoadedHook>,
+    pub hooks: Vec<LoadedHooksFile>,
     pub mcp_servers: Vec<LoadedMcpServer>,
     pub lsp_servers: Vec<LoadedLspServer>,
     pub output_styles: Vec<LoadedOutputStyle>,
     pub bin_paths: Vec<PathBuf>,
     pub defaults: PluginDefaults,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledResources {
+    pub snapshot: ResourceSnapshot,
+    pub hooks: Arc<Hooks>,
+    pub hook_warnings: Vec<HookWarning>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -119,8 +134,10 @@ impl PluginLoader {
                 debug!(root = %root.display(), "skipping missing plugin root");
                 continue;
             }
-            for entry in fs::read_dir(&root)? {
-                let entry = entry?;
+            let mut entries = fs::read_dir(&root)?.collect::<Result<Vec<_>, std::io::Error>>()?;
+            // Preserve path order so plugin_load_order stays deterministic across reloads.
+            entries.sort_by_key(|entry| entry.path());
+            for entry in entries {
                 if entry.file_type()?.is_dir() {
                     let plugin_root = entry.path();
                     if let Some(plugin) = load_plugin_root(&plugin_root)? {
@@ -179,14 +196,14 @@ impl ResourceCompiler {
         self
     }
 
-    pub async fn compile(self) -> anyhow::Result<ResourceSnapshot> {
+    pub async fn compile(self) -> anyhow::Result<CompiledResources> {
         tokio::task::spawn_blocking(move || compile_resources(self))
             .await
             .context("failed to join resource compiler task")?
     }
 }
 
-fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<ResourceSnapshot> {
+fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<CompiledResources> {
     let ResourceCompiler {
         config,
         skill_roots,
@@ -243,9 +260,45 @@ fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<ResourceSnaps
         );
     }
 
+    let hook_sources = plugins
+        .iter()
+        .flat_map(|plugin| {
+            plugin
+                .hooks
+                .iter()
+                .cloned()
+                .map(|hooks_file| HookRegistrySource {
+                    plugin_id: hooks_file.plugin_id,
+                    plugin_root: hooks_file.plugin_root,
+                    source_path: hooks_file.source_path,
+                    allowed_http_hosts: plugin.manifest.allowed_http_hosts.clone(),
+                    allowed_env_vars: plugin.manifest.allowed_env_vars.clone(),
+                    file: hooks_file.parsed,
+                })
+        })
+        .collect::<Vec<_>>();
+    let hook_warnings = plugins
+        .iter()
+        .flat_map(|plugin| {
+            plugin.hooks.iter().flat_map(move |hooks_file| {
+                hooks_file.warnings.iter().map(move |warning| HookWarning {
+                    severity: HookWarningSeverity::Warning,
+                    category: warning.category.clone(),
+                    plugin_id: Some(plugin.id.clone()),
+                    plugin_name: Some(plugin.manifest.name.clone()),
+                    source_path: Some(hooks_file.source_path.clone()),
+                    message: warning.message.clone(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
     for plugin in plugins {
         revision_hasher.update(plugin.manifest.name.as_bytes());
         revision_hasher.update(plugin.manifest.version.as_bytes());
+        for hooks_file in &plugin.hooks {
+            revision_hasher.update(hooks_file.revision.as_bytes());
+        }
         for agent in &plugin.agents {
             snapshot.agents.insert(
                 AgentName::from(agent.name.clone()),
@@ -266,7 +319,11 @@ fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<ResourceSnaps
     });
     snapshot.revision = Revision::from(format!("{:x}", revision_hasher.finalize()));
     info!(revision = %snapshot.revision, "compiled resource snapshot");
-    Ok(snapshot)
+    Ok(CompiledResources {
+        snapshot,
+        hooks: Arc::new(Hooks::from_sources(hook_sources)),
+        hook_warnings,
+    })
 }
 
 fn collect_skills(
@@ -378,7 +435,10 @@ fn load_plugin_root(root: &Path) -> anyhow::Result<Option<LoadedPlugin>> {
             .get("lspServers")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        allowed_http_hosts: read_string_array(&manifest_value, "allowedHttpHosts"),
+        allowed_env_vars: read_string_array(&manifest_value, "allowedEnvVars"),
     };
+    let plugin_id = stable_plugin_id(root, &manifest);
 
     let mut skills = Vec::new();
     let mut visited_skill_dirs = BTreeSet::new();
@@ -401,13 +461,15 @@ fn load_plugin_root(root: &Path) -> anyhow::Result<Option<LoadedPlugin>> {
         }
     }
 
+    let hooks = load_plugin_hooks(root, &plugin_id, &manifest)?;
+
     Ok(Some(LoadedPlugin {
-        id: PluginId::new(),
+        id: plugin_id,
         root: root.to_path_buf(),
         manifest,
         skills,
         agents,
-        hooks: Vec::new(),
+        hooks,
         mcp_servers: Vec::new(),
         lsp_servers: Vec::new(),
         output_styles: Vec::new(),
@@ -494,6 +556,17 @@ fn hash_bytes(bytes: &[u8]) -> ContentHash {
     format!("{:x}", hasher.finalize())
 }
 
+fn stable_plugin_id(root: &Path, manifest: &PluginManifest) -> PluginId {
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let fingerprint = format!(
+        "{}\0{}\0{}",
+        manifest.name,
+        manifest.version,
+        canonical_root.display()
+    );
+    PluginId::from(format!("plugin-{}", hash_bytes(fingerprint.as_bytes())))
+}
+
 fn normalized_roots(roots: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     let mut seen = BTreeSet::new();
     let mut normalized = Vec::new();
@@ -566,6 +639,43 @@ fn load_agent_file(path: &Path) -> anyhow::Result<LoadedAgent> {
     })
 }
 
+fn load_plugin_hooks(
+    root: &Path,
+    plugin_id: &PluginId,
+    manifest: &PluginManifest,
+) -> anyhow::Result<Vec<LoadedHooksFile>> {
+    let hooks_path = match manifest.hooks.as_deref() {
+        Some(component) => Some(resolve_plugin_path(root, component)?),
+        None => {
+            let candidate = root.join("hooks/hooks.json");
+            candidate.exists().then_some(candidate)
+        }
+    };
+    let Some(source_path) = hooks_path else {
+        return Ok(Vec::new());
+    };
+
+    let body = fs::read(&source_path)
+        .with_context(|| format!("failed to read hooks file at {}", source_path.display()))?;
+    let revision = hash_bytes(&body);
+    let (parsed, warnings) = match HooksFile::from_json_bytes(&body) {
+        Ok(result) => result,
+        Err(error) => (
+            HooksFile::default(),
+            vec![HooksLoadWarning::new("parse_error", error.to_string())],
+        ),
+    };
+
+    Ok(vec![LoadedHooksFile {
+        plugin_id: plugin_id.clone(),
+        plugin_root: root.to_path_buf(),
+        source_path,
+        revision,
+        parsed,
+        warnings,
+    }])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,12 +699,17 @@ description: says hello
 
         let mut config = HarnessConfig::default();
         config.resources.skills.roots = vec![temp.path().join("skills")];
-        let snapshot = ResourceCompiler::from_config(&config)
+        let resources = ResourceCompiler::from_config(&config)
             .compile()
             .await
             .expect("compile resources");
 
-        assert!(snapshot.skills.contains_key(&SkillName::from("hello")));
+        assert!(
+            resources
+                .snapshot
+                .skills
+                .contains_key(&SkillName::from("hello"))
+        );
     }
 
     #[tokio::test]
@@ -633,13 +748,23 @@ description: reviews code
 
         let mut config = HarnessConfig::default();
         config.resources.plugins.roots = vec![temp.path().to_path_buf()];
-        let snapshot = ResourceCompiler::from_config(&config)
+        let resources = ResourceCompiler::from_config(&config)
             .compile()
             .await
             .expect("compile resources");
 
-        assert!(snapshot.skills.contains_key(&SkillName::from("reviewer")));
-        assert!(snapshot.agents.contains_key(&AgentName::from("helper")));
+        assert!(
+            resources
+                .snapshot
+                .skills
+                .contains_key(&SkillName::from("reviewer"))
+        );
+        assert!(
+            resources
+                .snapshot
+                .agents
+                .contains_key(&AgentName::from("helper"))
+        );
     }
 
     #[tokio::test]
@@ -671,5 +796,51 @@ description: reviews code
                 .to_string()
                 .contains("component resolves outside the plugin root")
         );
+    }
+
+    #[tokio::test]
+    async fn resource_compiler_uses_stable_plugin_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let manifest_dir = plugin_root.join(".halter-plugin");
+
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            r#"{
+  "name": "stable-plugin",
+  "version": "1.2.3"
+}"#,
+        )
+        .expect("write manifest");
+
+        let mut config = HarnessConfig::default();
+        config.resources.plugins.roots = vec![temp.path().to_path_buf()];
+
+        let first = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect("compile resources");
+        let second = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect("compile resources again");
+
+        let first_id = first
+            .snapshot
+            .plugins
+            .keys()
+            .next()
+            .cloned()
+            .expect("plugin id");
+        let second_id = second
+            .snapshot
+            .plugins
+            .keys()
+            .next()
+            .cloned()
+            .expect("plugin id");
+
+        assert_eq!(first_id, second_id);
     }
 }

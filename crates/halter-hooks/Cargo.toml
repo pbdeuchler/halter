@@ -1,5 +1,5 @@
 [package]
-name = "halter-session"
+name = "halter-hooks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,18 +10,14 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
-[features]
-sqlite = ["dep:rusqlite"]
-
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
 halter-protocol = { path = "../halter-protocol" }
-rusqlite = { workspace = true, optional = true }
+indexmap.workspace = true
+regex.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

@@ -24,10 +24,12 @@ arc-swap.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
+halter-hooks = { path = "../halter-hooks" }
 halter-protocol = { path = "../halter-protocol" }
 halter-providers = { path = "../halter-providers" }
 halter-session = { path = "../halter-session" }
 halter-tools = { path = "../halter-tools" }
+reqwest.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true

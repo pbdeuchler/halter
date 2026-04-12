@@ -5,9 +5,9 @@ mod resources;
 
 pub use builder::{Halter, HalterBuilder};
 pub use resources::{
-    LoadedAgent, LoadedExecutable, LoadedHook, LoadedLspServer, LoadedMcpServer, LoadedOutputStyle,
-    LoadedPlugin, LoadedResourceFile, LoadedSkill, PluginDefaults, PluginLoader, ResourceCompiler,
-    SkillLoader,
+    CompiledResources, LoadedAgent, LoadedExecutable, LoadedHooksFile, LoadedLspServer,
+    LoadedMcpServer, LoadedOutputStyle, LoadedPlugin, LoadedResourceFile, LoadedSkill,
+    PluginDefaults, PluginLoader, ResourceCompiler, SkillLoader,
 };
 
 pub mod session {

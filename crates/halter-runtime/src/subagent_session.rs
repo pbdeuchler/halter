@@ -62,6 +62,9 @@ pub fn build_subagent_state(
         usage_so_far: Usage::default(),
         summaries: parent.state.summaries.clone(),
         lineage,
+        fired_hook_ids: parent.state.fired_hook_ids.clone(),
+        pending_session_start_source: None,
+        pending_warning_messages: parent.state.pending_warning_messages.clone(),
     }
 }
 

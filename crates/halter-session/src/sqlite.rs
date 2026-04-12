@@ -15,7 +15,7 @@ use halter_protocol::{
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use tracing::{debug, info};
 
-use crate::{SessionStore, StoredSession};
+use crate::{SessionCommitConflict, SessionStore, StoredSession};
 
 const MIGRATIONS: &[(u32, &str)] = &[(
     1,
@@ -127,12 +127,15 @@ impl SessionStore for SqliteSessionStore {
         &self,
         session_id: &SessionId,
         snapshot: Option<Arc<ResourceSnapshot>>,
+        expected_state: Option<SessionState>,
         state: Option<SessionState>,
         events: Vec<SessionEvent>,
     ) -> Result<Vec<SessionEvent>> {
         let session_id = session_id.clone();
-        self.with_conn(move |conn| commit_with_conn(conn, &session_id, snapshot, state, events))
-            .await
+        self.with_conn(move |conn| {
+            commit_with_conn(conn, &session_id, snapshot, expected_state, state, events)
+        })
+        .await
     }
 
     async fn replay(&self, session_id: &SessionId) -> Result<Vec<SessionEvent>> {
@@ -260,6 +263,7 @@ fn commit_with_conn(
     conn: &mut Connection,
     session_id: &SessionId,
     snapshot: Option<Arc<ResourceSnapshot>>,
+    expected_state: Option<SessionState>,
     state: Option<SessionState>,
     events: Vec<SessionEvent>,
 ) -> Result<Vec<SessionEvent>> {
@@ -268,11 +272,11 @@ fn commit_with_conn(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start sqlite commit transaction")?;
 
-    let blueprint_json = tx
+    let (blueprint_json, current_state_json) = tx
         .query_row(
-            "SELECT blueprint FROM sessions WHERE session_id = ?1",
+            "SELECT blueprint, state FROM sessions WHERE session_id = ?1",
             [session_id.0.as_str()],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .with_context(|| format!("failed to load session '{}'", session_id.0))?
@@ -282,6 +286,17 @@ fn commit_with_conn(
                 session_id.0
             )
         })?;
+
+    if let Some(expected_state) = expected_state.as_ref() {
+        let expected_state_json = serde_json::to_string(expected_state)
+            .context("failed to serialize expected session state")?;
+        if current_state_json != expected_state_json {
+            return Err(SessionCommitConflict {
+                session_id: session_id.clone(),
+            }
+            .into());
+        }
+    }
 
     if let Some(snapshot) = snapshot.as_ref() {
         store_snapshot(&tx, snapshot.as_ref())?;
@@ -693,6 +708,7 @@ mod tests {
             .commit(
                 &session.blueprint.session_id,
                 Some(Arc::clone(&updated_snapshot)),
+                None,
                 Some(updated_state.clone()),
                 events,
             )
@@ -741,6 +757,7 @@ mod tests {
         store
             .commit(
                 &first.blueprint.session_id,
+                None,
                 None,
                 None,
                 vec![test_event("first-only", Delivery::Lossless)],
@@ -815,12 +832,55 @@ mod tests {
                 &SessionId::from("missing-session"),
                 None,
                 None,
+                None,
                 vec![test_event("missing", Delivery::Lossless)],
             )
             .await
             .expect_err("commit should fail");
 
         assert!(error.to_string().contains("unknown session"));
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_stale_expected_state() {
+        let store = SqliteSessionStore::open(":memory:").expect("open sqlite store");
+        let session = test_session("stale-state", "revision-a");
+        let original_state = session.state.clone();
+
+        store
+            .create_session(session.clone())
+            .await
+            .expect("create session");
+        store
+            .commit(
+                &session.blueprint.session_id,
+                None,
+                Some(original_state.clone()),
+                Some(SessionState {
+                    pending_warning_messages: vec![halter_protocol::HookWarning {
+                        category: "test".to_owned(),
+                        message: "updated".to_owned(),
+                        ..halter_protocol::HookWarning::default()
+                    }],
+                    ..SessionState::default()
+                }),
+                Vec::new(),
+            )
+            .await
+            .expect("commit updated state");
+
+        let error = store
+            .commit(
+                &session.blueprint.session_id,
+                None,
+                Some(original_state),
+                Some(SessionState::default()),
+                Vec::new(),
+            )
+            .await
+            .expect_err("stale commit should fail");
+
+        assert!(error.downcast_ref::<SessionCommitConflict>().is_some());
     }
 
     #[tokio::test]
@@ -857,6 +917,7 @@ mod tests {
                 &session.blueprint.session_id,
                 None,
                 None,
+                None,
                 vec![
                     test_event("one", Delivery::Lossless),
                     test_event("two", Delivery::Lossless),
@@ -867,6 +928,7 @@ mod tests {
         let second = store
             .commit(
                 &session.blueprint.session_id,
+                None,
                 None,
                 None,
                 vec![test_event("three", Delivery::BestEffort)],

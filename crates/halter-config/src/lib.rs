@@ -10,7 +10,7 @@ pub use loader::{
 pub use schema::{
     ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelsConfig,
     NetworkPolicyConfig, PolicyConfig, PromptsConfig, ProviderConfig, ProvidersConfig,
-    ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SUBAGENT_MODEL_ID, SearchRoots,
-    SessionBackend, SessionsConfig, ShellPolicyConfig, ToolsConfig,
+    ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID,
+    SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig, ToolsConfig,
     resolve_provider_runtime_config,
 };

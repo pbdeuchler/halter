@@ -1203,6 +1203,7 @@ dependencies = [
  "async-trait",
  "futures",
  "halter-config",
+ "halter-hooks",
  "halter-protocol",
  "halter-providers",
  "halter-runtime",
@@ -1245,6 +1246,22 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "halter-hooks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures",
+ "halter-protocol",
+ "indexmap",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 
@@ -1292,10 +1309,12 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "halter-hooks",
  "halter-protocol",
  "halter-providers",
  "halter-session",
  "halter-tools",
+ "reqwest",
  "serde_json",
  "sha2",
  "tempfile",
@@ -1315,6 +1334,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

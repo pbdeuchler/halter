@@ -13,6 +13,7 @@ use crate::Provider;
 pub struct ModelRegistry {
     models: HashMap<String, ResolvedModel>,
     default_model: Option<ResolvedModel>,
+    small_model: Option<ResolvedModel>,
     subagent_model: Option<ResolvedModel>,
     providers: HashMap<String, Arc<dyn Provider>>,
 }
@@ -33,6 +34,19 @@ impl ModelRegistry {
         self.default_model
             .clone()
             .context("failed to resolve model: default model is not configured")
+    }
+
+    pub fn set_small_model(&mut self, model: ResolvedModel) {
+        debug!(model_id = %model.id, provider = %model.provider, "setting small model");
+        self.models.insert(model.id.0.clone(), model.clone());
+        self.small_model = Some(model);
+    }
+
+    pub fn small_model(&self) -> anyhow::Result<ResolvedModel> {
+        self.small_model
+            .clone()
+            .or_else(|| self.default_model.clone())
+            .context("failed to resolve model: small model is not configured")
     }
 
     pub fn set_subagent_model(&mut self, model: ResolvedModel) {

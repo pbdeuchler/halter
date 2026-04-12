@@ -136,6 +136,23 @@ impl ToolRuntime {
             .collect()
     }
 
+    #[must_use]
+    pub fn clone_filtered(&self, allowed: &[String]) -> Self {
+        let allow_all = allowed.is_empty();
+        let allowed = allowed.iter().collect::<std::collections::HashSet<_>>();
+        let tools = self
+            .tools
+            .read()
+            .expect("tool runtime lock poisoned")
+            .iter()
+            .filter(|(name, _)| allow_all || allowed.contains(name))
+            .map(|(name, tool)| (name.clone(), tool.clone()))
+            .collect();
+        Self {
+            tools: RwLock::new(tools),
+        }
+    }
+
     pub async fn execute(
         &self,
         name: &str,

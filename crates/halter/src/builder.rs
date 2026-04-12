@@ -8,9 +8,13 @@ use std::sync::Arc;
 use anyhow::Context;
 use halter_config::{
     ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, PolicyConfig, ResolvedProviderConfig,
-    SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, load_path, resolve_provider_runtime_config,
+    SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, load_path,
+    resolve_provider_runtime_config,
 };
-use halter_protocol::{ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot};
+use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
+use halter_protocol::{
+    HookWarning, ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot,
+};
 use halter_providers::{AnthropicProvider, ModelRegistry, OpenAiProvider, OpenRouterProvider};
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
@@ -23,7 +27,7 @@ use halter_tools::{
 };
 use tracing::{debug, info};
 
-use crate::{LoadedPlugin, LoadedSkill, ResourceCompiler};
+use crate::{CompiledResources, LoadedPlugin, LoadedSkill, ResourceCompiler};
 
 #[cfg(feature = "sqlite")]
 use halter_session::SqliteSessionStore;
@@ -32,6 +36,9 @@ use halter_session::SqliteSessionStore;
 pub struct HalterBuilder {
     config: HarnessConfig,
     resource_snapshot: Option<ResourceSnapshot>,
+    resource_hooks: Option<Arc<Hooks>>,
+    resource_hook_warnings: Vec<HookWarning>,
+    registered_hooks: RegisteredHooks,
     loaded_skills: Vec<LoadedSkill>,
     loaded_plugins: Vec<LoadedPlugin>,
     tools: Vec<Arc<dyn Tool>>,
@@ -57,6 +64,14 @@ impl HalterBuilder {
     }
 
     #[must_use]
+    pub fn with_compiled_resources(mut self, resources: CompiledResources) -> Self {
+        self.resource_snapshot = Some(resources.snapshot);
+        self.resource_hooks = Some(resources.hooks);
+        self.resource_hook_warnings = resources.hook_warnings;
+        self
+    }
+
+    #[must_use]
     pub fn with_loaded_skills(mut self, skills: Vec<LoadedSkill>) -> Self {
         self.loaded_skills = skills;
         self
@@ -65,6 +80,24 @@ impl HalterBuilder {
     #[must_use]
     pub fn with_loaded_plugins(mut self, plugins: Vec<LoadedPlugin>) -> Self {
         self.loaded_plugins = plugins;
+        self
+    }
+
+    #[must_use]
+    pub fn with_plugin_hook(mut self, plugin_id: halter_protocol::PluginId, hook: Hook) -> Self {
+        self.registered_hooks
+            .register(plugin_id, RegisteredHookPriority::AfterPlugins, hook);
+        self
+    }
+
+    #[must_use]
+    pub fn with_plugin_hook_priority(
+        mut self,
+        plugin_id: halter_protocol::PluginId,
+        priority: RegisteredHookPriority,
+        hook: Hook,
+    ) -> Self {
+        self.registered_hooks.register(plugin_id, priority, hook);
         self
     }
 
@@ -84,6 +117,7 @@ impl HalterBuilder {
         let config = self.config;
         debug!("validating halter builder config");
         config.validate()?;
+        self.registered_hooks.validate()?;
 
         if !self.loaded_skills.is_empty() || !self.loaded_plugins.is_empty() {
             anyhow::bail!(
@@ -94,6 +128,10 @@ impl HalterBuilder {
         let snapshot = self.resource_snapshot.with_context(|| {
             "failed to build halter runtime: missing resource snapshot; use Halter::from_config_file or HalterBuilder::with_resource_snapshot"
         })?;
+        let hooks = self
+            .resource_hooks
+            .unwrap_or_else(|| Arc::new(Hooks::default()));
+        let hook_warnings = self.resource_hook_warnings;
 
         let models = Arc::new(build_model_registry(&config)?);
         let tools = Arc::new(ToolRuntime::new());
@@ -113,7 +151,9 @@ impl HalterBuilder {
             None => build_session_store(&config.sessions)?,
         };
         let services = Arc::new(RuntimeServices {
-            resources: Arc::new(ResourceHandle::new(snapshot)),
+            resources: Arc::new(ResourceHandle::new(snapshot, hooks, hook_warnings)),
+            registered_hooks: Arc::new(self.registered_hooks),
+            session_hook_store: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             models,
             tools,
             path_locks: Arc::new(PathLockMap::default()),
@@ -166,8 +206,8 @@ impl Halter {
     pub async fn from_config_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         debug!(path = %path.as_ref().display(), "building halter from config file");
         let config = load_path(path).await?;
-        let snapshot = ResourceCompiler::from_config(&config).compile().await?;
-        Self::from_config(config, snapshot).await
+        let resources = ResourceCompiler::from_config(&config).compile().await?;
+        Self::from_compiled_resources(config, resources).await
     }
 
     pub async fn from_config(
@@ -177,6 +217,17 @@ impl Halter {
         HalterBuilder::default()
             .with_config(config)
             .with_resource_snapshot(snapshot)
+            .build()
+            .await
+    }
+
+    pub async fn from_compiled_resources(
+        config: HarnessConfig,
+        resources: CompiledResources,
+    ) -> anyhow::Result<Self> {
+        HalterBuilder::default()
+            .with_config(config)
+            .with_compiled_resources(resources)
             .build()
             .await
     }
@@ -191,8 +242,12 @@ impl Halter {
         self.runtime.new_session(init).await
     }
 
-    pub fn replace_resources(&self, snapshot: ResourceSnapshot) {
-        self.runtime.replace_resources(snapshot);
+    pub fn replace_resources(&self, resources: CompiledResources) {
+        self.runtime.replace_resources(
+            resources.snapshot,
+            resources.hooks,
+            resources.hook_warnings,
+        );
     }
 
     #[must_use]
@@ -251,6 +306,7 @@ fn describe_session_backend(config: &SessionsConfig) -> &'static str {
 fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry> {
     let mut registry = ModelRegistry::new();
     let default_config = config.default_model()?;
+    let small_config = config.small_model().unwrap_or(default_config);
     let subagent_config = config.subagent_model().unwrap_or(default_config);
     let default_model = ResolvedModel {
         role: ModelRole::default(),
@@ -262,6 +318,17 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         max_input_tokens: default_config.max_input_tokens,
         max_output_tokens: default_config.max_output_tokens,
         reasoning: default_config.reasoning,
+    };
+    let small_model = ResolvedModel {
+        role: ModelRole::small(),
+        id: ModelId::from(SMALL_MODEL_ID),
+        provider: ProviderName::from(small_config.provider.to_string()),
+        provider_kind: small_config.provider.provider_kind(),
+        api_kind: small_config.provider.api_kind(),
+        model: small_config.model.clone(),
+        max_input_tokens: small_config.max_input_tokens,
+        max_output_tokens: small_config.max_output_tokens,
+        reasoning: small_config.reasoning,
     };
     let subagent_model = ResolvedModel {
         role: ModelRole::subagent(),
@@ -278,6 +345,8 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
     debug!(
         default_provider = %default_model.provider,
         default_model = %default_model.model,
+        small_provider = %small_model.provider,
+        small_model = %small_model.model,
         subagent_provider = %subagent_model.provider,
         subagent_model = %subagent_model.model,
         "building model registry"
@@ -286,6 +355,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
     let mut registered_providers = HashSet::new();
     for (provider_name, configured_provider) in [
         (&default_model.provider, default_config.provider),
+        (&small_model.provider, small_config.provider),
         (&subagent_model.provider, subagent_config.provider),
     ] {
         if !registered_providers.insert(provider_name.0.clone()) {
@@ -295,6 +365,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         registry.register_provider(provider_name.clone(), build_provider(&resolved)?);
     }
     registry.set_default_model(default_model);
+    registry.set_small_model(small_model);
     registry.set_subagent_model(subagent_model);
 
     Ok(registry)
@@ -529,11 +600,14 @@ mod tests {
             &self,
             session_id: &halter_protocol::SessionId,
             snapshot: Option<Arc<halter_protocol::ResourceSnapshot>>,
+            expected_state: Option<halter_protocol::SessionState>,
             state: Option<halter_protocol::SessionState>,
             events: Vec<halter_protocol::SessionEvent>,
         ) -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
             self.commit_calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.commit(session_id, snapshot, state, events).await
+            self.inner
+                .commit(session_id, snapshot, expected_state, state, events)
+                .await
         }
 
         async fn replay(
