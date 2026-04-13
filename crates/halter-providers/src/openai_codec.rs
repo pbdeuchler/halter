@@ -81,11 +81,7 @@ pub(crate) fn decode_responses_response(
     request: &ProviderRequest,
     response: &Value,
 ) -> anyhow::Result<Vec<StreamEvent>> {
-    let message_id = response
-        .get("id")
-        .and_then(Value::as_str)
-        .map(|id| MessageId::from(id.to_owned()))
-        .unwrap_or_default();
+    let message_id = response_output_message_id(response).unwrap_or_default();
     let mut events = vec![StreamEvent::MessageStart {
         id: message_id.clone(),
     }];
@@ -189,7 +185,6 @@ pub(crate) struct ResponsesStreamDecoder {
     tool_specs: Vec<halter_protocol::ToolSpec>,
     provider_kind: halter_protocol::ProviderKind,
     message_id: Option<MessageId>,
-    response_id: Option<MessageId>,
     started: bool,
     saw_tool_call: bool,
     active_text: Option<PendingTextBlock>,
@@ -230,7 +225,6 @@ impl ResponsesStreamDecoder {
             tool_specs: request.tools.clone(),
             provider_kind: request.model.provider_kind,
             message_id: None,
-            response_id: None,
             started: false,
             saw_tool_call: false,
             active_text: None,
@@ -245,9 +239,7 @@ impl ResponsesStreamDecoder {
     ) -> anyhow::Result<Vec<StreamEvent>> {
         let mut events = Vec::new();
         match event {
-            ResponseStreamEvent::ResponseCreated(event) => {
-                self.response_id = Some(MessageId::from(event.response.id));
-            }
+            ResponseStreamEvent::ResponseCreated(_) => {}
             ResponseStreamEvent::ResponseOutputItemAdded(event) => match event.item {
                 OutputItem::Message(message) => {
                     self.ensure_message_started(Some(&message.id), &mut events);
@@ -402,8 +394,8 @@ impl ResponsesStreamDecoder {
 
         let message_id = self.message_id.clone().unwrap_or_else(|| {
             message_id
+                .filter(|id| is_responses_message_item_id(id))
                 .map(|id| MessageId::from(id.to_owned()))
-                .or_else(|| self.response_id.clone())
                 .unwrap_or_default()
         });
         self.message_id = Some(message_id.clone());
@@ -869,19 +861,25 @@ fn encode_responses_assistant_message(
         return None;
     }
 
-    Some(json!({
-        "type": "message",
-        "role": "assistant",
-        "id": message.id,
-        "status": "completed",
-        "content": [
+    let mut encoded = Map::new();
+    encoded.insert("type".to_owned(), json!("message"));
+    encoded.insert("role".to_owned(), json!("assistant"));
+    encoded.insert("status".to_owned(), json!("completed"));
+    encoded.insert(
+        "content".to_owned(),
+        json!([
             {
                 "type": "output_text",
                 "text": text,
                 "annotations": [],
             }
-        ],
-    }))
+        ]),
+    );
+    if let Some(message_id) = encode_responses_message_item_id(&message.id) {
+        encoded.insert("id".to_owned(), Value::String(message_id));
+    }
+
+    Some(Value::Object(encoded))
 }
 
 fn encode_responses_tool_call(
@@ -917,6 +915,14 @@ fn responses_function_call_item_id(call_id: &halter_protocol::ToolCallId) -> Str
 
 fn responses_function_call_output_item_id(call_id: &halter_protocol::ToolCallId) -> String {
     format!("fc_output_{}", normalized_tool_call_id(call_id))
+}
+
+fn encode_responses_message_item_id(message_id: &MessageId) -> Option<String> {
+    is_responses_message_item_id(&message_id.0).then(|| message_id.0.clone())
+}
+
+fn is_responses_message_item_id(id: &str) -> bool {
+    id.starts_with("msg_")
 }
 
 fn encode_responses_tools(request: &ProviderRequest) -> Vec<Value> {
@@ -1338,6 +1344,35 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_request_omits_invalid_assistant_message_ids() {
+        let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        let Message::Assistant(assistant) = &mut request.messages[1] else {
+            panic!("expected assistant history");
+        };
+        assistant.id = MessageId::from("resp_123");
+
+        let body = encode_responses_request(
+            &request,
+            ResponsesRequestOptions {
+                stream: false,
+                store: Some(false),
+                prompt_cache_key: None,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+            },
+        )
+        .expect("encode request");
+
+        let assistant_message = body["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .find(|item| item["type"] == "message" && item["role"] == "assistant")
+            .expect("assistant message");
+        assert!(assistant_message.get("id").is_none());
+    }
+
+    #[test]
     fn openrouter_responses_request_omits_openai_only_fields() {
         let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter);
         let body = encode_responses_request(
@@ -1669,6 +1704,103 @@ mod tests {
         assert!(decoded.iter().any(|event| matches!(
             event,
             StreamEvent::MessageEnd { stop_reason, .. } if *stop_reason == StopReason::ToolUse
+        )));
+    }
+
+    #[test]
+    fn responses_stream_decoder_does_not_reuse_response_id_for_tool_only_turns() {
+        let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        let mut decoder = ResponsesStreamDecoder::new(&request);
+        let stream_events = vec![
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_123",
+                    "created_at": 0,
+                    "model": "gpt-5",
+                    "object": "response",
+                    "output": [],
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_123",
+                    "name": "fs_read",
+                    "arguments": "",
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "sequence_number": 2,
+                "item_id": "fc_1",
+                "output_index": 0,
+                "arguments": "{\"path\":\"README.md\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 3,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_123",
+                    "name": "fs_read",
+                    "arguments": "{\"path\":\"README.md\"}",
+                    "status": "completed"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 4,
+                "response": {
+                    "id": "resp_123",
+                    "created_at": 0,
+                    "model": "gpt-5",
+                    "object": "response",
+                    "output": [],
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 12,
+                        "input_tokens_details": {
+                            "cached_tokens": 0
+                        },
+                        "output_tokens": 4,
+                        "output_tokens_details": {
+                            "reasoning_tokens": 0
+                        },
+                        "total_tokens": 16
+                    }
+                }
+            }),
+        ];
+
+        let decoded = stream_events
+            .into_iter()
+            .flat_map(|event| {
+                let event = serde_json::from_value(event).expect("parse stream event");
+                decoder.decode(event).expect("decode stream event")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(decoded.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageStart { id } if id.0 != "resp_123"
+        )));
+        assert!(!decoded.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageStart { id } if id.0 == "resp_123"
+        )));
+        assert!(decoded.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallStart { name, .. } if name.0 == "read"
         )));
     }
 

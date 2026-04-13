@@ -1,8 +1,13 @@
 // pattern: Functional Core
 
 use async_trait::async_trait;
-use halter_protocol::{AssembledPrompt, CacheScope, ContextPlan, Message};
+use halter_protocol::{
+    AssembledPrompt, CacheScope, ContentHash, ContextPlan, Message, PromptSegment, PromptSegmentId,
+    Volatility,
+};
 use sha2::{Digest, Sha256};
+
+const DEFAULT_SYSTEM_PROMPT_MARKDOWN: &str = include_str!("../prompts/default-system.md");
 
 #[async_trait]
 pub trait PromptAssembler: Send + Sync {
@@ -11,6 +16,23 @@ pub trait PromptAssembler: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct DefaultPromptAssembler;
+
+#[must_use]
+pub(crate) fn default_system_prompt_text() -> &'static str {
+    DEFAULT_SYSTEM_PROMPT_MARKDOWN.trim()
+}
+
+#[must_use]
+pub(crate) fn default_system_prompt_segment() -> PromptSegment {
+    let text = default_system_prompt_text().to_owned();
+    PromptSegment {
+        id: PromptSegmentId::new(),
+        text: text.clone(),
+        volatility: Volatility::Static,
+        cache_scope: CacheScope::PrefixCacheable,
+        content_hash: hash_prompt_text(&text),
+    }
+}
 
 #[async_trait]
 impl PromptAssembler for DefaultPromptAssembler {
@@ -83,6 +105,12 @@ fn render_message(message: &Message) -> String {
     }
 }
 
+fn hash_prompt_text(text: &str) -> ContentHash {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -92,6 +120,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn default_system_prompt_segment_loads_embedded_markdown() {
+        let segment = default_system_prompt_segment();
+
+        assert_eq!(segment.text, default_system_prompt_text());
+        assert!(!segment.text.is_empty());
+        assert_eq!(segment.volatility, Volatility::Static);
+        assert_eq!(segment.cache_scope, CacheScope::PrefixCacheable);
+    }
 
     #[tokio::test]
     async fn prefix_cache_key_ignores_transcript_changes() {

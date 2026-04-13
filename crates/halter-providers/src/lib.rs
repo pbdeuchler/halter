@@ -7,6 +7,8 @@ mod fake;
 mod http_client;
 mod openai;
 mod openai_codec;
+mod openai_rate_limit;
+mod openai_rate_limit_policy;
 mod openrouter;
 mod registry;
 mod responses_provider;

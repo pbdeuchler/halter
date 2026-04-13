@@ -8,7 +8,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::openai_codec::{self, ResponsesRequestOptions};
-use crate::responses_transport::ResponsesTransport;
+use crate::openai_rate_limit_policy::estimate_openai_request_cost;
+use crate::responses_transport::{
+    ResponsesRateLimitStrategy, ResponsesTransport, ResponsesTransportRequest,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponsesProviderRequestConfig {
@@ -23,6 +26,7 @@ pub(crate) struct ResponsesProviderConfig {
     pub label: &'static str,
     pub capabilities: ProviderCapabilities,
     pub request: ResponsesProviderRequestConfig,
+    pub rate_limit_strategy: Option<ResponsesRateLimitStrategy>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,14 +83,26 @@ impl ResponsesProvider {
                 reasoning_summary: self.config.request.reasoning_summary,
             },
         )?;
+        let request_bytes = request_body.to_string().len();
         debug!(
             provider = self.config.label,
-            request_bytes = request_body.to_string().len(),
-            "encoded responses request"
+            request_bytes, "encoded responses request"
         );
         let mut response_stream = self
             .transport
-            .responses_stream(request_body, cancel.child_token())
+            .responses_stream(
+                request_body,
+                ResponsesTransportRequest {
+                    provider_label: self.config.label,
+                    model: request.model.model.clone(),
+                    reservation: estimate_openai_request_cost(
+                        request_bytes,
+                        request.model.max_output_tokens,
+                    ),
+                    rate_limit_strategy: self.config.rate_limit_strategy,
+                },
+                cancel.child_token(),
+            )
             .await?;
         let mut decoder = openai_codec::ResponsesStreamDecoder::new(&request);
         let (tx, rx) = mpsc::unbounded();

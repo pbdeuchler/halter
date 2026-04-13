@@ -11,6 +11,7 @@ use crate::Provider;
 use crate::responses_provider::{
     ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
+use crate::responses_transport::ResponsesRateLimitStrategy;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -64,6 +65,7 @@ fn config() -> ResponsesProviderConfig {
             include_encrypted_reasoning: true,
             reasoning_summary: Some("auto"),
         },
+        rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
     }
 }
 

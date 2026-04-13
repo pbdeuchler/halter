@@ -64,6 +64,7 @@ fn config() -> ResponsesProviderConfig {
             include_encrypted_reasoning: false,
             reasoning_summary: None,
         },
+        rate_limit_strategy: None,
     }
 }
 

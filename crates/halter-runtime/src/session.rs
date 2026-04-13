@@ -136,7 +136,7 @@ impl Default for SessionInit {
             session_id: None,
             parent_session_id: None,
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            system_prompt_seed: Vec::new(),
+            system_prompt_seed: vec![crate::prompt::default_system_prompt_segment()],
             max_turns: None,
             default_model: None,
             subagent_model: None,
@@ -1784,6 +1784,17 @@ mod tests {
     use test_support::{
         configured_services, empty_hooks, install_file_hooks, new_session, resolved_test_model,
     };
+
+    #[test]
+    fn session_init_default_uses_embedded_system_prompt_seed() {
+        let init = SessionInit::default();
+
+        assert_eq!(init.system_prompt_seed.len(), 1);
+        assert_eq!(
+            init.system_prompt_seed[0].text,
+            crate::prompt::default_system_prompt_text()
+        );
+    }
 
     mod test_support {
         use std::path::Path;

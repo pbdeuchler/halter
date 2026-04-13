@@ -1228,6 +1228,7 @@ dependencies = [
  "halter-config",
  "halter-protocol",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1289,6 +1290,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "eventsource-stream",
  "futures",
  "halter-protocol",
  "indexmap",
@@ -1296,6 +1298,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
 ]
