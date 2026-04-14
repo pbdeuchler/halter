@@ -8,8 +8,9 @@ use async_openai::types::responses::{
     ResponseStreamEvent, SummaryPart,
 };
 use halter_protocol::{
-    ApiKind, AssistantPart, BlockId, Message, MessageId, ProviderRequest, ReasoningEffort,
-    StopReason, StreamEvent, Usage, UserPart,
+    ApiKind, AssistantPart, BlockId, Message, MessageId, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderRequest, ReasoningEffort, StopReason, StreamEvent, Usage,
+    UserPart,
 };
 use serde_json::{Map, Value, json};
 
@@ -91,6 +92,75 @@ pub(crate) fn encode_responses_request(
     }
 
     Ok(Value::Object(body))
+}
+
+pub(crate) fn encode_responses_compact_request(
+    request: &ProviderCompactionRequest,
+) -> anyhow::Result<Value> {
+    if request.model.api_kind != ApiKind::OpenAiResponses {
+        anyhow::bail!("failed to encode openai compaction request: unsupported api kind");
+    }
+
+    let input = encode_responses_compact_input(request)?;
+    validate_responses_input_item_ids(&input)?;
+    Ok(json!({
+        "model": request.model.model,
+        "input": input,
+        "instructions": request.instructions,
+    }))
+}
+
+pub(crate) fn decode_responses_compact_response(
+    response: &Value,
+) -> anyhow::Result<ProviderCompactionResponse> {
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to decode openai compaction response: missing output array")
+        })?;
+
+    Ok(ProviderCompactionResponse {
+        output,
+        usage: decode_openai_usage(response),
+    })
+}
+
+fn encode_responses_compact_input(
+    request: &ProviderCompactionRequest,
+) -> anyhow::Result<Vec<Value>> {
+    let mut input = request.compacted_prefix.clone();
+    for message in &request.messages {
+        match message {
+            Message::System(_) => {}
+            Message::User(user) => input.push(encode_responses_user_message(user)?),
+            Message::Assistant(assistant) => {
+                if let Some(message) = encode_responses_assistant_message(assistant) {
+                    input.push(message);
+                }
+                for part in &assistant.parts {
+                    if let AssistantPart::ToolCall(call) = part {
+                        input.push(json!({
+                            "type": "function_call",
+                            "id": responses_function_call_item_id(&call.id),
+                            "call_id": call.id,
+                            "name": tool_name_for_provider(
+                                &call.name,
+                                &request.tools,
+                                request.model.provider_kind,
+                            ),
+                            "arguments": call.arguments.to_string(),
+                            "status": "completed",
+                        }));
+                    }
+                }
+            }
+            Message::Tool(tool) => input.push(encode_responses_tool_output(tool)),
+        }
+    }
+
+    Ok(input)
 }
 
 #[cfg(test)]
@@ -202,6 +272,7 @@ pub(crate) fn decode_responses_response(
 pub(crate) struct ResponsesStreamDecoder {
     tool_specs: Vec<halter_protocol::ToolSpec>,
     provider_kind: halter_protocol::ProviderKind,
+    track_response_id: bool,
     response_id: Option<String>,
     message_id: Option<MessageId>,
     started: bool,
@@ -240,10 +311,11 @@ struct PendingToolCallBlock {
 
 impl ResponsesStreamDecoder {
     #[must_use]
-    pub(crate) fn new(request: &ProviderRequest) -> Self {
+    pub(crate) fn new(request: &ProviderRequest, track_response_id: bool) -> Self {
         Self {
             tool_specs: request.tools.clone(),
             provider_kind: request.model.provider_kind,
+            track_response_id,
             response_id: None,
             message_id: None,
             started: false,
@@ -709,7 +781,7 @@ impl ResponsesStreamDecoder {
     }
 
     fn remember_response_id(&mut self, response_id: &str) {
-        if !response_id.is_empty() {
+        if self.track_response_id && !response_id.is_empty() {
             self.response_id = Some(response_id.to_owned());
         }
     }
@@ -833,6 +905,7 @@ fn encode_responses_input(request: &ProviderRequest) -> anyhow::Result<Vec<Value
     if let Some(system) = collect_system_text(request) {
         input.push(encode_responses_developer_message(&system));
     }
+    input.extend(request.compacted_prefix.clone());
 
     for message in &request.messages {
         match message {
@@ -1266,7 +1339,6 @@ fn decode_chat_stop_reason(choice: &Value) -> StopReason {
     }
 }
 
-#[cfg(test)]
 fn decode_openai_usage(response: &Value) -> Usage {
     Usage {
         input_tokens: response
@@ -1774,7 +1846,7 @@ mod tests {
     #[test]
     fn responses_stream_decoder_maps_text_reasoning_tool_calls_and_usage() {
         let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
-        let mut decoder = ResponsesStreamDecoder::new(&request);
+        let mut decoder = ResponsesStreamDecoder::new(&request, true);
         let stream_events = vec![
             json!({
                 "type": "response.created",
@@ -1983,7 +2055,7 @@ mod tests {
     #[test]
     fn responses_stream_decoder_does_not_reuse_response_id_for_tool_only_turns() {
         let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
-        let mut decoder = ResponsesStreamDecoder::new(&request);
+        let mut decoder = ResponsesStreamDecoder::new(&request, true);
         let stream_events = vec![
             json!({
                 "type": "response.created",
@@ -2103,7 +2175,7 @@ mod tests {
     #[test]
     fn responses_stream_decoder_ignores_duplicate_tool_completion_events() {
         let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
-        let mut decoder = ResponsesStreamDecoder::new(&request);
+        let mut decoder = ResponsesStreamDecoder::new(&request, true);
         let stream_events = vec![
             json!({
                 "type": "response.created",
@@ -2223,6 +2295,7 @@ mod tests {
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(8_192),
                 reasoning: Some(ReasoningEffort::Medium),
+                tokens_per_minute: None,
             },
             prompt: AssembledPrompt {
                 segments: vec![PromptSegment {
@@ -2239,6 +2312,7 @@ mod tests {
                 rendered_transcript: String::new(),
                 rendered: String::new(),
             },
+            compacted_prefix: Vec::new(),
             messages: vec![
                 Message::User(UserMessage::text("hello")),
                 Message::Assistant(AssistantMessage {

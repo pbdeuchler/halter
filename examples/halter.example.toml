@@ -8,6 +8,7 @@ version = 1
 provider = "openai"
 model = "gpt-5.4"
 reasoning = "high"
+# tokens_per_minute = 500_000  # Default: 500,000. Proactive token budget for rate limiting.
 
 [models.subagent]
 provider = "openai"
@@ -51,11 +52,11 @@ enabled = [
 ]
 
 [context]
-# max_context_messages = 24  # Hard cap on messages per request (fallback).
-# token_budget = 80000       # Token budget for the active conversation layer.
-                              # When exceeded, low-signal messages are compacted
-                              # into summaries that become part of the stable
-                              # cache prefix.
+compaction_threshold = 200_000   # Trigger compaction when estimated tokens reach
+                               # this threshold, with a 100-token buffer.
+pre_compaction_target = 150_000  # Evict low-signal history down to this target
+                               # before calling /v1/responses/compact.
+prune_signal_threshold = "low" # Evict up through very_low/low/normal.
 
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]

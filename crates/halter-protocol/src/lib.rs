@@ -844,6 +844,8 @@ pub struct SessionBlueprint {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 pub struct SessionState {
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub compacted_prefix: Vec<Value>,
     pub file_view_cache: FileViewCache,
     pub appended_prompt_segments: Vec<PromptSegment>,
     pub pending_tool_calls: IndexMap<ToolCallId, PendingToolCall>,
@@ -946,6 +948,7 @@ pub struct ProviderCapabilities {
     pub supports_images: bool,
     pub supports_documents: bool,
     pub supports_prompt_cache: bool,
+    pub supports_compaction: bool,
     pub supports_tool_result_media: bool,
     pub requires_non_empty_assistant_content: bool,
     pub tool_call_id_policy: ToolCallIdPolicy,
@@ -963,6 +966,7 @@ impl Default for ProviderCapabilities {
             supports_images: false,
             supports_documents: false,
             supports_prompt_cache: false,
+            supports_compaction: false,
             supports_tool_result_media: false,
             requires_non_empty_assistant_content: false,
             tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
@@ -991,6 +995,8 @@ pub struct ResolvedModel {
     pub max_input_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub tokens_per_minute: Option<u64>,
 }
 
 #[derive(
@@ -1004,24 +1010,45 @@ pub enum MessageSignal {
     Low = 1,
     /// Default for most messages.
     Normal = 2,
-    /// Assistant reasoning, active file reads.
+    /// Active file reads and system guidance.
     High = 3,
+    /// Assistant text or reasoning content.
+    VeryHigh = 4,
     /// Never compact -- user messages.
-    Anchor = 4,
+    Anchor = 5,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneSignalThreshold {
+    VeryLow,
+    Low,
+    Normal,
+    High,
+}
+
+impl Default for PruneSignalThreshold {
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CompactionResult {
-    /// Number of messages removed from the front of the history.
+    /// Number of messages compacted into the raw prefix.
     pub compacted_count: usize,
-    /// Summary generated from the compacted messages.
-    pub summary: SummarySlice,
+    /// Human-readable summary for events and hooks.
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ContextPlan {
     pub prompt_segments: Vec<PromptSegment>,
     pub transcript_window: TranscriptWindow,
+    #[serde(default)]
+    pub compacted_prefix: Vec<Value>,
     pub file_views: Vec<FileViewSlice>,
     pub carried_summaries: Vec<SummarySlice>,
     pub elided_tool_results: Vec<ElisionMarker>,
@@ -1060,6 +1087,8 @@ pub struct ProviderRequest {
     pub turn_id: TurnId,
     pub model: ResolvedModel,
     pub prompt: AssembledPrompt,
+    #[serde(default)]
+    pub compacted_prefix: Vec<Value>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     /// When set, the provider can chain onto the previous response instead of
@@ -1071,6 +1100,23 @@ pub struct ProviderRequest {
     /// Only meaningful when `previous_response_id` is `Some`.
     #[serde(default)]
     pub new_messages_start: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderCompactionRequest {
+    pub session_id: SessionId,
+    pub model: ResolvedModel,
+    #[serde(default)]
+    pub compacted_prefix: Vec<Value>,
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolSpec>,
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderCompactionResponse {
+    pub output: Vec<Value>,
+    pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

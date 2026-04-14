@@ -459,6 +459,7 @@ mod tests {
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(8_192),
                 reasoning: None,
+                tokens_per_minute: None,
             },
             prompt: AssembledPrompt {
                 segments: vec![PromptSegment {
@@ -475,6 +476,7 @@ mod tests {
                 rendered_transcript: String::new(),
                 rendered: String::new(),
             },
+            compacted_prefix: Vec::new(),
             messages,
             tools: vec![ToolSpec {
                 name: "read".into(),

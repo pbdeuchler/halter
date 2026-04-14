@@ -48,6 +48,14 @@ pub(crate) enum AcquireDecision {
     WaitUntil(Instant),
 }
 
+pub(crate) fn initial_token_window(tokens_per_minute: u64) -> OpenAiWindowState {
+    OpenAiWindowState {
+        limit: tokens_per_minute,
+        remaining: tokens_per_minute,
+        reset_at: None,
+    }
+}
+
 pub(crate) fn estimate_openai_request_cost(
     request_json_bytes: usize,
     max_output_tokens: Option<u32>,
@@ -414,5 +422,84 @@ mod tests {
         let requests = state.requests.expect("request window");
         assert_eq!(requests.remaining, 59);
         assert_eq!(requests.reset_at, Some(now + Duration::from_secs(65)));
+    }
+
+    #[test]
+    fn initial_token_window_seeds_full_budget() {
+        let window = initial_token_window(500_000);
+        assert_eq!(window.limit, 500_000);
+        assert_eq!(window.remaining, 500_000);
+        assert_eq!(window.reset_at, None);
+    }
+
+    #[test]
+    fn try_acquire_reservation_waits_when_token_budget_exhausted() {
+        let now = Instant::now();
+        let mut state = OpenAiRateLimitState {
+            tokens: Some(initial_token_window(1_000)),
+            ..OpenAiRateLimitState::default()
+        };
+
+        let decision = try_acquire_reservation(
+            &mut state,
+            OpenAiReservation {
+                requests: 0,
+                tokens: 1_001,
+            },
+            now,
+        );
+
+        assert!(
+            matches!(decision, AcquireDecision::WaitUntil(_)),
+            "should wait when tokens exceed budget"
+        );
+    }
+
+    #[test]
+    fn try_acquire_reservation_proceeds_within_token_budget() {
+        let now = Instant::now();
+        let mut state = OpenAiRateLimitState {
+            tokens: Some(initial_token_window(500_000)),
+            ..OpenAiRateLimitState::default()
+        };
+
+        let decision = try_acquire_reservation(
+            &mut state,
+            OpenAiReservation {
+                requests: 0,
+                tokens: 100_000,
+            },
+            now,
+        );
+
+        assert_eq!(decision, AcquireDecision::Ready);
+        assert_eq!(state.reserved.tokens, 100_000);
+    }
+
+    #[test]
+    fn header_snapshot_overrides_initial_token_window() {
+        let now = Instant::now();
+        let mut state = OpenAiRateLimitState {
+            tokens: Some(initial_token_window(500_000)),
+            ..OpenAiRateLimitState::default()
+        };
+
+        reconcile_rate_limit_snapshot(
+            &mut state,
+            OpenAiReservation::default(),
+            Some(OpenAiRateLimitSnapshot {
+                tokens: Some(OpenAiWindowSnapshot {
+                    limit: 1_000_000,
+                    remaining: 800_000,
+                    reset_after: Some(Duration::from_secs(60)),
+                }),
+                ..OpenAiRateLimitSnapshot::default()
+            }),
+            now,
+        );
+
+        let tokens = state.tokens.expect("token window");
+        assert_eq!(tokens.limit, 1_000_000);
+        assert_eq!(tokens.remaining, 800_000);
     }
 }

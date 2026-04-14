@@ -15,8 +15,8 @@ use tracing::debug;
 
 use crate::openai_rate_limit_policy::{
     AcquireDecision, OpenAiRateLimitSnapshot, OpenAiRateLimitState, OpenAiReservation,
-    OpenAiWindowSnapshot, parse_openai_reset_duration, parse_retry_after_duration,
-    reconcile_rate_limit_snapshot, try_acquire_reservation,
+    OpenAiWindowSnapshot, initial_token_window, parse_openai_reset_duration,
+    parse_retry_after_duration, reconcile_rate_limit_snapshot, try_acquire_reservation,
 };
 
 static OPENAI_RATE_LIMITS: OnceLock<Mutex<HashMap<OpenAiRateLimitKey, Arc<OpenAiRateLimitEntry>>>> =
@@ -77,9 +77,10 @@ impl OpenAiRateLimiter {
         &self,
         model: &str,
         reservation: OpenAiReservation,
+        tokens_per_minute: Option<u64>,
         cancel: CancellationToken,
     ) -> anyhow::Result<OpenAiRateLimitPermit> {
-        let entry = self.entry(model);
+        let entry = self.entry(model, tokens_per_minute);
 
         loop {
             let decision = {
@@ -118,7 +119,7 @@ impl OpenAiRateLimiter {
         }
     }
 
-    fn entry(&self, model: &str) -> Arc<OpenAiRateLimitEntry> {
+    fn entry(&self, model: &str, tokens_per_minute: Option<u64>) -> Arc<OpenAiRateLimitEntry> {
         let key = OpenAiRateLimitKey {
             base_url: self.scope.base_url.clone(),
             credential_fingerprint: self.scope.credential_fingerprint.clone(),
@@ -128,8 +129,35 @@ impl OpenAiRateLimiter {
         let mut registry = registry.lock().expect("rate limit registry lock poisoned");
         registry
             .entry(key)
-            .or_insert_with(|| Arc::new(OpenAiRateLimitEntry::default()))
+            .or_insert_with(|| {
+                let state = OpenAiRateLimitState {
+                    tokens: tokens_per_minute.map(initial_token_window),
+                    ..OpenAiRateLimitState::default()
+                };
+                Arc::new(OpenAiRateLimitEntry {
+                    state: Mutex::new(state),
+                    notify: Notify::new(),
+                })
+            })
             .clone()
+    }
+
+    pub(crate) fn apply_retry_after(&self, model: &str, retry_after: Duration) {
+        let entry = self.entry(model, None);
+        {
+            let mut state = entry.state.lock().expect("rate limit lock poisoned");
+            reconcile_rate_limit_snapshot(
+                &mut state,
+                OpenAiReservation::default(),
+                Some(OpenAiRateLimitSnapshot {
+                    requests: None,
+                    tokens: None,
+                    retry_after: Some(retry_after),
+                }),
+                Instant::now(),
+            );
+        }
+        entry.notify.notify_waiters();
     }
 }
 

@@ -7,6 +7,8 @@ use halter_protocol::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::compaction::stable_json;
+
 const DEFAULT_SYSTEM_PROMPT_MARKDOWN: &str = include_str!("../prompts/default-system.md");
 
 #[async_trait]
@@ -61,10 +63,17 @@ impl PromptAssembler for DefaultPromptAssembler {
             prefix_parts.push(summary.text.clone());
         }
 
+        // Layer 3: raw compacted prefix items returned by /v1/responses/compact.
+        for item in &plan.compacted_prefix {
+            let serialized = stable_json(item);
+            hasher.update(serialized.as_bytes());
+            prefix_parts.push(serialized);
+        }
+
         hasher.update(plan.cache_boundary_hash.as_bytes());
         let rendered_prefix = prefix_parts.join("\n\n");
 
-        // Layer 3: active conversation tail (mutable, uncached).
+        // Layer 4: active conversation tail (mutable, uncached).
         let rendered_transcript = plan
             .transcript_window
             .messages
@@ -161,6 +170,7 @@ mod tests {
                 messages: vec![Message::User(UserMessage::text("hello"))],
                 elided_message_count: 0,
             },
+            compacted_prefix: vec![],
             file_views: Vec::new(),
             carried_summaries: vec![SummarySlice {
                 id: "summary".to_owned(),
@@ -221,6 +231,7 @@ mod tests {
                 messages: vec![Message::User(UserMessage::text("hello"))],
                 elided_message_count: 0,
             },
+            compacted_prefix: vec![],
             file_views: Vec::new(),
             carried_summaries: vec![],
             elided_tool_results: Vec::new(),

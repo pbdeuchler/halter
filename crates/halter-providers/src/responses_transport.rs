@@ -1,7 +1,7 @@
 // pattern: Imperative Shell
 
 use async_openai::{
-    error::{ApiError, OpenAIError, StreamError, WrappedError},
+    error::{ApiError, OpenAIError, StreamError},
     types::responses::{ResponseStream, ResponseStreamEvent},
 };
 use eventsource_stream::Eventsource;
@@ -13,10 +13,14 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::openai_error::{
+    openai_api_error_retry_after, parse_openai_http_error, parse_openai_stream_error,
+};
 use crate::openai_rate_limit::{OpenAiRateLimitPermit, OpenAiRateLimiter};
 use crate::openai_rate_limit_policy::OpenAiReservation;
 
 const RESPONSES_PATH: &str = "/v1/responses";
+const RESPONSES_COMPACT_PATH: &str = "/v1/responses/compact";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResponsesRateLimitStrategy {
@@ -29,6 +33,7 @@ pub(crate) struct ResponsesTransportRequest {
     pub model: String,
     pub reservation: OpenAiReservation,
     pub rate_limit_strategy: Option<ResponsesRateLimitStrategy>,
+    pub tokens_per_minute: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,12 +68,56 @@ impl ResponsesTransport {
         request_meta: ResponsesTransportRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<ResponseStream> {
+        let response = self
+            .send_json_request(RESPONSES_PATH, request, request_meta.clone(), cancel)
+            .await?;
+        Ok(stream_response(
+            response,
+            OpenAiStreamRateLimitObserver {
+                limiter: self.openai_rate_limiter.clone(),
+                model: request_meta.model,
+            },
+        ))
+    }
+
+    pub(crate) async fn responses_compact(
+        &self,
+        request: Value,
+        request_meta: ResponsesTransportRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Value> {
+        let provider_label = request_meta.provider_label;
+        let response = self
+            .send_json_request(
+                RESPONSES_COMPACT_PATH,
+                request,
+                request_meta,
+                cancel.child_token(),
+            )
+            .await?;
+        select! {
+            _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),
+            result = response.json::<Value>() => result,
+        }
+        .map_err(|error| anyhow::anyhow!(
+            "failed to decode {} compaction response: {error}",
+            provider_label
+        ))
+    }
+
+    async fn send_json_request(
+        &self,
+        path: &str,
+        request: Value,
+        request_meta: ResponsesTransportRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Response> {
         let mut permit = self
             .rate_limit_permit(&request_meta, cancel.child_token())
             .await?;
         let request_builder = self
             .client
-            .post(provider_url(&self.base_url, RESPONSES_PATH))
+            .post(provider_url(&self.base_url, path))
             .bearer_auth(&self.api_key)
             .json(&request);
 
@@ -79,7 +128,7 @@ impl ResponsesTransport {
         .map_err(|error| anyhow::anyhow!(
             "failed to execute {} request: {error}",
             request_meta.provider_label
-        ))?;
+            ))?;
         let status = response.status();
         let headers = response.headers().clone();
         if let Some(permit) = permit.as_mut() {
@@ -96,10 +145,16 @@ impl ResponsesTransport {
                 request_meta.provider_label
             ))?;
             let error = decode_openai_error(status, &body);
+            if let OpenAIError::ApiError(api_error) = &error {
+                if let Some(retry_after) = openai_api_error_retry_after(api_error) {
+                    self.openai_rate_limiter
+                        .apply_retry_after(&request_meta.model, retry_after);
+                }
+            }
             anyhow::bail!("failed to execute provider request: {error}");
         }
 
-        Ok(stream_response(response))
+        Ok(response)
     }
 
     async fn rate_limit_permit(
@@ -110,7 +165,12 @@ impl ResponsesTransport {
         match request_meta.rate_limit_strategy {
             Some(ResponsesRateLimitStrategy::OpenAiHeaders) => Ok(Some(
                 self.openai_rate_limiter
-                    .acquire(&request_meta.model, request_meta.reservation, cancel)
+                    .acquire(
+                        &request_meta.model,
+                        request_meta.reservation,
+                        request_meta.tokens_per_minute,
+                        cancel,
+                    )
                     .await?,
             )),
             None => Ok(None),
@@ -122,7 +182,24 @@ fn provider_url(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
 }
 
-fn stream_response(response: Response) -> ResponseStream {
+#[derive(Debug, Clone)]
+struct OpenAiStreamRateLimitObserver {
+    limiter: OpenAiRateLimiter,
+    model: String,
+}
+
+impl OpenAiStreamRateLimitObserver {
+    fn record_api_error(&self, error: &ApiError) {
+        if let Some(retry_after) = openai_api_error_retry_after(error) {
+            self.limiter.apply_retry_after(&self.model, retry_after);
+        }
+    }
+}
+
+fn stream_response(
+    response: Response,
+    rate_limits: OpenAiStreamRateLimitObserver,
+) -> ResponseStream {
     let stream = response.bytes_stream().eventsource();
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -145,8 +222,7 @@ fn stream_response(response: Response) -> ResponseStream {
                         break;
                     }
 
-                    let parsed = serde_json::from_str::<ResponseStreamEvent>(&event.data)
-                        .map_err(|error| OpenAIError::JSONDeserialize(error, event.data.clone()));
+                    let parsed = decode_stream_event(&event.data, &rate_limits);
 
                     if tx.send(parsed).is_err() {
                         break;
@@ -157,6 +233,19 @@ fn stream_response(response: Response) -> ResponseStream {
     });
 
     Box::pin(UnboundedReceiverStream::new(rx))
+}
+
+fn decode_stream_event(
+    data: &str,
+    rate_limits: &OpenAiStreamRateLimitObserver,
+) -> Result<ResponseStreamEvent, OpenAIError> {
+    if let Some(api_error) = parse_openai_stream_error(data) {
+        rate_limits.record_api_error(&api_error);
+        return Err(OpenAIError::ApiError(api_error));
+    }
+
+    serde_json::from_str::<ResponseStreamEvent>(data)
+        .map_err(|error| OpenAIError::JSONDeserialize(error, data.to_owned()))
 }
 
 fn decode_openai_error(status: StatusCode, body: &[u8]) -> OpenAIError {
@@ -170,9 +259,9 @@ fn decode_openai_error(status: StatusCode, body: &[u8]) -> OpenAIError {
         });
     }
 
-    serde_json::from_slice::<WrappedError>(body)
-        .map(|wrapped| OpenAIError::ApiError(wrapped.error))
-        .unwrap_or_else(|_| {
+    parse_openai_http_error(body)
+        .map(OpenAIError::ApiError)
+        .unwrap_or_else(|| {
             OpenAIError::ApiError(ApiError {
                 message: String::from_utf8_lossy(body).trim().to_owned(),
                 r#type: None,
@@ -209,6 +298,7 @@ mod tests {
             model: "gpt-5".to_owned(),
             reservation: estimate_openai_request_cost(request.to_string().len(), Some(32)),
             rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
+            tokens_per_minute: None,
         };
 
         let mut first = transport

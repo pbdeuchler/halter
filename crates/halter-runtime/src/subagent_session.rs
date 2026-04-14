@@ -56,6 +56,7 @@ pub fn build_subagent_state(
 
     SessionState {
         messages: parent.state.messages.clone(),
+        compacted_prefix: parent.state.compacted_prefix.clone(),
         file_view_cache: parent.state.file_view_cache.clone(),
         appended_prompt_segments: parent.state.appended_prompt_segments.clone(),
         pending_tool_calls: Default::default(),

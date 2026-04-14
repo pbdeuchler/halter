@@ -196,8 +196,9 @@ impl HalterBuilder {
             policy: policy.clone(),
             prompt_assembler: Arc::new(DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::new(
-                config.context.max_context_messages,
-                config.context.token_budget,
+                config.context.compaction_threshold,
+                config.context.pre_compaction_target,
+                config.context.prune_signal_threshold,
             )),
             event_bus: Arc::new(EventBus::default()),
             max_tool_output_bytes: config.policy.max_tool_output_bytes,
@@ -345,6 +346,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         max_input_tokens: default_config.max_input_tokens,
         max_output_tokens: default_config.max_output_tokens,
         reasoning: default_config.reasoning,
+        tokens_per_minute: default_config.tokens_per_minute,
     };
     let small_model = ResolvedModel {
         role: ModelRole::small(),
@@ -356,6 +358,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         max_input_tokens: small_config.max_input_tokens,
         max_output_tokens: small_config.max_output_tokens,
         reasoning: small_config.reasoning,
+        tokens_per_minute: small_config.tokens_per_minute,
     };
     let subagent_model = ResolvedModel {
         role: ModelRole::subagent(),
@@ -367,6 +370,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         max_input_tokens: subagent_config.max_input_tokens,
         max_output_tokens: subagent_config.max_output_tokens,
         reasoning: subagent_config.reasoning,
+        tokens_per_minute: subagent_config.tokens_per_minute,
     };
 
     debug!(
@@ -630,6 +634,7 @@ mod tests {
             max_input_tokens: Some(200_000),
             max_output_tokens: Some(8_192),
             reasoning: Some(ReasoningEffort::Medium),
+            tokens_per_minute: None,
         });
         config.providers.openai = Some(ProviderConfig {
             base_url: None,

@@ -626,7 +626,35 @@ impl HalterSession {
             return Ok(());
         }
 
-        let summary = compact_session_state(&mut state, custom_instructions);
+        let observed = observe_state(stored.blueprint.working_dir.clone());
+        let compaction_model = self
+            .services
+            .models
+            .model(&stored.blueprint.default_model)?;
+        let compaction_provider = self.services.models.provider(&compaction_model.provider)?;
+        let compaction = self
+            .services
+            .context_manager
+            .compact_now(
+                &stored.blueprint,
+                &state,
+                &observed,
+                stored.snapshot.as_ref(),
+                &self.services.tools.specs(),
+                &compaction_model,
+                compaction_provider.as_ref(),
+                custom_instructions,
+            )
+            .await?;
+        let summary = if let Some(result) = compaction.compaction {
+            state.compacted_prefix = compaction.compacted_prefix;
+            state.messages = compaction.messages;
+            state.last_response_id = None;
+            state.messages_seen_by_provider = 0;
+            result.summary
+        } else {
+            "No compaction needed.".to_owned()
+        };
         state.pending_session_start_source = Some(HookSessionStartSource::Compact);
         self.push_event(
             &mut events,
@@ -776,6 +804,11 @@ impl HalterSession {
             .push(Message::User(turn.user_message.clone()));
 
         loop {
+            let compaction_model = self
+                .services
+                .models
+                .model(&stored.blueprint.default_model)?;
+            let compaction_provider = self.services.models.provider(&compaction_model.provider)?;
             let observed = observe_state(stored.blueprint.working_dir.clone());
             let plan = self
                 .services
@@ -786,22 +819,20 @@ impl HalterSession {
                     &observed,
                     snapshot.as_ref(),
                     &self.services.tools.specs(),
+                    &compaction_model,
+                    compaction_provider.as_ref(),
                 )
                 .await?;
 
-            // Apply compaction to session state so future turns see the trimmed history.
-            // Signal-based eviction may remove messages from anywhere in the history,
-            // so replace state.messages with the kept set from the plan.
             if let Some(ref compaction) = plan.compaction {
-                state.summaries.push(compaction.summary.clone());
+                state.compacted_prefix = plan.compacted_prefix.clone();
                 state.messages = plan.messages.clone();
-                // Invalidate response chaining — the server's state no longer matches.
                 state.last_response_id = None;
                 state.messages_seen_by_provider = 0;
                 self.push_event(
                     &mut events,
                     SessionEventPayload::ContextCompacted {
-                        summary: compaction.summary.text.clone(),
+                        summary: compaction.summary.clone(),
                     },
                     live.as_ref(),
                 );
@@ -826,6 +857,7 @@ impl HalterSession {
                 turn_id: turn.id.clone(),
                 model: model.clone(),
                 prompt,
+                compacted_prefix: plan.compacted_prefix.clone(),
                 messages: plan.messages.clone(),
                 tools: plan.tool_specs.clone(),
                 previous_response_id: plan.previous_response_id.clone(),
@@ -881,6 +913,34 @@ impl HalterSession {
                 },
                 live.as_ref(),
             );
+
+            let post_response_observed = observe_state(stored.blueprint.working_dir.clone());
+            let post_response_plan = self
+                .services
+                .context_manager
+                .plan(
+                    &stored.blueprint,
+                    &state,
+                    &post_response_observed,
+                    snapshot.as_ref(),
+                    &self.services.tools.specs(),
+                    &compaction_model,
+                    compaction_provider.as_ref(),
+                )
+                .await?;
+            if let Some(ref compaction) = post_response_plan.compaction {
+                state.compacted_prefix = post_response_plan.compacted_prefix.clone();
+                state.messages = post_response_plan.messages.clone();
+                state.last_response_id = None;
+                state.messages_seen_by_provider = 0;
+                self.push_event(
+                    &mut events,
+                    SessionEventPayload::ContextCompacted {
+                        summary: compaction.summary.clone(),
+                    },
+                    live.as_ref(),
+                );
+            }
 
             let tool_calls = assistant_tool_calls(&materialized.message);
             if tool_calls.is_empty() {
@@ -1591,66 +1651,6 @@ fn tool_result_from_hook_value(value: serde_json::Value) -> ToolResult {
     }
 }
 
-fn compact_session_state(state: &mut SessionState, custom_instructions: Option<&str>) -> String {
-    const RETAINED_MESSAGES: usize = 8;
-
-    if state.messages.len() <= RETAINED_MESSAGES {
-        return "No compaction needed.".to_owned();
-    }
-
-    let split_index = state.messages.len() - RETAINED_MESSAGES;
-    let summary_body = state.messages[..split_index]
-        .iter()
-        .map(render_message_for_summary)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let summary =
-        if let Some(instructions) = custom_instructions.filter(|value| !value.trim().is_empty()) {
-            format!("{instructions}\n\n{summary_body}")
-        } else {
-            summary_body
-        };
-
-    state.summaries.push(halter_protocol::SummarySlice {
-        id: MessageId::new().0,
-        text: summary.clone(),
-    });
-    state.messages = state.messages.split_off(split_index);
-    // Invalidate response chaining after hook-triggered compaction.
-    state.last_response_id = None;
-    state.messages_seen_by_provider = 0;
-
-    summary
-}
-
-fn render_message_for_summary(message: &Message) -> String {
-    match message {
-        Message::System(message) => format!("system: {}", message.text),
-        Message::User(message) => format!("user: {}", message.plain_text()),
-        Message::Assistant(message) => {
-            format!("assistant: {}", render_assistant_summary_text(message))
-        }
-        Message::Tool(message) => match &message.content {
-            ToolResult::Empty => "tool: empty".to_owned(),
-            ToolResult::Text { text } => format!("tool: {text}"),
-            ToolResult::Json { value } => format!("tool: {value}"),
-        },
-    }
-}
-
-fn render_assistant_summary_text(message: &AssistantMessage) -> String {
-    message
-        .parts
-        .iter()
-        .filter_map(|part| match part {
-            AssistantPart::Text { text } => Some(text.as_str()),
-            AssistantPart::Thinking(_) | AssistantPart::ToolCall(_) => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 pub(crate) async fn create_session_seeded(
     services: Arc<RuntimeServices>,
     init: SessionInit,
@@ -1887,6 +1887,7 @@ mod tests {
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
                 reasoning: None,
+                tokens_per_minute: None,
             });
             models.set_subagent_model(ResolvedModel {
                 role: ModelRole::subagent(),
@@ -1898,6 +1899,7 @@ mod tests {
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
                 reasoning: None,
+                tokens_per_minute: None,
             });
             models.set_small_model(ResolvedModel {
                 role: ModelRole::small(),
@@ -1909,6 +1911,7 @@ mod tests {
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
                 reasoning: None,
+                tokens_per_minute: None,
             });
             models.register_provider(ProviderName::from("fake"), provider);
             services.models = Arc::new(models);
@@ -1970,6 +1973,7 @@ mod tests {
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
                 reasoning: None,
+                tokens_per_minute: None,
             }
         }
     }
@@ -1988,6 +1992,7 @@ mod tests {
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
             reasoning: None,
+            tokens_per_minute: None,
         });
         models.set_subagent_model(ResolvedModel {
             role: ModelRole::subagent(),
@@ -1999,6 +2004,7 @@ mod tests {
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
             reasoning: None,
+            tokens_per_minute: None,
         });
         models.register_provider(
             ProviderName::from("fake"),
@@ -2216,6 +2222,7 @@ mod tests {
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
             reasoning: None,
+            tokens_per_minute: None,
         });
         models.set_subagent_model(resolved_test_model("subagent", "fake", "subagent/model"));
         models.register_provider(
@@ -2528,8 +2535,8 @@ mod tests {
             .await
             .expect("load compacted session")
             .expect("session exists");
-        assert!(!stored.state.summaries.is_empty());
-        assert!(stored.state.messages.len() <= 8);
+        assert!(!stored.state.compacted_prefix.is_empty());
+        assert!(stored.state.messages.is_empty());
         assert_eq!(
             stored.state.pending_session_start_source,
             Some(HookSessionStartSource::Compact)
@@ -2541,6 +2548,39 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn submit_turn_compacts_immediately_after_response_when_threshold_is_reached() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .context_manager = Arc::new(DefaultContextManager::new(
+            150,
+            0,
+            halter_protocol::PruneSignalThreshold::VeryLow,
+        ));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        session
+            .submit_turn(Turn::user("x".repeat(150)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert!(!stored.state.compacted_prefix.is_empty());
+        assert_eq!(stored.state.messages.len(), 1);
+        assert!(matches!(stored.state.messages[0], Message::Assistant(_)));
     }
 
     #[tokio::test]

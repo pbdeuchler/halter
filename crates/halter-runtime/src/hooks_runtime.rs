@@ -778,6 +778,7 @@ async fn run_prompt(
             rendered_transcript: prompt_text.clone(),
             rendered: prompt_text,
         },
+        compacted_prefix: Vec::new(),
         messages: vec![Message::User(user_message)],
         tools: Vec::new(),
         previous_response_id: None,
