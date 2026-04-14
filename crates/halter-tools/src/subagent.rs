@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 use halter_protocol::{
-    CloseSubagentRequest, SendSubagentInputRequest, SpawnSubagentRequest, ToolCapabilities,
-    ToolConcurrency, ToolName, ToolResult, ToolSpec, WaitSubagentRequest,
+    CloseSubagentRequest, ResourceSnapshot, SendSubagentInputRequest, SpawnSubagentRequest,
+    ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec, WaitSubagentRequest,
 };
 use serde_json::{Value, json};
 
@@ -16,10 +16,20 @@ pub fn register_subagent_tools(
     runtime: &ToolRuntime,
     control: Arc<dyn SubagentControl>,
     enabled: &[String],
+    snapshot: &ResourceSnapshot,
 ) {
     let register_all = enabled.is_empty();
+    let mut available_agent_types = snapshot
+        .agents
+        .keys()
+        .map(|name| name.0.clone())
+        .collect::<Vec<_>>();
+    available_agent_types.sort();
     for tool in [
-        Arc::new(SpawnAgentTool::new(control.clone())) as Arc<dyn Tool>,
+        Arc::new(SpawnAgentTool::new(
+            control.clone(),
+            available_agent_types.clone(),
+        )) as Arc<dyn Tool>,
         Arc::new(SendInputTool::new(control.clone())),
         Arc::new(WaitAgentTool::new(control.clone())),
         Arc::new(CloseAgentTool::new(control.clone())),
@@ -34,11 +44,73 @@ pub fn register_subagent_tools(
 #[derive(Clone)]
 struct SpawnAgentTool {
     control: Arc<dyn SubagentControl>,
+    available_agent_types: Vec<String>,
 }
 
 impl SpawnAgentTool {
-    fn new(control: Arc<dyn SubagentControl>) -> Self {
-        Self { control }
+    fn new(control: Arc<dyn SubagentControl>, available_agent_types: Vec<String>) -> Self {
+        Self {
+            control,
+            available_agent_types,
+        }
+    }
+
+    fn input_schema(&self) -> Value {
+        let mut properties = serde_json::Map::from_iter([
+            ("message".to_owned(), json!({ "type": "string" })),
+            (
+                "fork_context".to_owned(),
+                json!({
+                    "type": "boolean",
+                    "description": "When true, start from the parent session context. Defaults to true."
+                }),
+            ),
+            ("model".to_owned(), json!({ "type": "string" })),
+        ]);
+        if !self.available_agent_types.is_empty() {
+            properties.insert(
+                "agent_type".to_owned(),
+                json!({
+                    "type": "string",
+                    "enum": self.available_agent_types,
+                    "description": "Optional named agent role. Omit to use the default child session."
+                }),
+            );
+        }
+
+        Value::Object(serde_json::Map::from_iter([
+            ("type".to_owned(), json!("object")),
+            ("properties".to_owned(), Value::Object(properties)),
+            ("required".to_owned(), json!(["message"])),
+        ]))
+    }
+
+    fn normalize_request(
+        &self,
+        mut request: SpawnSubagentRequest,
+    ) -> anyhow::Result<SpawnSubagentRequest> {
+        let Some(agent_type) = request.agent_type.as_ref() else {
+            return Ok(request);
+        };
+
+        if self.available_agent_types.is_empty() {
+            request.agent_type = None;
+            return Ok(request);
+        }
+
+        if self
+            .available_agent_types
+            .iter()
+            .any(|name| name == &agent_type.0)
+        {
+            return Ok(request);
+        }
+
+        anyhow::bail!(
+            "failed to execute spawn_agent tool: unknown agent_type '{}'; available agent_type values: {}",
+            agent_type.0,
+            self.available_agent_types.join(", ")
+        );
     }
 }
 
@@ -47,17 +119,10 @@ impl Tool for SpawnAgentTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("spawn_agent"),
-            description: "Spawn a child session to work on a delegated task".to_owned(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "message": { "type": "string" },
-                    "agent_type": { "type": "string" },
-                    "fork_context": { "type": "boolean" },
-                    "model": { "type": "string" }
-                },
-                "required": ["message"],
-            }),
+            description:
+                "Spawn a child session to work on a delegated task. Omit agent_type to use the default child session."
+                    .to_owned(),
+            input_schema: self.input_schema(),
             concurrency: ToolConcurrency::Exclusive,
             capabilities: ToolCapabilities {
                 mutating: false,
@@ -77,6 +142,7 @@ impl Tool for SpawnAgentTool {
             .context("failed to execute spawn_agent tool: missing parent session context")?;
         let request: SpawnSubagentRequest = serde_json::from_value(input)
             .context("failed to execute spawn_agent tool: invalid input")?;
+        let request = self.normalize_request(request)?;
         let status = self.control.spawn(parent, request).await?;
         emit_completed(&context, "spawn_agent");
         Ok(ToolResult::Json {
@@ -318,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_agent_forwards_request() {
         let control = Arc::new(RecordingSubagentControl::default());
-        let tool = SpawnAgentTool::new(control.clone());
+        let tool = SpawnAgentTool::new(control.clone(), vec!["helper".to_owned()]);
         let context = ToolContext {
             session_id: SessionId::new(),
             working_dir: ".".into(),
@@ -377,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_agent_requires_parent_context() {
-        let tool = SpawnAgentTool::new(Arc::new(RecordingSubagentControl::default()));
+        let tool = SpawnAgentTool::new(Arc::new(RecordingSubagentControl::default()), Vec::new());
         let context = ToolContext {
             session_id: SessionId::new(),
             working_dir: ".".into(),
@@ -400,5 +466,77 @@ mod tests {
             .expect_err("missing parent context should fail");
 
         assert!(error.to_string().contains("missing parent session context"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_ignores_agent_type_when_no_roles_are_loaded() {
+        let control = Arc::new(RecordingSubagentControl::default());
+        let tool = SpawnAgentTool::new(control.clone(), Vec::new());
+        let context = ToolContext {
+            session_id: SessionId::new(),
+            working_dir: ".".into(),
+            path_locks: Arc::new(crate::PathLockMap::default()),
+            tool_sessions: Arc::new(crate::ToolSessionStore::default()),
+            file_view: Arc::new(Default::default()),
+            snapshot: Arc::new(ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(NoopToolEventSink),
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
+                as Arc<dyn ToolPolicy>,
+            max_tool_output_bytes: 16_384,
+            shell_timeout_secs: 30,
+            subagent_parent: Some(Arc::new(SubagentParentContext {
+                blueprint: SessionBlueprint {
+                    session_id: SessionId::from("parent-session"),
+                    parent_session_id: None,
+                    default_model: ModelId::from("default"),
+                    subagent_model: ModelId::from("subagent"),
+                    snapshot_revision: "revision".into(),
+                    working_dir: ".".into(),
+                    system_prompt_seed: Vec::new(),
+                    max_turns: None,
+                    subagent_depth: 0,
+                },
+                state: SessionState::default(),
+                snapshot: Arc::new(ResourceSnapshot::empty()),
+                subagent_model: ModelId::from("subagent"),
+            })),
+        };
+
+        tool.execute(
+            context,
+            json!({
+                "message": "delegate this",
+                "agent_type": "general"
+            }),
+        )
+        .await
+        .expect("spawn succeeds");
+
+        let requests = control.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].agent_type, None);
+    }
+
+    #[test]
+    fn spawn_agent_schema_omits_agent_type_without_loaded_roles() {
+        let tool = SpawnAgentTool::new(Arc::new(RecordingSubagentControl::default()), Vec::new());
+        let spec = tool.spec();
+
+        assert!(spec.input_schema["properties"].get("agent_type").is_none());
+    }
+
+    #[test]
+    fn spawn_agent_schema_lists_loaded_roles() {
+        let tool = SpawnAgentTool::new(
+            Arc::new(RecordingSubagentControl::default()),
+            vec!["helper".to_owned(), "reviewer".to_owned()],
+        );
+        let spec = tool.spec();
+
+        assert_eq!(
+            spec.input_schema["properties"]["agent_type"]["enum"],
+            json!(["helper", "reviewer"])
+        );
     }
 }

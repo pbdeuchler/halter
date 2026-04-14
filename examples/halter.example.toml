@@ -6,13 +6,13 @@ version = 1
 
 [models.default]
 provider = "openai"
-model = "gpt-5.4-mini"
+model = "gpt-5.4"
 reasoning = "high"
 
-# [models.subagent]
-# provider = "openai"
-# model = "gpt-5.4-nano"
-# reasoning = "medium"
+[models.subagent]
+provider = "openai"
+model = "gpt-5.4-mini"
+reasoning = "medium"
 
 # [providers.openai]
 # base_url = "https://myproxy.example.com"
@@ -25,7 +25,37 @@ roots = ["./.agent/skills"]
 roots = ["./.agent/plugins"]
 
 [tools]
-enabled = ["read", "write", "glob", "shell"]
+enabled = [
+  # Built-in read tools.
+  "read",
+  "glob",
+  "grep",
+  "profile", # requires the `profiling` feature
+
+  # Built-in write or side-effecting tools.
+  "write",
+  "edit",
+  "shell",
+  "process",
+  "pty",      # requires the `pty` feature
+  "ast_grep", # requires the `ast-tools` feature; `find` reads, `replace` writes
+  "image",    # requires the `image-tools` feature; `info` reads, `resize`/`convert` can write
+
+  # Subagent read tools.
+  "wait_agent",
+
+  # Subagent write tools.
+  "spawn_agent",
+  "send_input",
+  "close_agent",
+]
+
+[context]
+# max_context_messages = 24  # Hard cap on messages per request (fallback).
+# token_budget = 80000       # Token budget for the active conversation layer.
+                              # When exceeded, low-signal messages are compacted
+                              # into summaries that become part of the stable
+                              # cache prefix.
 
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
@@ -36,7 +66,7 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "python"]
+allow = ["git", "cargo", "rg", "ls", "find", "python", "pwd", "cwd", "echo"]
 timeout_secs = 30
 
 [sessions]

@@ -114,45 +114,79 @@ impl HalterBuilder {
     }
 
     pub async fn build(self) -> anyhow::Result<Halter> {
-        let config = self.config;
+        let HalterBuilder {
+            config,
+            resource_snapshot,
+            resource_hooks,
+            resource_hook_warnings,
+            registered_hooks,
+            loaded_skills,
+            loaded_plugins,
+            tools: custom_tools,
+            session_store,
+        } = self;
         debug!("validating halter builder config");
         config.validate()?;
-        self.registered_hooks.validate()?;
+        registered_hooks.validate()?;
 
-        if !self.loaded_skills.is_empty() || !self.loaded_plugins.is_empty() {
+        if resource_snapshot.is_some() && (!loaded_skills.is_empty() || !loaded_plugins.is_empty())
+        {
             anyhow::bail!(
-                "failed to build halter runtime: loaded skills/plugins require a prebuilt resource snapshot"
+                "failed to build halter runtime: cannot combine a prebuilt resource snapshot with loaded skills/plugins"
             );
         }
 
-        let snapshot = self.resource_snapshot.with_context(|| {
-            "failed to build halter runtime: missing resource snapshot; use Halter::from_config_file or HalterBuilder::with_resource_snapshot"
-        })?;
-        let hooks = self
-            .resource_hooks
+        let compiled_resources = if resource_snapshot.is_none()
+            && (!loaded_skills.is_empty() || !loaded_plugins.is_empty())
+        {
+            Some(
+                ResourceCompiler::from_config(&config)
+                    .with_loaded_skills(loaded_skills)
+                    .with_loaded_plugins(loaded_plugins)
+                    .compile()
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let snapshot = resource_snapshot
+            .or_else(|| compiled_resources.as_ref().map(|resources| resources.snapshot.clone()))
+            .with_context(|| {
+                "failed to build halter runtime: missing resource snapshot; use Halter::from_config_file or HalterBuilder::with_resource_snapshot"
+            })?;
+        let hooks = resource_hooks
+            .or_else(|| {
+                compiled_resources
+                    .as_ref()
+                    .map(|resources| resources.hooks.clone())
+            })
             .unwrap_or_else(|| Arc::new(Hooks::default()));
-        let hook_warnings = self.resource_hook_warnings;
+        let hook_warnings = compiled_resources
+            .as_ref()
+            .map_or(resource_hook_warnings, |resources| {
+                resources.hook_warnings.clone()
+            });
 
         let models = Arc::new(build_model_registry(&config)?);
         let tools = Arc::new(ToolRuntime::new());
         register_builtin_tools(&tools, &config.tools.enabled);
-        for tool in self.tools {
+        for tool in custom_tools {
             tools.register(tool);
         }
 
         let policy = Arc::new(DefaultToolPolicy::new(policy_from_config(&config.policy)));
-        let session_backend = self
-            .session_store
+        let session_backend = session_store
             .as_ref()
             .map(|_| "custom".to_owned())
             .unwrap_or_else(|| describe_session_backend(&config.sessions).to_owned());
-        let sessions = match self.session_store {
+        let sessions = match session_store {
             Some(store) => store,
             None => build_session_store(&config.sessions)?,
         };
         let services = Arc::new(RuntimeServices {
             resources: Arc::new(ResourceHandle::new(snapshot, hooks, hook_warnings)),
-            registered_hooks: Arc::new(self.registered_hooks),
+            registered_hooks: Arc::new(registered_hooks),
             session_hook_store: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             models,
             tools,
@@ -163,6 +197,7 @@ impl HalterBuilder {
             prompt_assembler: Arc::new(DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::new(
                 config.context.max_context_messages,
+                config.context.token_budget,
             )),
             event_bus: Arc::new(EventBus::default()),
             max_tool_output_bytes: config.policy.max_tool_output_bytes,
@@ -173,6 +208,7 @@ impl HalterBuilder {
             &services.tools,
             runtime.subagent_control(),
             &config.tools.enabled,
+            services.resources.snapshot().as_ref(),
         );
         let default_model = config.default_model()?;
         let subagent_model = config.subagent_model().unwrap_or(default_model);
@@ -232,12 +268,6 @@ impl Halter {
             .await
     }
 
-    pub async fn from_resource_snapshot(_snapshot: ResourceSnapshot) -> anyhow::Result<Self> {
-        anyhow::bail!(
-            "failed to build halter runtime: missing config; use Halter::from_config_file or Halter::from_config"
-        )
-    }
-
     pub async fn new_session(&self, init: SessionInit) -> anyhow::Result<HalterSession> {
         self.runtime.new_session(init).await
     }
@@ -261,20 +291,18 @@ impl Halter {
     }
 }
 
+#[cfg(feature = "sqlite")]
 fn build_session_store(config: &SessionsConfig) -> anyhow::Result<Arc<dyn SessionStore>> {
     match config.backend {
         SessionBackend::Memory => Ok(Arc::new(InMemorySessionStore::default())),
         SessionBackend::Sqlite => build_sqlite_session_store(config),
-        SessionBackend::FlatFile => {
-            anyhow::bail!(
-                "failed to build halter runtime: session backend 'flat_file' is not implemented"
-            );
-        }
-        SessionBackend::Postgres => {
-            anyhow::bail!(
-                "failed to build halter runtime: session backend 'postgres' is not implemented"
-            );
-        }
+    }
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn build_session_store(config: &SessionsConfig) -> anyhow::Result<Arc<dyn SessionStore>> {
+    match config.backend {
+        SessionBackend::Memory => Ok(Arc::new(InMemorySessionStore::default())),
     }
 }
 
@@ -287,19 +315,18 @@ fn build_sqlite_session_store(config: &SessionsConfig) -> anyhow::Result<Arc<dyn
     Ok(Arc::new(store))
 }
 
-#[cfg(not(feature = "sqlite"))]
-fn build_sqlite_session_store(_config: &SessionsConfig) -> anyhow::Result<Arc<dyn SessionStore>> {
-    anyhow::bail!(
-        "failed to build halter runtime: session backend 'sqlite' requires the 'sqlite' cargo feature"
-    );
-}
-
+#[cfg(feature = "sqlite")]
 fn describe_session_backend(config: &SessionsConfig) -> &'static str {
     match config.backend {
         SessionBackend::Memory => "memory",
-        SessionBackend::FlatFile => "flat_file",
         SessionBackend::Sqlite => "sqlite",
-        SessionBackend::Postgres => "postgres",
+    }
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn describe_session_backend(config: &SessionsConfig) -> &'static str {
+    match config.backend {
+        SessionBackend::Memory => "memory",
     }
 }
 
@@ -444,7 +471,7 @@ mod tests {
 
     use async_trait::async_trait;
     use halter_config::{ModelConfig, ProviderConfig};
-    use halter_protocol::ReasoningEffort;
+    use halter_protocol::{PluginManifest, ReasoningEffort, SkillId};
     use tempfile::tempdir;
 
     use super::*;
@@ -512,6 +539,55 @@ mod tests {
 
         assert_eq!(store.create_calls(), 1);
         assert_eq!(store.commit_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn builder_accepts_loaded_skills_without_prebuilt_snapshot() {
+        let temp = tempdir().expect("tempdir");
+
+        HalterBuilder::default()
+            .with_config(openai_config(Some("test-key")))
+            .with_loaded_skills(vec![LoadedSkill {
+                id: SkillId::from("skill-1"),
+                name: "helper".to_owned(),
+                description: "Loaded helper skill".to_owned(),
+                root: temp.path().join("helper"),
+                body: "Do the helpful thing.".to_owned(),
+                supporting_files: Vec::new(),
+                scripts: Vec::new(),
+                revision: "skill-revision".to_owned(),
+            }])
+            .build()
+            .await
+            .expect("build halter");
+    }
+
+    #[tokio::test]
+    async fn builder_accepts_loaded_plugins_without_prebuilt_snapshot() {
+        let temp = tempdir().expect("tempdir");
+
+        HalterBuilder::default()
+            .with_config(openai_config(Some("test-key")))
+            .with_loaded_plugins(vec![LoadedPlugin {
+                id: "plugin-1".into(),
+                root: temp.path().join("plugin"),
+                manifest: PluginManifest {
+                    name: "plugin".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    ..PluginManifest::default()
+                },
+                skills: Vec::new(),
+                agents: Vec::new(),
+                hooks: Vec::new(),
+                mcp_servers: Vec::new(),
+                lsp_servers: Vec::new(),
+                output_styles: Vec::new(),
+                bin_paths: Vec::new(),
+                defaults: crate::PluginDefaults::default(),
+            }])
+            .build()
+            .await
+            .expect("build halter");
     }
 
     #[cfg(feature = "sqlite")]

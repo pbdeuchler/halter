@@ -73,7 +73,7 @@ impl Tool for PtyTool {
             concurrency: ToolConcurrency::Exclusive,
             capabilities: ToolCapabilities {
                 mutating: false,
-                requires_approval: true,
+                requires_approval: false,
                 cancellable: false,
                 long_running: true,
             },
@@ -99,6 +99,7 @@ impl Tool for PtyTool {
                     cols: optional_u64(&input, "cols")?.unwrap_or(120) as u16,
                     rows: optional_u64(&input, "rows")?.unwrap_or(40) as u16,
                 };
+                context.policy.check_shell_command(&config.command).await?;
                 start_session(session, config, context.emit.clone());
                 Ok(ToolResult::Json {
                     value: json!({ "started": true }),

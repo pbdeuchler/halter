@@ -4,8 +4,9 @@ mod run_output;
 
 use std::env;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, LineWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -19,7 +20,11 @@ use run_output::{
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::{self, MakeWriter},
+    prelude::*,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "halter")]
@@ -61,10 +66,10 @@ enum ConfigCommands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging()?;
     let cli = Cli::parse();
+    let OutputHandles { mut output, trace } = open_output_handles(cli.output_file.as_deref())?;
+    init_logging(trace)?;
     debug!(config_path = %cli.config.display(), command = ?cli.command, "parsed cli arguments");
-    let mut output = open_output_writer(cli.output_file.as_deref())?;
 
     match cli.command {
         Commands::Init => init_config(&cli.config, output.as_mut()).await,
@@ -210,26 +215,122 @@ async fn chat(path: &Path, output: &mut dyn Write) -> anyhow::Result<()> {
 
 fn write_json_event(output: &mut dyn Write, event: &SessionEvent) -> anyhow::Result<()> {
     let event = strip_signatures_from_session_event(event);
-    serde_json::to_writer(&mut *output, &event).context("failed to serialize session event")?;
-    writeln!(output).context("failed to write output")?;
+    let mut line = serde_json::to_vec(&event).context("failed to serialize session event")?;
+    line.push(b'\n');
+    output.write_all(&line).context("failed to write output")?;
     output.flush().context("failed to flush output")
 }
 
 fn write_json_result(output: &mut dyn Write, result: &AssistantMessage) -> anyhow::Result<()> {
     let result = strip_signatures_from_assistant_message(result);
-    serde_json::to_writer(&mut *output, &result).context("failed to serialize assistant result")?;
-    writeln!(output).context("failed to write output")?;
+    let mut line = serde_json::to_vec(&result).context("failed to serialize assistant result")?;
+    line.push(b'\n');
+    output.write_all(&line).context("failed to write output")?;
     output.flush().context("failed to flush output")
 }
 
-fn open_output_writer(path: Option<&Path>) -> anyhow::Result<Box<dyn Write>> {
+struct OutputHandles {
+    output: Box<dyn Write>,
+    trace: TraceWriter,
+}
+
+#[derive(Clone)]
+enum TraceWriter {
+    Stderr,
+    SharedFile(SharedFileWriter),
+}
+
+enum TraceWriteHandle {
+    Stderr(io::Stderr),
+    SharedFile(SharedFileWriter),
+}
+
+#[derive(Clone)]
+struct SharedFileWriter {
+    inner: Arc<Mutex<LineWriter<File>>>,
+}
+
+impl SharedFileWriter {
+    fn create(path: &Path) -> anyhow::Result<Self> {
+        let file = File::create(path)
+            .with_context(|| format!("failed to create output file {}", path.display()))?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(LineWriter::new(file))),
+        })
+    }
+
+    fn with_locked_writer<T>(
+        &self,
+        f: impl FnOnce(&mut LineWriter<File>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut writer = self.inner.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "shared output writer mutex poisoned")
+        })?;
+        f(&mut writer)
+    }
+}
+
+impl Write for SharedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.with_locked_writer(|writer| writer.write(buf))
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.with_locked_writer(|writer| writer.write_all(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.with_locked_writer(|writer| writer.flush())
+    }
+}
+
+impl Write for TraceWriteHandle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stderr(writer) => writer.write(buf),
+            Self::SharedFile(writer) => writer.write(buf),
+        }
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Stderr(writer) => writer.write_all(buf),
+            Self::SharedFile(writer) => writer.write_all(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stderr(writer) => writer.flush(),
+            Self::SharedFile(writer) => writer.flush(),
+        }
+    }
+}
+
+impl<'a> MakeWriter<'a> for TraceWriter {
+    type Writer = TraceWriteHandle;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        match self {
+            Self::Stderr => TraceWriteHandle::Stderr(io::stderr()),
+            Self::SharedFile(writer) => TraceWriteHandle::SharedFile(writer.clone()),
+        }
+    }
+}
+
+fn open_output_handles(path: Option<&Path>) -> anyhow::Result<OutputHandles> {
     match path {
         Some(path) => {
-            let file = File::create(path)
-                .with_context(|| format!("failed to create output file {}", path.display()))?;
-            Ok(Box::new(BufWriter::new(file)))
+            let writer = SharedFileWriter::create(path)?;
+            Ok(OutputHandles {
+                output: Box::new(writer.clone()),
+                trace: TraceWriter::SharedFile(writer),
+            })
         }
-        None => Ok(Box::new(io::stdout())),
+        None => Ok(OutputHandles {
+            output: Box::new(io::stdout()),
+            trace: TraceWriter::Stderr,
+        }),
     }
 }
 
@@ -237,18 +338,15 @@ fn write_output_line(output: &mut dyn Write, line: impl std::fmt::Display) -> an
     writeln!(output, "{line}").context("failed to write output")
 }
 
-fn init_logging() -> anyhow::Result<()> {
+fn init_logging(writer: TraceWriter) -> anyhow::Result<()> {
     let filter = match env::var(EnvFilter::DEFAULT_ENV) {
         Ok(value) => EnvFilter::try_new(value).context("invalid RUST_LOG filter")?,
         Err(env::VarError::NotPresent) => EnvFilter::try_new("off")?,
         Err(env::VarError::NotUnicode(_)) => anyhow::bail!("invalid utf-8 in RUST_LOG"),
     };
-    let subscriber = tracing_subscriber::registry().with(filter).with(
-        fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_target(true)
-            .compact(),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(writer).with_target(true).compact());
     tracing::subscriber::set_global_default(subscriber).context("failed to initialize logging")
 }
 
@@ -276,15 +374,21 @@ mod tests {
     }
 
     #[test]
-    fn open_output_writer_redirects_output_to_file() {
+    fn open_output_handles_redirect_output_and_traces_to_same_file() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("output.txt");
-        let mut output = open_output_writer(Some(&path)).expect("open output");
+        let OutputHandles { mut output, trace } =
+            open_output_handles(Some(&path)).expect("open output");
 
         write_output_line(output.as_mut(), "hello world").expect("write output");
+        let mut trace_output = trace.make_writer();
+        trace_output
+            .write_all(b"trace line\n")
+            .expect("write trace output");
         output.flush().expect("flush output");
+        trace_output.flush().expect("flush trace output");
 
         let contents = std::fs::read_to_string(&path).expect("read output");
-        assert_eq!(contents, "hello world\n");
+        assert_eq!(contents, "hello world\ntrace line\n");
     }
 }

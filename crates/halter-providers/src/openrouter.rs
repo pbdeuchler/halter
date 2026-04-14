@@ -124,6 +124,8 @@ mod tests {
             },
             messages: Vec::new(),
             tools: Vec::new(),
+            previous_response_id: None,
+            new_messages_start: 0,
         }
     }
 }

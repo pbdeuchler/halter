@@ -9,7 +9,7 @@ mod session;
 mod subagent_session;
 mod subagents;
 
-pub use context::{ContextManager, ContextSettings, DefaultContextManager};
+pub use context::{ContextManager, ContextSettings, DefaultContextManager, score_message};
 pub use event_bus::EventBus;
 pub use hooks_runtime::{
     ExecutedHookDispatch, HookInvocationContext, run_notification, run_post_compact,

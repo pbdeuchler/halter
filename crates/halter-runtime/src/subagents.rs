@@ -986,6 +986,7 @@ mod tests {
                 Ok(StreamEvent::MessageEnd {
                     id: message_id,
                     stop_reason: StopReason::EndTurn,
+                    response_id: None,
                 }),
             ])
             .boxed())

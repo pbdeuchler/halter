@@ -137,7 +137,6 @@ mod tests {
             working_dir: PathBuf::from("."),
             system_prompt_seed: Vec::new(),
             max_turns: None,
-            // max_tool_calls_per_turn: 8,
             subagent_depth: 0,
         };
 

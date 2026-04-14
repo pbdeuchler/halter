@@ -148,6 +148,7 @@ pub(crate) fn decode_response(
     events.push(StreamEvent::MessageEnd {
         id: message_id,
         stop_reason: decode_stop_reason(response),
+        response_id: None,
     });
     Ok(events)
 }
@@ -483,6 +484,8 @@ mod tests {
                 capabilities: ToolCapabilities::default(),
                 provider_aliases,
             }],
+            previous_response_id: None,
+            new_messages_start: 0,
         }
     }
 }

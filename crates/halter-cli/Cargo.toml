@@ -27,6 +27,7 @@ image-tools = ["halter/image-tools"]
 pty = ["halter/pty"]
 profiling = ["halter/profiling"]
 full = ["halter/full"]
+sqlite = ["halter/sqlite", "halter-config/sqlite"]
 
 [dependencies]
 anyhow.workspace = true

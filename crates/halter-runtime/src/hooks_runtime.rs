@@ -780,6 +780,8 @@ async fn run_prompt(
         },
         messages: vec![Message::User(user_message)],
         tools: Vec::new(),
+        previous_response_id: None,
+        new_messages_start: 0,
     };
 
     let materialized = tokio::select! {

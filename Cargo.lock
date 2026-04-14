@@ -1353,6 +1353,7 @@ dependencies = [
  "base64",
  "brush-builtins",
  "brush-core",
+ "brush-parser",
  "dashmap",
  "globset",
  "grep-matcher",

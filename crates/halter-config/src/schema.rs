@@ -362,20 +362,30 @@ pub struct PromptsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContextConfig {
+    /// Hard cap on messages sent per request (fallback when token estimation is unavailable).
     #[serde(default = "default_max_context_messages")]
     pub max_context_messages: usize,
+    /// Token budget for the active conversation layer. When estimated tokens exceed this,
+    /// the context manager compacts low-signal messages into summaries.
+    #[serde(default = "default_token_budget")]
+    pub token_budget: u64,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             max_context_messages: default_max_context_messages(),
+            token_budget: default_token_budget(),
         }
     }
 }
 
 const fn default_max_context_messages() -> usize {
     24
+}
+
+const fn default_token_budget() -> u64 {
+    80_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -491,9 +501,8 @@ pub struct NetworkPolicyConfig {
 pub enum SessionBackend {
     #[default]
     Memory,
-    FlatFile,
+    #[cfg(feature = "sqlite")]
     Sqlite,
-    Postgres,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -520,6 +529,20 @@ impl SessionsConfig {
             && path.as_os_str().is_empty()
         {
             anyhow::bail!("invalid configuration: sessions.sqlite_path must not be empty");
+        }
+
+        #[cfg(feature = "sqlite")]
+        if self.sqlite_path.is_some() && self.backend != SessionBackend::Sqlite {
+            anyhow::bail!(
+                "invalid configuration: sessions.sqlite_path requires sessions.backend = 'sqlite'"
+            );
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        if self.sqlite_path.is_some() {
+            anyhow::bail!(
+                "invalid configuration: sessions.sqlite_path requires the 'sqlite' cargo feature"
+            );
         }
 
         Ok(())
@@ -599,5 +622,38 @@ mod tests {
         };
 
         assert_eq!(model.provider.api_kind(), ApiKind::OpenAiResponses);
+    }
+
+    #[test]
+    fn sqlite_path_requires_supported_sqlite_backend() {
+        let mut config = HarnessConfig::default();
+        config.models.default = Some(ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: "gpt-5".to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning: None,
+        });
+        config.providers.openai = Some(ProviderConfig {
+            base_url: None,
+            api_key: Some("test-key".to_owned()),
+        });
+        config.sessions.sqlite_path = Some(PathBuf::from("/tmp/halter.db"));
+
+        let error = config.validate().expect_err("sqlite path should fail");
+
+        #[cfg(feature = "sqlite")]
+        assert!(
+            error
+                .to_string()
+                .contains("sessions.sqlite_path requires sessions.backend = 'sqlite'")
+        );
+
+        #[cfg(not(feature = "sqlite"))]
+        assert!(
+            error
+                .to_string()
+                .contains("sessions.sqlite_path requires the 'sqlite' cargo feature")
+        );
     }
 }

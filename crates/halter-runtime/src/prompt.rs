@@ -38,7 +38,9 @@ pub(crate) fn default_system_prompt_segment() -> PromptSegment {
 impl PromptAssembler for DefaultPromptAssembler {
     async fn assemble(&self, plan: &ContextPlan) -> anyhow::Result<AssembledPrompt> {
         let mut hasher = Sha256::new();
-        let rendered_prefix = plan
+
+        // Layer 1: system prompt segments (static prefix).
+        let mut prefix_parts: Vec<String> = plan
             .prompt_segments
             .iter()
             .map(|segment| {
@@ -48,9 +50,21 @@ impl PromptAssembler for DefaultPromptAssembler {
                 }
                 segment.text.clone()
             })
-            .collect::<Vec<_>>()
-            .join("\n\n");
+            .collect();
+
+        // Layer 2: accumulated summaries (append-only, changes only on compaction).
+        // Including these in the prefix keeps the cache key stable across turns
+        // while giving the model visibility into compacted earlier conversation.
+        for summary in &plan.carried_summaries {
+            hasher.update(summary.id.as_bytes());
+            hasher.update(summary.text.as_bytes());
+            prefix_parts.push(summary.text.clone());
+        }
+
         hasher.update(plan.cache_boundary_hash.as_bytes());
+        let rendered_prefix = prefix_parts.join("\n\n");
+
+        // Layer 3: active conversation tail (mutable, uncached).
         let rendered_transcript = plan
             .transcript_window
             .messages
@@ -166,6 +180,9 @@ mod tests {
             cache_boundary_hash: "boundary".to_owned(),
             messages: vec![Message::User(UserMessage::text("hello"))],
             estimated_tokens: 10,
+            compaction: None,
+            previous_response_id: None,
+            new_messages_start: 0,
         };
 
         let assembled_a = assembler.assemble(&base_plan).await.expect("assemble");
@@ -185,6 +202,65 @@ mod tests {
         assert_ne!(
             assembled_a.rendered_transcript,
             assembled_b.rendered_transcript
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_key_changes_when_summaries_change() {
+        let assembler = DefaultPromptAssembler;
+        let segments = vec![PromptSegment {
+            id: PromptSegmentId::new(),
+            text: "system".to_owned(),
+            volatility: Volatility::Static,
+            cache_scope: CacheScope::PrefixCacheable,
+            content_hash: ContentHash::from("seg-1"),
+        }];
+        let base_plan = ContextPlan {
+            prompt_segments: segments.clone(),
+            transcript_window: TranscriptWindow {
+                messages: vec![Message::User(UserMessage::text("hello"))],
+                elided_message_count: 0,
+            },
+            file_views: Vec::new(),
+            carried_summaries: vec![],
+            elided_tool_results: Vec::new(),
+            memory_items: Vec::new(),
+            tool_specs: Vec::new(),
+            observed_state: ObservedState {
+                cwd: ".".into(),
+                git_branch: None,
+                git_dirty: None,
+                now_utc: Utc::now(),
+                env_facts: Default::default(),
+            },
+            projected_input_tokens: 10,
+            cache_boundary_hash: "boundary".to_owned(),
+            messages: vec![Message::User(UserMessage::text("hello"))],
+            estimated_tokens: 10,
+            compaction: None,
+            previous_response_id: None,
+            new_messages_start: 0,
+        };
+
+        let without_summary = assembler.assemble(&base_plan).await.expect("assemble");
+
+        let mut with_summary = base_plan.clone();
+        with_summary.carried_summaries = vec![SummarySlice {
+            id: "s1".to_owned(),
+            text: "earlier context was compacted".to_owned(),
+        }];
+        let with_summary = assembler.assemble(&with_summary).await.expect("assemble");
+
+        // Adding a summary changes the prefix cache key.
+        assert_ne!(
+            without_summary.prefix_cache_key,
+            with_summary.prefix_cache_key
+        );
+        // The summary text appears in the rendered prefix.
+        assert!(
+            with_summary
+                .rendered_prefix
+                .contains("earlier context was compacted")
         );
     }
 }

@@ -377,6 +377,9 @@ pub enum StreamEvent {
     MessageEnd {
         id: MessageId,
         stop_reason: StopReason,
+        /// The provider's response ID, used for `previous_response_id` chaining.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
     },
     ProviderWarning {
         message: SharedStr,
@@ -835,7 +838,6 @@ pub struct SessionBlueprint {
     pub working_dir: PathBuf,
     pub system_prompt_seed: Vec<PromptSegment>,
     pub max_turns: Option<u32>,
-    // pub max_tool_calls_per_turn: u32,
     pub subagent_depth: u32,
 }
 
@@ -851,6 +853,14 @@ pub struct SessionState {
     pub fired_hook_ids: Vec<String>,
     pub pending_session_start_source: Option<HookSessionStartSource>,
     pub pending_warning_messages: Vec<HookWarning>,
+    /// The OpenAI Responses API response ID from the last successful turn.
+    /// Used for `previous_response_id` chaining to avoid re-sending full history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_response_id: Option<String>,
+    /// Number of messages the model has already seen via `previous_response_id`.
+    /// Messages at indices `[0..messages_seen_by_provider)` don't need re-sending.
+    #[serde(default)]
+    pub messages_seen_by_provider: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -983,6 +993,31 @@ pub struct ResolvedModel {
     pub reasoning: Option<ReasoningEffort>,
 }
 
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSignal {
+    /// Compact first -- orientation commands, empty results, duplicate failures.
+    VeryLow = 0,
+    /// Low signal -- failed tool calls, stale reads.
+    Low = 1,
+    /// Default for most messages.
+    Normal = 2,
+    /// Assistant reasoning, active file reads.
+    High = 3,
+    /// Never compact -- user messages.
+    Anchor = 4,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CompactionResult {
+    /// Number of messages removed from the front of the history.
+    pub compacted_count: usize,
+    /// Summary generated from the compacted messages.
+    pub summary: SummarySlice,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ContextPlan {
     pub prompt_segments: Vec<PromptSegment>,
@@ -997,6 +1032,15 @@ pub struct ContextPlan {
     pub cache_boundary_hash: ContentHash,
     pub messages: Vec<Message>,
     pub estimated_tokens: u64,
+    /// If the planner compacted messages this turn, the result is here.
+    /// The caller should apply it to `SessionState` after using the plan.
+    pub compaction: Option<CompactionResult>,
+    /// When set, the codec should chain via `previous_response_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    /// Index into `messages` where new messages start (for chained requests).
+    #[serde(default)]
+    pub new_messages_start: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1018,6 +1062,15 @@ pub struct ProviderRequest {
     pub prompt: AssembledPrompt,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    /// When set, the provider can chain onto the previous response instead of
+    /// re-sending the full conversation history. The codec should send only
+    /// messages after `new_messages_start` when this is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    /// Index into `messages` where new (unseen-by-provider) messages begin.
+    /// Only meaningful when `previous_response_id` is `Some`.
+    #[serde(default)]
+    pub new_messages_start: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

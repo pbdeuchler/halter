@@ -89,6 +89,7 @@ impl Provider for FakeProvider {
             Ok(StreamEvent::MessageEnd {
                 id: message_id,
                 stop_reason: StopReason::EndTurn,
+                response_id: None,
             }),
         ];
         Ok(stream::iter(events).boxed())
