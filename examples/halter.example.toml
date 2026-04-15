@@ -7,7 +7,7 @@ version = 1
 [models.default]
 provider = "openai"
 model = "gpt-5.4"
-reasoning = "high"
+reasoning = "xhigh"
 # tokens_per_minute = 500_000  # Default: 500,000. Proactive token budget for rate limiting.
 
 [models.subagent]

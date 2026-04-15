@@ -12,6 +12,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use crate::openai_error::{
     openai_api_error_retry_after, parse_openai_http_error, parse_openai_stream_error,
@@ -21,6 +22,24 @@ use crate::openai_rate_limit_policy::OpenAiReservation;
 
 const RESPONSES_PATH: &str = "/v1/responses";
 const RESPONSES_COMPACT_PATH: &str = "/v1/responses/compact";
+
+/// An event sent by the OpenAI Responses streaming API that the `async-openai`
+/// SDK does not yet model (e.g. `keepalive` heartbeat pings).
+#[derive(Debug, Clone)]
+enum NonStandardStreamEvent {
+    Keepalive { sequence_number: u64 },
+}
+
+impl NonStandardStreamEvent {
+    fn parse(data: &Value) -> Option<Self> {
+        match data.get("type")?.as_str()? {
+            "keepalive" => Some(Self::Keepalive {
+                sequence_number: data.get("sequence_number")?.as_u64()?,
+            }),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResponsesRateLimitStrategy {
@@ -222,10 +241,18 @@ fn stream_response(
                         break;
                     }
 
-                    let parsed = decode_stream_event(&event.data, &rate_limits);
-
-                    if tx.send(parsed).is_err() {
-                        break;
+                    match decode_stream_event(&event.data, &rate_limits) {
+                        Ok(Some(event)) => {
+                            if tx.send(Ok(event)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => {} // non-standard event already handled (e.g. keepalive)
+                        Err(err) => {
+                            if tx.send(Err(err)).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -238,13 +265,25 @@ fn stream_response(
 fn decode_stream_event(
     data: &str,
     rate_limits: &OpenAiStreamRateLimitObserver,
-) -> Result<ResponseStreamEvent, OpenAIError> {
+) -> Result<Option<ResponseStreamEvent>, OpenAIError> {
     if let Some(api_error) = parse_openai_stream_error(data) {
         rate_limits.record_api_error(&api_error);
         return Err(OpenAIError::ApiError(api_error));
     }
 
+    if let Ok(raw) = serde_json::from_str::<Value>(data) {
+        if let Some(event) = NonStandardStreamEvent::parse(&raw) {
+            match event {
+                NonStandardStreamEvent::Keepalive { sequence_number } => {
+                    info!(sequence_number, "received keepalive from responses stream");
+                }
+            }
+            return Ok(None);
+        }
+    }
+
     serde_json::from_str::<ResponseStreamEvent>(data)
+        .map(Some)
         .map_err(|error| OpenAIError::JSONDeserialize(error, data.to_owned()))
 }
 

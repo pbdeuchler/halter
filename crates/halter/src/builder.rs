@@ -210,6 +210,12 @@ impl HalterBuilder {
             runtime.subagent_control(),
             &config.tools.enabled,
             services.resources.snapshot().as_ref(),
+            &services
+                .models
+                .model_ids()
+                .into_iter()
+                .map(|model_id| model_id.0)
+                .collect::<Vec<_>>(),
         );
         let default_model = config.default_model()?;
         let subagent_model = config.subagent_model().unwrap_or(default_model);

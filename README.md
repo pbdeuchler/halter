@@ -1,15 +1,24 @@
 # halter
 
-`halter` is a **local-first agent runtime, protocol, and tool harness** for building and operating serious tool-using agents.
+`halter` is a **simple and configurable agent harness and SDK** for building and operating thoroughbred agents.
 
-This repository is organized as a Rust workspace with two primary audiences:
+> [!CAUTION]
+> `halter` is still a heavy work in progress. Proceed at your own risk.
 
-- **Programmers embedding halter** as an SDK and extending its runtime, tools, hooks, providers, and persistence
-- **Users/operators running the CLI** to execute tasks, inspect resources, validate config, and interact with sessions
+> [!TIP]
+> `halter` is explictly designed for long running, multi model, and dynamic workflows. If you have a preferred model family you like to use, don't need to spin up agents dynamically, or keep your workflow or agent setup local then `halter` is probably not for you
 
-The SDK story is the primary one. The CLI is a thin, practical wrapper around that SDK.
+## Design Goals
 
----
+- Cache Friendliness
+- Obsessive token optimization
+- Best in class multi model support
+- Best in class tool calling and hook support
+
+## Tradeoffs
+
+- halter implements it's own compaction strategy. This _can be_ (but is not always) less token effecient than the managed compaction functionality offered by inference providers. The goal of the custom compaction is to result in a _higher quality_ context window, hopefully reducing overall token use throughout the turn. This also allows halter to provide a consistent, baseline experience regardless of which inference provider or model is used.
+- There are no plans for halter to implement MCP. It's a bad, poorly designed protocol that serves little to no purpose. If you absolutely need MCP like functionality you can provide it with either skills or custom tools.
 
 ## What halter gives you
 
@@ -27,29 +36,6 @@ If you're familiar with agentic coding systems, halter is the substrate that let
 
 ---
 
-## Audience guide
-
-### If you are embedding halter in Rust
-
-Start here, then read these in order:
-
-1. `crates/halter/README.md`
-2. `crates/halter-config/README.md`
-3. `crates/halter-runtime/README.md`
-4. `crates/halter-tools/README.md`
-5. whichever subsystem crate you need next
-
-### If you are using the CLI
-
-Start here, then read:
-
-1. `crates/halter-cli/README.md`
-2. `crates/halter-config/README.md`
-3. `crates/halter-tools/README.md`
-4. optionally `crates/halter-hooks/README.md` if you care about policy interception
-
----
-
 ## Workspace layout
 
 This repository contains these crates:
@@ -63,20 +49,6 @@ This repository contains these crates:
 - `crates/halter-tools` — tool runtime, built-in tools, policy, subagent control tools
 - `crates/halter-hooks` — event-driven hook and policy interception layer
 - `crates/halter-session` — session persistence and replay
-
-A useful mental model is:
-
-```text
-halter-config      -> load/validate config
-halter-protocol    -> shared data model
-halter-providers   -> model backends
-halter-tools       -> tools + policy
-halter-hooks       -> interception + approvals + annotations
-halter-session     -> persistence + replay
-halter-runtime     -> session execution engine
-halter             -> high-level assembly layer
-halter-cli         -> user-facing binary
-```
 
 ---
 
@@ -105,137 +77,6 @@ Typical responsibilities:
 - inspecting loaded skills/plugins
 - capturing JSON output for automation
 - tuning policy and compaction thresholds
-
----
-
-## Quick start for CLI users
-
-## 1. Create a config
-
-```bash
-cargo run -p halter-cli -- init
-```
-
-This writes a starter `halter.toml`.
-
-You can also inspect the example config in:
-
-- `examples/halter.example.toml`
-
----
-
-## 2. Set credentials
-
-At minimum, configure the API key for the provider used by `[models.default]`.
-
-Examples:
-
-```bash
-export OPENAI_API_KEY=...
-export ANTHROPIC_API_KEY=...
-export OPENROUTER_API_KEY=...
-```
-
-Which one you need depends on your config.
-
----
-
-## 3. Validate config and runtime prerequisites
-
-```bash
-cargo run -p halter-cli -- validate
-```
-
-This checks more than TOML syntax. It also checks things like:
-
-- `version = 1`
-- `[models.default]` exists
-- selected providers have credentials available
-- context thresholds are coherent
-- session backend settings are valid
-
----
-
-## 4. Inspect discovered resources
-
-```bash
-cargo run -p halter-cli -- resources
-```
-
-Use this to verify that your skill and plugin roots are being discovered and compiled the way you expect.
-
----
-
-## 5. Run a task
-
-```bash
-cargo run -p halter-cli -- run "Summarize this repository's architecture"
-```
-
-By default, `run` emits the final assistant result as JSON.
-
-To stream raw session events instead:
-
-```bash
-cargo run -p halter-cli -- run --streaming-json "Summarize this repository's architecture"
-```
-
-To write output and tracing to one file:
-
-```bash
-cargo run -p halter-cli -- \
-  --output-file out.jsonl \
-  run --streaming-json "Summarize this repository's architecture"
-```
-
----
-
-## 6. Use interactive mode
-
-```bash
-cargo run -p halter-cli -- chat
-```
-
-This opens a REPL-style interactive session backed by the same runtime and config.
-
----
-
-## Quick start for SDK users
-
-The simplest path is to use the high-level `halter` crate.
-
-```rust
-use futures::StreamExt;
-use halter::prelude::*;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let harness = Halter::from_config_file("halter.toml").await?;
-    let session = harness.new_session(SessionInit::default()).await?;
-
-    let mut events = session
-        .submit_turn(Turn::user("Summarize the session persistence design"))
-        .await?;
-
-    while let Some(event) = events.next().await {
-        let event = event?;
-        println!("{:?}", event.payload);
-    }
-
-    Ok(())
-}
-```
-
-That flow does all of the following:
-
-- loads and validates config
-- compiles resources
-- builds providers, tools, hooks, policy, and session storage
-- creates a runtime
-- creates a session
-- executes one turn and streams the resulting events
-
-For a deeper walkthrough, read `crates/halter/README.md`.
 
 ---
 
@@ -302,6 +143,137 @@ You can derive this from `examples/halter.example.toml` and tailor it to your en
 
 ---
 
+## Quick start for CLI users
+
+### 1. Create a config
+
+```bash
+cargo run -p halter-cli -- init
+```
+
+This writes a starter `halter.toml`.
+
+You can also inspect the example config in:
+
+- `examples/halter.example.toml`
+
+---
+
+### 2. Set credentials
+
+At minimum, configure the API key for the provider used by `[models.default]`.
+
+Examples:
+
+```bash
+export OPENAI_API_KEY=...
+export ANTHROPIC_API_KEY=...
+export OPENROUTER_API_KEY=...
+```
+
+Which one you need depends on your config.
+
+---
+
+### 3. Validate config and runtime prerequisites
+
+```bash
+cargo run -p halter-cli -- validate
+```
+
+This checks more than TOML syntax. It also checks things like:
+
+- `version = 1`
+- `[models.default]` exists
+- selected providers have credentials available
+- context thresholds are coherent
+- session backend settings are valid
+
+---
+
+### 4. Inspect discovered resources
+
+```bash
+cargo run -p halter-cli -- resources
+```
+
+Use this to verify that your skill and plugin roots are being discovered and compiled the way you expect.
+
+---
+
+### 5. Run a task
+
+```bash
+cargo run -p halter-cli -- run "Summarize this repository's architecture"
+```
+
+By default, `run` emits the final assistant result as JSON.
+
+To stream raw session events instead:
+
+```bash
+cargo run -p halter-cli -- run --streaming-json "Summarize this repository's architecture"
+```
+
+To write output and tracing to one file:
+
+```bash
+cargo run -p halter-cli -- \
+  --output-file out.jsonl \
+  run --streaming-json "Summarize this repository's architecture"
+```
+
+---
+
+### 6. Use interactive mode
+
+```bash
+cargo run -p halter-cli -- chat
+```
+
+This opens a REPL-style interactive session backed by the same runtime and config.
+
+---
+
+## Quick start for SDK users
+
+The simplest path is to use the high-level `halter` crate.
+
+```rust
+use futures::StreamExt;
+use halter::prelude::*;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let harness = Halter::from_config_file("halter.toml").await?;
+    let session = harness.new_session(SessionInit::default()).await?;
+
+    let mut events = session
+        .submit_turn(Turn::user("Summarize the session persistence design"))
+        .await?;
+
+    while let Some(event) = events.next().await {
+        let event = event?;
+        println!("{:?}", event.payload);
+    }
+
+    Ok(())
+}
+```
+
+That flow does all of the following:
+
+- loads and validates config
+- compiles resources
+- builds providers, tools, hooks, policy, and session storage
+- creates a runtime
+- creates a session
+- executes one turn and streams the resulting events
+
+For a deeper walkthrough, read `crates/halter/README.md`.
+
+---
+
 ## How the system is structured
 
 ## Configuration layer
@@ -327,6 +299,9 @@ It also handles:
 - starter config generation
 
 If you care about what is valid in `halter.toml`, read `crates/halter-config/README.md`.
+
+> [!NOTE]
+> .toml config file usage is a thin serialization veneer over the programmatic config. For full customization programmatic configuration should be used, and probably preferred in headless, automated, or dynamic environments.
 
 ---
 
@@ -372,6 +347,9 @@ Important operational differences:
 
 `halter-tools` is what makes the agent do real work in the local environment.
 
+> [!NOTE]
+> The vast majority of original ideas (and code) in this crate is taken from other FOSS projects, namely [pi-mono](https://github.com/badlogic/pi-mono) and [oh-my-pi](https://github.com/can1357/oh-my-pi/tree/main/crates/pi-natives)'s native Rust tool.
+
 Built-in tools include:
 
 - `read`
@@ -402,8 +380,6 @@ This crate also enforces policy boundaries such as:
 - write-root restrictions
 - read/output size limits
 - subagent depth and concurrency limits
-
-If you are a CLI user, this is one of the most important per-crate READMEs to read.
 
 ---
 
@@ -498,69 +474,6 @@ It is intentionally thin. Reading its `README.md` is useful both for users and f
 
 ---
 
-## Typical workflows
-
-## Workflow: local coding-agent usage from the CLI
-
-1. create `halter.toml`
-2. set provider credentials
-3. enable the tools you want
-4. constrain shell allowlists and write roots
-5. run a task with `halter run`
-6. switch to `halter chat` for interactive refinement
-7. use `--streaming-json` or `--output-file` for automation
-
-Example:
-
-```bash
-halter validate
-halter resources
-halter run "Review the staged diff and summarize risk"
-halter run --streaming-json "Refactor the config loader and explain changes"
-```
-
----
-
-## Workflow: repository-aware agent with local skills/plugins
-
-1. put skills under `.agent/skills`
-2. put plugins under `.agent/plugins`
-3. point `resources.skills.roots` and `resources.plugins.roots` at them
-4. use `halter resources` to confirm they load
-5. run tasks that rely on those instructions and hooks
-
-This is where halter starts to feel like a real harness rather than just a thin model wrapper.
-
----
-
-## Workflow: embedded application using halter as a library
-
-1. load config with `Halter::from_config_file(...)` or manually with `halter-config`
-2. compile resources
-3. optionally inject custom tools or session stores with `HalterBuilder`
-4. create sessions
-5. submit turns and consume streamed events
-6. persist or replay sessions as needed
-
----
-
-## Workflow: delegated parallel work
-
-1. enable subagent tools in config
-2. set sensible `max_subagent_depth` and `max_concurrent_subagents`
-3. let a parent session use `spawn_agent`
-4. synchronize with `wait_agent`
-5. use `send_input` for corrections and `close_agent` for cleanup
-
-This is especially useful for:
-
-- codebase documentation
-- per-crate analysis
-- parallel test or failure triage
-- structured audits across multiple subsystems
-
----
-
 ## CLI reference
 
 All CLI commands accept:
@@ -634,35 +547,166 @@ The most common entrypoints for library users are:
 - `Halter::replace_resources(...)`
 - `HalterBuilder`
 
-A realistic advanced composition path:
+A realistic advanced composition path, built entirely in Rust:
 
 ```rust
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use halter::{HalterBuilder, ResourceCompiler};
-use halter_config::load_path;
-use halter_session::InMemorySessionStore;
+use halter::session::InMemorySessionStore;
+use halter::{HalterBuilder, LoadedSkill};
+use halter_config::{
+    ConfiguredProvider, ContextConfig, HarnessConfig, ModelConfig, ModelsConfig,
+    NetworkPolicyConfig, PolicyConfig, PromptsConfig, ProviderConfig, ProvidersConfig,
+    ResourcesConfig, RuntimeConfig, SearchRoots, SessionBackend, SessionsConfig,
+    ShellPolicyConfig, ToolsConfig,
+};
+use halter_protocol::{PruneSignalThreshold, ReasoningEffort, SkillId, Turn};
+use halter_runtime::SessionInit;
+
+const SYSTEM_PROMPT: &str =
+    "You are a careful local coding agent. Prefer concrete, verifiable answers.";
+const REPO_REVIEW_SKILL: &str = r#"When asked to review a codebase:
+1. Start with correctness risks.
+2. Then call out maintainability issues.
+3. End with the smallest high-leverage next steps.
+"#;
+
+fn build_config() -> anyhow::Result<HarnessConfig> {
+    let working_dir = std::env::current_dir()?;
+    let temp_write_root = std::env::temp_dir().join("halter");
+
+    Ok(HarnessConfig {
+        version: 1,
+        providers: ProvidersConfig {
+            openai: Some(ProviderConfig {
+                base_url: Some("https://api.openai.com".to_owned()),
+                api_key: Some(std::env::var("OPENAI_API_KEY")?),
+            }),
+            anthropic: None,
+            openrouter: None,
+        },
+        models: ModelsConfig {
+            default: Some(ModelConfig {
+                provider: ConfiguredProvider::OpenAi,
+                model: "gpt-5.4".to_owned(),
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(8_192),
+                reasoning: Some(ReasoningEffort::High),
+                tokens_per_minute: Some(500_000),
+            }),
+            fast: Some(ModelConfig {
+                provider: ConfiguredProvider::OpenAi,
+                model: "gpt-5.4-mini".to_owned(),
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(4_096),
+                reasoning: Some(ReasoningEffort::Low),
+                tokens_per_minute: Some(1_000_000),
+            }),
+            subagent: Some(ModelConfig {
+                provider: ConfiguredProvider::OpenAi,
+                model: "gpt-5.4-mini".to_owned(),
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(4_096),
+                reasoning: Some(ReasoningEffort::Medium),
+                tokens_per_minute: Some(750_000),
+            }),
+        },
+        resources: ResourcesConfig {
+            skills: SearchRoots { roots: Vec::new() },
+            plugins: SearchRoots { roots: Vec::new() },
+        },
+        prompts: PromptsConfig {
+            system_prompt: Some(SYSTEM_PROMPT.to_owned()),
+        },
+        context: ContextConfig {
+            compaction_threshold: 200_000,
+            pre_compaction_target: 150_000,
+            prune_signal_threshold: PruneSignalThreshold::Low,
+        },
+        tools: ToolsConfig {
+            enabled: vec![
+                "read".to_owned(),
+                "glob".to_owned(),
+                "grep".to_owned(),
+                "write".to_owned(),
+                "edit".to_owned(),
+                "shell".to_owned(),
+                "process".to_owned(),
+                "spawn_agent".to_owned(),
+                "send_input".to_owned(),
+                "wait_agent".to_owned(),
+                "close_agent".to_owned(),
+            ],
+        },
+        policy: PolicyConfig {
+            allowed_write_roots: vec![working_dir.clone(), temp_write_root],
+            max_read_bytes: 1_048_576,
+            max_tool_output_bytes: 262_144,
+            max_subagent_depth: 3,
+            max_concurrent_subagents: 8,
+            shell: ShellPolicyConfig {
+                enabled: true,
+                allow: vec![
+                    "git".to_owned(),
+                    "cargo".to_owned(),
+                    "rg".to_owned(),
+                    "ls".to_owned(),
+                    "find".to_owned(),
+                    "python".to_owned(),
+                    "pwd".to_owned(),
+                    "echo".to_owned(),
+                ],
+                timeout_secs: 30,
+            },
+            network: NetworkPolicyConfig {
+                enabled: false,
+                allowed_hosts: Vec::new(),
+            },
+        },
+        sessions: SessionsConfig {
+            backend: SessionBackend::Memory,
+            sqlite_path: None,
+        },
+        runtime: RuntimeConfig {
+            working_dir: Some(working_dir),
+        },
+    })
+}
+
+fn inline_skills() -> Vec<LoadedSkill> {
+    vec![LoadedSkill {
+        id: SkillId::from("repo-review"),
+        name: "repo-review".to_owned(),
+        description: "Review a repository for correctness, maintainability, and next steps."
+            .to_owned(),
+        root: PathBuf::from("inline-skills/repo-review"),
+        body: REPO_REVIEW_SKILL.to_owned(),
+        supporting_files: Vec::new(),
+        scripts: Vec::new(),
+        revision: "repo-review-v1".to_owned(),
+    }]
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = load_path("halter.toml").await?;
-    let resources = ResourceCompiler::from_config(&config).compile().await?;
-
     let harness = HalterBuilder::new()
-        .with_config(config)
-        .with_compiled_resources(resources)
+        .with_config(build_config()?)
+        .with_loaded_skills(inline_skills())
         .with_session_store(Arc::new(InMemorySessionStore::default()))
         .build()
         .await?;
 
-    let session = harness.new_session(halter_runtime::SessionInit::default()).await?;
+    let session = harness.new_session(SessionInit::default()).await?;
     let _events = session
-        .submit_turn(halter_protocol::Turn::user("Describe the active runtime"))
+        .submit_turn(Turn::user("Describe the active runtime and available skills"))
         .await?;
 
     Ok(())
 }
 ```
+
+This skips `halter.toml` entirely: model roles, policy, runtime settings, and even skills are assembled in memory before the harness is built.
 
 For deeper examples, use the crate-specific READMEs.
 
@@ -739,108 +783,3 @@ The config crate supports a focused set of environment overrides, including:
 These are useful for CI, local overrides, or environment-specific deployment adjustments without duplicating full config files.
 
 ---
-
-## Common mistakes
-
-### 1. Supplying an incomplete config
-
-`[models.default]` is required. A config without it is not valid.
-
-### 2. Forgetting provider credentials
-
-If your config references OpenAI, Anthropic, or OpenRouter, the corresponding credentials must be available either in config or environment.
-
-### 3. Assuming every provider supports streaming or compaction
-
-Those are provider capabilities, not universal guarantees.
-
-### 4. Enabling tools in config without compiling their features
-
-For example, `pty` or `ast_grep` must exist in the build before config can make them useful.
-
-### 5. Shell allowlists that are too narrow or too broad
-
-Too narrow makes the agent ineffective. Too broad expands risk. Tune deliberately.
-
-### 6. Using `write` where `edit` is safer
-
-For small source changes, targeted edits are generally easier to reason about and verify.
-
-### 7. Ignoring subagent limits
-
-If you rely on delegated work, configure depth and concurrency intentionally.
-
----
-
-## Recommendations
-
-### For SDK users
-
-- Start with `halter::Halter` before dropping to lower-level crates.
-- Use `InMemorySessionStore` in tests and SQLite only when you need durability.
-- Subscribe to or persist session events early; they are invaluable for debugging.
-- Treat provider capabilities as explicit contracts.
-- Add custom tools only when built-ins do not cover the need.
-
-### For CLI users
-
-- Keep `halter.toml` explicit and small.
-- Use `halter validate` and `halter resources` before blaming runtime behavior.
-- Treat `tools.enabled` and shell allowlists as important operational policy.
-- Use `--streaming-json` when integrating with other systems.
-- Use `--output-file` when you want a single artifact containing output and tracing.
-
----
-
-## Per-crate documentation
-
-Detailed READMEs have been written for every crate in this workspace:
-
-- [`crates/halter/README.md`](crates/halter/README.md)
-- [`crates/halter-cli/README.md`](crates/halter-cli/README.md)
-- [`crates/halter-config/README.md`](crates/halter-config/README.md)
-- [`crates/halter-hooks/README.md`](crates/halter-hooks/README.md)
-- [`crates/halter-protocol/README.md`](crates/halter-protocol/README.md)
-- [`crates/halter-providers/README.md`](crates/halter-providers/README.md)
-- [`crates/halter-runtime/README.md`](crates/halter-runtime/README.md)
-- [`crates/halter-session/README.md`](crates/halter-session/README.md)
-- [`crates/halter-tools/README.md`](crates/halter-tools/README.md)
-
-If you want one takeaway from this repo structure, it is this:
-
-- use **`halter`** if you want the easiest embedding path
-- use **`halter-cli`** if you want the easiest operator path
-- use the lower-level crates when you need deeper control
-
----
-
-## Build notes
-
-Workspace metadata currently targets:
-
-- Rust edition: `2024`
-- Rust version: `1.93`
-
-Standard development entrypoints:
-
-```bash
-cargo run -p halter-cli -- --help
-cargo run -p halter-cli -- validate
-cargo test
-```
-
----
-
-## Final summary
-
-Halter is not just a model wrapper. It is a composable agent harness with:
-
-- a real runtime
-- a real tool system
-- explicit policy boundaries
-- pluggable providers
-- durable session semantics
-- hookable lifecycle events
-- both SDK and CLI entrypoints
-
-If you're building or operating serious local-first agents, that's the right level of abstraction.
