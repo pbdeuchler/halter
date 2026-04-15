@@ -74,6 +74,18 @@ impl ModelRegistry {
             .with_context(|| format!("failed to resolve model: unknown model '{}'", model_id.0))
     }
 
+    #[must_use]
+    pub fn model_ids(&self) -> Vec<ModelId> {
+        let mut model_ids = self
+            .models
+            .keys()
+            .cloned()
+            .map(ModelId::from)
+            .collect::<Vec<_>>();
+        model_ids.sort_by(|left, right| left.0.cmp(&right.0));
+        model_ids
+    }
+
     pub fn register_provider(&mut self, name: ProviderName, provider: Arc<dyn Provider>) {
         debug!(provider = %name, "registering provider");
         self.providers.insert(name.0, provider);

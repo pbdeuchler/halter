@@ -126,7 +126,6 @@ pub struct SessionInit {
     pub max_turns: Option<u32>,
     pub default_model: Option<ModelId>,
     pub subagent_model: Option<ModelId>,
-    // pub max_tool_calls_per_turn: u32,
     pub subagent_depth: u32,
 }
 
@@ -136,11 +135,10 @@ impl Default for SessionInit {
             session_id: None,
             parent_session_id: None,
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            system_prompt_seed: Vec::new(),
+            system_prompt_seed: vec![crate::prompt::default_system_prompt_segment()],
             max_turns: None,
             default_model: None,
             subagent_model: None,
-            // max_tool_calls_per_turn: 8,
             subagent_depth: 0,
         }
     }
@@ -628,7 +626,35 @@ impl HalterSession {
             return Ok(());
         }
 
-        let summary = compact_session_state(&mut state, custom_instructions);
+        let observed = observe_state(stored.blueprint.working_dir.clone());
+        let compaction_model = self
+            .services
+            .models
+            .model(&stored.blueprint.default_model)?;
+        let compaction_provider = self.services.models.provider(&compaction_model.provider)?;
+        let compaction = self
+            .services
+            .context_manager
+            .compact_now(
+                &stored.blueprint,
+                &state,
+                &observed,
+                stored.snapshot.as_ref(),
+                &self.services.tools.specs(),
+                &compaction_model,
+                compaction_provider.as_ref(),
+                custom_instructions,
+            )
+            .await?;
+        let summary = if let Some(result) = compaction.compaction {
+            state.compacted_prefix = compaction.compacted_prefix;
+            state.messages = compaction.messages;
+            state.last_response_id = None;
+            state.messages_seen_by_provider = 0;
+            result.summary
+        } else {
+            "No compaction needed.".to_owned()
+        };
         state.pending_session_start_source = Some(HookSessionStartSource::Compact);
         self.push_event(
             &mut events,
@@ -669,7 +695,6 @@ impl HalterSession {
             },
         )];
         let mut turn_usage = Usage::default();
-        let mut tool_calls_executed = 0u32;
         let mut fired_hook_ids = state
             .fired_hook_ids
             .iter()
@@ -779,6 +804,11 @@ impl HalterSession {
             .push(Message::User(turn.user_message.clone()));
 
         loop {
+            let compaction_model = self
+                .services
+                .models
+                .model(&stored.blueprint.default_model)?;
+            let compaction_provider = self.services.models.provider(&compaction_model.provider)?;
             let observed = observe_state(stored.blueprint.working_dir.clone());
             let plan = self
                 .services
@@ -789,8 +819,25 @@ impl HalterSession {
                     &observed,
                     snapshot.as_ref(),
                     &self.services.tools.specs(),
+                    &compaction_model,
+                    compaction_provider.as_ref(),
                 )
                 .await?;
+
+            if let Some(ref compaction) = plan.compaction {
+                state.compacted_prefix = plan.compacted_prefix.clone();
+                state.messages = plan.messages.clone();
+                state.last_response_id = None;
+                state.messages_seen_by_provider = 0;
+                self.push_event(
+                    &mut events,
+                    SessionEventPayload::ContextCompacted {
+                        summary: compaction.summary.clone(),
+                    },
+                    live.as_ref(),
+                );
+            }
+
             let prompt = self.services.prompt_assembler.assemble(&plan).await?;
 
             let selected_models = select_models(
@@ -810,12 +857,15 @@ impl HalterSession {
                 turn_id: turn.id.clone(),
                 model: model.clone(),
                 prompt,
+                compacted_prefix: plan.compacted_prefix.clone(),
                 messages: plan.messages.clone(),
                 tools: plan.tool_specs.clone(),
+                previous_response_id: plan.previous_response_id.clone(),
+                new_messages_start: plan.new_messages_start,
             };
 
             let provider_stream = provider.stream(request, turn_cancel.child_token()).await?;
-            let materialized = materialize_assistant_message(provider_stream, &model).await?;
+            let mut materialized = materialize_assistant_message(provider_stream, &model).await?;
             accumulate_usage(&mut state.usage_so_far, &materialized.usage);
             accumulate_usage(&mut turn_usage, &materialized.usage);
             debug!(
@@ -830,8 +880,29 @@ impl HalterSession {
                 "materialized assistant message"
             );
 
+            let (deduped_parts, duplicate_tool_calls) =
+                dedupe_assistant_tool_call_parts(std::mem::take(&mut materialized.message.parts));
+            if duplicate_tool_calls > 0 {
+                warn!(
+                    session_id = %self.session_id,
+                    turn_id = %turn.id,
+                    duplicate_tool_call_count = duplicate_tool_calls,
+                    "deduped duplicate tool calls from provider output"
+                );
+                materialized.message.parts = deduped_parts;
+            } else {
+                materialized.message.parts = deduped_parts;
+            }
+
             let assistant_message = Message::Assistant(materialized.message.clone());
             state.messages.push(assistant_message.clone());
+
+            // Track response ID for previous_response_id chaining.
+            if let Some(ref resp_id) = materialized.response_id {
+                state.last_response_id = Some(resp_id.clone());
+                state.messages_seen_by_provider = state.messages.len();
+            }
+
             for payload in materialized.events {
                 self.push_event(&mut events, payload, live.as_ref());
             }
@@ -842,6 +913,34 @@ impl HalterSession {
                 },
                 live.as_ref(),
             );
+
+            let post_response_observed = observe_state(stored.blueprint.working_dir.clone());
+            let post_response_plan = self
+                .services
+                .context_manager
+                .plan(
+                    &stored.blueprint,
+                    &state,
+                    &post_response_observed,
+                    snapshot.as_ref(),
+                    &self.services.tools.specs(),
+                    &compaction_model,
+                    compaction_provider.as_ref(),
+                )
+                .await?;
+            if let Some(ref compaction) = post_response_plan.compaction {
+                state.compacted_prefix = post_response_plan.compacted_prefix.clone();
+                state.messages = post_response_plan.messages.clone();
+                state.last_response_id = None;
+                state.messages_seen_by_provider = 0;
+                self.push_event(
+                    &mut events,
+                    SessionEventPayload::ContextCompacted {
+                        summary: compaction.summary.clone(),
+                    },
+                    live.as_ref(),
+                );
+            }
 
             let tool_calls = assistant_tool_calls(&materialized.message);
             if tool_calls.is_empty() {
@@ -907,21 +1006,12 @@ impl HalterSession {
                 });
             }
 
-            tool_calls_executed += u32::try_from(tool_calls.len()).unwrap_or(u32::MAX);
             info!(
                 session_id = %self.session_id,
                 turn_id = %turn.id,
                 tool_call_count = tool_calls.len(),
-                tool_calls_executed,
                 "assistant requested tool calls"
             );
-            // if tool_calls_executed > stored.blueprint.max_tool_calls_per_turn {
-            //     anyhow::bail!(
-            //         "failed to submit turn: tool calls {} exceed max_tool_calls_per_turn {}",
-            //         tool_calls_executed,
-            //         stored.blueprint.max_tool_calls_per_turn
-            //     );
-            // }
 
             let tool_events = self
                 .execute_tool_calls(
@@ -1300,6 +1390,8 @@ pub(crate) struct MaterializedAssistantMessage {
     pub(crate) message: AssistantMessage,
     pub(crate) usage: Usage,
     pub(crate) events: Vec<SessionEventPayload>,
+    /// Provider's response ID for `previous_response_id` chaining.
+    pub(crate) response_id: Option<String>,
 }
 
 pub(crate) async fn materialize_assistant_message(
@@ -1316,6 +1408,7 @@ pub(crate) async fn materialize_assistant_message(
     let mut thinking_block: Option<PendingThinkingBlock> = None;
     let mut tool_call_blocks: std::collections::BTreeMap<BlockId, PendingToolCallBlock> =
         std::collections::BTreeMap::new();
+    let mut captured_response_id: Option<String> = None;
 
     while let Some(item) = provider_stream.next().await {
         match item {
@@ -1385,9 +1478,13 @@ pub(crate) async fn materialize_assistant_message(
             }
             Ok(StreamEvent::MessageEnd {
                 stop_reason: ended_reason,
+                response_id: resp_id,
                 ..
             }) => {
                 stop_reason = ended_reason;
+                if resp_id.is_some() {
+                    captured_response_id = resp_id;
+                }
             }
             Ok(StreamEvent::ProviderWarning { message }) => {
                 warn!(provider = %model.provider, message = %message, "provider emitted warning");
@@ -1426,6 +1523,7 @@ pub(crate) async fn materialize_assistant_message(
         },
         usage,
         events: delta_events,
+        response_id: captured_response_id,
     })
 }
 
@@ -1457,6 +1555,27 @@ fn assistant_tool_calls(message: &AssistantMessage) -> Vec<ToolCall> {
             AssistantPart::Text { .. } | AssistantPart::Thinking(_) => None,
         })
         .collect()
+}
+
+fn dedupe_assistant_tool_call_parts(parts: Vec<AssistantPart>) -> (Vec<AssistantPart>, usize) {
+    let mut deduped = Vec::with_capacity(parts.len());
+    let mut seen_tool_call_ids = BTreeSet::new();
+    let mut duplicate_count = 0;
+
+    for part in parts {
+        match &part {
+            AssistantPart::ToolCall(call) => {
+                if !seen_tool_call_ids.insert(call.id.clone()) {
+                    duplicate_count += 1;
+                    continue;
+                }
+            }
+            AssistantPart::Text { .. } | AssistantPart::Thinking(_) => {}
+        }
+        deduped.push(part);
+    }
+
+    (deduped, duplicate_count)
 }
 
 fn accumulate_usage(total: &mut Usage, delta: &Usage) {
@@ -1532,63 +1651,6 @@ fn tool_result_from_hook_value(value: serde_json::Value) -> ToolResult {
     }
 }
 
-fn compact_session_state(state: &mut SessionState, custom_instructions: Option<&str>) -> String {
-    const RETAINED_MESSAGES: usize = 8;
-
-    if state.messages.len() <= RETAINED_MESSAGES {
-        return "No compaction needed.".to_owned();
-    }
-
-    let split_index = state.messages.len() - RETAINED_MESSAGES;
-    let summary_body = state.messages[..split_index]
-        .iter()
-        .map(render_message_for_summary)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let summary =
-        if let Some(instructions) = custom_instructions.filter(|value| !value.trim().is_empty()) {
-            format!("{instructions}\n\n{summary_body}")
-        } else {
-            summary_body
-        };
-
-    state.summaries.push(halter_protocol::SummarySlice {
-        id: MessageId::new().0,
-        text: summary.clone(),
-    });
-    state.messages = state.messages.split_off(split_index);
-
-    summary
-}
-
-fn render_message_for_summary(message: &Message) -> String {
-    match message {
-        Message::System(message) => format!("system: {}", message.text),
-        Message::User(message) => format!("user: {}", message.plain_text()),
-        Message::Assistant(message) => {
-            format!("assistant: {}", render_assistant_summary_text(message))
-        }
-        Message::Tool(message) => match &message.content {
-            ToolResult::Empty => "tool: empty".to_owned(),
-            ToolResult::Text { text } => format!("tool: {text}"),
-            ToolResult::Json { value } => format!("tool: {value}"),
-        },
-    }
-}
-
-fn render_assistant_summary_text(message: &AssistantMessage) -> String {
-    message
-        .parts
-        .iter()
-        .filter_map(|part| match part {
-            AssistantPart::Text { text } => Some(text.as_str()),
-            AssistantPart::Thinking(_) | AssistantPart::ToolCall(_) => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 pub(crate) async fn create_session_seeded(
     services: Arc<RuntimeServices>,
     init: SessionInit,
@@ -1615,7 +1677,6 @@ pub(crate) async fn create_session_seeded(
         working_dir: init.working_dir,
         system_prompt_seed: init.system_prompt_seed,
         max_turns: init.max_turns,
-        // max_tool_calls_per_turn: init.max_tool_calls_per_turn,
         subagent_depth: init.subagent_depth,
     };
     info!(
@@ -1785,6 +1846,17 @@ mod tests {
         configured_services, empty_hooks, install_file_hooks, new_session, resolved_test_model,
     };
 
+    #[test]
+    fn session_init_default_uses_embedded_system_prompt_seed() {
+        let init = SessionInit::default();
+
+        assert_eq!(init.system_prompt_seed.len(), 1);
+        assert_eq!(
+            init.system_prompt_seed[0].text,
+            crate::prompt::default_system_prompt_text()
+        );
+    }
+
     mod test_support {
         use std::path::Path;
         use std::sync::Arc;
@@ -1815,6 +1887,7 @@ mod tests {
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
                 reasoning: None,
+                tokens_per_minute: None,
             });
             models.set_subagent_model(ResolvedModel {
                 role: ModelRole::subagent(),
@@ -1826,6 +1899,7 @@ mod tests {
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
                 reasoning: None,
+                tokens_per_minute: None,
             });
             models.set_small_model(ResolvedModel {
                 role: ModelRole::small(),
@@ -1837,6 +1911,7 @@ mod tests {
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
                 reasoning: None,
+                tokens_per_minute: None,
             });
             models.register_provider(ProviderName::from("fake"), provider);
             services.models = Arc::new(models);
@@ -1898,6 +1973,7 @@ mod tests {
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
                 reasoning: None,
+                tokens_per_minute: None,
             }
         }
     }
@@ -1916,6 +1992,7 @@ mod tests {
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
             reasoning: None,
+            tokens_per_minute: None,
         });
         models.set_subagent_model(ResolvedModel {
             role: ModelRole::subagent(),
@@ -1927,6 +2004,7 @@ mod tests {
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
             reasoning: None,
+            tokens_per_minute: None,
         });
         models.register_provider(
             ProviderName::from("fake"),
@@ -1987,6 +2065,34 @@ mod tests {
                 part,
                 AssistantPart::Text { text } if text.contains("tool completed")
             ))
+        )));
+    }
+
+    #[tokio::test]
+    async fn submit_turn_dedupes_duplicate_tool_call_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let executions = Arc::new(Mutex::new(0usize));
+        let services = configured_services(Arc::new(DuplicateToolCallProvider), temp.path());
+        services
+            .tools
+            .register(Arc::new(CountingTool::new(executions.clone())));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("dedupe tool calls"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert_eq!(*executions.lock().expect("executions"), 1);
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::MessageItem {
+                message: Message::Assistant(assistant),
+            } if assistant.parts.iter().filter(|part| matches!(part, AssistantPart::ToolCall(_))).count() == 1
         )));
     }
 
@@ -2116,6 +2222,7 @@ mod tests {
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
             reasoning: None,
+            tokens_per_minute: None,
         });
         models.set_subagent_model(resolved_test_model("subagent", "fake", "subagent/model"));
         models.register_provider(
@@ -2428,8 +2535,8 @@ mod tests {
             .await
             .expect("load compacted session")
             .expect("session exists");
-        assert!(!stored.state.summaries.is_empty());
-        assert!(stored.state.messages.len() <= 8);
+        assert!(!stored.state.compacted_prefix.is_empty());
+        assert!(stored.state.messages.is_empty());
         assert_eq!(
             stored.state.pending_session_start_source,
             Some(HookSessionStartSource::Compact)
@@ -2441,6 +2548,39 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn submit_turn_compacts_immediately_after_response_when_threshold_is_reached() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .context_manager = Arc::new(DefaultContextManager::new(
+            150,
+            0,
+            halter_protocol::PruneSignalThreshold::VeryLow,
+        ));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        session
+            .submit_turn(Turn::user("x".repeat(150)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert!(!stored.state.compacted_prefix.is_empty());
+        assert_eq!(stored.state.messages.len(), 1);
+        assert!(matches!(stored.state.messages[0], Message::Assistant(_)));
     }
 
     #[tokio::test]
@@ -2667,6 +2807,9 @@ mod tests {
     struct ToolLoopProvider;
 
     #[derive(Debug)]
+    struct DuplicateToolCallProvider;
+
+    #[derive(Debug)]
     struct JsonHookProvider {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
     }
@@ -2731,6 +2874,7 @@ mod tests {
                 Ok(StreamEvent::MessageEnd {
                     id: message_id,
                     stop_reason: StopReason::EndTurn,
+                    response_id: None,
                 }),
             ])
             .boxed())
@@ -2774,6 +2918,7 @@ mod tests {
                     Ok(StreamEvent::MessageEnd {
                         id: halter_protocol::MessageId::new(),
                         stop_reason: StopReason::EndTurn,
+                        response_id: None,
                     }),
                 ])
                 .boxed());
@@ -2811,6 +2956,81 @@ mod tests {
                 Ok(StreamEvent::MessageEnd {
                     id: message_id,
                     stop_reason: StopReason::ToolUse,
+                    response_id: None,
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[async_trait]
+    impl Provider for DuplicateToolCallProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            if request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool(_)))
+            {
+                return Ok(stream::iter(vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: halter_protocol::MessageId::new(),
+                    }),
+                    Ok(StreamEvent::TextStart { id: BlockId::new() }),
+                    Ok(StreamEvent::TextDelta {
+                        id: BlockId::new(),
+                        delta: "tool completed".to_owned(),
+                    }),
+                    Ok(StreamEvent::TextEnd { id: BlockId::new() }),
+                    Ok(StreamEvent::MessageEnd {
+                        id: halter_protocol::MessageId::new(),
+                        stop_reason: StopReason::EndTurn,
+                        response_id: None,
+                    }),
+                ])
+                .boxed());
+            }
+
+            let first_block_id = BlockId::new();
+            let second_block_id = BlockId::new();
+            let tool_call_id = ToolCallId::from("call-dedupe");
+            Ok(stream::iter(vec![
+                Ok(StreamEvent::MessageStart {
+                    id: halter_protocol::MessageId::new(),
+                }),
+                Ok(StreamEvent::ToolCallStart {
+                    id: first_block_id.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    name: ToolName::from("count_test"),
+                }),
+                Ok(StreamEvent::ToolArgsDelta {
+                    id: first_block_id.clone(),
+                    delta: json!({ "value": 1 }).to_string(),
+                }),
+                Ok(StreamEvent::ToolCallEnd { id: first_block_id }),
+                Ok(StreamEvent::ToolCallStart {
+                    id: second_block_id.clone(),
+                    tool_call_id,
+                    name: ToolName::from("count_test"),
+                }),
+                Ok(StreamEvent::ToolArgsDelta {
+                    id: second_block_id.clone(),
+                    delta: json!({ "value": 1 }).to_string(),
+                }),
+                Ok(StreamEvent::ToolCallEnd {
+                    id: second_block_id,
+                }),
+                Ok(StreamEvent::MessageEnd {
+                    id: halter_protocol::MessageId::new(),
+                    stop_reason: StopReason::ToolUse,
+                    response_id: None,
                 }),
             ])
             .boxed())
@@ -2876,6 +3096,7 @@ mod tests {
                 Ok(StreamEvent::MessageEnd {
                     id: message_id,
                     stop_reason: StopReason::EndTurn,
+                    response_id: None,
                 }),
             ])
             .boxed())
@@ -2914,6 +3135,7 @@ mod tests {
                     Ok(StreamEvent::MessageEnd {
                         id: halter_protocol::MessageId::new(),
                         stop_reason: StopReason::EndTurn,
+                        response_id: None,
                     }),
                 ])
                 .boxed());
@@ -2937,6 +3159,7 @@ mod tests {
                 Ok(StreamEvent::MessageEnd {
                     id: halter_protocol::MessageId::new(),
                     stop_reason: StopReason::ToolUse,
+                    response_id: None,
                 }),
             ])
             .boxed())
@@ -2945,6 +3168,45 @@ mod tests {
 
     #[derive(Debug)]
     struct StreamingTestTool;
+
+    #[derive(Debug)]
+    struct CountingTool {
+        executions: Arc<Mutex<usize>>,
+    }
+
+    impl CountingTool {
+        fn new(executions: Arc<Mutex<usize>>) -> Self {
+            Self { executions }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: ToolName::from("count_test"),
+                description: "Count tool executions".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                concurrency: ToolConcurrency::Exclusive,
+                capabilities: ToolCapabilities::default(),
+                provider_aliases: Default::default(),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _context: ToolContext,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<ToolResult> {
+            *self.executions.lock().expect("executions") += 1;
+            Ok(ToolResult::Json {
+                value: json!({ "ok": true }),
+            })
+        }
+    }
 
     #[async_trait]
     impl Tool for StreamingTestTool {

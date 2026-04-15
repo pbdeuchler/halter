@@ -7,6 +7,8 @@ use halter_protocol::{
 };
 use sha2::{Digest, Sha256};
 
+const DEFAULT_PROVIDER_ID_MAX_LEN: usize = 64;
+
 pub(crate) fn collect_system_text(request: &ProviderRequest) -> Option<String> {
     let mut sections = Vec::new();
     let rendered_prefix = request.prompt.rendered_prefix.trim();
@@ -115,26 +117,41 @@ pub(crate) fn tool_result_text(result: &ToolResult, error: &Option<ToolError>) -
 }
 
 pub(crate) fn normalized_tool_call_id(call_id: &ToolCallId) -> String {
-    let sanitized = call_id
-        .0
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        return format!("tool_{}", short_hash(&call_id.0));
-    }
-    if sanitized.len() <= 64 {
-        return sanitized;
+    bounded_provider_id_with_prefix("", &call_id.0, DEFAULT_PROVIDER_ID_MAX_LEN, "tool")
+}
+
+pub(crate) fn bounded_provider_id(value: &str, max_len: usize, empty_prefix: &str) -> String {
+    bounded_provider_id_with_prefix("", value, max_len, empty_prefix)
+}
+
+pub(crate) fn bounded_provider_id_with_prefix(
+    prefix: &str,
+    value: &str,
+    max_len: usize,
+    empty_prefix: &str,
+) -> String {
+    let sanitized = sanitize_provider_id(value);
+    let base = if sanitized.is_empty() {
+        format!("{empty_prefix}_{}", short_hash(value))
+    } else {
+        sanitized
+    };
+    if prefix.len() + base.len() <= max_len {
+        return format!("{prefix}{base}");
     }
 
-    let suffix = short_hash(&call_id.0);
-    format!("{}_{}", &sanitized[..55], suffix)
+    let available = max_len.saturating_sub(prefix.len());
+    if available == 0 {
+        return short_hash(value).chars().take(max_len).collect();
+    }
+
+    let suffix = short_hash(value);
+    if suffix.len() >= available {
+        return format!("{prefix}{}", &suffix[..available]);
+    }
+
+    let head_len = available - suffix.len() - 1;
+    format!("{prefix}{}_{}", &base[..head_len], suffix)
 }
 
 pub(crate) fn data_url(media_type: &str, data: &[u8]) -> String {
@@ -155,6 +172,19 @@ fn short_hash(value: &str) -> String {
     hasher.update(value.as_bytes());
     let digest = hasher.finalize();
     hex_prefix(&digest, 8)
+}
+
+fn sanitize_provider_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn hex_prefix(bytes: &[u8], hex_chars: usize) -> String {

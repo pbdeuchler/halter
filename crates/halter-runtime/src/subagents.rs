@@ -874,6 +874,7 @@ mod tests {
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
             reasoning: None,
+            tokens_per_minute: None,
         });
         models.set_subagent_model(ResolvedModel {
             role: ModelRole::subagent(),
@@ -885,6 +886,7 @@ mod tests {
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
             reasoning: None,
+            tokens_per_minute: None,
         });
         models.register_provider(ProviderName::from("fake"), provider);
 
@@ -986,6 +988,7 @@ mod tests {
                 Ok(StreamEvent::MessageEnd {
                     id: message_id,
                     stop_reason: StopReason::EndTurn,
+                    response_id: None,
                 }),
             ])
             .boxed())

@@ -7,6 +7,9 @@ mod fake;
 mod http_client;
 mod openai;
 mod openai_codec;
+mod openai_error;
+mod openai_rate_limit;
+mod openai_rate_limit_policy;
 mod openrouter;
 mod registry;
 mod responses_provider;
@@ -15,7 +18,10 @@ mod unsupported;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use halter_protocol::{ProviderCapabilities, ProviderError, ProviderRequest, StreamEvent};
+use halter_protocol::{
+    ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
+    ProviderRequest, StreamEvent,
+};
 use tokio_util::sync::CancellationToken;
 
 pub use anthropic::AnthropicProvider;
@@ -34,4 +40,12 @@ pub trait Provider: Send + Sync {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>>;
+
+    async fn compact(
+        &self,
+        _request: ProviderCompactionRequest,
+        _cancel: CancellationToken,
+    ) -> anyhow::Result<ProviderCompactionResponse> {
+        anyhow::bail!("failed to compact session: provider does not support compaction");
+    }
 }

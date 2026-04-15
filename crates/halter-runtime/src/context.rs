@@ -1,23 +1,28 @@
-// pattern: Functional Core
+// pattern: Imperative Shell
 
 use async_trait::async_trait;
 use halter_protocol::{
-    AssistantPart, ContextPlan, FileViewSlice, Message, ObservedState, ResourceSnapshot,
-    SessionBlueprint, SessionState, ToolCallId, TranscriptWindow,
+    CompactionResult, ContextPlan, FileViewSlice, Message, ObservedState, PromptSegment,
+    ProviderCompactionRequest, ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionState,
+    ToolSpec, TranscriptWindow,
 };
+use halter_providers::Provider;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tracing::info;
 
-#[derive(Debug, Clone, Copy)]
-pub struct ContextSettings {
-    pub max_context_messages: usize,
-}
+use crate::compaction::{
+    ContextSettings, estimate_context_tokens, prepare_compaction, render_compaction_event_summary,
+    should_trigger_compaction,
+};
 
-impl Default for ContextSettings {
-    fn default() -> Self {
-        Self {
-            max_context_messages: 24,
-        }
-    }
+const DEFAULT_COMPACTION_PROMPT_MARKDOWN: &str = include_str!("../prompts/default-compaction.md");
+
+#[derive(Debug, Clone)]
+pub struct CompactionOutcome {
+    pub messages: Vec<Message>,
+    pub compacted_prefix: Vec<Value>,
+    pub compaction: Option<CompactionResult>,
 }
 
 #[async_trait]
@@ -28,8 +33,22 @@ pub trait ContextManager: Send + Sync {
         state: &SessionState,
         observed: &ObservedState,
         snapshot: &ResourceSnapshot,
-        tool_specs: &[halter_protocol::ToolSpec],
+        tool_specs: &[ToolSpec],
+        compaction_model: &ResolvedModel,
+        compaction_provider: &(dyn Provider + Send + Sync),
     ) -> anyhow::Result<ContextPlan>;
+
+    async fn compact_now(
+        &self,
+        blueprint: &SessionBlueprint,
+        state: &SessionState,
+        observed: &ObservedState,
+        snapshot: &ResourceSnapshot,
+        tool_specs: &[ToolSpec],
+        compaction_model: &ResolvedModel,
+        compaction_provider: &(dyn Provider + Send + Sync),
+        custom_instructions: Option<&str>,
+    ) -> anyhow::Result<CompactionOutcome>;
 }
 
 #[derive(Debug, Default)]
@@ -39,17 +58,100 @@ pub struct DefaultContextManager {
 
 impl DefaultContextManager {
     #[must_use]
-    pub fn new(max_context_messages: usize) -> Self {
+    pub fn new(
+        compaction_threshold: u64,
+        pre_compaction_target: u64,
+        prune_signal_threshold: halter_protocol::PruneSignalThreshold,
+    ) -> Self {
         Self {
             settings: ContextSettings {
-                max_context_messages,
+                compaction_threshold,
+                pre_compaction_target,
+                prune_signal_threshold,
             },
         }
     }
 
     #[must_use]
+    pub fn from_settings(settings: ContextSettings) -> Self {
+        Self { settings }
+    }
+
+    #[must_use]
     pub fn settings(&self) -> ContextSettings {
         self.settings
+    }
+
+    async fn execute_compaction(
+        &self,
+        blueprint: &SessionBlueprint,
+        state: &SessionState,
+        prompt_segments: &[PromptSegment],
+        tool_specs: &[ToolSpec],
+        compaction_model: &ResolvedModel,
+        compaction_provider: &(dyn Provider + Send + Sync),
+        force: bool,
+        custom_instructions: Option<&str>,
+    ) -> anyhow::Result<CompactionOutcome> {
+        let estimated_tokens = estimate_context_tokens(
+            prompt_segments,
+            &state.summaries,
+            &state.compacted_prefix,
+            &state.messages,
+        );
+        if !force && !should_trigger_compaction(estimated_tokens, &self.settings) {
+            return Ok(CompactionOutcome {
+                messages: state.messages.clone(),
+                compacted_prefix: state.compacted_prefix.clone(),
+                compaction: None,
+            });
+        }
+
+        if !compaction_provider.capabilities().supports_compaction {
+            anyhow::bail!(
+                "failed to compact session: provider '{}' does not support compaction",
+                compaction_model.provider
+            );
+        }
+
+        let preparation =
+            prepare_compaction(&self.settings, &state.compacted_prefix, &state.messages);
+        if state.compacted_prefix.is_empty() && preparation.compact_messages.is_empty() {
+            return Ok(CompactionOutcome {
+                messages: state.messages.clone(),
+                compacted_prefix: state.compacted_prefix.clone(),
+                compaction: None,
+            });
+        }
+
+        let response = compaction_provider
+            .compact(
+                ProviderCompactionRequest {
+                    session_id: blueprint.session_id.clone(),
+                    model: compaction_model.clone(),
+                    compacted_prefix: state.compacted_prefix.clone(),
+                    messages: preparation.compact_messages.clone(),
+                    tools: tool_specs.to_vec(),
+                    instructions: compaction_instructions(custom_instructions),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        let summary = render_compaction_event_summary(
+            preparation.compacted_message_count,
+            response.output.len(),
+            preparation.evicted_unit_count,
+            preparation.reserved_response_block,
+        );
+
+        Ok(CompactionOutcome {
+            messages: preparation.reserved_suffix,
+            compacted_prefix: response.output,
+            compaction: Some(CompactionResult {
+                compacted_count: preparation.compacted_message_count,
+                summary,
+            }),
+        })
     }
 }
 
@@ -61,12 +163,13 @@ impl ContextManager for DefaultContextManager {
         state: &SessionState,
         observed: &ObservedState,
         _snapshot: &ResourceSnapshot,
-        tool_specs: &[halter_protocol::ToolSpec],
+        tool_specs: &[ToolSpec],
+        compaction_model: &ResolvedModel,
+        compaction_provider: &(dyn Provider + Send + Sync),
     ) -> anyhow::Result<ContextPlan> {
         let mut prompt_segments = blueprint.system_prompt_seed.clone();
         prompt_segments.extend(state.appended_prompt_segments.clone());
 
-        let messages = slice_recent_messages(&state.messages, self.settings.max_context_messages);
         let file_views = state
             .file_view_cache
             .values()
@@ -78,252 +181,244 @@ impl ContextManager for DefaultContextManager {
                 last_shown_turn: entry.last_shown_turn,
             })
             .collect::<Vec<_>>();
-        let estimated_tokens = estimate_tokens(&prompt_segments, &messages);
+
+        let outcome = self
+            .execute_compaction(
+                blueprint,
+                state,
+                &prompt_segments,
+                tool_specs,
+                compaction_model,
+                compaction_provider,
+                false,
+                None,
+            )
+            .await?;
+        let estimated_tokens = estimate_context_tokens(
+            &prompt_segments,
+            &state.summaries,
+            &outcome.compacted_prefix,
+            &outcome.messages,
+        );
+
+        if let Some(compaction) = outcome.compaction.as_ref() {
+            info!(
+                compacted_messages = compaction.compacted_count,
+                remaining_messages = outcome.messages.len(),
+                compacted_prefix_items = outcome.compacted_prefix.len(),
+                estimated_tokens,
+                compaction_threshold = self.settings.compaction_threshold,
+                "context manager compacted session state"
+            );
+        }
+
+        let (previous_response_id, new_messages_start) = if outcome.compaction.is_none()
+            && outcome.compacted_prefix.is_empty()
+            && state.last_response_id.is_some()
+            && state.messages_seen_by_provider > 0
+        {
+            let seen = state.messages_seen_by_provider;
+            let total = state.messages.len();
+            let window_offset = total.saturating_sub(outcome.messages.len());
+            let new_start = seen
+                .saturating_sub(window_offset)
+                .min(outcome.messages.len());
+            (state.last_response_id.clone(), new_start)
+        } else {
+            (None, 0)
+        };
 
         Ok(ContextPlan {
+            prompt_segments,
             transcript_window: TranscriptWindow {
-                messages: messages.clone(),
-                elided_message_count: state.messages.len().saturating_sub(messages.len()) as u64,
+                messages: outcome.messages.clone(),
+                elided_message_count: state.messages.len().saturating_sub(outcome.messages.len())
+                    as u64,
             },
+            compacted_prefix: outcome.compacted_prefix.clone(),
             file_views,
             carried_summaries: state.summaries.clone(),
             elided_tool_results: Vec::new(),
             memory_items: Vec::new(),
-            prompt_segments,
             tool_specs: tool_specs.to_vec(),
             observed_state: observed.clone(),
             projected_input_tokens: estimated_tokens,
             cache_boundary_hash: cache_boundary_hash(),
-            messages,
+            messages: outcome.messages,
             estimated_tokens,
+            compaction: outcome.compaction,
+            previous_response_id,
+            new_messages_start,
         })
     }
-}
 
-fn slice_recent_messages(messages: &[Message], max_messages: usize) -> Vec<Message> {
-    if max_messages == 0 || messages.is_empty() {
-        return Vec::new();
+    async fn compact_now(
+        &self,
+        blueprint: &SessionBlueprint,
+        state: &SessionState,
+        _observed: &ObservedState,
+        _snapshot: &ResourceSnapshot,
+        tool_specs: &[ToolSpec],
+        compaction_model: &ResolvedModel,
+        compaction_provider: &(dyn Provider + Send + Sync),
+        custom_instructions: Option<&str>,
+    ) -> anyhow::Result<CompactionOutcome> {
+        let mut prompt_segments = blueprint.system_prompt_seed.clone();
+        prompt_segments.extend(state.appended_prompt_segments.clone());
+        self.execute_compaction(
+            blueprint,
+            state,
+            &prompt_segments,
+            tool_specs,
+            compaction_model,
+            compaction_provider,
+            true,
+            custom_instructions,
+        )
+        .await
     }
-    if messages.len() <= max_messages {
-        messages.to_vec()
-    } else {
-        let start = adjusted_slice_start(messages, messages.len() - max_messages);
-        messages[start..].to_vec()
-    }
-}
-
-fn adjusted_slice_start(messages: &[Message], start: usize) -> usize {
-    let mut adjusted_start = start;
-
-    for message in &messages[start..] {
-        let Message::Tool(tool) = message else {
-            continue;
-        };
-
-        if window_contains_tool_call(messages, adjusted_start, &tool.call_id) {
-            continue;
-        }
-
-        if let Some(required_start) =
-            find_matching_tool_call_start(messages, adjusted_start, &tool.call_id)
-        {
-            adjusted_start = adjusted_start.min(required_start);
-        }
-    }
-
-    adjusted_start
-}
-
-fn window_contains_tool_call(messages: &[Message], start: usize, call_id: &ToolCallId) -> bool {
-    messages[start..]
-        .iter()
-        .any(|message| message_contains_tool_call(message, call_id))
-}
-
-fn find_matching_tool_call_start(
-    messages: &[Message],
-    start: usize,
-    call_id: &ToolCallId,
-) -> Option<usize> {
-    messages[..start]
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, message)| message_contains_tool_call(message, call_id).then_some(index))
-}
-
-fn message_contains_tool_call(message: &Message, call_id: &ToolCallId) -> bool {
-    match message {
-        Message::Assistant(assistant) => assistant
-            .parts
-            .iter()
-            .any(|part| matches!(part, AssistantPart::ToolCall(call) if call.id == *call_id)),
-        Message::System(_) | Message::User(_) | Message::Tool(_) => false,
-    }
-}
-
-fn estimate_tokens(
-    prompt_segments: &[halter_protocol::PromptSegment],
-    messages: &[Message],
-) -> u64 {
-    // This remains a cheap heuristic until provider-specific tokenizers land.
-    let prompt_cost = prompt_segments
-        .iter()
-        .map(|segment| segment.text.split_whitespace().count() as u64)
-        .sum::<u64>();
-    let message_cost = messages
-        .iter()
-        .map(|message| match message {
-            Message::System(message) => message.text.split_whitespace().count() as u64,
-            Message::User(message) => message.plain_text().split_whitespace().count() as u64,
-            Message::Assistant(message) => message
-                .parts
-                .iter()
-                .map(|part| match part {
-                    halter_protocol::AssistantPart::Text { text } => {
-                        text.split_whitespace().count() as u64
-                    }
-                    halter_protocol::AssistantPart::Thinking(block) => {
-                        block.text.split_whitespace().count() as u64
-                    }
-                    halter_protocol::AssistantPart::ToolCall(_) => 8,
-                })
-                .sum(),
-            Message::Tool(message) => match &message.content {
-                halter_protocol::ToolResult::Empty => 0,
-                halter_protocol::ToolResult::Text { text } => {
-                    text.split_whitespace().count() as u64
-                }
-                halter_protocol::ToolResult::Json { value } => {
-                    value.to_string().split_whitespace().count() as u64
-                }
-            },
-        })
-        .sum::<u64>();
-    prompt_cost + message_cost
 }
 
 fn cache_boundary_hash() -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"transcript_boundary_v1");
+    hasher.update(b"transcript_boundary_v2");
     format!("{:x}", hasher.finalize())
+}
+
+fn compaction_instructions(custom_instructions: Option<&str>) -> String {
+    let base = DEFAULT_COMPACTION_PROMPT_MARKDOWN.trim();
+    if let Some(custom_instructions) =
+        custom_instructions.filter(|instructions| !instructions.trim().is_empty())
+    {
+        format!("{base}\n\n{custom_instructions}")
+    } else {
+        base.to_owned()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use halter_protocol::{
-        AssistantMessage, MessageId, ToolCall, ToolResult, ToolResultMessage, UserMessage,
+        ModelId, ModelRole, ProviderCapabilities, ProviderKind, ProviderName, ResolvedModel,
+        SessionId, SummarySlice, ToolCallIdPolicy, Usage, UserMessage,
     };
-    use serde_json::json;
 
     use super::*;
 
-    #[test]
-    fn slice_recent_messages_preserves_matching_tool_calls() {
-        let tool_call_id = ToolCallId::from("call_1");
-        let messages = vec![
-            Message::User(UserMessage::text("earlier")),
-            Message::Assistant(AssistantMessage {
-                id: MessageId::new(),
-                created_at: Utc::now(),
-                parts: vec![AssistantPart::ToolCall(ToolCall {
-                    id: tool_call_id.clone(),
-                    name: "read".into(),
-                    arguments: json!({"path": "README.md"}),
-                })],
-                stop_reason: None,
-                usage: None,
-                replay_meta: Default::default(),
-            }),
-            Message::Tool(ToolResultMessage {
-                id: MessageId::new(),
-                call_id: tool_call_id.clone(),
-                content: ToolResult::Json {
-                    value: json!({"ok": true}),
+    #[tokio::test]
+    async fn plan_disables_previous_response_chaining_when_compacted_prefix_exists() {
+        let manager = DefaultContextManager::default();
+        let outcome = manager
+            .plan(
+                &SessionBlueprint {
+                    session_id: SessionId::new(),
+                    parent_session_id: None,
+                    default_model: "default".into(),
+                    subagent_model: "subagent".into(),
+                    snapshot_revision: "r1".into(),
+                    working_dir: ".".into(),
+                    system_prompt_seed: Vec::new(),
+                    max_turns: None,
+                    subagent_depth: 0,
                 },
-                error: None,
-                created_at: Utc::now(),
-            }),
-            Message::User(UserMessage::text("next")),
-            Message::Assistant(AssistantMessage {
-                id: MessageId::new(),
-                created_at: Utc::now(),
-                parts: vec![AssistantPart::Text {
-                    text: "done".to_owned(),
-                }],
-                stop_reason: None,
-                usage: None,
-                replay_meta: Default::default(),
-            }),
-        ];
+                &SessionState {
+                    compacted_prefix: vec![serde_json::json!({
+                        "type": "compaction",
+                        "id": "cmp_1",
+                        "encrypted_content": "x",
+                    })],
+                    summaries: vec![SummarySlice {
+                        id: "summary-1".to_owned(),
+                        text: "summary".to_owned(),
+                    }],
+                    messages: vec![Message::User(UserMessage::text("hello"))],
+                    last_response_id: Some("resp_1".to_owned()),
+                    messages_seen_by_provider: 1,
+                    ..SessionState::default()
+                },
+                &ObservedState {
+                    cwd: ".".into(),
+                    git_branch: None,
+                    git_dirty: None,
+                    now_utc: Utc::now(),
+                    env_facts: Default::default(),
+                },
+                &ResourceSnapshot::empty(),
+                &[],
+                &ResolvedModel {
+                    role: ModelRole::default(),
+                    id: ModelId::from("default"),
+                    provider: ProviderName::from("fake"),
+                    provider_kind: ProviderKind::Fake,
+                    api_kind: halter_protocol::ApiKind::Fake,
+                    model: "fake".to_owned(),
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    reasoning: None,
+                    tokens_per_minute: None,
+                },
+                &NoopProvider,
+            )
+            .await
+            .expect("plan");
 
-        let window = slice_recent_messages(&messages, 3);
+        assert!(outcome.previous_response_id.is_none());
+    }
 
-        assert_eq!(window.len(), 4);
-        assert!(matches!(window.first(), Some(Message::Assistant(_))));
-        assert!(matches!(window.get(1), Some(Message::Tool(tool)) if tool.call_id == tool_call_id));
+    struct NoopProvider;
+
+    #[async_trait]
+    impl Provider for NoopProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_compaction: true,
+                tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn stream(
+            &self,
+            _request: halter_protocol::ProviderRequest,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<halter_protocol::StreamEvent, halter_protocol::ProviderError>,
+            >,
+        > {
+            anyhow::bail!("stream should not be called in this test");
+        }
+
+        async fn compact(
+            &self,
+            _request: ProviderCompactionRequest,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<halter_protocol::ProviderCompactionResponse> {
+            Ok(halter_protocol::ProviderCompactionResponse {
+                output: vec![serde_json::json!({
+                    "type": "compaction",
+                    "id": "cmp_1",
+                    "encrypted_content": "summary",
+                })],
+                usage: Usage::default(),
+            })
+        }
     }
 
     #[test]
-    fn slice_recent_messages_preserves_multi_result_assistant_blocks() {
-        let first = ToolCallId::from("call_1");
-        let second = ToolCallId::from("call_2");
-        let messages = vec![
-            Message::User(UserMessage::text("loop")),
-            Message::Assistant(AssistantMessage {
-                id: MessageId::new(),
-                created_at: Utc::now(),
-                parts: vec![
-                    AssistantPart::ToolCall(ToolCall {
-                        id: first.clone(),
-                        name: "read".into(),
-                        arguments: json!({"path": "a.txt"}),
-                    }),
-                    AssistantPart::ToolCall(ToolCall {
-                        id: second.clone(),
-                        name: "read".into(),
-                        arguments: json!({"path": "b.txt"}),
-                    }),
-                ],
-                stop_reason: None,
-                usage: None,
-                replay_meta: Default::default(),
-            }),
-            Message::Tool(ToolResultMessage {
-                id: MessageId::new(),
-                call_id: first,
-                content: ToolResult::Text {
-                    text: "a".to_owned(),
-                },
-                error: None,
-                created_at: Utc::now(),
-            }),
-            Message::Tool(ToolResultMessage {
-                id: MessageId::new(),
-                call_id: second.clone(),
-                content: ToolResult::Text {
-                    text: "b".to_owned(),
-                },
-                error: None,
-                created_at: Utc::now(),
-            }),
-            Message::Assistant(AssistantMessage {
-                id: MessageId::new(),
-                created_at: Utc::now(),
-                parts: vec![AssistantPart::Text {
-                    text: "complete".to_owned(),
-                }],
-                stop_reason: None,
-                usage: None,
-                replay_meta: Default::default(),
-            }),
-        ];
+    fn compaction_instructions_append_custom_text() {
+        let instructions = compaction_instructions(Some("Focus on decisions."));
+        assert!(instructions.contains("Compress the conversation"));
+        assert!(instructions.contains("Focus on decisions."));
+    }
 
-        let window = slice_recent_messages(&messages, 3);
-
-        assert_eq!(window.len(), 4);
-        assert!(matches!(window.first(), Some(Message::Assistant(_))));
-        assert!(matches!(window.get(2), Some(Message::Tool(tool)) if tool.call_id == second));
+    #[test]
+    fn compaction_instructions_ignore_blank_custom_text() {
+        assert_eq!(
+            compaction_instructions(Some("   ")),
+            DEFAULT_COMPACTION_PROMPT_MARKDOWN.trim()
+        );
     }
 }

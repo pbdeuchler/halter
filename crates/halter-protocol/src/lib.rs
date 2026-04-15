@@ -377,6 +377,9 @@ pub enum StreamEvent {
     MessageEnd {
         id: MessageId,
         stop_reason: StopReason,
+        /// The provider's response ID, used for `previous_response_id` chaining.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
     },
     ProviderWarning {
         message: SharedStr,
@@ -835,13 +838,14 @@ pub struct SessionBlueprint {
     pub working_dir: PathBuf,
     pub system_prompt_seed: Vec<PromptSegment>,
     pub max_turns: Option<u32>,
-    // pub max_tool_calls_per_turn: u32,
     pub subagent_depth: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 pub struct SessionState {
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub compacted_prefix: Vec<Value>,
     pub file_view_cache: FileViewCache,
     pub appended_prompt_segments: Vec<PromptSegment>,
     pub pending_tool_calls: IndexMap<ToolCallId, PendingToolCall>,
@@ -851,6 +855,14 @@ pub struct SessionState {
     pub fired_hook_ids: Vec<String>,
     pub pending_session_start_source: Option<HookSessionStartSource>,
     pub pending_warning_messages: Vec<HookWarning>,
+    /// The OpenAI Responses API response ID from the last successful turn.
+    /// Used for `previous_response_id` chaining to avoid re-sending full history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_response_id: Option<String>,
+    /// Number of messages the model has already seen via `previous_response_id`.
+    /// Messages at indices `[0..messages_seen_by_provider)` don't need re-sending.
+    #[serde(default)]
+    pub messages_seen_by_provider: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -936,6 +948,7 @@ pub struct ProviderCapabilities {
     pub supports_images: bool,
     pub supports_documents: bool,
     pub supports_prompt_cache: bool,
+    pub supports_compaction: bool,
     pub supports_tool_result_media: bool,
     pub requires_non_empty_assistant_content: bool,
     pub tool_call_id_policy: ToolCallIdPolicy,
@@ -953,6 +966,7 @@ impl Default for ProviderCapabilities {
             supports_images: false,
             supports_documents: false,
             supports_prompt_cache: false,
+            supports_compaction: false,
             supports_tool_result_media: false,
             requires_non_empty_assistant_content: false,
             tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
@@ -981,12 +995,60 @@ pub struct ResolvedModel {
     pub max_input_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub tokens_per_minute: Option<u64>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSignal {
+    /// Compact first -- orientation commands, empty results, duplicate failures.
+    VeryLow = 0,
+    /// Low signal -- failed tool calls, stale reads.
+    Low = 1,
+    /// Default for most messages.
+    Normal = 2,
+    /// Active file reads and system guidance.
+    High = 3,
+    /// Assistant text or reasoning content.
+    VeryHigh = 4,
+    /// Never compact -- user messages.
+    Anchor = 5,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneSignalThreshold {
+    VeryLow,
+    Low,
+    Normal,
+    High,
+}
+
+impl Default for PruneSignalThreshold {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CompactionResult {
+    /// Number of messages compacted into the raw prefix.
+    pub compacted_count: usize,
+    /// Human-readable summary for events and hooks.
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ContextPlan {
     pub prompt_segments: Vec<PromptSegment>,
     pub transcript_window: TranscriptWindow,
+    #[serde(default)]
+    pub compacted_prefix: Vec<Value>,
     pub file_views: Vec<FileViewSlice>,
     pub carried_summaries: Vec<SummarySlice>,
     pub elided_tool_results: Vec<ElisionMarker>,
@@ -997,6 +1059,15 @@ pub struct ContextPlan {
     pub cache_boundary_hash: ContentHash,
     pub messages: Vec<Message>,
     pub estimated_tokens: u64,
+    /// If the planner compacted messages this turn, the result is here.
+    /// The caller should apply it to `SessionState` after using the plan.
+    pub compaction: Option<CompactionResult>,
+    /// When set, the codec should chain via `previous_response_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    /// Index into `messages` where new messages start (for chained requests).
+    #[serde(default)]
+    pub new_messages_start: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1016,8 +1087,36 @@ pub struct ProviderRequest {
     pub turn_id: TurnId,
     pub model: ResolvedModel,
     pub prompt: AssembledPrompt,
+    #[serde(default)]
+    pub compacted_prefix: Vec<Value>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    /// When set, the provider can chain onto the previous response instead of
+    /// re-sending the full conversation history. The codec should send only
+    /// messages after `new_messages_start` when this is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    /// Index into `messages` where new (unseen-by-provider) messages begin.
+    /// Only meaningful when `previous_response_id` is `Some`.
+    #[serde(default)]
+    pub new_messages_start: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderCompactionRequest {
+    pub session_id: SessionId,
+    pub model: ResolvedModel,
+    #[serde(default)]
+    pub compacted_prefix: Vec<Value>,
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolSpec>,
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderCompactionResponse {
+    pub output: Vec<Value>,
+    pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

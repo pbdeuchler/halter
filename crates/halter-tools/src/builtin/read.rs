@@ -1,33 +1,56 @@
 // pattern: Imperative Shell
 
+use std::io::{BufRead, BufReader};
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::{Tool, ToolContext};
 
-use super::common::{
-    ToolScope, ensure_not_cancelled, hash_text, optional_u64, required_string, resolve_path,
-};
+use super::common::{ToolScope, ensure_not_cancelled, optional_u64, required_string, resolve_path};
+
+const DEFAULT_READ_LIMIT: u64 = 500;
+const MAX_READ_LIMIT: u64 = 500;
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug)]
 pub struct ReadTool;
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReadWindow {
+    content: String,
+    sha256: String,
+    total_lines: u64,
+}
 
 #[async_trait]
 impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("read"),
-            description: "Read a UTF-8 file from disk".to_owned(),
+            description: "Read up to 500 UTF-8 lines from disk".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 1 },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "offset": { "type": "integer", "minimum": 1, "default": 1 },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_READ_LIMIT,
+                        "default": DEFAULT_READ_LIMIT
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": DEFAULT_READ_TIMEOUT_SECS
+                    }
                 },
-                "required": ["path"],
+                "required": ["path", "limit"],
             }),
             concurrency: ToolConcurrency::ReadOnly,
             capabilities: ToolCapabilities::default(),
@@ -40,73 +63,111 @@ impl Tool for ReadTool {
         ensure_not_cancelled(&context.cancel)?;
         let path = resolve_path(&context.working_dir, required_string(&input, "path")?);
         let offset = optional_u64(&input, "offset")?.unwrap_or(1);
-        let limit = optional_u64(&input, "limit")?;
-        debug!(session_id = %context.session_id, path = %path.display(), offset, limit, "reading file");
+        let limit = parse_limit(&input)?;
+        let timeout = parse_timeout(&input)?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        debug!(
+            session_id = %context.session_id,
+            path = %path.display(),
+            offset,
+            limit,
+            timeout_secs = timeout.as_secs(),
+            "reading file"
+        );
 
         let path_locks = context.path_locks.clone();
         let path_for_read = path.clone();
-        let text = tokio::task::spawn_blocking(move || {
+        let read_window = tokio::task::spawn_blocking(move || {
             let _lock = path_locks.acquire_read(&path_for_read)?;
-            let text = std::fs::read_to_string(&path_for_read)?;
-            Ok::<_, anyhow::Error>(text)
+            let file = std::fs::File::open(&path_for_read)?;
+            let reader = BufReader::new(file);
+            read_window_from_reader(reader, offset, limit, timeout, deadline)
         })
         .await??;
-        let (content, total_lines) = slice_by_lines(&text, offset, limit);
-        context.policy.check_read(&path, content.len()).await?;
+        context
+            .policy
+            .check_read(&path, read_window.content.len())
+            .await?;
 
         Ok(ToolResult::Json {
             value: json!({
                 "path": path,
-                "content": content,
-                "sha256": hash_text(&text),
-                "total_lines": total_lines,
+                "content": read_window.content,
+                "sha256": read_window.sha256,
+                "total_lines": read_window.total_lines,
             }),
         })
     }
 }
 
-fn slice_by_lines(text: &str, offset: u64, limit: Option<u64>) -> (String, u64) {
-    let starts = line_start_offsets(text);
-    let total_lines = starts.len() as u64;
-    if total_lines == 0 {
-        return (String::new(), 0);
+fn parse_limit(input: &Value) -> anyhow::Result<u64> {
+    let limit = optional_u64(input, "limit")?.unwrap_or(DEFAULT_READ_LIMIT);
+    if !(1..=MAX_READ_LIMIT).contains(&limit) {
+        anyhow::bail!("invalid tool input: field 'limit' must be between 1 and {MAX_READ_LIMIT}");
     }
-
-    let start_line = offset.max(1);
-    if start_line > total_lines {
-        return (String::new(), total_lines);
-    }
-
-    let end_line = limit
-        .map(|limit| start_line.saturating_add(limit).saturating_sub(1))
-        .unwrap_or(total_lines)
-        .min(total_lines);
-
-    let start_index = starts[(start_line - 1) as usize];
-    let end_index = if end_line < total_lines {
-        starts[end_line as usize]
-    } else {
-        text.len()
-    };
-
-    (text[start_index..end_index].to_owned(), total_lines)
+    Ok(limit)
 }
 
-fn line_start_offsets(text: &str) -> Vec<usize> {
-    if text.is_empty() {
-        return Vec::new();
+fn parse_timeout(input: &Value) -> anyhow::Result<Duration> {
+    let timeout_secs = optional_u64(input, "timeout_secs")?.unwrap_or(DEFAULT_READ_TIMEOUT_SECS);
+    if timeout_secs == 0 {
+        anyhow::bail!("invalid tool input: field 'timeout_secs' must be at least 1");
     }
-    let mut starts = vec![0];
-    for (index, byte) in text.bytes().enumerate() {
-        if byte == b'\n' && index + 1 < text.len() {
-            starts.push(index + 1);
+    Ok(Duration::from_secs(timeout_secs))
+}
+
+fn read_window_from_reader<R: BufRead>(
+    mut reader: R,
+    offset: u64,
+    limit: u64,
+    timeout: Duration,
+    deadline: Instant,
+) -> anyhow::Result<ReadWindow> {
+    let start_line = offset.max(1);
+    let end_line = start_line.saturating_add(limit).saturating_sub(1);
+    let mut content = String::new();
+    let mut total_lines = 0;
+    let mut current_line = String::new();
+    let mut hasher = Sha256::new();
+
+    loop {
+        ensure_before_deadline(timeout, deadline)?;
+        current_line.clear();
+        let read = reader.read_line(&mut current_line)?;
+        ensure_before_deadline(timeout, deadline)?;
+        if read == 0 {
+            break;
+        }
+
+        total_lines += 1;
+        hasher.update(current_line.as_bytes());
+        if (start_line..=end_line).contains(&total_lines) {
+            content.push_str(&current_line);
         }
     }
-    starts
+
+    Ok(ReadWindow {
+        content,
+        sha256: format!("{:x}", hasher.finalize()),
+        total_lines,
+    })
+}
+
+fn ensure_before_deadline(timeout: Duration, deadline: Instant) -> anyhow::Result<()> {
+    if Instant::now() >= deadline {
+        anyhow::bail!(
+            "failed to execute read tool: timed out after {} seconds",
+            timeout.as_secs()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::sync::Arc;
 
     use serde_json::json;
@@ -120,10 +181,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slices_requested_line_window() {
-        let (content, total_lines) = slice_by_lines("a\nb\nc\n", 2, Some(1));
-        assert_eq!(content, "b\n");
-        assert_eq!(total_lines, 3);
+    fn reads_requested_line_window() {
+        let window = read_window_from_reader(
+            Cursor::new("a\nb\nc\n"),
+            2,
+            1,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_add(Duration::from_secs(10))
+                .expect("future deadline"),
+        )
+        .expect("window read succeeds");
+
+        assert_eq!(window.content, "b\n");
+        assert_eq!(window.total_lines, 3);
     }
 
     fn tool_context(root: &std::path::Path, max_read_bytes: usize) -> ToolContext {
@@ -168,5 +239,74 @@ mod tests {
         };
 
         assert_eq!(value["content"], "b\n");
+    }
+
+    #[tokio::test]
+    async fn read_defaults_limit_to_500_lines() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let text = (1..=600)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(temp.path().join("note.txt"), text).expect("write");
+
+        let ToolResult::Json { value } = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({ "path": "note.txt" }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        let content = value["content"].as_str().expect("content string");
+        assert_eq!(content.lines().count(), 500);
+        assert!(content.contains("line 500"));
+        assert!(!content.contains("line 501"));
+        assert_eq!(value["total_lines"], 600);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_limit_above_max() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "a\n").expect("write");
+
+        let error = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "limit": MAX_READ_LIMIT + 1
+                }),
+            )
+            .await
+            .expect_err("limit above max is rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid tool input: field 'limit' must be between 1 and 500")
+        );
+    }
+
+    #[test]
+    fn read_window_times_out() {
+        let error = read_window_from_reader(
+            Cursor::new("a\nb\n"),
+            1,
+            1,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("past deadline"),
+        )
+        .expect_err("read should time out");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to execute read tool: timed out after 10 seconds")
+        );
     }
 }

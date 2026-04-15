@@ -110,7 +110,14 @@ pub fn export_json_schema() -> anyhow::Result<String> {
 }
 
 pub fn generate_starter_config() -> String {
-    r#"version = 1
+    let sqlite_comment = if cfg!(feature = "sqlite") {
+        "\n[sessions]\nbackend = \"memory\"\n# sqlite_path = \"/tmp/halter/sessions.db\"\n"
+    } else {
+        "\n[sessions]\nbackend = \"memory\"\n"
+    };
+
+    format!(
+        r#"version = 1
 
 [models.default]
 provider = "openai"
@@ -143,12 +150,8 @@ timeout_secs = 30
 [policy.network]
 enabled = false
 allowed_hosts = []
-
-[sessions]
-backend = "memory"
-# sqlite_path = "/tmp/halter/sessions.db"
-"#
-    .to_owned()
+{sqlite_comment}"#
+    )
 }
 
 fn validate_runtime_requirements(config: &HarnessConfig) -> anyhow::Result<()> {
@@ -509,7 +512,7 @@ api_key = "openai-key"
     fn env_overrides_apply_from_table() {
         let mut value = toml::Value::try_from(HarnessConfig::default()).expect("defaults");
         let overrides = BTreeMap::from([
-            ("HALTER_SESSION_BACKEND", "sqlite"),
+            ("HALTER_SESSION_BACKEND", "memory"),
             ("HALTER_POLICY_SHELL_ENABLED", "false"),
             ("HALTER_SKILL_ROOTS", "./skills:./vendor/skills"),
             ("HALTER_POLICY_SHELL_ALLOW", "git,just"),
@@ -522,7 +525,7 @@ api_key = "openai-key"
         let decoded: HarnessConfig = value.try_into().expect("decode config");
         assert_eq!(
             decoded.sessions.backend,
-            crate::schema::SessionBackend::Sqlite
+            crate::schema::SessionBackend::Memory
         );
         assert!(!decoded.policy.shell.enabled);
         assert_eq!(
@@ -531,6 +534,47 @@ api_key = "openai-key"
         );
         assert_eq!(decoded.policy.shell.allow, vec!["git", "just"]);
         assert_eq!(decoded.tools.enabled, vec!["read", "glob"]);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn env_overrides_can_select_sqlite_backend() {
+        let mut value = toml::Value::try_from(HarnessConfig::default()).expect("defaults");
+        let overrides = BTreeMap::from([("HALTER_SESSION_BACKEND", "sqlite")]);
+
+        apply_env_overrides_with(&mut value, |name| overrides.get(name).map(OsString::from))
+            .expect("apply overrides");
+
+        let decoded: HarnessConfig = value.try_into().expect("decode config");
+        assert_eq!(
+            decoded.sessions.backend,
+            crate::schema::SessionBackend::Sqlite
+        );
+    }
+
+    #[test]
+    fn unsupported_session_backend_is_rejected_during_decode() {
+        let parsed = parse_toml(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[sessions]
+backend = "flat_file"
+"#,
+        )
+        .expect("parse config");
+
+        let error: Result<HarnessConfig, _> = parsed.try_into();
+        let error = error.expect_err("unsupported backend should fail");
+
+        assert!(error.to_string().contains("unknown variant `flat_file`"));
     }
 
     #[tokio::test]

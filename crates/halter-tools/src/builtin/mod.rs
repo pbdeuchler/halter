@@ -145,7 +145,7 @@ mod tests {
             .expect("write file");
 
         let result = runtime
-            .execute("read", context, json!({ "path": "note.txt" }))
+            .execute("read", context, json!({ "path": "note.txt", "limit": 500 }))
             .await
             .expect("read file");
 

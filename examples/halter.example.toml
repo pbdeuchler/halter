@@ -6,13 +6,14 @@ version = 1
 
 [models.default]
 provider = "openai"
-model = "gpt-5.4-mini"
-reasoning = "high"
+model = "gpt-5.4"
+reasoning = "xhigh"
+# tokens_per_minute = 500_000  # Default: 500,000. Proactive token budget for rate limiting.
 
-# [models.subagent]
-# provider = "openai"
-# model = "gpt-5.4-nano"
-# reasoning = "medium"
+[models.subagent]
+provider = "openai"
+model = "gpt-5.4-mini"
+reasoning = "medium"
 
 # [providers.openai]
 # base_url = "https://myproxy.example.com"
@@ -25,7 +26,37 @@ roots = ["./.agent/skills"]
 roots = ["./.agent/plugins"]
 
 [tools]
-enabled = ["read", "write", "glob", "shell"]
+enabled = [
+  # Built-in read tools.
+  "read",
+  "glob",
+  "grep",
+  "profile", # requires the `profiling` feature
+
+  # Built-in write or side-effecting tools.
+  "write",
+  "edit",
+  "shell",
+  "process",
+  "pty",      # requires the `pty` feature
+  "ast_grep", # requires the `ast-tools` feature; `find` reads, `replace` writes
+  "image",    # requires the `image-tools` feature; `info` reads, `resize`/`convert` can write
+
+  # Subagent read tools.
+  "wait_agent",
+
+  # Subagent write tools.
+  "spawn_agent",
+  "send_input",
+  "close_agent",
+]
+
+[context]
+compaction_threshold = 200_000   # Trigger compaction when estimated tokens reach
+                               # this threshold, with a 100-token buffer.
+pre_compaction_target = 150_000  # Evict low-signal history down to this target
+                               # before calling /v1/responses/compact.
+prune_signal_threshold = "low" # Evict up through very_low/low/normal.
 
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
@@ -36,7 +67,7 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find"]
+allow = ["git", "cargo", "rg", "ls", "find", "python", "pwd", "cwd", "echo"]
 timeout_secs = 30
 
 [sessions]

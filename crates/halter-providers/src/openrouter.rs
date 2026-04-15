@@ -52,6 +52,7 @@ fn config() -> ResponsesProviderConfig {
             supports_images: true,
             supports_documents: false,
             supports_prompt_cache: false,
+            supports_compaction: false,
             supports_tool_result_media: false,
             requires_non_empty_assistant_content: false,
             tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
@@ -64,6 +65,7 @@ fn config() -> ResponsesProviderConfig {
             include_encrypted_reasoning: false,
             reasoning_summary: None,
         },
+        rate_limit_strategy: None,
     }
 }
 
@@ -111,6 +113,7 @@ mod tests {
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(8_192),
                 reasoning: None,
+                tokens_per_minute: None,
             },
             prompt: AssembledPrompt {
                 segments: Vec::new(),
@@ -121,8 +124,11 @@ mod tests {
                 rendered_transcript: String::new(),
                 rendered: String::new(),
             },
+            compacted_prefix: Vec::new(),
             messages: Vec::new(),
             tools: Vec::new(),
+            previous_response_id: None,
+            new_messages_start: 0,
         }
     }
 }

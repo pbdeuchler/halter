@@ -148,6 +148,7 @@ pub(crate) fn decode_response(
     events.push(StreamEvent::MessageEnd {
         id: message_id,
         stop_reason: decode_stop_reason(response),
+        response_id: None,
     });
     Ok(events)
 }
@@ -458,6 +459,7 @@ mod tests {
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(8_192),
                 reasoning: None,
+                tokens_per_minute: None,
             },
             prompt: AssembledPrompt {
                 segments: vec![PromptSegment {
@@ -474,6 +476,7 @@ mod tests {
                 rendered_transcript: String::new(),
                 rendered: String::new(),
             },
+            compacted_prefix: Vec::new(),
             messages,
             tools: vec![ToolSpec {
                 name: "read".into(),
@@ -483,6 +486,8 @@ mod tests {
                 capabilities: ToolCapabilities::default(),
                 provider_aliases,
             }],
+            previous_response_id: None,
+            new_messages_start: 0,
         }
     }
 }

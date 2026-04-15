@@ -43,6 +43,7 @@ impl Provider for AnthropicProvider {
             supports_images: true,
             supports_documents: true,
             supports_prompt_cache: false,
+            supports_compaction: false,
             supports_tool_result_media: false,
             requires_non_empty_assistant_content: true,
             tool_call_id_policy: ToolCallIdPolicy::StableReplayNormalized,

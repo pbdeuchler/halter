@@ -56,6 +56,7 @@ pub fn build_subagent_state(
 
     SessionState {
         messages: parent.state.messages.clone(),
+        compacted_prefix: parent.state.compacted_prefix.clone(),
         file_view_cache: parent.state.file_view_cache.clone(),
         appended_prompt_segments: parent.state.appended_prompt_segments.clone(),
         pending_tool_calls: Default::default(),
@@ -65,6 +66,8 @@ pub fn build_subagent_state(
         fired_hook_ids: parent.state.fired_hook_ids.clone(),
         pending_session_start_source: None,
         pending_warning_messages: parent.state.pending_warning_messages.clone(),
+        last_response_id: None,
+        messages_seen_by_provider: 0,
     }
 }
 
@@ -89,10 +92,23 @@ fn build_agent_prompt_segment(
     agent_type: &AgentName,
 ) -> anyhow::Result<PromptSegment> {
     let agent = snapshot.agents.get(agent_type).ok_or_else(|| {
-        anyhow::anyhow!(
-            "failed to execute spawn_agent tool: unknown agent_type '{}'",
-            agent_type.0
-        )
+        let available_agent_types = snapshot
+            .agents
+            .keys()
+            .map(|name| name.0.as_str())
+            .collect::<Vec<_>>();
+        if available_agent_types.is_empty() {
+            anyhow::anyhow!(
+                "failed to execute spawn_agent tool: unknown agent_type '{}'; no named agent roles are loaded, omit agent_type to use the default child session",
+                agent_type.0
+            )
+        } else {
+            anyhow::anyhow!(
+                "failed to execute spawn_agent tool: unknown agent_type '{}'; available agent_type values: {}",
+                agent_type.0,
+                available_agent_types.join(", ")
+            )
+        }
     })?;
     Ok(PromptSegment {
         id: PromptSegmentId::new(),
@@ -231,6 +247,53 @@ mod tests {
         assert_eq!(init.subagent_depth, 2);
         assert_eq!(init.system_prompt_seed.len(), 2);
         assert_eq!(init.system_prompt_seed[1].text, "specialized helper prompt");
+    }
+
+    #[test]
+    fn build_subagent_session_init_reports_available_roles_for_unknown_agent_type() {
+        let mut snapshot = halter_protocol::ResourceSnapshot::empty();
+        snapshot.agents.insert(
+            AgentName::from("helper"),
+            AgentDef {
+                id: AgentId::new(),
+                name: "helper".to_owned(),
+                prompt: "specialized helper prompt".to_owned(),
+            },
+        );
+        let parent = SubagentParentContext {
+            blueprint: SessionBlueprint {
+                session_id: SessionId::from("parent"),
+                parent_session_id: None,
+                default_model: "default".into(),
+                subagent_model: "subagent".into(),
+                snapshot_revision: Revision::from("revision"),
+                working_dir: ".".into(),
+                system_prompt_seed: Vec::new(),
+                max_turns: None,
+                subagent_depth: 0,
+            },
+            state: SessionState::default(),
+            snapshot: Arc::new(snapshot),
+            subagent_model: "subagent".into(),
+        };
+
+        let error = build_subagent_session_init(
+            &parent,
+            &SessionId::from("child"),
+            &SpawnSubagentRequest {
+                message: "task".to_owned(),
+                agent_type: Some(AgentName::from("general")),
+                fork_context: false,
+                model: None,
+            },
+        )
+        .expect_err("unknown agent type should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("available agent_type values: helper")
+        );
     }
 
     #[test]

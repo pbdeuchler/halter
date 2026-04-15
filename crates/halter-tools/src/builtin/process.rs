@@ -298,7 +298,7 @@ impl Tool for ProcessTool {
             concurrency: ToolConcurrency::Exclusive,
             capabilities: ToolCapabilities {
                 mutating: true,
-                requires_approval: true,
+                requires_approval: false,
                 cancellable: false,
                 long_running: false,
             },

@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use halter_protocol::{ApiKind, ProviderKind, ReasoningEffort};
+use halter_protocol::{ApiKind, ProviderKind, PruneSignalThreshold, ReasoningEffort};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +81,8 @@ impl HarnessConfig {
         if self.policy.max_read_bytes == 0 {
             anyhow::bail!("invalid configuration: max_read_bytes must be greater than zero");
         }
+
+        self.context.validate()?;
 
         Ok(())
     }
@@ -240,6 +242,8 @@ pub struct ModelConfig {
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
     pub reasoning: Option<ReasoningEffort>,
+    #[serde(default = "default_tokens_per_minute")]
+    pub tokens_per_minute: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,20 +366,54 @@ pub struct PromptsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContextConfig {
-    #[serde(default = "default_max_context_messages")]
-    pub max_context_messages: usize,
+    /// Trigger compaction when the estimated input reaches this threshold, with a 100-token buffer.
+    #[serde(default = "default_compaction_threshold")]
+    pub compaction_threshold: u64,
+    /// Evict low-signal history until the estimated prefix is below this target before compaction.
+    #[serde(default = "default_pre_compaction_target")]
+    pub pre_compaction_target: u64,
+    /// Highest signal tier eligible for pre-compaction eviction.
+    #[serde(default)]
+    pub prune_signal_threshold: PruneSignalThreshold,
+}
+
+impl ContextConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.compaction_threshold == 0 {
+            anyhow::bail!(
+                "invalid configuration: context.compaction_threshold must be greater than zero"
+            );
+        }
+        if self.pre_compaction_target >= self.compaction_threshold {
+            anyhow::bail!(
+                "invalid configuration: context.pre_compaction_target must be less than context.compaction_threshold"
+            );
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            max_context_messages: default_max_context_messages(),
+            compaction_threshold: default_compaction_threshold(),
+            pre_compaction_target: default_pre_compaction_target(),
+            prune_signal_threshold: PruneSignalThreshold::default(),
         }
     }
 }
 
-const fn default_max_context_messages() -> usize {
-    24
+const fn default_tokens_per_minute() -> Option<u64> {
+    Some(500_000)
+}
+
+const fn default_compaction_threshold() -> u64 {
+    80_000
+}
+
+const fn default_pre_compaction_target() -> u64 {
+    60_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -491,9 +529,8 @@ pub struct NetworkPolicyConfig {
 pub enum SessionBackend {
     #[default]
     Memory,
-    FlatFile,
+    #[cfg(feature = "sqlite")]
     Sqlite,
-    Postgres,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -520,6 +557,20 @@ impl SessionsConfig {
             && path.as_os_str().is_empty()
         {
             anyhow::bail!("invalid configuration: sessions.sqlite_path must not be empty");
+        }
+
+        #[cfg(feature = "sqlite")]
+        if self.sqlite_path.is_some() && self.backend != SessionBackend::Sqlite {
+            anyhow::bail!(
+                "invalid configuration: sessions.sqlite_path requires sessions.backend = 'sqlite'"
+            );
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        if self.sqlite_path.is_some() {
+            anyhow::bail!(
+                "invalid configuration: sessions.sqlite_path requires the 'sqlite' cargo feature"
+            );
         }
 
         Ok(())
@@ -583,6 +634,7 @@ mod tests {
             max_input_tokens: None,
             max_output_tokens: None,
             reasoning: Some(ReasoningEffort::Medium),
+            tokens_per_minute: None,
         };
 
         assert_eq!(model.provider.api_kind(), ApiKind::OpenAiResponses);
@@ -596,8 +648,43 @@ mod tests {
             max_input_tokens: None,
             max_output_tokens: None,
             reasoning: Some(ReasoningEffort::Medium),
+            tokens_per_minute: None,
         };
 
         assert_eq!(model.provider.api_kind(), ApiKind::OpenAiResponses);
+    }
+
+    #[test]
+    fn sqlite_path_requires_supported_sqlite_backend() {
+        let mut config = HarnessConfig::default();
+        config.models.default = Some(ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: "gpt-5".to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tokens_per_minute: None,
+        });
+        config.providers.openai = Some(ProviderConfig {
+            base_url: None,
+            api_key: Some("test-key".to_owned()),
+        });
+        config.sessions.sqlite_path = Some(PathBuf::from("/tmp/halter.db"));
+
+        let error = config.validate().expect_err("sqlite path should fail");
+
+        #[cfg(feature = "sqlite")]
+        assert!(
+            error
+                .to_string()
+                .contains("sessions.sqlite_path requires sessions.backend = 'sqlite'")
+        );
+
+        #[cfg(not(feature = "sqlite"))]
+        assert!(
+            error
+                .to_string()
+                .contains("sessions.sqlite_path requires the 'sqlite' cargo feature")
+        );
     }
 }

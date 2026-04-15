@@ -3,9 +3,10 @@
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use halter_protocol::{
-    BlockId, Message, MessageId, ProviderCapabilities, ProviderError, ProviderRequest, StopReason,
-    StreamEvent, Usage,
+    BlockId, Message, MessageId, ProviderCapabilities, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderRequest, StopReason, StreamEvent, Usage,
 };
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::Provider;
@@ -52,7 +53,10 @@ impl FakeProvider {
 #[async_trait]
 impl Provider for FakeProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities::default()
+        ProviderCapabilities {
+            supports_compaction: true,
+            ..ProviderCapabilities::default()
+        }
     }
 
     async fn stream(
@@ -89,8 +93,82 @@ impl Provider for FakeProvider {
             Ok(StreamEvent::MessageEnd {
                 id: message_id,
                 stop_reason: StopReason::EndTurn,
+                response_id: None,
             }),
         ];
         Ok(stream::iter(events).boxed())
+    }
+
+    async fn compact(
+        &self,
+        request: ProviderCompactionRequest,
+        _cancel: CancellationToken,
+    ) -> anyhow::Result<ProviderCompactionResponse> {
+        let mut items = request
+            .compacted_prefix
+            .iter()
+            .map(render_compaction_input_item)
+            .collect::<Vec<_>>();
+        items.extend(request.messages.iter().map(render_compaction_message));
+        let summary = items
+            .into_iter()
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ProviderCompactionResponse {
+            output: vec![json!({
+                "type": "compaction",
+                "id": format!("cmp_{}", request.session_id.0),
+                "encrypted_content": summary,
+            })],
+            usage: Usage {
+                input_tokens: (request.compacted_prefix.len() + request.messages.len()) as u64 * 8,
+                output_tokens: 8,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        })
+    }
+}
+
+fn render_compaction_input_item(item: &Value) -> String {
+    match item {
+        Value::Object(map) => {
+            if let Some(role) = map.get("role").and_then(Value::as_str) {
+                return format!("{role}: {}", item);
+            }
+            if let Some(kind) = map.get("type").and_then(Value::as_str) {
+                return format!("{kind}: {}", item);
+            }
+            item.to_string()
+        }
+        _ => item.to_string(),
+    }
+}
+
+fn render_compaction_message(message: &Message) -> String {
+    match message {
+        Message::System(message) => format!("system: {}", message.text),
+        Message::User(message) => format!("user: {}", message.plain_text()),
+        Message::Assistant(message) => format!(
+            "assistant: {}",
+            message
+                .parts
+                .iter()
+                .map(|part| match part {
+                    halter_protocol::AssistantPart::Text { text } => text.clone(),
+                    halter_protocol::AssistantPart::Thinking(block) => block.text.clone(),
+                    halter_protocol::AssistantPart::ToolCall(call) => {
+                        format!("tool_call {} {}", call.name, call.arguments)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        Message::Tool(message) => match &message.content {
+            halter_protocol::ToolResult::Empty => "tool: <empty>".to_owned(),
+            halter_protocol::ToolResult::Text { text } => format!("tool: {text}"),
+            halter_protocol::ToolResult::Json { value } => format!("tool: {value}"),
+        },
     }
 }

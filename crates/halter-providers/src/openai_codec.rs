@@ -1,6 +1,6 @@
 // pattern: Functional Core
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use async_openai::types::responses::{
@@ -8,15 +8,19 @@ use async_openai::types::responses::{
     ResponseStreamEvent, SummaryPart,
 };
 use halter_protocol::{
-    ApiKind, AssistantPart, BlockId, Message, MessageId, ProviderRequest, ReasoningEffort,
-    StopReason, StreamEvent, Usage, UserPart,
+    ApiKind, AssistantPart, BlockId, Message, MessageId, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderRequest, ReasoningEffort, StopReason, StreamEvent, Usage,
+    UserPart,
 };
 use serde_json::{Map, Value, json};
 
 use crate::codec_common::{
-    assistant_text, canonical_tool_name, collect_system_text, data_url, document_filename,
-    has_user_media, normalized_tool_call_id, tool_name_for_provider, tool_result_text, user_text,
+    assistant_text, bounded_provider_id, bounded_provider_id_with_prefix, canonical_tool_name,
+    collect_system_text, data_url, document_filename, has_user_media, tool_name_for_provider,
+    tool_result_text, user_text,
 };
+
+const RESPONSES_ITEM_ID_MAX_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponsesRequestOptions<'a> {
@@ -40,10 +44,24 @@ pub(crate) fn encode_responses_request(
         "model".to_owned(),
         Value::String(request.model.model.clone()),
     );
-    body.insert(
-        "input".to_owned(),
-        Value::Array(encode_responses_input(request)?),
-    );
+
+    // When chaining via previous_response_id, only send new messages.
+    // The server retains the prior conversation state.
+    if let Some(ref prev_id) = request.previous_response_id {
+        body.insert(
+            "previous_response_id".to_owned(),
+            Value::String(prev_id.clone()),
+        );
+        let new_messages = &request.messages[request.new_messages_start..];
+        let input = encode_responses_input_slice(new_messages, request)?;
+        validate_responses_input_item_ids(&input)?;
+        body.insert("input".to_owned(), Value::Array(input));
+    } else {
+        let input = encode_responses_input(request)?;
+        validate_responses_input_item_ids(&input)?;
+        body.insert("input".to_owned(), Value::Array(input));
+    }
+
     body.insert("stream".to_owned(), Value::Bool(options.stream));
 
     if let Some(max_output_tokens) = request.model.max_output_tokens {
@@ -76,16 +94,81 @@ pub(crate) fn encode_responses_request(
     Ok(Value::Object(body))
 }
 
+pub(crate) fn encode_responses_compact_request(
+    request: &ProviderCompactionRequest,
+) -> anyhow::Result<Value> {
+    if request.model.api_kind != ApiKind::OpenAiResponses {
+        anyhow::bail!("failed to encode openai compaction request: unsupported api kind");
+    }
+
+    let input = encode_responses_compact_input(request)?;
+    validate_responses_input_item_ids(&input)?;
+    Ok(json!({
+        "model": request.model.model,
+        "input": input,
+        "instructions": request.instructions,
+    }))
+}
+
+pub(crate) fn decode_responses_compact_response(
+    response: &Value,
+) -> anyhow::Result<ProviderCompactionResponse> {
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to decode openai compaction response: missing output array")
+        })?;
+
+    Ok(ProviderCompactionResponse {
+        output,
+        usage: decode_openai_usage(response),
+    })
+}
+
+fn encode_responses_compact_input(
+    request: &ProviderCompactionRequest,
+) -> anyhow::Result<Vec<Value>> {
+    let mut input = request.compacted_prefix.clone();
+    for message in &request.messages {
+        match message {
+            Message::System(_) => {}
+            Message::User(user) => input.push(encode_responses_user_message(user)?),
+            Message::Assistant(assistant) => {
+                if let Some(message) = encode_responses_assistant_message(assistant) {
+                    input.push(message);
+                }
+                for part in &assistant.parts {
+                    if let AssistantPart::ToolCall(call) = part {
+                        input.push(json!({
+                            "type": "function_call",
+                            "id": responses_function_call_item_id(&call.id),
+                            "call_id": call.id,
+                            "name": tool_name_for_provider(
+                                &call.name,
+                                &request.tools,
+                                request.model.provider_kind,
+                            ),
+                            "arguments": call.arguments.to_string(),
+                            "status": "completed",
+                        }));
+                    }
+                }
+            }
+            Message::Tool(tool) => input.push(encode_responses_tool_output(tool)),
+        }
+    }
+
+    Ok(input)
+}
+
 #[cfg(test)]
 pub(crate) fn decode_responses_response(
     request: &ProviderRequest,
     response: &Value,
 ) -> anyhow::Result<Vec<StreamEvent>> {
-    let message_id = response
-        .get("id")
-        .and_then(Value::as_str)
-        .map(|id| MessageId::from(id.to_owned()))
-        .unwrap_or_default();
+    let message_id = response_output_message_id(response).unwrap_or_default();
     let mut events = vec![StreamEvent::MessageStart {
         id: message_id.clone(),
     }];
@@ -180,6 +263,7 @@ pub(crate) fn decode_responses_response(
     events.push(StreamEvent::MessageEnd {
         id: message_id,
         stop_reason: decode_responses_stop_reason(response, saw_tool_call),
+        response_id: response_output_response_id(response),
     });
     Ok(events)
 }
@@ -188,13 +272,15 @@ pub(crate) fn decode_responses_response(
 pub(crate) struct ResponsesStreamDecoder {
     tool_specs: Vec<halter_protocol::ToolSpec>,
     provider_kind: halter_protocol::ProviderKind,
+    track_response_id: bool,
+    response_id: Option<String>,
     message_id: Option<MessageId>,
-    response_id: Option<MessageId>,
     started: bool,
     saw_tool_call: bool,
     active_text: Option<PendingTextBlock>,
     active_reasoning: Option<PendingReasoningBlock>,
     active_tool_calls: BTreeMap<String, PendingToolCallBlock>,
+    completed_tool_calls: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,17 +311,19 @@ struct PendingToolCallBlock {
 
 impl ResponsesStreamDecoder {
     #[must_use]
-    pub(crate) fn new(request: &ProviderRequest) -> Self {
+    pub(crate) fn new(request: &ProviderRequest, track_response_id: bool) -> Self {
         Self {
             tool_specs: request.tools.clone(),
             provider_kind: request.model.provider_kind,
-            message_id: None,
+            track_response_id,
             response_id: None,
+            message_id: None,
             started: false,
             saw_tool_call: false,
             active_text: None,
             active_reasoning: None,
             active_tool_calls: BTreeMap::new(),
+            completed_tool_calls: BTreeSet::new(),
         }
     }
 
@@ -246,7 +334,7 @@ impl ResponsesStreamDecoder {
         let mut events = Vec::new();
         match event {
             ResponseStreamEvent::ResponseCreated(event) => {
-                self.response_id = Some(MessageId::from(event.response.id));
+                self.remember_response_id(&event.response.id);
             }
             ResponseStreamEvent::ResponseOutputItemAdded(event) => match event.item {
                 OutputItem::Message(message) => {
@@ -402,8 +490,13 @@ impl ResponsesStreamDecoder {
 
         let message_id = self.message_id.clone().unwrap_or_else(|| {
             message_id
+                .filter(|id| is_responses_message_item_id(id))
                 .map(|id| MessageId::from(id.to_owned()))
-                .or_else(|| self.response_id.clone())
+                .or_else(|| {
+                    self.response_id
+                        .as_deref()
+                        .map(synthesized_responses_message_id)
+                })
                 .unwrap_or_default()
         });
         self.message_id = Some(message_id.clone());
@@ -566,6 +659,11 @@ impl ResponsesStreamDecoder {
         call: &FunctionToolCall,
         events: &mut Vec<StreamEvent>,
     ) {
+        if self.active_tool_calls.contains_key(&item_key)
+            || self.completed_tool_calls.contains(&item_key)
+        {
+            return;
+        }
         let tool_call_id: halter_protocol::ToolCallId = call.call_id.as_str().into();
         let name = canonical_tool_name(&call.name, &self.tool_specs, self.provider_kind);
         let block = PendingToolCallBlock {
@@ -628,7 +726,12 @@ impl ResponsesStreamDecoder {
                 .active_tool_calls
                 .remove(item_key)
                 .expect("tool call present after lookup");
+            self.completed_tool_calls.insert(item_key.to_owned());
             events.push(StreamEvent::ToolCallEnd { id: pending.id });
+            return Ok(());
+        }
+
+        if self.completed_tool_calls.contains(item_key) {
             return Ok(());
         }
 
@@ -654,11 +757,13 @@ impl ResponsesStreamDecoder {
                 delta: full_arguments.to_owned(),
             });
         }
+        self.completed_tool_calls.insert(item_key.to_owned());
         events.push(StreamEvent::ToolCallEnd { id: block_id });
         Ok(())
     }
 
     fn finish_response(&mut self, response: &Response, events: &mut Vec<StreamEvent>) {
+        self.remember_response_id(&response.id);
         self.ensure_message_started(None, events);
         if let Some(usage) = &response.usage {
             events.push(StreamEvent::UsageUpdate {
@@ -671,7 +776,14 @@ impl ResponsesStreamDecoder {
                 .clone()
                 .expect("message id initialized before message end"),
             stop_reason: decode_responses_stop_reason_from_response(response, self.saw_tool_call),
+            response_id: self.response_id.clone(),
         });
+    }
+
+    fn remember_response_id(&mut self, response_id: &str) {
+        if self.track_response_id && !response_id.is_empty() {
+            self.response_id = Some(response_id.to_owned());
+        }
     }
 }
 
@@ -783,6 +895,7 @@ pub(crate) fn decode_chat_response(
     events.push(StreamEvent::MessageEnd {
         id: message_id,
         stop_reason: decode_chat_stop_reason(choice),
+        response_id: None,
     });
     Ok(events)
 }
@@ -792,6 +905,7 @@ fn encode_responses_input(request: &ProviderRequest) -> anyhow::Result<Vec<Value
     if let Some(system) = collect_system_text(request) {
         input.push(encode_responses_developer_message(&system));
     }
+    input.extend(request.compacted_prefix.clone());
 
     for message in &request.messages {
         match message {
@@ -811,6 +925,33 @@ fn encode_responses_input(request: &ProviderRequest) -> anyhow::Result<Vec<Value
         }
     }
 
+    Ok(input)
+}
+
+/// Encode only the given message slice — used when chaining via `previous_response_id`.
+/// Omits the developer/system message since the server already has it.
+fn encode_responses_input_slice(
+    messages: &[Message],
+    request: &ProviderRequest,
+) -> anyhow::Result<Vec<Value>> {
+    let mut input = Vec::new();
+    for message in messages {
+        match message {
+            Message::System(_) => {}
+            Message::User(user) => input.push(encode_responses_user_message(user)?),
+            Message::Assistant(assistant) => {
+                if let Some(message) = encode_responses_assistant_message(assistant) {
+                    input.push(message);
+                }
+                for part in &assistant.parts {
+                    if let AssistantPart::ToolCall(call) = part {
+                        input.push(encode_responses_tool_call(call, request));
+                    }
+                }
+            }
+            Message::Tool(tool) => input.push(encode_responses_tool_output(tool)),
+        }
+    }
     Ok(input)
 }
 
@@ -869,19 +1010,25 @@ fn encode_responses_assistant_message(
         return None;
     }
 
-    Some(json!({
-        "type": "message",
-        "role": "assistant",
-        "id": message.id,
-        "status": "completed",
-        "content": [
+    let mut encoded = Map::new();
+    encoded.insert("type".to_owned(), json!("message"));
+    encoded.insert("role".to_owned(), json!("assistant"));
+    encoded.insert("status".to_owned(), json!("completed"));
+    encoded.insert(
+        "content".to_owned(),
+        json!([
             {
                 "type": "output_text",
                 "text": text,
                 "annotations": [],
             }
-        ],
-    }))
+        ]),
+    );
+    if let Some(message_id) = encode_responses_message_item_id(&message.id) {
+        encoded.insert("id".to_owned(), Value::String(message_id));
+    }
+
+    Some(Value::Object(encoded))
 }
 
 fn encode_responses_tool_call(
@@ -912,11 +1059,92 @@ fn encode_responses_tool_output(message: &halter_protocol::ToolResultMessage) ->
 }
 
 fn responses_function_call_item_id(call_id: &halter_protocol::ToolCallId) -> String {
-    format!("fc_{}", normalized_tool_call_id(call_id))
+    bounded_provider_id_with_prefix("fc_", &call_id.0, RESPONSES_ITEM_ID_MAX_LEN, "fc")
 }
 
 fn responses_function_call_output_item_id(call_id: &halter_protocol::ToolCallId) -> String {
-    format!("fc_output_{}", normalized_tool_call_id(call_id))
+    bounded_provider_id_with_prefix(
+        "fc_output_",
+        &call_id.0,
+        RESPONSES_ITEM_ID_MAX_LEN,
+        "fc_output",
+    )
+}
+
+fn synthesized_responses_message_id(response_id: &str) -> MessageId {
+    if is_responses_message_item_id(response_id) {
+        return MessageId::from(bounded_provider_id(
+            response_id,
+            RESPONSES_ITEM_ID_MAX_LEN,
+            "msg",
+        ));
+    }
+    MessageId::from(bounded_provider_id_with_prefix(
+        "msg_response_",
+        response_id,
+        RESPONSES_ITEM_ID_MAX_LEN,
+        "msg_response",
+    ))
+}
+
+#[cfg(test)]
+fn response_output_message_id(response: &Value) -> Option<MessageId> {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|item| {
+            if item.get("type").and_then(Value::as_str) != Some("message") {
+                return None;
+            }
+            item.get("id")
+                .and_then(Value::as_str)
+                .filter(|id| is_responses_message_item_id(id))
+                .map(|id| MessageId::from(id.to_owned()))
+        })
+        .or_else(|| {
+            response
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(synthesized_responses_message_id)
+        })
+}
+
+#[cfg(test)]
+fn response_output_response_id(response: &Value) -> Option<String> {
+    response
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_owned())
+}
+
+fn encode_responses_message_item_id(message_id: &MessageId) -> Option<String> {
+    is_responses_message_item_id(&message_id.0)
+        .then(|| bounded_provider_id(&message_id.0, RESPONSES_ITEM_ID_MAX_LEN, "msg"))
+}
+
+fn is_responses_message_item_id(id: &str) -> bool {
+    id.starts_with("msg_")
+}
+
+fn validate_responses_input_item_ids(input: &[Value]) -> anyhow::Result<()> {
+    for (index, item) in input.iter().enumerate() {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.len() > RESPONSES_ITEM_ID_MAX_LEN {
+            anyhow::bail!(
+                "failed to encode openai responses request: input[{index}].id length {} exceeds {}",
+                id.len(),
+                RESPONSES_ITEM_ID_MAX_LEN
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn encode_responses_tools(request: &ProviderRequest) -> Vec<Value> {
@@ -1111,7 +1339,6 @@ fn decode_chat_stop_reason(choice: &Value) -> StopReason {
     }
 }
 
-#[cfg(test)]
 fn decode_openai_usage(response: &Value) -> Usage {
     Usage {
         input_tokens: response
@@ -1338,6 +1565,35 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_request_omits_invalid_assistant_message_ids() {
+        let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        let Message::Assistant(assistant) = &mut request.messages[1] else {
+            panic!("expected assistant history");
+        };
+        assistant.id = MessageId::from("resp_123");
+
+        let body = encode_responses_request(
+            &request,
+            ResponsesRequestOptions {
+                stream: false,
+                store: Some(false),
+                prompt_cache_key: None,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+            },
+        )
+        .expect("encode request");
+
+        let assistant_message = body["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .find(|item| item["type"] == "message" && item["role"] == "assistant")
+            .expect("assistant message");
+        assert!(assistant_message.get("id").is_none());
+    }
+
+    #[test]
     fn openrouter_responses_request_omits_openai_only_fields() {
         let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter);
         let body = encode_responses_request(
@@ -1368,6 +1624,130 @@ mod tests {
                 && item["id"] == "fc_output_call_123"
                 && item["call_id"] == "call_123"
         }));
+    }
+
+    #[test]
+    fn openai_responses_request_bounds_legacy_message_and_tool_item_ids() {
+        let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        let long_response_id = "resp_06e44240522f2cae0169ddd62f88908190a4bc4203232681a5";
+        let long_call_id = "call_1234567890abcdef1234567890abcdef1234567890abcdef12345".to_owned();
+        let legacy_message_id = format!("msg_response_{long_response_id}");
+
+        let Message::Assistant(assistant) = &mut request.messages[1] else {
+            panic!("expected assistant history");
+        };
+        assistant.id = MessageId::from(legacy_message_id.clone());
+        let tool_call = assistant
+            .parts
+            .iter_mut()
+            .find_map(|part| match part {
+                AssistantPart::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("assistant tool call");
+        tool_call.id = ToolCallId::from(long_call_id.clone());
+
+        let Message::Tool(tool) = &mut request.messages[2] else {
+            panic!("expected tool message");
+        };
+        tool.call_id = ToolCallId::from(long_call_id.clone());
+
+        let body = encode_responses_request(
+            &request,
+            ResponsesRequestOptions {
+                stream: false,
+                store: Some(false),
+                prompt_cache_key: None,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+            },
+        )
+        .expect("encode request");
+
+        let input = body["input"].as_array().expect("input");
+        for item in input {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                assert!(
+                    id.len() <= RESPONSES_ITEM_ID_MAX_LEN,
+                    "expected bounded input id, got {id}"
+                );
+            }
+        }
+
+        let assistant_message = input
+            .iter()
+            .find(|item| item["type"] == "message" && item["role"] == "assistant")
+            .expect("assistant message");
+        let assistant_id = assistant_message["id"]
+            .as_str()
+            .expect("assistant message id");
+        assert!(assistant_id.starts_with("msg_response_"));
+        assert!(assistant_id.len() <= RESPONSES_ITEM_ID_MAX_LEN);
+        assert_ne!(assistant_id, legacy_message_id);
+
+        let function_call = input
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function call");
+        assert_eq!(function_call["call_id"], long_call_id);
+        assert!(
+            function_call["id"]
+                .as_str()
+                .expect("function call id")
+                .starts_with("fc_")
+        );
+        assert!(
+            function_call["id"]
+                .as_str()
+                .expect("function call id")
+                .len()
+                <= RESPONSES_ITEM_ID_MAX_LEN
+        );
+
+        let function_call_output = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .expect("function call output");
+        assert_eq!(function_call_output["call_id"], long_call_id);
+        assert!(
+            function_call_output["id"]
+                .as_str()
+                .expect("function call output id")
+                .starts_with("fc_output_")
+        );
+        assert!(
+            function_call_output["id"]
+                .as_str()
+                .expect("function call output id")
+                .len()
+                <= RESPONSES_ITEM_ID_MAX_LEN
+        );
+    }
+
+    #[test]
+    fn synthesized_responses_message_id_stays_within_limit() {
+        let response_id = "resp_06e44240522f2cae0169ddd62f88908190a4bc4203232681a5";
+
+        let message_id = synthesized_responses_message_id(response_id);
+
+        assert!(message_id.0.starts_with("msg_response_"));
+        assert!(message_id.0.len() <= RESPONSES_ITEM_ID_MAX_LEN);
+    }
+
+    #[test]
+    fn validate_responses_input_item_ids_rejects_overlong_ids() {
+        let overlong_id = "x".repeat(RESPONSES_ITEM_ID_MAX_LEN + 1);
+
+        let error = validate_responses_input_item_ids(&[json!({
+            "type": "message",
+            "id": overlong_id,
+        })])
+        .expect_err("expected validation failure");
+
+        assert_eq!(
+            error.to_string(),
+            "failed to encode openai responses request: input[0].id length 65 exceeds 64"
+        );
     }
 
     #[test]
@@ -1466,7 +1846,7 @@ mod tests {
     #[test]
     fn responses_stream_decoder_maps_text_reasoning_tool_calls_and_usage() {
         let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
-        let mut decoder = ResponsesStreamDecoder::new(&request);
+        let mut decoder = ResponsesStreamDecoder::new(&request, true);
         let stream_events = vec![
             json!({
                 "type": "response.created",
@@ -1673,6 +2053,216 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_decoder_does_not_reuse_response_id_for_tool_only_turns() {
+        let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        let mut decoder = ResponsesStreamDecoder::new(&request, true);
+        let stream_events = vec![
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_123",
+                    "created_at": 0,
+                    "model": "gpt-5",
+                    "object": "response",
+                    "output": [],
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_123",
+                    "name": "fs_read",
+                    "arguments": "",
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "sequence_number": 2,
+                "item_id": "fc_1",
+                "output_index": 0,
+                "arguments": "{\"path\":\"README.md\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 3,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_123",
+                    "name": "fs_read",
+                    "arguments": "{\"path\":\"README.md\"}",
+                    "status": "completed"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 4,
+                "response": {
+                    "id": "resp_123",
+                    "created_at": 0,
+                    "model": "gpt-5",
+                    "object": "response",
+                    "output": [],
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 12,
+                        "input_tokens_details": {
+                            "cached_tokens": 0
+                        },
+                        "output_tokens": 4,
+                        "output_tokens_details": {
+                            "reasoning_tokens": 0
+                        },
+                        "total_tokens": 16
+                    }
+                }
+            }),
+        ];
+
+        let decoded = stream_events
+            .into_iter()
+            .flat_map(|event| {
+                let event = serde_json::from_value(event).expect("parse stream event");
+                decoder.decode(event).expect("decode stream event")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(decoded.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageStart { id } if id.0 == "msg_response_resp_123"
+        )));
+        assert!(decoded.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallStart { name, .. } if name.0 == "read"
+        )));
+    }
+
+    #[test]
+    fn responses_response_uses_stable_tool_only_message_id() {
+        let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        let response = json!({
+            "id": "resp_123",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "fs_read",
+                    "arguments": "{\"path\":\"README.md\"}"
+                }
+            ],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
+        });
+
+        let events = decode_responses_response(&request, &response).expect("decode response");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageStart { id } if id.0 == "msg_response_resp_123"
+        )));
+    }
+
+    #[test]
+    fn responses_stream_decoder_ignores_duplicate_tool_completion_events() {
+        let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        let mut decoder = ResponsesStreamDecoder::new(&request, true);
+        let stream_events = vec![
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_123",
+                    "created_at": 0,
+                    "model": "gpt-5",
+                    "object": "response",
+                    "output": [],
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_123",
+                    "name": "fs_read",
+                    "arguments": "",
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": 2,
+                "item_id": "fc_1",
+                "output_index": 0,
+                "delta": "{\"path\":"
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "sequence_number": 3,
+                "item_id": "fc_1",
+                "output_index": 0,
+                "arguments": "{\"path\":\"README.md\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 4,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_123",
+                    "name": "fs_read",
+                    "arguments": "{\"path\":\"README.md\"}",
+                    "status": "completed"
+                }
+            }),
+        ];
+
+        let decoded = stream_events
+            .into_iter()
+            .flat_map(|event| {
+                let event = serde_json::from_value(event).expect("parse stream event");
+                decoder.decode(event).expect("decode stream event")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolArgsDelta { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn chat_request_uses_tool_messages_and_aliases() {
         let request = sample_request(ApiKind::OpenAiChat, ProviderKind::OpenRouter);
         let body = encode_chat_request(&request, false).expect("encode chat");
@@ -1705,6 +2295,7 @@ mod tests {
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(8_192),
                 reasoning: Some(ReasoningEffort::Medium),
+                tokens_per_minute: None,
             },
             prompt: AssembledPrompt {
                 segments: vec![PromptSegment {
@@ -1721,6 +2312,7 @@ mod tests {
                 rendered_transcript: String::new(),
                 rendered: String::new(),
             },
+            compacted_prefix: Vec::new(),
             messages: vec![
                 Message::User(UserMessage::text("hello")),
                 Message::Assistant(AssistantMessage {
@@ -1758,6 +2350,8 @@ mod tests {
                 capabilities: ToolCapabilities::default(),
                 provider_aliases,
             }],
+            previous_response_id: None,
+            new_messages_start: 0,
         }
     }
 }

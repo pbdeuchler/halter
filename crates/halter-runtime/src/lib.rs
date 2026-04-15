@@ -1,5 +1,6 @@
 // pattern: Functional Core
 
+mod compaction;
 mod context;
 mod event_bus;
 mod hooks_runtime;
@@ -9,7 +10,8 @@ mod session;
 mod subagent_session;
 mod subagents;
 
-pub use context::{ContextManager, ContextSettings, DefaultContextManager};
+pub use compaction::{ContextSettings, score_message};
+pub use context::{CompactionOutcome, ContextManager, DefaultContextManager};
 pub use event_bus::EventBus;
 pub use hooks_runtime::{
     ExecutedHookDispatch, HookInvocationContext, run_notification, run_post_compact,
