@@ -67,8 +67,9 @@ enum ConfigCommands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let to_file = cli.output_file.is_some();
     let OutputHandles { mut output, trace } = open_output_handles(cli.output_file.as_deref())?;
-    init_logging(trace)?;
+    init_logging(trace, to_file)?;
     debug!(config_path = %cli.config.display(), command = ?cli.command, "parsed cli arguments");
 
     match cli.command {
@@ -338,16 +339,20 @@ fn write_output_line(output: &mut dyn Write, line: impl std::fmt::Display) -> an
     writeln!(output, "{line}").context("failed to write output")
 }
 
-fn init_logging(writer: TraceWriter) -> anyhow::Result<()> {
+fn init_logging(writer: TraceWriter, json: bool) -> anyhow::Result<()> {
     let filter = match env::var(EnvFilter::DEFAULT_ENV) {
         Ok(value) => EnvFilter::try_new(value).context("invalid RUST_LOG filter")?,
         Err(env::VarError::NotPresent) => EnvFilter::try_new("off")?,
         Err(env::VarError::NotUnicode(_)) => anyhow::bail!("invalid utf-8 in RUST_LOG"),
     };
-    let subscriber = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_writer(writer).with_target(true).compact());
-    tracing::subscriber::set_global_default(subscriber).context("failed to initialize logging")
+    let base = fmt::layer().with_writer(writer).with_target(true);
+    let registry = tracing_subscriber::registry().with(filter);
+    if json {
+        tracing::subscriber::set_global_default(registry.with(base.json()))
+    } else {
+        tracing::subscriber::set_global_default(registry.with(base.compact()))
+    }
+    .context("failed to initialize logging")
 }
 
 #[cfg(test)]

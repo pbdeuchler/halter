@@ -5,7 +5,6 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{DateTime, Utc};
 
 pub(crate) const SAME_WINDOW_TOLERANCE: Duration = Duration::from_millis(1500);
-const UNKNOWN_RESET_FALLBACK: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct OpenAiReservation {
@@ -212,14 +211,21 @@ fn refresh_window(window: &mut Option<OpenAiWindowState>, now: Instant) {
 fn window_ready_deadline(
     window: Option<&OpenAiWindowState>,
     required_reserved: u64,
-    now: Instant,
+    _now: Instant,
 ) -> Option<Instant> {
     let window = window?;
     if window.remaining >= required_reserved {
         return None;
     }
 
-    Some(window.reset_at.unwrap_or(now + UNKNOWN_RESET_FALLBACK))
+    // When reset_at is None we have no information about when the budget
+    // replenishes.  Returning a synthetic fallback deadline here creates an
+    // infinite 1-second spin because nothing updates the window state between
+    // iterations and no in-flight requests can complete to notify us.  Instead,
+    // let the request proceed — the server is the source of truth and will 429
+    // if we are genuinely over-limit, at which point apply_retry_after provides
+    // the correct backoff via cooldown_until.
+    window.reset_at
 }
 
 fn apply_window_snapshot(
@@ -433,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn try_acquire_reservation_waits_when_token_budget_exhausted() {
+    fn try_acquire_reservation_proceeds_when_token_budget_exhausted_without_reset() {
         let now = Instant::now();
         let mut state = OpenAiRateLimitState {
             tokens: Some(initial_token_window(1_000)),
@@ -449,9 +455,38 @@ mod tests {
             now,
         );
 
-        assert!(
-            matches!(decision, AcquireDecision::WaitUntil(_)),
-            "should wait when tokens exceed budget"
+        assert_eq!(
+            decision,
+            AcquireDecision::Ready,
+            "should proceed when reset_at is unknown to avoid infinite spin"
+        );
+    }
+
+    #[test]
+    fn try_acquire_reservation_waits_when_token_budget_exhausted_with_reset() {
+        let now = Instant::now();
+        let mut state = OpenAiRateLimitState {
+            tokens: Some(OpenAiWindowState {
+                limit: 1_000,
+                remaining: 1_000,
+                reset_at: Some(now + Duration::from_secs(60)),
+            }),
+            ..OpenAiRateLimitState::default()
+        };
+
+        let decision = try_acquire_reservation(
+            &mut state,
+            OpenAiReservation {
+                requests: 0,
+                tokens: 1_001,
+            },
+            now,
+        );
+
+        assert_eq!(
+            decision,
+            AcquireDecision::WaitUntil(now + Duration::from_secs(60)),
+            "should wait for known reset when tokens exceed budget"
         );
     }
 
