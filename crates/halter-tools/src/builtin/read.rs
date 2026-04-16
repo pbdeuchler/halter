@@ -210,7 +210,7 @@ mod tests {
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings {
                 allowed_write_roots: vec![root.to_path_buf()],
                 max_read_bytes,
-                ..PolicySettings::default()
+                ..PolicySettings::permissive()
             })) as Arc<dyn ToolPolicy>,
             max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,

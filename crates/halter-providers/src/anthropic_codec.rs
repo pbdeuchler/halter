@@ -12,10 +12,10 @@ use crate::codec_common::{
 };
 
 pub(crate) fn encode_request(request: &ProviderRequest) -> anyhow::Result<Value> {
-    if request.model.api_kind != ApiKind::AnthropicMessages {
+    if request.model.api_kind() != ApiKind::AnthropicMessages {
         anyhow::bail!(
             "failed to encode anthropic request: unsupported api kind '{}'",
-            request.model.api_kind as u8
+            request.model.api_kind() as u8
         );
     }
 
@@ -345,10 +345,10 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use halter_protocol::{
-        ApiKind, AssembledPrompt, AssistantMessage, AssistantPart, CacheScope, Message, MessageId,
-        ModelId, ModelRole, PromptSegment, PromptSegmentId, ProviderKind, ProviderName,
-        ProviderRequest, ResolvedModel, ToolAlias, ToolCall, ToolCallId, ToolCapabilities,
-        ToolConcurrency, ToolSpec, TurnId, UserMessage, Volatility,
+        AssembledPrompt, AssistantMessage, AssistantPart, CacheScope, Message, MessageId, ModelId,
+        ModelRole, PromptSegment, PromptSegmentId, ProviderKind, ProviderName, ProviderRequest,
+        ResolvedModel, ToolAlias, ToolCall, ToolCallId, ToolCapabilities, ToolConcurrency,
+        ToolSpec, TurnId, UserMessage, Volatility,
     };
     use indexmap::IndexMap;
     use serde_json::json;
@@ -454,7 +454,6 @@ mod tests {
                 id: ModelId::from("claude_default"),
                 provider: ProviderName::from("anthropic"),
                 provider_kind: ProviderKind::Anthropic,
-                api_kind: ApiKind::AnthropicMessages,
                 model: "claude-sonnet-4-5".to_owned(),
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(8_192),

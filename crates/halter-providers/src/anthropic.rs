@@ -3,13 +3,14 @@
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use halter_protocol::{
-    ApiKind, ProviderCapabilities, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
+    ApiKind, ProviderCapabilities, ProviderError, ProviderKind, ProviderRequest, StreamEvent,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::Provider;
 use crate::anthropic_codec;
+use crate::codec_common::provider_url;
 use crate::http_client::{JsonHttpClient, JsonRequest};
 
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
@@ -35,21 +36,7 @@ impl AnthropicProvider {
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            supports_tools: true,
-            supports_streaming: false,
-            supports_reasoning: true,
-            supports_interleaved_reasoning: false,
-            supports_images: true,
-            supports_documents: true,
-            supports_prompt_cache: false,
-            supports_compaction: false,
-            supports_tool_result_media: false,
-            requires_non_empty_assistant_content: true,
-            tool_call_id_policy: ToolCallIdPolicy::StableReplayNormalized,
-            max_input_tokens: 200_000,
-            max_output_tokens: 8_192,
-        }
+        ProviderCapabilities::for_provider(ProviderKind::Anthropic)
     }
 
     async fn stream(
@@ -57,7 +44,7 @@ impl Provider for AnthropicProvider {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
-        if request.model.api_kind != ApiKind::AnthropicMessages {
+        if request.model.api_kind() != ApiKind::AnthropicMessages {
             anyhow::bail!(
                 "failed to execute provider request: anthropic provider requires anthropic_messages api kind"
             );
@@ -94,6 +81,3 @@ impl Provider for AnthropicProvider {
     }
 }
 
-fn provider_url(base_url: &str, path: &str) -> String {
-    format!("{}{}", base_url.trim_end_matches('/'), path)
-}

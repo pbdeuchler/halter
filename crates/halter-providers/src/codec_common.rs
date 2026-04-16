@@ -154,6 +154,10 @@ pub(crate) fn bounded_provider_id_with_prefix(
     format!("{prefix}{}_{}", &base[..head_len], suffix)
 }
 
+pub(crate) fn provider_url(base_url: &str, path: &str) -> String {
+    format!("{}{}", base_url.trim_end_matches('/'), path)
+}
+
 pub(crate) fn data_url(media_type: &str, data: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     format!("data:{media_type};base64,{encoded}")

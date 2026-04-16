@@ -1807,7 +1807,9 @@ impl Default for RuntimeServices {
             path_locks: Arc::new(PathLockMap::default()),
             tool_sessions: Arc::new(ToolSessionStore::default()),
             sessions: Arc::new(halter_session::InMemorySessionStore::default()),
-            policy: Arc::new(halter_tools::DefaultToolPolicy::new(Default::default())),
+            policy: Arc::new(halter_tools::DefaultToolPolicy::new(
+                halter_tools::PolicySettings::permissive(),
+            )),
             prompt_assembler: Arc::new(crate::DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::default()),
             event_bus: Arc::new(EventBus::default()),
@@ -1829,7 +1831,7 @@ mod tests {
         Hook, HookEventName, HookResponse, HooksFile, RegisteredHookPriority, RegisteredHooks,
     };
     use halter_protocol::{
-        ApiKind, BlockId, HookHandlerType, HookRunStatus, HookSessionStartSource, Message, ModelId,
+        BlockId, HookHandlerType, HookRunStatus, HookSessionStartSource, Message, ModelId,
         ModelRole, PluginId, ProviderCapabilities, ProviderError, ProviderKind, ProviderName,
         ProviderRequest, ResolvedModel, StopReason, StreamEvent, ToolCallId, ToolCapabilities,
         ToolConcurrency, ToolName, ToolResult, ToolSpec, Turn,
@@ -1863,7 +1865,7 @@ mod tests {
 
         use halter_hooks::{HookRegistrySource, Hooks, HooksFile};
         use halter_protocol::{
-            ApiKind, ModelId, ModelRole, PluginId, ProviderKind, ProviderName, ResolvedModel,
+            ModelId, ModelRole, PluginId, ProviderKind, ProviderName, ResolvedModel,
             ResourceSnapshot,
         };
         use halter_providers::Provider;
@@ -1882,7 +1884,6 @@ mod tests {
                 id: ModelId::from("default"),
                 provider: ProviderName::from("fake"),
                 provider_kind: ProviderKind::Fake,
-                api_kind: ApiKind::Fake,
                 model: "halter/fake".to_owned(),
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
@@ -1894,7 +1895,6 @@ mod tests {
                 id: ModelId::from("subagent"),
                 provider: ProviderName::from("fake"),
                 provider_kind: ProviderKind::Fake,
-                api_kind: ApiKind::Fake,
                 model: "halter/fake".to_owned(),
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
@@ -1906,7 +1906,6 @@ mod tests {
                 id: ModelId::from("small"),
                 provider: ProviderName::from("fake"),
                 provider_kind: ProviderKind::Fake,
-                api_kind: ApiKind::Fake,
                 model: "halter/fake-small".to_owned(),
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
@@ -1917,7 +1916,7 @@ mod tests {
             services.models = Arc::new(models);
             services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
                 allowed_write_roots: vec![working_dir.to_path_buf()],
-                ..PolicySettings::default()
+                ..PolicySettings::permissive()
             }));
             Arc::new(services)
         }
@@ -1968,7 +1967,6 @@ mod tests {
                 id: ModelId::from(id),
                 provider: ProviderName::from(provider),
                 provider_kind: ProviderKind::Fake,
-                api_kind: ApiKind::Fake,
                 model: model.to_owned(),
                 max_input_tokens: Some(32_000),
                 max_output_tokens: Some(4_096),
@@ -1987,7 +1985,6 @@ mod tests {
             id: ModelId::from("default"),
             provider: ProviderName::from("fake"),
             provider_kind: ProviderKind::Fake,
-            api_kind: ApiKind::Fake,
             model: "halter/fake".to_owned(),
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
@@ -1999,7 +1996,6 @@ mod tests {
             id: ModelId::from("subagent"),
             provider: ProviderName::from("fake"),
             provider_kind: ProviderKind::Fake,
-            api_kind: ApiKind::Fake,
             model: "halter/fake".to_owned(),
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
@@ -2217,7 +2213,6 @@ mod tests {
             id: ModelId::from("small"),
             provider: ProviderName::from("fake"),
             provider_kind: ProviderKind::Fake,
-            api_kind: ApiKind::Fake,
             model: "small/model".to_owned(),
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
@@ -2232,7 +2227,7 @@ mod tests {
         services.models = Arc::new(models);
         services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_write_roots: vec![temp.path().to_path_buf()],
-            ..PolicySettings::default()
+            ..PolicySettings::permissive()
         }));
 
         let (hooks_file, warnings) = HooksFile::from_json_bytes(
@@ -2419,7 +2414,7 @@ mod tests {
         services.models = Arc::new(models);
         services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_write_roots: vec![temp.path().to_path_buf()],
-            ..PolicySettings::default()
+            ..PolicySettings::permissive()
         }));
 
         let runtime = SessionRuntime::new(Arc::new(services));
@@ -2711,7 +2706,7 @@ mod tests {
         services.models = Arc::new(models);
         services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_write_roots: vec![temp.path().to_path_buf()],
-            ..PolicySettings::default()
+            ..PolicySettings::permissive()
         }));
 
         let runtime = SessionRuntime::new(Arc::new(services));

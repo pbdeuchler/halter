@@ -1,15 +1,17 @@
 // pattern: Imperative Shell
 
 use async_openai::error::OpenAIError;
+use async_trait::async_trait;
 use futures::{StreamExt, channel::mpsc, stream::BoxStream};
 use halter_protocol::{
     ApiKind, ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse,
-    ProviderError, ProviderRequest, StreamEvent,
+    ProviderError, ProviderKind, ProviderRequest, StreamEvent,
 };
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::Provider;
 use crate::openai_codec::{self, ResponsesRequestOptions};
 use crate::openai_error::{
     openai_api_error_is_rate_limit, openai_message_is_rate_limit, parse_openai_stream_error,
@@ -43,7 +45,7 @@ pub(crate) struct ResponsesProviderConfig {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResponsesProvider {
+pub struct ResponsesProvider {
     config: ResponsesProviderConfig,
     transport: ResponsesTransport,
 }
@@ -61,14 +63,28 @@ impl ResponsesProvider {
         }
     }
 
+    /// Construct a `ResponsesProvider` for OpenAI (platform.openai.com).
     #[must_use]
-    pub(crate) fn capabilities(&self) -> ProviderCapabilities {
+    pub fn openai(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self::new(config_for(ProviderKind::OpenAi), api_key, base_url)
+    }
+
+    /// Construct a `ResponsesProvider` for OpenRouter (openrouter.ai).
+    #[must_use]
+    pub fn openrouter(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self::new(config_for(ProviderKind::OpenRouter), api_key, base_url)
+    }
+}
+
+#[async_trait]
+impl Provider for ResponsesProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
         let mut capabilities = self.config.capabilities.clone();
         capabilities.supports_compaction = self.config.compact_strategy.is_some();
         capabilities
     }
 
-    pub(crate) async fn stream(
+    async fn stream(
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
@@ -221,7 +237,7 @@ impl ResponsesProvider {
         Ok(rx.boxed())
     }
 
-    pub(crate) async fn compact(
+    async fn compact(
         &self,
         request: ProviderCompactionRequest,
         cancel: CancellationToken,
@@ -307,7 +323,7 @@ impl ResponsesProvider {
 }
 
 fn validate_responses_request(label: &str, request: &ProviderRequest) -> anyhow::Result<()> {
-    if request.model.api_kind != ApiKind::OpenAiResponses {
+    if request.model.api_kind() != ApiKind::OpenAiResponses {
         anyhow::bail!(
             "failed to execute provider request: {label} provider requires openai_responses api kind"
         );
@@ -321,7 +337,7 @@ fn validate_responses_compaction_request(
     config: &ResponsesProviderConfig,
     request: &ProviderCompactionRequest,
 ) -> anyhow::Result<()> {
-    if request.model.api_kind != ApiKind::OpenAiResponses {
+    if request.model.api_kind() != ApiKind::OpenAiResponses {
         anyhow::bail!(
             "failed to compact session: {label} provider requires openai_responses api kind"
         );
@@ -333,13 +349,57 @@ fn validate_responses_compaction_request(
     Ok(())
 }
 
+fn config_for(kind: ProviderKind) -> ResponsesProviderConfig {
+    match kind {
+        ProviderKind::OpenAi => ResponsesProviderConfig {
+            label: "openai",
+            capabilities: ProviderCapabilities::for_provider(ProviderKind::OpenAi),
+            request: ResponsesProviderRequestConfig {
+                store: None,
+                include_prompt_cache_key: true,
+                include_encrypted_reasoning: true,
+                reasoning_summary: Some("auto"),
+            },
+            compact_strategy: Some(CompactStrategy::DedicatedEndpoint),
+            rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
+        },
+        ProviderKind::OpenRouter => ResponsesProviderConfig {
+            label: "openrouter",
+            capabilities: ProviderCapabilities::for_provider(ProviderKind::OpenRouter),
+            request: ResponsesProviderRequestConfig {
+                store: Some(false),
+                include_prompt_cache_key: true,
+                include_encrypted_reasoning: false,
+                reasoning_summary: Some("auto"),
+            },
+            compact_strategy: Some(CompactStrategy::InlineResponses),
+            rate_limit_strategy: None,
+        },
+        ProviderKind::Anthropic | ProviderKind::Fake => {
+            panic!("ResponsesProvider does not support {kind:?}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use chrono::Utc;
+    use futures::StreamExt;
     use halter_protocol::{
-        ModelId, ModelRole, ProviderKind, ProviderName, ResolvedModel, SessionId,
+        AssembledPrompt, AssistantMessage, AssistantPart, Message, MessageId, ModelId, ModelRole,
+        ProviderName, ResolvedModel, SessionId, ToolCall, ToolCallId, ToolCapabilities,
+        ToolConcurrency, ToolResult, ToolResultMessage, ToolSpec, TurnId, UserMessage,
     };
+    use indexmap::IndexMap;
+    use serde_json::{Value, json};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::test_http::{find_headers_end, read_http_request};
 
     #[tokio::test]
     async fn responses_provider_without_compaction_strategy_rejects_compaction() {
@@ -364,7 +424,10 @@ mod tests {
         );
 
         let error = provider
-            .compact(sample_compaction_request(), CancellationToken::new())
+            .compact(
+                sample_compaction_request(ProviderKind::OpenAi, "responses-test"),
+                CancellationToken::new(),
+            )
             .await
             .expect_err("compaction should fail without a strategy");
 
@@ -376,15 +439,208 @@ mod tests {
         assert!(!provider.capabilities().supports_compaction);
     }
 
-    fn sample_compaction_request() -> ProviderCompactionRequest {
+    #[tokio::test]
+    async fn openai_provider_retries_streamed_token_rate_limits() {
+        let request_times = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let base_url = spawn_retrying_stream_server(request_times.clone()).await;
+        let provider = ResponsesProvider::openai("test-key", base_url);
+        let mut stream = provider
+            .stream(
+                sample_request(ProviderKind::OpenAi),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("provider stream");
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            let event = item.expect("stream event");
+            let done = matches!(event, StreamEvent::MessageEnd { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::MessageStart { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "done"
+        )));
+
+        let request_times = request_times.lock().await.clone();
+        assert_eq!(request_times.len(), 2);
+        let gap = request_times[1].saturating_duration_since(request_times[0]);
+        assert!(
+            gap >= Duration::from_millis(15),
+            "expected retry to honor cooldown, saw gap {gap:?}"
+        );
+    }
+
+    #[test]
+    fn openrouter_provider_reports_compaction_and_prompt_cache_support() {
+        let capabilities =
+            ResponsesProvider::openrouter("test-key", "https://openrouter.ai/api").capabilities();
+
+        assert!(capabilities.supports_prompt_cache);
+        assert!(capabilities.supports_compaction);
+    }
+
+    #[tokio::test]
+    async fn openrouter_provider_compacts_via_inline_responses_request() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept socket");
+            let request = read_http_request(&mut socket).await.expect("read request");
+
+            let headers_end = find_headers_end(&request).expect("headers end");
+            let request_text = String::from_utf8_lossy(&request[..headers_end]);
+            assert!(request_text.starts_with("POST /v1/responses HTTP/1.1"));
+
+            let body: Value =
+                serde_json::from_slice(&request[headers_end + 4..]).expect("parse request body");
+            assert_eq!(body["model"], "gpt-5");
+            assert_eq!(body["instructions"], "Summarize the session");
+            assert_eq!(body["stream"], false);
+            assert_eq!(body["store"], false);
+            assert!(body.get("tools").is_none());
+            assert!(
+                body["input"]
+                    .as_array()
+                    .expect("input")
+                    .iter()
+                    .any(|item| item["role"] == "developer")
+            );
+            assert!(
+                body["input"]
+                    .as_array()
+                    .expect("input")
+                    .iter()
+                    .any(|item| item["type"] == "function_call")
+            );
+
+            let response_body = json!({
+                "id": "resp_openrouter_compaction",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [{"text": "ignore"}]
+                    },
+                    {
+                        "type": "message",
+                        "id": "msg_summary",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "## User Intent\nShip compaction support",
+                                "annotations": []
+                            }
+                        ]
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 42,
+                    "output_tokens": 13,
+                    "input_tokens_details": {
+                        "cache_creation_tokens": 0,
+                        "cached_tokens": 0
+                    }
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let provider = ResponsesProvider::openrouter("test-key", format!("http://{address}"));
+        let response = provider
+            .compact(
+                sample_openrouter_compaction_request(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("provider compaction");
+
+        assert_eq!(response.usage.input_tokens, 42);
+        assert_eq!(
+            response.output,
+            vec![json!({
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "[Compacted context]\n\n## User Intent\nShip compaction support"
+                    }
+                ],
+            })]
+        );
+
+        server.await.expect("server task");
+    }
+
+    fn sample_request(kind: ProviderKind) -> ProviderRequest {
+        ProviderRequest {
+            session_id: SessionId::new(),
+            turn_id: TurnId::new(),
+            model: ResolvedModel {
+                role: ModelRole::default(),
+                id: ModelId::from("default"),
+                provider: ProviderName::from(match kind {
+                    ProviderKind::OpenAi => "openai",
+                    ProviderKind::OpenRouter => "openrouter",
+                    other => panic!("unsupported provider kind in test: {other:?}"),
+                }),
+                provider_kind: kind,
+                model: "gpt-5".to_owned(),
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(8_192),
+                reasoning: None,
+                tokens_per_minute: None,
+            },
+            prompt: AssembledPrompt {
+                segments: Vec::new(),
+                transcript: Vec::new(),
+                ordered_segments: Vec::new(),
+                prefix_cache_key: "cache-key".to_owned(),
+                rendered_prefix: String::new(),
+                rendered_transcript: String::new(),
+                rendered: String::new(),
+            },
+            compacted_prefix: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            previous_response_id: None,
+            new_messages_start: 0,
+        }
+    }
+
+    fn sample_compaction_request(kind: ProviderKind, provider: &str) -> ProviderCompactionRequest {
         ProviderCompactionRequest {
             session_id: SessionId::new(),
             model: ResolvedModel {
                 role: ModelRole::default(),
                 id: ModelId::from("default"),
-                provider: ProviderName::from("responses-test"),
-                provider_kind: ProviderKind::OpenAi,
-                api_kind: ApiKind::OpenAiResponses,
+                provider: ProviderName::from(provider),
+                provider_kind: kind,
                 model: "gpt-5".to_owned(),
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(8_192),
@@ -396,6 +652,203 @@ mod tests {
             tools: Vec::new(),
             instructions: "Summarize".to_owned(),
         }
+    }
+
+    fn sample_openrouter_compaction_request() -> ProviderCompactionRequest {
+        let mut provider_aliases = IndexMap::new();
+        provider_aliases.insert(ProviderKind::OpenRouter, "fs_read".into());
+        ProviderCompactionRequest {
+            session_id: SessionId::new(),
+            model: ResolvedModel {
+                role: ModelRole::default(),
+                id: ModelId::from("default"),
+                provider: ProviderName::from("openrouter"),
+                provider_kind: ProviderKind::OpenRouter,
+                model: "gpt-5".to_owned(),
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(8_192),
+                reasoning: None,
+                tokens_per_minute: None,
+            },
+            compacted_prefix: vec![json!({
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "[Compacted context]\n\nEarlier summary"
+                    }
+                ],
+            })],
+            messages: vec![
+                Message::User(UserMessage::text("ship compaction support")),
+                Message::Assistant(AssistantMessage {
+                    id: MessageId::from("msg_history_1"),
+                    created_at: Utc::now(),
+                    parts: vec![
+                        AssistantPart::Text {
+                            text: "Investigating".to_owned(),
+                        },
+                        AssistantPart::ToolCall(ToolCall {
+                            id: ToolCallId::from("call_123"),
+                            name: "read".into(),
+                            arguments: json!({"path": "docs/openrouter-compaction-design.md"}),
+                        }),
+                    ],
+                    stop_reason: None,
+                    usage: None,
+                    replay_meta: Default::default(),
+                }),
+                Message::Tool(ToolResultMessage {
+                    id: MessageId::from("tool_output_1"),
+                    call_id: ToolCallId::from("call_123"),
+                    content: ToolResult::Json {
+                        value: json!({"ok": true}),
+                    },
+                    error: None,
+                    created_at: Utc::now(),
+                }),
+            ],
+            tools: vec![ToolSpec {
+                name: "read".into(),
+                description: "Read a file".to_owned(),
+                input_schema: json!({"type": "object"}),
+                concurrency: ToolConcurrency::ReadOnly,
+                capabilities: ToolCapabilities::default(),
+                provider_aliases,
+            }],
+            instructions: "Summarize the session".to_owned(),
+        }
+    }
+
+    async fn spawn_retrying_stream_server(
+        request_times: Arc<tokio::sync::Mutex<Vec<Instant>>>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept socket");
+                read_http_request(&mut socket).await.expect("read request");
+                request_times.lock().await.push(Instant::now());
+                let body = if attempt == 0 {
+                    let warmup = json!({
+                        "type": "response.output_item.added",
+                        "sequence_number": 0,
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "id": "msg_retry",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": []
+                        }
+                    });
+                    let error = json!({
+                        "type": "error",
+                        "error": {
+                            "type": "tokens",
+                            "code": "rate_limit_exceeded",
+                            "message": "Rate limit reached for gpt-5.4 in organization org_test on tokens per min (TPM): Limit 500000, Used 414695, Requested 94256. Please try again in 0.02s. Visit https://platform.openai.com/account/rate-limits to learn more.",
+                            "param": null
+                        },
+                        "sequence_number": 1
+                    });
+                    format!("data: {warmup}\n\ndata: {error}\n\ndata: [DONE]\n\n")
+                } else {
+                    let created = json!({
+                        "type": "response.created",
+                        "sequence_number": 0,
+                        "response": {
+                            "id": "resp_success",
+                            "created_at": 0,
+                            "model": "gpt-5.4",
+                            "object": "response",
+                            "output": [],
+                            "status": "in_progress"
+                        }
+                    });
+                    let added = json!({
+                        "type": "response.output_item.added",
+                        "sequence_number": 1,
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "id": "msg_success",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": []
+                        }
+                    });
+                    let delta = json!({
+                        "type": "response.output_text.delta",
+                        "sequence_number": 2,
+                        "item_id": "msg_success",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "done"
+                    });
+                    let item_done = json!({
+                        "type": "response.output_item.done",
+                        "sequence_number": 3,
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "id": "msg_success",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "done",
+                                    "annotations": []
+                                }
+                            ]
+                        }
+                    });
+                    let completed = json!({
+                        "type": "response.completed",
+                        "sequence_number": 4,
+                        "response": {
+                            "id": "resp_success",
+                            "created_at": 0,
+                            "model": "gpt-5.4",
+                            "object": "response",
+                            "output": [],
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": 12,
+                                "input_tokens_details": {
+                                    "cached_tokens": 0
+                                },
+                                "output_tokens": 4,
+                                "output_tokens_details": {
+                                    "reasoning_tokens": 0
+                                },
+                                "total_tokens": 16
+                            }
+                        }
+                    });
+                    format!(
+                        "data: {created}\n\ndata: {added}\n\ndata: {delta}\n\ndata: {item_done}\n\ndata: {completed}\n\ndata: [DONE]\n\n"
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        format!("http://{address}")
     }
 }
 

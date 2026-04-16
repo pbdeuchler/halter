@@ -471,6 +471,7 @@ max_read_bytes = 99
         validate_runtime_requirements_with(&config, |name| {
             Some(OsString::from(match name {
                 "OPENAI_API_KEY" => "test-key",
+                "OPENROUTER_API_KEY" => "test-key",
                 _ => unreachable!("unexpected env var"),
             }))
         })

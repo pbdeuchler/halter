@@ -20,8 +20,12 @@ pub struct PolicySettings {
     pub max_concurrent_subagents: usize,
 }
 
-impl Default for PolicySettings {
-    fn default() -> Self {
+impl PolicySettings {
+    /// Permissive settings used only in tests. Production code must construct
+    /// `PolicySettings` from a user-supplied `PolicyConfig` via the builder so
+    /// policy behavior is never silently inherited from a hard-coded default.
+    #[must_use]
+    pub fn permissive() -> Self {
         Self {
             allowed_write_roots: vec![PathBuf::from("."), PathBuf::from("/tmp/halter")],
             max_read_bytes: 1_048_576,
@@ -412,7 +416,7 @@ mod tests {
     async fn check_shell_command_rejects_disallowed_program() {
         let policy = DefaultToolPolicy::new(PolicySettings {
             allowed_shell_commands: vec!["git".to_owned()],
-            ..PolicySettings::default()
+            ..PolicySettings::permissive()
         });
 
         let error = policy
@@ -431,7 +435,7 @@ mod tests {
     async fn check_shell_command_rejects_mixed_pipeline() {
         let policy = DefaultToolPolicy::new(PolicySettings {
             allowed_shell_commands: vec!["rg".to_owned()],
-            ..PolicySettings::default()
+            ..PolicySettings::permissive()
         });
 
         let error = policy
@@ -450,7 +454,7 @@ mod tests {
     async fn check_shell_command_allows_allowlisted_commands_and_pipelines() {
         let policy = DefaultToolPolicy::new(PolicySettings {
             allowed_shell_commands: vec!["git".to_owned(), "rg".to_owned()],
-            ..PolicySettings::default()
+            ..PolicySettings::permissive()
         });
 
         policy

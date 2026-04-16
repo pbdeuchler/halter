@@ -78,7 +78,7 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "python", "pwd", "cwd", "echo"]
+allow = ["git", "cargo", "rg", "ls", "find", "python", "pwd", "cwd", "echo", "gh"]
 timeout_secs = 30
 
 [sessions]

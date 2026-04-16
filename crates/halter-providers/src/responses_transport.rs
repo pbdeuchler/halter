@@ -14,6 +14,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::codec_common::provider_url;
 use crate::openai_error::{
     openai_api_error_retry_after, parse_openai_http_error, parse_openai_stream_error,
 };
@@ -214,10 +215,6 @@ impl ResponsesTransport {
     }
 }
 
-fn provider_url(base_url: &str, path: &str) -> String {
-    format!("{}{}", base_url.trim_end_matches('/'), path)
-}
-
 #[derive(Debug, Clone)]
 struct OpenAiStreamRateLimitObserver {
     limiter: OpenAiRateLimiter,
@@ -333,11 +330,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
     use crate::openai_rate_limit_policy::estimate_openai_request_cost;
+    use crate::test_http::read_http_request;
 
     #[tokio::test]
     async fn responses_stream_honors_openai_header_waits() {
@@ -429,40 +427,4 @@ mod tests {
         format!("http://{address}")
     }
 
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<()> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
-
-        loop {
-            let read = socket.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(headers_end) = find_headers_end(&buffer) {
-                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    })
-                    .unwrap_or(0);
-                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
-                if body_bytes >= content_length {
-                    return Ok(());
-                }
-            }
-        }
-
-        anyhow::bail!("incomplete http request")
-    }
-
-    fn find_headers_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n")
-    }
 }

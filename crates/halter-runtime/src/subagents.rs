@@ -728,8 +728,8 @@ mod tests {
     use futures::StreamExt;
     use futures::stream::{self, BoxStream};
     use halter_protocol::{
-        ApiKind, BlockId, Message, ModelId, ModelRole, ProviderCapabilities, ProviderError,
-        ProviderKind, ProviderName, ProviderRequest, ResolvedModel, StopReason, StreamEvent,
+        BlockId, Message, ModelId, ModelRole, ProviderCapabilities, ProviderError, ProviderKind,
+        ProviderName, ProviderRequest, ResolvedModel, StopReason, StreamEvent,
     };
     use halter_providers::{ModelRegistry, Provider};
     use halter_session::InMemorySessionStore;
@@ -869,7 +869,6 @@ mod tests {
             id: ModelId::from("default"),
             provider: ProviderName::from("fake"),
             provider_kind: ProviderKind::Fake,
-            api_kind: ApiKind::Fake,
             model: "default/model".to_owned(),
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
@@ -881,7 +880,6 @@ mod tests {
             id: ModelId::from("subagent"),
             provider: ProviderName::from("fake"),
             provider_kind: ProviderKind::Fake,
-            api_kind: ApiKind::Fake,
             model: "subagent/model".to_owned(),
             max_input_tokens: Some(32_000),
             max_output_tokens: Some(4_096),
@@ -903,7 +901,7 @@ mod tests {
             path_locks: Arc::new(PathLockMap::default()),
             tool_sessions: Arc::new(ToolSessionStore::default()),
             sessions: Arc::new(InMemorySessionStore::default()),
-            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default())),
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::permissive())),
             prompt_assembler: Arc::new(DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::default()),
             event_bus: Arc::new(EventBus::default()),

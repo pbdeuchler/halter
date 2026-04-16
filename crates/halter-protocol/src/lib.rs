@@ -19,8 +19,53 @@ pub type ReplaySignature = String;
 pub type ContentHash = String;
 pub type Timestamp = DateTime<Utc>;
 
-macro_rules! id_type {
+/// Declare a newtype around `String` with the standard trait impls used across
+/// the protocol: Debug/Clone/Eq/Ord/Hash/Serialize/Deserialize/JsonSchema plus
+/// `Display` and `From<&str>` / `From<String>`.
+///
+/// The plain form derives `Default` (empty string). The `uuid` form replaces
+/// the derived `Default` with one that generates a fresh UUID and exposes a
+/// `new()` constructor — use it for identifiers that must be unique per
+/// instance (session/turn/message ids).
+macro_rules! string_wrapper {
+    (@common $name:ident) => {
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_owned())
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+    };
     ($name:ident) => {
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Default,
+            Serialize,
+            Deserialize,
+            JsonSchema,
+        )]
+        pub struct $name(pub String);
+
+        string_wrapper!(@common $name);
+    };
+    ($name:ident, uuid) => {
         #[derive(
             Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
         )]
@@ -39,73 +84,20 @@ macro_rules! id_type {
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-
-        impl From<&str> for $name {
-            fn from(value: &str) -> Self {
-                Self(value.to_owned())
-            }
-        }
-
-        impl From<String> for $name {
-            fn from(value: String) -> Self {
-                Self(value)
-            }
-        }
+        string_wrapper!(@common $name);
     };
 }
 
-macro_rules! string_wrapper {
-    ($name:ident) => {
-        #[derive(
-            Debug,
-            Clone,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Hash,
-            Default,
-            Serialize,
-            Deserialize,
-            JsonSchema,
-        )]
-        pub struct $name(pub String);
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-
-        impl From<&str> for $name {
-            fn from(value: &str) -> Self {
-                Self(value.to_owned())
-            }
-        }
-
-        impl From<String> for $name {
-            fn from(value: String) -> Self {
-                Self(value)
-            }
-        }
-    };
-}
-
-id_type!(MessageId);
-id_type!(BlockId);
-id_type!(ToolCallId);
-id_type!(PromptId);
-id_type!(PromptSegmentId);
-id_type!(SessionId);
-id_type!(TurnId);
-id_type!(SkillId);
-id_type!(PluginId);
-id_type!(AgentId);
+string_wrapper!(MessageId, uuid);
+string_wrapper!(BlockId, uuid);
+string_wrapper!(ToolCallId, uuid);
+string_wrapper!(PromptId, uuid);
+string_wrapper!(PromptSegmentId, uuid);
+string_wrapper!(SessionId, uuid);
+string_wrapper!(TurnId, uuid);
+string_wrapper!(SkillId, uuid);
+string_wrapper!(PluginId, uuid);
+string_wrapper!(AgentId, uuid);
 
 string_wrapper!(Revision);
 string_wrapper!(ModelId);
@@ -169,12 +161,25 @@ pub enum ProviderKind {
     Fake,
 }
 
+impl ProviderKind {
+    /// The wire-format API family this provider speaks. Kept as a method rather
+    /// than a stored field on `ResolvedModel` so the provider and its API kind
+    /// cannot drift apart.
+    #[must_use]
+    pub const fn api_kind(self) -> ApiKind {
+        match self {
+            Self::Anthropic => ApiKind::AnthropicMessages,
+            Self::OpenAi | Self::OpenRouter => ApiKind::OpenAiResponses,
+            Self::Fake => ApiKind::Fake,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiKind {
     AnthropicMessages,
     OpenAiResponses,
-    OpenAiChat,
     Fake,
 }
 
@@ -976,6 +981,63 @@ impl Default for ProviderCapabilities {
     }
 }
 
+impl ProviderCapabilities {
+    /// Baseline capabilities for a given provider. Callers can override fields
+    /// when they need provider-variant behavior (e.g. a model that lacks
+    /// document support).
+    #[must_use]
+    pub fn for_provider(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::Anthropic => Self {
+                supports_tools: true,
+                supports_streaming: false,
+                supports_reasoning: true,
+                supports_interleaved_reasoning: false,
+                supports_images: true,
+                supports_documents: true,
+                supports_prompt_cache: false,
+                supports_compaction: false,
+                supports_tool_result_media: false,
+                requires_non_empty_assistant_content: true,
+                tool_call_id_policy: ToolCallIdPolicy::StableReplayNormalized,
+                max_input_tokens: 200_000,
+                max_output_tokens: 8_192,
+            },
+            ProviderKind::OpenAi => Self {
+                supports_tools: true,
+                supports_streaming: true,
+                supports_reasoning: true,
+                supports_interleaved_reasoning: false,
+                supports_images: true,
+                supports_documents: true,
+                supports_prompt_cache: true,
+                supports_compaction: true,
+                supports_tool_result_media: false,
+                requires_non_empty_assistant_content: false,
+                tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
+                max_input_tokens: 200_000,
+                max_output_tokens: 8_192,
+            },
+            ProviderKind::OpenRouter => Self {
+                supports_tools: true,
+                supports_streaming: true,
+                supports_reasoning: true,
+                supports_interleaved_reasoning: false,
+                supports_images: true,
+                supports_documents: false,
+                supports_prompt_cache: true,
+                supports_compaction: true,
+                supports_tool_result_media: false,
+                requires_non_empty_assistant_content: false,
+                tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
+                max_input_tokens: 200_000,
+                max_output_tokens: 8_192,
+            },
+            ProviderKind::Fake => Self::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallIdPolicy {
@@ -990,13 +1052,21 @@ pub struct ResolvedModel {
     pub id: ModelId,
     pub provider: ProviderName,
     pub provider_kind: ProviderKind,
-    pub api_kind: ApiKind,
     pub model: String,
     pub max_input_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning: Option<ReasoningEffort>,
     #[serde(default)]
     pub tokens_per_minute: Option<u64>,
+}
+
+impl ResolvedModel {
+    /// Convenience wrapper — the API kind is determined entirely by the
+    /// provider kind so callers never construct a mismatched pair.
+    #[must_use]
+    pub const fn api_kind(&self) -> ApiKind {
+        self.provider_kind.api_kind()
+    }
 }
 
 #[derive(

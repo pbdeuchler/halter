@@ -351,7 +351,6 @@ mod tests {
                     id: ModelId::from("default"),
                     provider: ProviderName::from("fake"),
                     provider_kind: ProviderKind::Fake,
-                    api_kind: halter_protocol::ApiKind::Fake,
                     model: "fake".to_owned(),
                     max_input_tokens: None,
                     max_output_tokens: None,

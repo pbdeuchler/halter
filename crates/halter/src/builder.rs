@@ -15,7 +15,7 @@ use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
     HookWarning, ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot,
 };
-use halter_providers::{AnthropicProvider, ModelRegistry, OpenAiProvider, OpenRouterProvider};
+use halter_providers::{AnthropicProvider, ModelRegistry, ResponsesProvider};
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
     RuntimeServices, SessionInit, SessionRuntime,
@@ -347,7 +347,6 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         id: ModelId::from(DEFAULT_MODEL_ID),
         provider: ProviderName::from(default_config.provider.to_string()),
         provider_kind: default_config.provider.provider_kind(),
-        api_kind: default_config.provider.api_kind(),
         model: default_config.model.clone(),
         max_input_tokens: default_config.max_input_tokens,
         max_output_tokens: default_config.max_output_tokens,
@@ -359,7 +358,6 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         id: ModelId::from(SMALL_MODEL_ID),
         provider: ProviderName::from(small_config.provider.to_string()),
         provider_kind: small_config.provider.provider_kind(),
-        api_kind: small_config.provider.api_kind(),
         model: small_config.model.clone(),
         max_input_tokens: small_config.max_input_tokens,
         max_output_tokens: small_config.max_output_tokens,
@@ -371,7 +369,6 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         id: ModelId::from(SUBAGENT_MODEL_ID),
         provider: ProviderName::from(subagent_config.provider.to_string()),
         provider_kind: subagent_config.provider.provider_kind(),
-        api_kind: subagent_config.provider.api_kind(),
         model: subagent_config.model.clone(),
         max_input_tokens: subagent_config.max_input_tokens,
         max_output_tokens: subagent_config.max_output_tokens,
@@ -421,11 +418,11 @@ fn build_provider(
             provider.api_key.clone(),
             provider.base_url.clone(),
         )),
-        ConfiguredProvider::OpenAi => Arc::new(OpenAiProvider::new(
+        ConfiguredProvider::OpenAi => Arc::new(ResponsesProvider::openai(
             provider.api_key.clone(),
             provider.base_url.clone(),
         )),
-        ConfiguredProvider::OpenRouter => Arc::new(OpenRouterProvider::new(
+        ConfiguredProvider::OpenRouter => Arc::new(ResponsesProvider::openrouter(
             provider.api_key.clone(),
             provider.base_url.clone(),
         )),

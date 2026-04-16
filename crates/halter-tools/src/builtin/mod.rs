@@ -131,7 +131,7 @@ mod tests {
         register_builtin_tools(&runtime, &[]);
         let policy: Arc<dyn ToolPolicy> = Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_write_roots: vec![temp.path().to_path_buf()],
-            ..PolicySettings::default()
+            ..PolicySettings::permissive()
         }));
         let context = tool_context(temp.path(), policy);
 
@@ -172,7 +172,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let policy: Arc<dyn ToolPolicy> = Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_write_roots: vec![temp.path().join("allowed")],
-            ..PolicySettings::default()
+            ..PolicySettings::permissive()
         }));
         let context = tool_context(temp.path(), policy);
 
@@ -191,7 +191,7 @@ mod tests {
         std::fs::write(temp.path().join("ignored.txt"), "ignored").expect("write ignored file");
         std::fs::write(temp.path().join("visible.txt"), "visible").expect("write visible file");
         let policy: Arc<dyn ToolPolicy> =
-            Arc::new(DefaultToolPolicy::new(PolicySettings::default()));
+            Arc::new(DefaultToolPolicy::new(PolicySettings::permissive()));
         let context = tool_context(temp.path(), policy);
 
         let result = GlobTool
@@ -218,7 +218,7 @@ mod tests {
         std::fs::write(temp.path().join("main.rs"), "needle\nneedle\n").expect("write rust file");
         std::fs::write(temp.path().join("notes.txt"), "needle\n").expect("write text file");
         let policy: Arc<dyn ToolPolicy> =
-            Arc::new(DefaultToolPolicy::new(PolicySettings::default()));
+            Arc::new(DefaultToolPolicy::new(PolicySettings::permissive()));
         let context = tool_context(temp.path(), policy);
 
         let result = GrepTool
@@ -250,7 +250,7 @@ mod tests {
         std::fs::write(temp.path().join("text.txt"), "needle\n").expect("write text file");
         std::fs::write(temp.path().join("binary.bin"), b"needle\0suffix").expect("write binary");
         let policy: Arc<dyn ToolPolicy> =
-            Arc::new(DefaultToolPolicy::new(PolicySettings::default()));
+            Arc::new(DefaultToolPolicy::new(PolicySettings::permissive()));
         let context = tool_context(temp.path(), policy);
 
         let result = GrepTool
@@ -277,7 +277,7 @@ mod tests {
         )
         .expect("write");
         let policy: Arc<dyn ToolPolicy> =
-            Arc::new(DefaultToolPolicy::new(PolicySettings::default()));
+            Arc::new(DefaultToolPolicy::new(PolicySettings::permissive()));
         let context = tool_context(temp.path(), policy);
 
         let result = GrepTool
@@ -310,7 +310,7 @@ mod tests {
         std::fs::write(temp.path().join("ignored.txt"), "needle\n").expect("write ignored");
         std::fs::write(temp.path().join("visible.txt"), "needle\n").expect("write visible");
         let policy: Arc<dyn ToolPolicy> =
-            Arc::new(DefaultToolPolicy::new(PolicySettings::default()));
+            Arc::new(DefaultToolPolicy::new(PolicySettings::permissive()));
         let context = tool_context(temp.path(), policy);
 
         let result = GrepTool

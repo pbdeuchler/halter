@@ -5,15 +5,15 @@ mod anthropic_codec;
 mod codec_common;
 mod fake;
 mod http_client;
-mod openai;
 mod openai_codec;
 mod openai_error;
 mod openai_rate_limit;
 mod openai_rate_limit_policy;
-mod openrouter;
 mod registry;
 mod responses_provider;
 mod responses_transport;
+#[cfg(test)]
+mod test_http;
 mod unsupported;
 
 use async_trait::async_trait;
@@ -26,9 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 pub use anthropic::AnthropicProvider;
 pub use fake::FakeProvider;
-pub use openai::OpenAiProvider;
-pub use openrouter::OpenRouterProvider;
 pub use registry::ModelRegistry;
+pub use responses_provider::ResponsesProvider;
 pub use unsupported::UnsupportedProvider;
 
 #[async_trait]

@@ -424,7 +424,7 @@ mod tests {
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
-            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::permissive()))
                 as Arc<dyn ToolPolicy>,
             max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
@@ -487,7 +487,7 @@ mod tests {
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
-            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::permissive()))
                 as Arc<dyn ToolPolicy>,
             max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
@@ -519,7 +519,7 @@ mod tests {
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
-            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::permissive()))
                 as Arc<dyn ToolPolicy>,
             max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
@@ -572,7 +572,7 @@ mod tests {
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
-            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::permissive()))
                 as Arc<dyn ToolPolicy>,
             max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
