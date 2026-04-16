@@ -4,15 +4,26 @@
 
 version = 1
 
+# [models.default]
+# provider = "openai"
+# model = "gpt-5.4"
+# reasoning = "xhigh"
+# tokens_per_minute = 500_000  # Default: 500,000. Proactive token budget for rate limiting.
+
+# [models.subagent]
+# provider = "openai"
+# model = "gpt-5.4-mini"
+# reasoning = "medium"
+
 [models.default]
-provider = "openai"
-model = "gpt-5.4"
+provider = "openrouter"
+model = "z-ai/glm-5.1"
 reasoning = "xhigh"
 # tokens_per_minute = 500_000  # Default: 500,000. Proactive token budget for rate limiting.
 
 [models.subagent]
 provider = "openai"
-model = "gpt-5.4-mini"
+model = "moonshotai/kimi-k2.5"
 reasoning = "medium"
 
 # [providers.openai]

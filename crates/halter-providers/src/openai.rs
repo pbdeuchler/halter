@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Provider;
 use crate::responses_provider::{
-    ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
+    CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
 use crate::responses_transport::ResponsesRateLimitStrategy;
 
@@ -75,6 +75,7 @@ fn config() -> ResponsesProviderConfig {
             include_encrypted_reasoning: true,
             reasoning_summary: Some("auto"),
         },
+        compact_strategy: Some(CompactStrategy::DedicatedEndpoint),
         rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
     }
 }

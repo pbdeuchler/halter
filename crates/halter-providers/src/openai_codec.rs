@@ -21,6 +21,7 @@ use crate::codec_common::{
 };
 
 const RESPONSES_ITEM_ID_MAX_LEN: usize = 64;
+const COMPACTED_CONTEXT_PREFIX: &str = "[Compacted context]\n\n";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponsesRequestOptions<'a> {
@@ -110,6 +111,24 @@ pub(crate) fn encode_responses_compact_request(
     }))
 }
 
+pub(crate) fn encode_openrouter_compact_request(
+    request: &ProviderCompactionRequest,
+) -> anyhow::Result<Value> {
+    if request.model.api_kind != ApiKind::OpenAiResponses {
+        anyhow::bail!("failed to encode openrouter compaction request: unsupported api kind");
+    }
+
+    let input = encode_responses_compact_input(request)?;
+    validate_responses_input_item_ids(&input)?;
+    Ok(json!({
+        "model": request.model.model.clone(),
+        "input": input,
+        "instructions": request.instructions.clone(),
+        "stream": false,
+        "store": false,
+    }))
+}
+
 pub(crate) fn decode_responses_compact_response(
     response: &Value,
 ) -> anyhow::Result<ProviderCompactionResponse> {
@@ -120,6 +139,30 @@ pub(crate) fn decode_responses_compact_response(
         .ok_or_else(|| {
             anyhow::anyhow!("failed to decode openai compaction response: missing output array")
         })?;
+
+    Ok(ProviderCompactionResponse {
+        output,
+        usage: decode_openai_usage(response),
+    })
+}
+
+pub(crate) fn decode_openrouter_compact_response(
+    response: &Value,
+) -> anyhow::Result<ProviderCompactionResponse> {
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to decode openrouter compaction response: missing output array")
+        })?;
+    let compacted_text = openrouter_compaction_output_text(output);
+    let output = if compacted_text.is_empty() {
+        Vec::new()
+    } else {
+        vec![encode_responses_developer_message(&format!(
+            "{COMPACTED_CONTEXT_PREFIX}{compacted_text}"
+        ))]
+    };
 
     Ok(ProviderCompactionResponse {
         output,
@@ -1445,6 +1488,38 @@ fn reasoning_item_text(item: &ReasoningItem) -> String {
         .join("\n")
 }
 
+fn openrouter_compaction_output_text(output: &[Value]) -> String {
+    output
+        .iter()
+        .filter_map(openrouter_compaction_message_text)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn openrouter_compaction_message_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+
+    let text = item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(openrouter_compaction_content_text)
+        .collect::<Vec<_>>()
+        .join("");
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn openrouter_compaction_content_text(content: &Value) -> Option<&str> {
+    content
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| content.get("output_text").and_then(Value::as_str))
+}
+
 fn output_message_text(message: &OutputMessage) -> String {
     message
         .content
@@ -1624,6 +1699,107 @@ mod tests {
                 && item["id"] == "fc_output_call_123"
                 && item["call_id"] == "call_123"
         }));
+    }
+
+    #[test]
+    fn openrouter_compaction_request_uses_responses_shape() {
+        let request = sample_compaction_request(ProviderKind::OpenRouter);
+        let body = encode_openrouter_compact_request(&request).expect("encode compaction request");
+        let input = body["input"].as_array().expect("input");
+
+        assert_eq!(body["model"], "gpt-5");
+        assert_eq!(body["instructions"], "Summarize the session");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["store"], false);
+        assert!(input.iter().any(|item| item["role"] == "developer"));
+        assert!(input.iter().any(|item| item["role"] == "user"));
+        assert!(input.iter().any(|item| item["type"] == "function_call"));
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+        );
+    }
+
+    #[test]
+    fn openrouter_compaction_response_wraps_summary_in_developer_message() {
+        let response = json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"text": "ignore reasoning"}]
+                },
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "## User Intent"
+                        },
+                        {
+                            "type": "output_text",
+                            "text": "\n- finish the fix"
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "## Completed Work"
+                        }
+                    ]
+                }
+            ],
+            "usage": {
+                "input_tokens": 17,
+                "output_tokens": 9,
+                "input_tokens_details": {
+                    "cache_creation_tokens": 0,
+                    "cached_tokens": 0
+                }
+            }
+        });
+
+        let decoded =
+            decode_openrouter_compact_response(&response).expect("decode compaction response");
+
+        assert_eq!(decoded.usage.input_tokens, 17);
+        assert_eq!(decoded.usage.output_tokens, 9);
+        assert_eq!(
+            decoded.output,
+            vec![json!({
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "[Compacted context]\n\n## User Intent\n- finish the fix\n\n## Completed Work"
+                    }
+                ],
+            })]
+        );
+    }
+
+    #[test]
+    fn openrouter_compaction_response_returns_empty_output_for_empty_text() {
+        let response = json!({
+            "output": [
+                { "type": "reasoning", "summary": [{"text": "ignore"}] },
+                { "type": "function_call", "name": "read" }
+            ],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 0
+            }
+        });
+
+        let decoded =
+            decode_openrouter_compact_response(&response).expect("decode compaction response");
+
+        assert!(decoded.output.is_empty());
+        assert_eq!(decoded.usage.input_tokens, 1);
     }
 
     #[test]
@@ -2352,6 +2528,27 @@ mod tests {
             }],
             previous_response_id: None,
             new_messages_start: 0,
+        }
+    }
+
+    fn sample_compaction_request(provider_kind: ProviderKind) -> ProviderCompactionRequest {
+        let request = sample_request(ApiKind::OpenAiResponses, provider_kind);
+        ProviderCompactionRequest {
+            session_id: request.session_id,
+            model: request.model,
+            compacted_prefix: vec![json!({
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "[Compacted context]\n\nEarlier summary"
+                    }
+                ],
+            })],
+            messages: request.messages,
+            tools: request.tools,
+            instructions: "Summarize the session".to_owned(),
         }
     }
 }

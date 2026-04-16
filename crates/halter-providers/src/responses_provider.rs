@@ -19,6 +19,12 @@ use crate::responses_transport::{
     ResponsesRateLimitStrategy, ResponsesTransport, ResponsesTransportRequest,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactStrategy {
+    DedicatedEndpoint,
+    InlineResponses,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponsesProviderRequestConfig {
     pub store: Option<bool>,
@@ -32,6 +38,7 @@ pub(crate) struct ResponsesProviderConfig {
     pub label: &'static str,
     pub capabilities: ProviderCapabilities,
     pub request: ResponsesProviderRequestConfig,
+    pub compact_strategy: Option<CompactStrategy>,
     pub rate_limit_strategy: Option<ResponsesRateLimitStrategy>,
 }
 
@@ -56,7 +63,9 @@ impl ResponsesProvider {
 
     #[must_use]
     pub(crate) fn capabilities(&self) -> ProviderCapabilities {
-        self.config.capabilities.clone()
+        let mut capabilities = self.config.capabilities.clone();
+        capabilities.supports_compaction = self.config.compact_strategy.is_some();
+        capabilities
     }
 
     pub(crate) async fn stream(
@@ -227,26 +236,73 @@ impl ResponsesProvider {
             "starting responses compaction request"
         );
 
-        let request_body = openai_codec::encode_responses_compact_request(&request)?;
+        match self.config.compact_strategy {
+            Some(CompactStrategy::DedicatedEndpoint) => {
+                self.compact_via_endpoint(&request, cancel).await
+            }
+            Some(CompactStrategy::InlineResponses) => {
+                self.compact_via_responses(&request, cancel).await
+            }
+            None => anyhow::bail!(
+                "failed to compact session: {} provider does not support compaction",
+                self.config.label
+            ),
+        }
+    }
+}
+
+impl ResponsesProvider {
+    async fn compact_via_endpoint(
+        &self,
+        request: &ProviderCompactionRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<ProviderCompactionResponse> {
+        let request_body = openai_codec::encode_responses_compact_request(request)?;
         let request_bytes = request_body.to_string().len();
         let response = self
             .transport
             .responses_compact(
                 request_body,
-                ResponsesTransportRequest {
-                    provider_label: self.config.label,
-                    model: request.model.model.clone(),
-                    reservation: estimate_openai_request_cost(
-                        request_bytes,
-                        request.model.max_output_tokens,
-                    ),
-                    rate_limit_strategy: self.config.rate_limit_strategy,
-                    tokens_per_minute: request.model.tokens_per_minute,
-                },
+                self.compaction_transport_request(request, request_bytes),
                 cancel,
             )
             .await?;
         openai_codec::decode_responses_compact_response(&response)
+    }
+
+    async fn compact_via_responses(
+        &self,
+        request: &ProviderCompactionRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<ProviderCompactionResponse> {
+        let request_body = openai_codec::encode_openrouter_compact_request(request)?;
+        let request_bytes = request_body.to_string().len();
+        let response = self
+            .transport
+            .responses_json(
+                request_body,
+                self.compaction_transport_request(request, request_bytes),
+                cancel,
+            )
+            .await?;
+        openai_codec::decode_openrouter_compact_response(&response)
+    }
+
+    fn compaction_transport_request(
+        &self,
+        request: &ProviderCompactionRequest,
+        request_bytes: usize,
+    ) -> ResponsesTransportRequest {
+        ResponsesTransportRequest {
+            provider_label: self.config.label,
+            model: request.model.model.clone(),
+            reservation: estimate_openai_request_cost(
+                request_bytes,
+                request.model.max_output_tokens,
+            ),
+            rate_limit_strategy: self.config.rate_limit_strategy,
+            tokens_per_minute: request.model.tokens_per_minute,
+        }
     }
 }
 
@@ -270,11 +326,77 @@ fn validate_responses_compaction_request(
             "failed to compact session: {label} provider requires openai_responses api kind"
         );
     }
-    if !config.capabilities.supports_compaction {
+    if config.compact_strategy.is_none() {
         anyhow::bail!("failed to compact session: {label} provider does not support compaction");
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use halter_protocol::{
+        ModelId, ModelRole, ProviderKind, ProviderName, ResolvedModel, SessionId,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn responses_provider_without_compaction_strategy_rejects_compaction() {
+        let provider = ResponsesProvider::new(
+            ResponsesProviderConfig {
+                label: "responses-test",
+                capabilities: ProviderCapabilities {
+                    supports_compaction: true,
+                    ..ProviderCapabilities::default()
+                },
+                request: ResponsesProviderRequestConfig {
+                    store: None,
+                    include_prompt_cache_key: false,
+                    include_encrypted_reasoning: false,
+                    reasoning_summary: None,
+                },
+                compact_strategy: None,
+                rate_limit_strategy: None,
+            },
+            "test-key",
+            "http://127.0.0.1:1",
+        );
+
+        let error = provider
+            .compact(sample_compaction_request(), CancellationToken::new())
+            .await
+            .expect_err("compaction should fail without a strategy");
+
+        assert!(
+            error
+                .to_string()
+                .contains("responses-test provider does not support compaction")
+        );
+        assert!(!provider.capabilities().supports_compaction);
+    }
+
+    fn sample_compaction_request() -> ProviderCompactionRequest {
+        ProviderCompactionRequest {
+            session_id: SessionId::new(),
+            model: ResolvedModel {
+                role: ModelRole::default(),
+                id: ModelId::from("default"),
+                provider: ProviderName::from("responses-test"),
+                provider_kind: ProviderKind::OpenAi,
+                api_kind: ApiKind::OpenAiResponses,
+                model: "gpt-5".to_owned(),
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(8_192),
+                reasoning: None,
+                tokens_per_minute: None,
+            },
+            compacted_prefix: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            instructions: "Summarize".to_owned(),
+        }
+    }
 }
 
 fn provider_error_from_stream_error(error: OpenAIError) -> ProviderError {

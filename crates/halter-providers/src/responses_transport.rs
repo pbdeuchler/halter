@@ -124,6 +124,23 @@ impl ResponsesTransport {
         ))
     }
 
+    pub(crate) async fn responses_json(
+        &self,
+        request: Value,
+        request_meta: ResponsesTransportRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Value> {
+        let provider_label = request_meta.provider_label;
+        let response = self
+            .send_json_request(RESPONSES_PATH, request, request_meta, cancel.child_token())
+            .await?;
+        select! {
+            _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),
+            result = response.json::<Value>() => result,
+        }
+        .map_err(|error| anyhow::anyhow!("failed to decode {} response: {error}", provider_label))
+    }
+
     async fn send_json_request(
         &self,
         path: &str,
