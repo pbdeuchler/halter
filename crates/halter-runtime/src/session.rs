@@ -3216,6 +3216,312 @@ mod tests {
         }
     }
 
+    /// Provider whose error is flagged retryable. Used to verify the
+    /// runtime preserves the `retryable` bit on `TurnFailed`.
+    #[derive(Debug)]
+    struct RetryableFailingProvider;
+
+    #[async_trait]
+    impl Provider for RetryableFailingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            Ok(stream::iter(vec![Err(ProviderError::new(
+                "rate limited",
+                true,
+            ))])
+            .boxed())
+        }
+    }
+
+    /// Provider that emits MessageStart and then blocks on its child
+    /// cancel token. Models a long-running provider that responds to
+    /// cancellation cooperatively — used for shutdown-drain tests.
+    #[derive(Debug)]
+    struct CancellableBlockingProvider {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for CancellableBlockingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            let started = self.started.clone();
+            let s = futures::stream::unfold(
+                Some((cancel, started, false)),
+                |state| async move {
+                    let (cancel, started, emitted) = state?;
+                    if !emitted {
+                        started.notify_one();
+                        return Some((
+                            Ok(StreamEvent::MessageStart {
+                                id: halter_protocol::MessageId::new(),
+                            }),
+                            Some((cancel, started, true)),
+                        ));
+                    }
+                    cancel.cancelled().await;
+                    Some((
+                        Err(ProviderError::new("cancelled", false)),
+                        None,
+                    ))
+                },
+            );
+            Ok(s.boxed())
+        }
+    }
+
+    /// Provider that emits MessageStart and then sleeps forever, ignoring
+    /// the cancel token. Used to verify the shutdown drain deadline aborts
+    /// uncooperative provider streams.
+    #[derive(Debug)]
+    struct UncancellableBlockingProvider {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for UncancellableBlockingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            let started = self.started.clone();
+            let s = futures::stream::unfold(Some(started), |state| async move {
+                let started = state?;
+                started.notify_one();
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Some((
+                    Ok(StreamEvent::MessageStart {
+                        id: halter_protocol::MessageId::new(),
+                    }),
+                    None,
+                ))
+            });
+            Ok(s.boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_failed_carries_retryable_flag_from_provider_error() {
+        // AC2.5: when a provider error is flagged retryable, TurnFailed
+        // surfaces that flag rather than silently dropping it.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services =
+            configured_services(Arc::new(RetryableFailingProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("retryable failure"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let live_failure = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { retryable, .. } => Some(*retryable),
+                _ => None,
+            })
+            .expect("TurnFailed in live stream");
+        assert!(live_failure, "live TurnFailed must preserve retryable=true");
+
+        let replay = services
+            .sessions
+            .replay(session.session_id())
+            .await
+            .expect("replay");
+        let persisted = replay
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { retryable, .. } => Some(*retryable),
+                _ => None,
+            })
+            .expect("TurnFailed in persisted store");
+        assert!(persisted, "persisted TurnFailed must preserve retryable=true");
+    }
+
+    #[tokio::test]
+    async fn turn_failed_non_retryable_default_path() {
+        // AC2.5 negative: a provider error with retryable=false stays
+        // false — guards against a misguided "default to true" patch.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FailingProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("non-retryable failure"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let retryable = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { retryable, .. } => Some(*retryable),
+                _ => None,
+            })
+            .expect("TurnFailed payload");
+        assert!(!retryable);
+    }
+
+    #[tokio::test]
+    async fn turn_failed_carries_originating_turn_id() {
+        // AC2.4: the TurnId on the streamed and persisted TurnFailed must
+        // match the TurnId of the submitted Turn.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FailingProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let turn = Turn::user("track id");
+        let expected_id = turn.id.clone();
+        let events = session
+            .submit_turn(turn)
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let live_id = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            })
+            .expect("TurnFailed in stream");
+        assert_eq!(live_id, expected_id, "stream turn_id must match submission");
+
+        let replay = services
+            .sessions
+            .replay(session.session_id())
+            .await
+            .expect("replay");
+        let persisted_id = replay
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            })
+            .expect("TurnFailed in store");
+        assert_eq!(
+            persisted_id, expected_id,
+            "persisted turn_id must match submission"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_cooperative_in_flight_turn() {
+        // AC2.3: shutdown cancels the provider stream's child token,
+        // the provider exits, the spawned turn task settles, and the
+        // drain reports completion within the deadline.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Arc::new(Notify::new());
+        let services = configured_services(
+            Arc::new(CancellableBlockingProvider {
+                started: started.clone(),
+            }),
+            temp.path(),
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let _stream = session
+            .submit_turn(Turn::user("blocking turn"))
+            .await
+            .expect("submit turn");
+
+        // Wait for the provider stream to actually start before signaling
+        // shutdown — otherwise we race the spawn and never observe the
+        // cooperative-cancellation path.
+        started.notified().await;
+
+        assert_eq!(services.turn_registry.in_flight_count(), 1);
+
+        let report = runtime.shutdown(Duration::from_secs(2)).await;
+        assert!(!report.timed_out, "cooperative drain must not time out");
+        assert_eq!(report.turns_drained, 1);
+        assert_eq!(report.turns_aborted, 0);
+        assert!(services.turn_registry.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_uncooperative_turn_after_deadline() {
+        // AC2.8: a turn whose provider stream ignores cancellation must
+        // still be aborted by the drain deadline rather than blocking
+        // shutdown forever.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Arc::new(Notify::new());
+        let services = configured_services(
+            Arc::new(UncancellableBlockingProvider {
+                started: started.clone(),
+            }),
+            temp.path(),
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let _stream = session
+            .submit_turn(Turn::user("stuck turn"))
+            .await
+            .expect("submit turn");
+        started.notified().await;
+
+        let report = runtime.shutdown(Duration::from_millis(100)).await;
+        assert!(report.timed_out, "uncooperative drain must time out");
+        assert!(
+            report.turns_aborted >= 1,
+            "at least one task must be aborted, got {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_turn_after_shutdown_is_rejected() {
+        // AC2.3 follow-on: the upfront shutdown check refuses to spawn
+        // new turns once the registry is shutting down so callers fail
+        // fast instead of seeing aborted-turn semantics.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let _ = runtime.shutdown(Duration::from_millis(0)).await;
+
+        let err = match session.submit_turn(Turn::user("late submission")).await {
+            Ok(_) => panic!("must reject post-shutdown submission"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("runtime is shutting down"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[derive(Debug)]
     struct RecordingProvider {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
