@@ -459,10 +459,15 @@ impl SessionHandle {
                     }
                 },
                 Err(error) => {
+                    let retryable = error
+                        .downcast_ref::<ProviderError>()
+                        .map(|provider_error| provider_error.retryable)
+                        .unwrap_or(false);
                     error!(
                         session_id = %session.session_id,
                         turn_id = %turn.id,
                         error = %error,
+                        retryable,
                         "turn failed before commit"
                     );
                     let turn_snapshot = session.services.resources.snapshot();
@@ -478,6 +483,7 @@ impl SessionHandle {
                             SessionEventPayload::TurnFailed {
                                 turn_id: turn.id.clone(),
                                 error: error.to_string(),
+                                retryable,
                             },
                         ),
                     ];
@@ -1523,7 +1529,7 @@ pub(crate) async fn materialize_assistant_message(
             }
             Ok(StreamEvent::Error { error }) | Err(error) => {
                 error!(provider = %model.provider, error = %error.message, "provider stream failed");
-                anyhow::bail!(error.message);
+                return Err(anyhow::Error::new(error));
             }
         }
     }

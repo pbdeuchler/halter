@@ -656,6 +656,11 @@ pub enum SessionEventPayload {
     TurnFailed {
         turn_id: TurnId,
         error: String,
+        /// Whether the underlying provider error advertised itself as
+        /// retryable. Defaults to `false` so historical replays without this
+        /// field deserialize cleanly.
+        #[serde(default)]
+        retryable: bool,
     },
     Lagged {
         dropped_events: u64,
