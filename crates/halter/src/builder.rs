@@ -460,6 +460,12 @@ where
 }
 
 fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
+    // Fields introduced by the capability-oriented policy redesign
+    // (`allowed_read_roots`, `sensitive_path_patterns`, `shell_mode`,
+    // `allowed_loopback_services`, `process_tree_root`) do not yet have
+    // `PolicyConfig` counterparts and take their defaults from
+    // `PolicySettings::default()`. Surfacing them into user config is
+    // tracked under Phase 2 of the review remediation.
     PolicySettings {
         allowed_write_roots: config.allowed_write_roots.clone(),
         max_read_bytes: config.max_read_bytes,
@@ -471,6 +477,7 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
         allowed_hosts: config.network.allowed_hosts.clone(),
         max_subagent_depth: config.max_subagent_depth,
         max_concurrent_subagents: config.max_concurrent_subagents,
+        ..PolicySettings::default()
     }
 }
 
