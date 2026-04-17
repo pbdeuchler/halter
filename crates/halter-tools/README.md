@@ -139,16 +139,32 @@ This struct defines the default policy envelope.
 Defaults:
 
 - `allowed_write_roots = [".", "/tmp/halter"]`
+- `allowed_read_roots = [".", $TMPDIR | "/tmp"]`
+- `sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.env", "**/.env.*", "/etc/shadow", "/etc/shadow.*"]`
 - `max_read_bytes = 1_048_576`
 - `max_tool_output_bytes = 262_144`
 - shell enabled = `true`
+- `shell_mode = Strict` (rejects `eval`, `exec`, `source`, `.`, and function definitions at the AST level)
 - shell allowlist = `git`, `cargo`, `rg`, `ls`, `find`
 - shell timeout = `30`
 - network enabled = `false`
+- `allowed_loopback_services = []` (loopback addresses require an explicit entry to be reached)
+- `process_tree_root = None` (Phase 2 threads the live session's root)
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
 
 This is the main security and operability boundary for tool use.
+
+`ToolPolicy` is being migrated from the older name-based surface
+(`check_read`, `check_write`, `check_shell`, `check_shell_command`,
+`check_subagent_spawn`) to a capability-oriented surface
+(`check_read_path`, `check_write_path`, `check_process_signal`,
+`check_shell_enabled`, `check_shell_command_strict`, `check_network`,
+`check_subagent_spawn_typed`) that returns `PolicyError` and binds
+resolved paths to a parent-directory fd via `CanonicalPath`. The old
+methods are retained as `#[deprecated]` shims and will be removed once
+every builtin call site has migrated (tracked under
+`docs/plans/2026-04-17-review-remediation-roadmap.md`).
 
 ### Why policy lives here
 
