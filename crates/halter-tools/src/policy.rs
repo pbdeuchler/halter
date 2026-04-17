@@ -117,8 +117,7 @@ fn default_sensitive_patterns() -> Vec<String> {
     vec![
         "**/.ssh/**".to_owned(),
         "**/.aws/**".to_owned(),
-        "**/.env".to_owned(),
-        "**/.env.*".to_owned(),
+        "**/.secrets".to_owned(),
         "/etc/shadow".to_owned(),
         "/etc/shadow.*".to_owned(),
     ]
@@ -246,10 +245,12 @@ impl DefaultToolPolicy {
             })?;
             builder.add(glob);
         }
-        builder.build().map_err(|_| PolicyError::SensitivePathDenied {
-            attempted: PathBuf::new(),
-            rule: "invalid_pattern_set",
-        })
+        builder
+            .build()
+            .map_err(|_| PolicyError::SensitivePathDenied {
+                attempted: PathBuf::new(),
+                rule: "invalid_pattern_set",
+            })
     }
 
     fn canonical_read_roots(&self) -> Result<Vec<PathBuf>, PolicyError> {
@@ -260,10 +261,7 @@ impl DefaultToolPolicy {
         canonicalize_root_list(&self.settings.allowed_write_roots)
     }
 
-    fn verify_under_any_root(
-        candidate: &Path,
-        roots: &[PathBuf],
-    ) -> Result<(), PolicyError> {
+    fn verify_under_any_root(candidate: &Path, roots: &[PathBuf]) -> Result<(), PolicyError> {
         if roots.iter().any(|root| candidate.starts_with(root)) {
             Ok(())
         } else {
@@ -481,20 +479,10 @@ impl ToolPolicy for DefaultToolPolicy {
 }
 
 impl DefaultToolPolicy {
-    fn allow_loopback(
-        &self,
-        url: &str,
-        host: &str,
-        port: Option<u16>,
-    ) -> Result<(), PolicyError> {
-        let matches = self
-            .settings
-            .allowed_loopback_services
-            .iter()
-            .any(|entry| {
-                entry.host.eq_ignore_ascii_case(host)
-                    && (entry.port.is_none() || entry.port == port)
-            });
+    fn allow_loopback(&self, url: &str, host: &str, port: Option<u16>) -> Result<(), PolicyError> {
+        let matches = self.settings.allowed_loopback_services.iter().any(|entry| {
+            entry.host.eq_ignore_ascii_case(host) && (entry.port.is_none() || entry.port == port)
+        });
         if matches {
             Ok(())
         } else {
@@ -516,11 +504,10 @@ fn canonicalize_root_list(roots: &[PathBuf]) -> Result<Vec<PathBuf>, PolicyError
     let mut out = Vec::with_capacity(roots.len());
     for root in roots {
         let absolute = absolute_path_typed(root)?;
-        let canonical = std::fs::canonicalize(&absolute).map_err(|_| {
-            PolicyError::NonexistentRoot {
+        let canonical =
+            std::fs::canonicalize(&absolute).map_err(|_| PolicyError::NonexistentRoot {
                 root: absolute.clone(),
-            }
-        })?;
+            })?;
         out.push(canonical);
     }
     Ok(out)
@@ -530,8 +517,7 @@ fn absolute_path_typed(path: &Path) -> Result<PathBuf, PolicyError> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
     } else {
-        let cwd = std::env::current_dir()
-            .map_err(|e| PolicyError::io(path.to_path_buf(), e))?;
+        let cwd = std::env::current_dir().map_err(|e| PolicyError::io(path.to_path_buf(), e))?;
         Ok(cwd.join(path))
     }
 }
@@ -551,17 +537,19 @@ fn reject_parent_traversal_typed(path: &Path) -> Result<(), PolicyError> {
 fn resolve_write_target_typed(absolute: &Path) -> Result<CanonicalPath, PolicyError> {
     let mut existing = absolute;
     while !existing.exists() {
-        existing = existing.parent().ok_or_else(|| PolicyError::ParentTraversal {
-            attempted: absolute.to_path_buf(),
-        })?;
+        existing = existing
+            .parent()
+            .ok_or_else(|| PolicyError::ParentTraversal {
+                attempted: absolute.to_path_buf(),
+            })?;
     }
     if existing == absolute {
         return CanonicalPath::for_existing(absolute);
     }
     // The leaf (or intermediate dirs) don't yet exist. Canonicalize the
     // closest existing ancestor and rejoin the non-existent suffix.
-    let canonical_ancestor = std::fs::canonicalize(existing)
-        .map_err(|e| PolicyError::io(existing.to_path_buf(), e))?;
+    let canonical_ancestor =
+        std::fs::canonicalize(existing).map_err(|e| PolicyError::io(existing.to_path_buf(), e))?;
     let suffix = absolute
         .strip_prefix(existing)
         .expect("existing ancestor must prefix absolute path");
