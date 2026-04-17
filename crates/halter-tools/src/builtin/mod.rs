@@ -170,8 +170,10 @@ mod tests {
     #[tokio::test]
     async fn write_tool_respects_policy_denials() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let allowed = temp.path().join("allowed");
+        std::fs::create_dir(&allowed).expect("create allowed root");
         let policy: Arc<dyn ToolPolicy> = Arc::new(DefaultToolPolicy::new(PolicySettings {
-            allowed_write_roots: vec![temp.path().join("allowed")],
+            allowed_write_roots: vec![allowed],
             ..PolicySettings::default()
         }));
         let context = tool_context(temp.path(), policy);
@@ -179,9 +181,13 @@ mod tests {
         let error = WriteTool
             .execute(context, json!({ "path": "denied.txt", "content": "nope" }))
             .await
-            .expect_err("write should be denied");
+            .expect_err("write outside the allowed root must be denied");
 
-        assert!(error.to_string().contains("outside allowed_write_roots"));
+        let message = error.to_string();
+        assert!(
+            message.contains("not under any allowed root"),
+            "expected NotInRoot, got: {message}"
+        );
     }
 
     #[tokio::test]

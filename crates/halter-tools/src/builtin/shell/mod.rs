@@ -59,7 +59,11 @@ impl Tool for ShellTool {
             env: parse_env_map(input.get("env"))?,
             timeout: optional_u64(&input, "timeout_ms")?.map(Duration::from_millis),
         };
-        context.policy.check_shell_command(&options.command).await?;
+        let mode = context.policy.shell_mode();
+        context
+            .policy
+            .check_shell_command_strict(&options.command, mode)
+            .await?;
         let session = context.tool_sessions.shell_session(&context.session_id);
         let result = run_persistent_shell(
             session,

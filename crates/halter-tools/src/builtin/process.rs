@@ -317,7 +317,7 @@ impl Tool for ProcessTool {
 
         let value = match action {
             "kill_tree" => {
-                context.policy.check_shell("process").await?;
+                context.policy.check_process_signal(pid).await?;
                 let signal = optional_u64(&input, "signal")?.unwrap_or(9);
                 let signal = i32::try_from(signal).map_err(|_| {
                     anyhow::anyhow!("failed to execute process tool: signal is out of range")
@@ -375,7 +375,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_tree_requires_process_allowlist_entry() {
+    async fn kill_tree_rejects_pids_outside_session_tree() {
+        // Targeting init / kernel pids must always be denied. The session
+        // tree boundary lives in the policy and shows up as the typed
+        // `ProcessOutsideTree` error.
         let temp = tempfile::tempdir().expect("tempdir");
         let error = ProcessTool
             .execute(
@@ -386,9 +389,11 @@ mod tests {
                 }),
             )
             .await
-            .expect_err("kill_tree should be denied");
+            .expect_err("kill_tree of init must be denied");
 
-        assert!(error.to_string().contains("allowlist"));
-        assert!(error.to_string().contains("process"));
+        assert!(
+            error.to_string().contains("outside the session"),
+            "expected ProcessOutsideTree, got: {error}"
+        );
     }
 }

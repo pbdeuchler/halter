@@ -22,6 +22,51 @@ const TERM_SIGNAL: i32 = 15;
 const KILL_SIGNAL: i32 = 9;
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+// Minimum env vars passed through to spawned PTYs. Keeps the surface small
+// while preserving locale and shell ergonomics. Anything more should come
+// from explicit caller-supplied env in `PtyConfig::env`.
+const PTY_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "PWD",
+    "SHELL",
+];
+
+/// Args passed to `sh`. We use `-c` (not `-lc`) so the spawned shell does not
+/// source login rc files (e.g. `~/.bash_profile`, `/etc/profile`) which can
+/// run arbitrary user-controlled startup code that bypasses the policy.
+fn pty_shell_args() -> &'static [&'static str] {
+    &["-c"]
+}
+
+/// Build the env vector that will be set on the spawned PTY after a clear.
+/// Order: allowlisted parent vars first, then caller-supplied overrides.
+/// Pure: takes its inputs (parent env via `std::env::var_os` and the
+/// caller-supplied map) and returns a Vec — no side effects, easy to test.
+fn pty_scrubbed_env(
+    overrides: Option<&HashMap<String, String>>,
+) -> Vec<(String, std::ffi::OsString)> {
+    let mut out: Vec<(String, std::ffi::OsString)> = Vec::new();
+    for var in PTY_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(var) {
+            out.push(((*var).to_owned(), value));
+        }
+    }
+    if let Some(overrides) = overrides {
+        for (key, value) in overrides {
+            out.push((key.clone(), std::ffi::OsString::from(value)));
+        }
+    }
+    out
+}
+
 pub struct PtySessionHandle {
     control_tx: mpsc::Sender<ControlMessage>,
 }
@@ -84,7 +129,7 @@ impl Tool for PtyTool {
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
         let _scope = ToolScope::new(&context, "pty");
         ensure_not_cancelled(&context.cancel)?;
-        context.policy.check_shell("shell").await?;
+        context.policy.check_shell_enabled().await?;
 
         let action = required_string(&input, "action")?;
         let session = context.tool_sessions.pty_session(&context.session_id);
@@ -99,7 +144,11 @@ impl Tool for PtyTool {
                     cols: optional_u64(&input, "cols")?.unwrap_or(120) as u16,
                     rows: optional_u64(&input, "rows")?.unwrap_or(40) as u16,
                 };
-                context.policy.check_shell_command(&config.command).await?;
+                let mode = context.policy.shell_mode();
+                context
+                    .policy
+                    .check_shell_command_strict(&config.command, mode)
+                    .await?;
                 start_session(session, config, context.emit.clone());
                 Ok(ToolResult::Json {
                     value: json!({ "started": true }),
@@ -196,15 +245,16 @@ fn run_pty(
     })?;
 
     let mut command = CommandBuilder::new("sh");
-    command.arg("-lc");
+    for arg in pty_shell_args() {
+        command.arg(arg);
+    }
     command.arg(&config.command);
     if let Some(cwd) = config.cwd.as_ref() {
         command.cwd(cwd);
     }
-    if let Some(env) = config.env.as_ref() {
-        for (key, value) in env {
-            command.env(key, value);
-        }
+    command.env_clear();
+    for (key, value) in pty_scrubbed_env(config.env.as_ref()) {
+        command.env(key, value);
     }
 
     let mut child = pair.slave.spawn_command(command)?;
@@ -342,5 +392,104 @@ fn terminate_pty(
     let _ = child.kill();
     if let Some(child_pid) = child_pid {
         let _ = kill_tree(child_pid, KILL_SIGNAL);
+    }
+}
+
+// AC1.9 (PTY half): Adversarial pinning for the rc-file inheritance and env
+// scrubbing rules. See `docs/design-plans/2026-04-17-review-remediation-core.md`
+// §AC1.9 — `sh -lc` is rejected; the spawned shell uses `-c` only and runs
+// with a scrubbed env.
+#[cfg(test)]
+mod security_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{
+        DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolContext,
+        ToolPolicy, ToolSessionStore,
+    };
+
+    use super::*;
+
+    fn tool_context_with(policy: Arc<dyn ToolPolicy>) -> ToolContext {
+        ToolContext {
+            session_id: halter_protocol::SessionId::new(),
+            working_dir: std::env::temp_dir(),
+            path_locks: Arc::new(PathLockMap::default()),
+            tool_sessions: Arc::new(ToolSessionStore::default()),
+            file_view: Arc::new(Default::default()),
+            snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(NoopToolEventSink),
+            policy,
+            max_tool_output_bytes: 16_384,
+            shell_timeout_secs: 30,
+            subagent_parent: None,
+        }
+    }
+
+    #[test]
+    fn ac1_9_pty_uses_dash_c_not_dash_lc() {
+        // Pinning: the shell args must never include `-l` (login shell, sources
+        // ~/.bash_profile, /etc/profile, ...). If this assertion fails, a
+        // contributor reintroduced rc-file inheritance — a well-known bypass.
+        let args = pty_shell_args();
+        assert_eq!(args, &["-c"], "PTY shell args must be `-c`, got {args:?}");
+        assert!(
+            !args.iter().any(|a| a.contains('l')),
+            "args must not contain `-l` / `-lc` flag (would source rc files)"
+        );
+    }
+
+    #[test]
+    fn ac1_9_pty_env_is_clear_then_allowlist_then_overrides() {
+        // SAFETY: a deliberately leaky env var that should not survive the scrub.
+        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "leaked") };
+        unsafe { std::env::set_var("PATH", "/usr/bin") };
+
+        let mut overrides = HashMap::new();
+        overrides.insert("CALLER_OVERRIDE".to_owned(), "yes".to_owned());
+
+        let env = pty_scrubbed_env(Some(&overrides));
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(
+            !keys.contains(&"AWS_SECRET_ACCESS_KEY"),
+            "scrub must drop AWS_SECRET_ACCESS_KEY, got {keys:?}"
+        );
+        assert!(keys.contains(&"PATH"), "PATH must be preserved");
+        assert!(
+            keys.contains(&"CALLER_OVERRIDE"),
+            "caller-supplied overrides must survive"
+        );
+
+        unsafe { std::env::remove_var("AWS_SECRET_ACCESS_KEY") };
+    }
+
+    #[tokio::test]
+    async fn ac1_9_pty_start_is_denied_when_shell_disabled() {
+        let policy: Arc<dyn ToolPolicy> = Arc::new(DefaultToolPolicy::new(PolicySettings {
+            shell_enabled: false,
+            ..PolicySettings::default()
+        }));
+        let context = tool_context_with(policy);
+
+        let err = PtyTool
+            .execute(
+                context,
+                json!({
+                    "action": "start",
+                    "command": "echo hi"
+                }),
+            )
+            .await
+            .expect_err("PTY start must be denied when shell is disabled");
+        assert!(
+            err.to_string().contains("disabled"),
+            "expected ShellDisabled, got: {err}"
+        );
     }
 }

@@ -64,9 +64,10 @@ impl Tool for EditTool {
             "editing file"
         );
 
-        context.policy.check_write(&path).await?;
+        let canonical = context.policy.check_write_path(&path).await?;
+        let canonical_path = canonical.into_path();
         let path_locks = context.path_locks.clone();
-        let path_for_edit = path.clone();
+        let path_for_edit = canonical_path.clone();
         let old = old_string.to_owned();
         let new = new_string.to_owned();
         let expected_sha256 = expected_sha256.clone();
@@ -111,7 +112,7 @@ impl Tool for EditTool {
 
         Ok(ToolResult::Json {
             value: json!({
-                "path": path,
+                "path": canonical_path,
                 "matches_replaced": if replace_all { result.0 } else { 1 },
                 "file_hash_before": result.1,
                 "file_hash_after": result.2,

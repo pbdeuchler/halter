@@ -155,16 +155,14 @@ Defaults:
 
 This is the main security and operability boundary for tool use.
 
-`ToolPolicy` is being migrated from the older name-based surface
-(`check_read`, `check_write`, `check_shell`, `check_shell_command`,
-`check_subagent_spawn`) to a capability-oriented surface
+`ToolPolicy` exposes a capability-oriented surface
 (`check_read_path`, `check_write_path`, `check_process_signal`,
 `check_shell_enabled`, `check_shell_command_strict`, `check_network`,
-`check_subagent_spawn_typed`) that returns `PolicyError` and binds
-resolved paths to a parent-directory fd via `CanonicalPath`. The old
-methods are retained as `#[deprecated]` shims and will be removed once
-every builtin call site has migrated (tracked under
-`docs/plans/2026-04-17-review-remediation-roadmap.md`).
+`check_subagent_spawn_typed`, `shell_mode`) that returns `PolicyError`
+and binds resolved paths to a parent-directory fd via `CanonicalPath`.
+Name-based bypass methods (`check_shell("shell")`,
+`check_shell("process")`) and the older string-error surface have been
+removed; built-in tools call the typed methods directly.
 
 ### Why policy lives here
 
