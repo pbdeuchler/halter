@@ -158,12 +158,39 @@ impl SessionInit {
     }
 }
 
+/// Drop-time hook eviction guard. Held inside an `Arc` on the session
+/// handle so eviction fires only when the *last* clone of the handle is
+/// dropped. Pre-Phase-3 code put `Drop` on `HalterSession` itself, which
+/// meant any short-lived clone (e.g. a clone moved into a `tokio::spawn`
+/// turn loop) would evict the hooks for the still-live original handle.
+struct EvictionGuard {
+    services: Arc<RuntimeServices>,
+    session_id: SessionId,
+}
+
+impl Drop for EvictionGuard {
+    fn drop(&mut self) {
+        evict_session_hooks(&self.services, &self.session_id);
+    }
+}
+
+/// Cheaply-cloneable handle to a halter session. Cloning bumps the inner
+/// `Arc`s; the session's hooks are only evicted from the runtime store
+/// when every clone of the handle has been dropped.
 #[derive(Clone)]
-pub struct HalterSession {
+pub struct SessionHandle {
     services: Arc<RuntimeServices>,
     session_id: SessionId,
     session_hooks: Arc<Hooks>,
+    /// Held only for its `Drop` side-effect on the last clone — see
+    /// `EvictionGuard`.
+    #[allow(dead_code)]
+    eviction: Arc<EvictionGuard>,
 }
+
+/// Backwards-compatible alias for the public session type. Prefer
+/// `SessionHandle` in new code.
+pub type HalterSession = SessionHandle;
 
 struct SessionToolEventSink {
     call_id: halter_protocol::ToolCallId,
@@ -334,16 +361,21 @@ impl SessionRuntime {
     }
 }
 
-impl HalterSession {
+impl SessionHandle {
     pub(crate) fn new(
         services: Arc<RuntimeServices>,
         session_id: SessionId,
     ) -> anyhow::Result<Self> {
         let session_hooks = lookup_or_create_session_hooks(&services, &session_id)?;
+        let eviction = Arc::new(EvictionGuard {
+            services: services.clone(),
+            session_id: session_id.clone(),
+        });
         Ok(Self {
             services,
             session_id,
             session_hooks,
+            eviction,
         })
     }
 
@@ -1774,12 +1806,6 @@ fn format_hook_warning(warning: &HookWarning) -> String {
     format!("{prefix}: {}", warning.message)
 }
 
-impl Drop for HalterSession {
-    fn drop(&mut self) {
-        evict_session_hooks(&self.services, &self.session_id);
-    }
-}
-
 fn observe_state(working_dir: PathBuf) -> ObservedState {
     ObservedState {
         cwd: working_dir,
@@ -2152,6 +2178,72 @@ mod tests {
                 .as_ref()
                 .is_some_and(|error| error.message.contains("blocked by hook"))
         )));
+
+        // C4 / AC2.6: a turn that the pre-tool hook blocks must not leak the
+        // (uninvoked) call into the persisted `pending_tool_calls` map.
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session present");
+        assert!(
+            stored.state.pending_tool_calls.is_empty(),
+            "blocked-tool path left pending_tool_calls populated: {} entries",
+            stored.state.pending_tool_calls.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn ac2_1_dropping_a_clone_does_not_evict_hooks_from_the_original_handle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(ToolLoopProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let session_id = session.session_id().clone();
+
+        // Setup: the SessionHandle's hooks are registered in the runtime store.
+        {
+            let store = services
+                .session_hook_store
+                .lock()
+                .expect("session hook store lock");
+            assert!(
+                store.contains_key(&session_id),
+                "session hooks should be registered after new_session"
+            );
+        }
+
+        // Before Phase 3, `HalterSession: Clone + Drop` evicted the hook entry
+        // every time any clone was dropped (even an internal clone moved into
+        // the spawned turn loop). The pinned PR re-introduces the footgun if
+        // this assertion ever flips back to "absent".
+        let cloned = session.clone();
+        drop(cloned);
+
+        {
+            let store = services
+                .session_hook_store
+                .lock()
+                .expect("session hook store lock");
+            assert!(
+                store.contains_key(&session_id),
+                "dropping a clone evicted hooks; the original handle must keep them alive"
+            );
+        }
+
+        drop(session);
+
+        {
+            let store = services
+                .session_hook_store
+                .lock()
+                .expect("session hook store lock");
+            assert!(
+                !store.contains_key(&session_id),
+                "session hooks should be evicted once the last handle is dropped"
+            );
+        }
     }
 
     #[tokio::test]

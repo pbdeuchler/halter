@@ -859,7 +859,11 @@ mod tests {
             .await
             .expect_err("depth should fail");
 
-        assert!(error.to_string().contains("max_subagent_depth"));
+        let message = error.to_string();
+        assert!(
+            message.contains("subagent limit reached: depth"),
+            "expected typed SubagentLimit error, got: {message}"
+        );
     }
 
     fn test_services(provider: Arc<dyn Provider>) -> Arc<RuntimeServices> {
