@@ -460,12 +460,12 @@ where
 }
 
 fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
-    // Fields introduced by the capability-oriented policy redesign
-    // (`allowed_read_roots`, `sensitive_path_patterns`, `shell_mode`,
-    // `allowed_loopback_services`, `process_tree_root`) do not yet have
-    // `PolicyConfig` counterparts and take their defaults from
-    // `PolicySettings::default()`. Surfacing them into user config is
-    // tracked under Phase 2 of the review remediation.
+    // `process_tree_root` is anchored to the live halter PID at builder
+    // time so process-signal checks (AC1.6 / AC1.7) can reject signals
+    // aimed at PIDs that aren't descendants of this process. Other newer
+    // fields (`allowed_read_roots`, `sensitive_path_patterns`,
+    // `shell_mode`, `allowed_loopback_services`) still inherit from
+    // `PolicySettings::default()` until the surface lands in user config.
     PolicySettings {
         allowed_write_roots: config.allowed_write_roots.clone(),
         max_read_bytes: config.max_read_bytes,
@@ -477,6 +477,7 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
         allowed_hosts: config.network.allowed_hosts.clone(),
         max_subagent_depth: config.max_subagent_depth,
         max_concurrent_subagents: config.max_concurrent_subagents,
+        process_tree_root: Some(std::process::id() as i32),
         ..PolicySettings::default()
     }
 }
@@ -519,6 +520,21 @@ mod tests {
         };
 
         assert!(error.to_string().contains("missing resource snapshot"));
+    }
+
+    #[test]
+    fn policy_from_config_anchors_process_tree_root_to_live_pid() {
+        // AC1.6 / AC1.7 rely on `process_tree_root` being populated so the
+        // policy can reject signals aimed at PIDs outside the halter process
+        // tree. The capability surface defaults to `None`; the builder is the
+        // single place where the live PID gets stitched in.
+        let config = openai_config(Some("test-key")).policy.clone();
+        let settings = policy_from_config(&config);
+        assert_eq!(
+            settings.process_tree_root,
+            Some(std::process::id() as i32),
+            "process_tree_root should be anchored to std::process::id() at builder time"
+        );
     }
 
     #[tokio::test]
