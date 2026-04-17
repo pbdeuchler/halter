@@ -9,6 +9,7 @@ mod prompt;
 mod session;
 mod subagent_session;
 mod subagents;
+mod turn_registry;
 
 pub use compaction::{ContextSettings, score_message};
 pub use context::{CompactionOutcome, ContextManager, DefaultContextManager};
@@ -21,3 +22,4 @@ pub use hooks_runtime::{
 };
 pub use prompt::{DefaultPromptAssembler, PromptAssembler};
 pub use session::{HalterSession, ResourceHandle, RuntimeServices, SessionInit, SessionRuntime};
+pub use turn_registry::{ShutdownReport, TurnRegistry, TurnRegistryError};

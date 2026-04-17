@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 use crate::DefaultContextManager;
 use crate::model_selection::select_models;
+use crate::turn_registry::TurnRegistry;
 use crate::{
     ContextManager, EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler,
     run_notification, run_post_compact, run_post_tool_use, run_post_tool_use_failure,
@@ -55,6 +56,7 @@ pub struct RuntimeServices {
     pub prompt_assembler: Arc<dyn PromptAssembler>,
     pub context_manager: Arc<dyn ContextManager>,
     pub event_bus: Arc<EventBus>,
+    pub turn_registry: Arc<TurnRegistry>,
     pub max_tool_output_bytes: usize,
     pub shell_timeout_secs: u64,
 }
@@ -359,6 +361,25 @@ impl SessionRuntime {
             .resources
             .replace(snapshot, hooks, hook_warnings);
     }
+
+    /// Mark the runtime as shutting down, cancel every in-flight turn,
+    /// and wait for the spawned task loops to settle (or be aborted)
+    /// within `drain`. After this returns, subsequent `submit_turn`
+    /// calls fail with a "runtime is shutting down" error.
+    ///
+    /// Idempotent: calling shutdown after the registry is already in
+    /// the shutting-down state still drains any newly raced-in turns.
+    pub async fn shutdown(&self, drain: std::time::Duration) -> crate::ShutdownReport {
+        let report = self.services.turn_registry.shutdown(drain).await;
+        info!(
+            drained = report.turns_drained,
+            aborted = report.turns_aborted,
+            timed_out = report.timed_out,
+            drain_ms = %drain.as_millis(),
+            "runtime shutdown"
+        );
+        report
+    }
 }
 
 impl SessionHandle {
@@ -419,18 +440,48 @@ impl SessionHandle {
                     self.session_id.0
                 )
             })?;
+        // Reject new turns once the runtime is shutting down so callers
+        // get a structured error instead of a turn that gets aborted
+        // mid-flight.
+        if self.services.turn_registry.is_shutting_down() {
+            anyhow::bail!(
+                "failed to submit turn '{}': runtime is shutting down",
+                turn.id
+            );
+        }
+
         let base_sequence = self.services.sessions.replay(&self.session_id).await?.len() as u64 + 1;
         let (tx, rx) = mpsc::unbounded_channel();
         let live = LiveTurnStream::new(self.session_id.clone(), tx, base_sequence);
         let session = self.clone();
 
-        tokio::spawn(async move {
+        let registry = session.services.turn_registry.clone();
+        let turn_id_for_dereg = turn.id.clone();
+        let turn_id_for_register = turn.id.clone();
+        let task_cancel = turn_cancel.clone();
+        let handle = tokio::spawn(async move {
+            // Always deregister, even if the turn body panics, so we don't
+            // leak entries that block shutdown drain.
+            struct DeregisterOnDrop {
+                registry: Arc<TurnRegistry>,
+                turn_id: TurnId,
+            }
+            impl Drop for DeregisterOnDrop {
+                fn drop(&mut self) {
+                    self.registry.deregister(&self.turn_id);
+                }
+            }
+            let _guard = DeregisterOnDrop {
+                registry: registry.clone(),
+                turn_id: turn_id_for_dereg,
+            };
+
             live.emit_payload(SessionEventPayload::TurnStarted {
                 turn_id: turn.id.clone(),
             });
 
             match session
-                .run_turn(stored, turn.clone(), turn_cancel, Some(live.clone()))
+                .run_turn(stored, turn.clone(), task_cancel, Some(live.clone()))
                 .await
             {
                 Ok(turn_commit) => match session
@@ -511,6 +562,17 @@ impl SessionHandle {
                 }
             }
         });
+
+        if let Err(register_error) =
+            self.services
+                .turn_registry
+                .register(turn_id_for_register, turn_cancel, handle)
+        {
+            // The registry already cancelled the token and aborted the
+            // task before returning the error. Surface the same shutdown
+            // error to the caller as the upfront check would have.
+            anyhow::bail!("failed to register turn: {register_error}");
+        }
 
         Ok(UnboundedReceiverStream::new(rx).boxed())
     }
@@ -1843,6 +1905,7 @@ impl Default for RuntimeServices {
             prompt_assembler: Arc::new(crate::DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::default()),
             event_bus: Arc::new(EventBus::default()),
+            turn_registry: Arc::new(TurnRegistry::new()),
             max_tool_output_bytes: 262_144,
             shell_timeout_secs: 30,
         }

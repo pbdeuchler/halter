@@ -201,6 +201,7 @@ impl HalterBuilder {
                 config.context.prune_signal_threshold,
             )),
             event_bus: Arc::new(EventBus::default()),
+            turn_registry: Arc::new(halter_runtime::TurnRegistry::new()),
             max_tool_output_bytes: config.policy.max_tool_output_bytes,
             shell_timeout_secs: config.policy.shell.timeout_secs,
         });
@@ -295,6 +296,20 @@ impl Halter {
     #[must_use]
     pub fn config(&self) -> &HarnessConfig {
         &self.config
+    }
+
+    /// Drain all in-flight turns and refuse new submissions. Bounded by
+    /// `drain` — tasks still running when the deadline elapses are
+    /// aborted via `JoinHandle::abort`.
+    ///
+    /// Wire this into your process-level signal handler (e.g.
+    /// `tokio::signal::ctrl_c`) so that Ctrl-C does not orphan
+    /// half-committed turns.
+    pub async fn shutdown(
+        &self,
+        drain: std::time::Duration,
+    ) -> halter_runtime::ShutdownReport {
+        self.runtime.shutdown(drain).await
     }
 }
 
