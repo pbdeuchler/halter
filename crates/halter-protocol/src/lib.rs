@@ -1024,20 +1024,15 @@ pub enum MessageSignal {
 }
 
 #[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+    Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PruneSignalThreshold {
     VeryLow,
     Low,
+    #[default]
     Normal,
     High,
-}
-
-impl Default for PruneSignalThreshold {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

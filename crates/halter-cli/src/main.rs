@@ -314,9 +314,10 @@ impl SharedFileWriter {
         &self,
         f: impl FnOnce(&mut LineWriter<File>) -> io::Result<T>,
     ) -> io::Result<T> {
-        let mut writer = self.inner.lock().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "shared output writer mutex poisoned")
-        })?;
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("shared output writer mutex poisoned"))?;
         f(&mut writer)
     }
 }

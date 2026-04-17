@@ -138,10 +138,7 @@ pub fn estimate_summary_tokens(summaries: &[SummarySlice]) -> u64 {
 
 #[must_use]
 pub fn estimate_compacted_prefix_tokens(compacted_prefix: &[Value]) -> u64 {
-    compacted_prefix
-        .iter()
-        .map(|item| estimate_json_tokens(item))
-        .sum()
+    compacted_prefix.iter().map(estimate_json_tokens).sum()
 }
 
 #[must_use]

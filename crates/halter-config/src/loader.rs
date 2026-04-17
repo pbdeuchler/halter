@@ -470,8 +470,8 @@ max_read_bytes = 99
         config.validate().expect("example config should validate");
         validate_runtime_requirements_with(&config, |name| {
             Some(OsString::from(match name {
-                "OPENAI_API_KEY" => "test-key",
-                _ => unreachable!("unexpected env var"),
+                "OPENAI_API_KEY" | "OPENROUTER_API_KEY" => "test-key",
+                _ => unreachable!("unexpected env var: {name}"),
             }))
         })
         .expect("example config runtime requirements should validate");
