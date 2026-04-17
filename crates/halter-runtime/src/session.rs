@@ -3232,11 +3232,7 @@ mod tests {
             _request: ProviderRequest,
             _cancel: CancellationToken,
         ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
-            Ok(stream::iter(vec![Err(ProviderError::new(
-                "rate limited",
-                true,
-            ))])
-            .boxed())
+            Ok(stream::iter(vec![Err(ProviderError::new("rate limited", true))]).boxed())
         }
     }
 
@@ -3260,26 +3256,20 @@ mod tests {
             cancel: CancellationToken,
         ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
             let started = self.started.clone();
-            let s = futures::stream::unfold(
-                Some((cancel, started, false)),
-                |state| async move {
-                    let (cancel, started, emitted) = state?;
-                    if !emitted {
-                        started.notify_one();
-                        return Some((
-                            Ok(StreamEvent::MessageStart {
-                                id: halter_protocol::MessageId::new(),
-                            }),
-                            Some((cancel, started, true)),
-                        ));
-                    }
-                    cancel.cancelled().await;
-                    Some((
-                        Err(ProviderError::new("cancelled", false)),
-                        None,
-                    ))
-                },
-            );
+            let s = futures::stream::unfold(Some((cancel, started, false)), |state| async move {
+                let (cancel, started, emitted) = state?;
+                if !emitted {
+                    started.notify_one();
+                    return Some((
+                        Ok(StreamEvent::MessageStart {
+                            id: halter_protocol::MessageId::new(),
+                        }),
+                        Some((cancel, started, true)),
+                    ));
+                }
+                cancel.cancelled().await;
+                Some((Err(ProviderError::new("cancelled", false)), None))
+            });
             Ok(s.boxed())
         }
     }
@@ -3325,8 +3315,7 @@ mod tests {
         // AC2.5: when a provider error is flagged retryable, TurnFailed
         // surfaces that flag rather than silently dropping it.
         let temp = tempfile::tempdir().expect("tempdir");
-        let services =
-            configured_services(Arc::new(RetryableFailingProvider), temp.path());
+        let services = configured_services(Arc::new(RetryableFailingProvider), temp.path());
         let runtime = SessionRuntime::new(services.clone());
         let session = new_session(&runtime, temp.path()).await;
 
@@ -3359,7 +3348,10 @@ mod tests {
                 _ => None,
             })
             .expect("TurnFailed in persisted store");
-        assert!(persisted, "persisted TurnFailed must preserve retryable=true");
+        assert!(
+            persisted,
+            "persisted TurnFailed must preserve retryable=true"
+        );
     }
 
     #[tokio::test]

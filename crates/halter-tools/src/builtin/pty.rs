@@ -26,17 +26,7 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 // while preserving locale and shell ergonomics. Anything more should come
 // from explicit caller-supplied env in `PtyConfig::env`.
 const PTY_ENV_ALLOWLIST: &[&str] = &[
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "TERM",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TZ",
-    "PWD",
-    "SHELL",
+    "PATH", "HOME", "USER", "LOGNAME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "PWD", "SHELL",
 ];
 
 /// Args passed to `sh`. We use `-c` (not `-lc`) so the spawned shell does not
@@ -408,8 +398,8 @@ mod security_tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolContext,
-        ToolPolicy, ToolSessionStore,
+        DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolContext, ToolPolicy,
+        ToolSessionStore,
     };
 
     use super::*;
