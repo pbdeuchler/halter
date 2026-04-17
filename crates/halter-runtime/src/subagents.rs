@@ -533,7 +533,7 @@ impl SubagentControl for RuntimeSubagentControl {
         self.inner
             .services
             .policy
-            .check_subagent_spawn(parent.blueprint.subagent_depth, active_subagents)
+            .check_subagent_spawn_typed(parent.blueprint.subagent_depth, active_subagents)
             .await?;
 
         let session_id = SessionId::new();

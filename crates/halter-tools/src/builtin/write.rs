@@ -46,9 +46,10 @@ impl Tool for WriteTool {
         let content = required_string(&input, "content")?;
         debug!(session_id = %context.session_id, path = %path.display(), bytes = content.len(), "writing file");
 
-        context.policy.check_write(&path).await?;
+        let canonical = context.policy.check_write_path(&path).await?;
+        let canonical_path = canonical.into_path();
         let path_locks = context.path_locks.clone();
-        let path_for_write = path.clone();
+        let path_for_write = canonical_path.clone();
         let bytes = content.as_bytes().to_vec();
         tokio::task::spawn_blocking(move || {
             let _lock = path_locks.acquire_write(&path_for_write)?;
@@ -56,7 +57,7 @@ impl Tool for WriteTool {
         })
         .await??;
         Ok(ToolResult::Json {
-            value: json!({ "path": path }),
+            value: json!({ "path": canonical_path }),
         })
     }
 }

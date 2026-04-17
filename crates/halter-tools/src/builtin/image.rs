@@ -91,10 +91,17 @@ impl Tool for ImageTool {
             .ok()
             .and_then(|metadata| usize::try_from(metadata.len()).ok())
             .unwrap_or(usize::MAX);
-        context.policy.check_read(&input_path, input_len).await?;
-        if let Some(output_path) = output_path.as_ref() {
-            context.policy.check_write(output_path).await?;
-        }
+        let canonical_input = context
+            .policy
+            .check_read_path(&input_path, input_len)
+            .await?;
+        let input_path = canonical_input.into_path();
+        let output_path = if let Some(output_path) = output_path {
+            let canonical_output = context.policy.check_write_path(&output_path).await?;
+            Some(canonical_output.into_path())
+        } else {
+            None
+        };
 
         let path_locks = context.path_locks.clone();
         let result = tokio::task::spawn_blocking(move || {

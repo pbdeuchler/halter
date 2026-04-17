@@ -99,7 +99,10 @@ impl Tool for AstGrepTool {
                 )?;
                 if !config.dry_run {
                     for candidate in &candidates {
-                        context.policy.check_write(&candidate.absolute_path).await?;
+                        context
+                            .policy
+                            .check_write_path(&candidate.absolute_path)
+                            .await?;
                     }
                 }
                 let path_locks = context.path_locks.clone();
