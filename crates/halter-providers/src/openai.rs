@@ -13,6 +13,7 @@ use crate::responses_provider::{
     CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
 use crate::responses_transport::ResponsesRateLimitStrategy;
+use crate::retry::RetryPolicy;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -77,6 +78,7 @@ fn config() -> ResponsesProviderConfig {
         },
         compact_strategy: Some(CompactStrategy::DedicatedEndpoint),
         rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
+        retry_policy: RetryPolicy::default(),
     }
 }
 

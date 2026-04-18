@@ -158,6 +158,7 @@ impl ResponsesTransport {
             OpenAiStreamRateLimitObserver {
                 limiter: self.openai_rate_limiter.clone(),
                 model: request_meta.model,
+                tokens_per_minute: request_meta.tokens_per_minute,
             },
             cancel,
         ))
@@ -255,8 +256,11 @@ impl ResponsesTransport {
             if let OpenAIError::ApiError(api_error) = &error
                 && let Some(retry_after) = openai_api_error_retry_after(api_error)
             {
-                self.openai_rate_limiter
-                    .apply_retry_after(&request_meta.model, retry_after);
+                self.openai_rate_limiter.apply_retry_after(
+                    &request_meta.model,
+                    request_meta.tokens_per_minute,
+                    retry_after,
+                );
             }
             return Err(TransportError::from_openai(error));
         }
@@ -297,12 +301,18 @@ fn provider_url(base_url: &str, path: &str) -> String {
 struct OpenAiStreamRateLimitObserver {
     limiter: OpenAiRateLimiter,
     model: String,
+    /// Plumbed through so a mid-stream rate-limit signal can re-reserve the
+    /// permit window with the correct TPM ceiling (H21). Without this, a
+    /// 429 observed *during* an SSE stream would call `apply_retry_after`
+    /// with `None`, dropping the model's TPM context.
+    tokens_per_minute: Option<u64>,
 }
 
 impl OpenAiStreamRateLimitObserver {
     fn record_api_error(&self, error: &ApiError) {
         if let Some(retry_after) = openai_api_error_retry_after(error) {
-            self.limiter.apply_retry_after(&self.model, retry_after);
+            self.limiter
+                .apply_retry_after(&self.model, self.tokens_per_minute, retry_after);
         }
     }
 }
