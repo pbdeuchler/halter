@@ -317,8 +317,8 @@ mod tests {
 
     // AC1.2 Lifecycle ----------------------------------------------------
 
-    #[tokio::test]
-    async fn dropping_limiter_drops_its_registry() {
+    #[test]
+    fn dropping_limiter_drops_its_registry() {
         // Construct a limiter, apply a cooldown via apply_retry_after, then drop it.
         // Create a new limiter with the same scope. If the registry were leaked into
         // a static, the new limiter's entry would still have the cooldown. With
