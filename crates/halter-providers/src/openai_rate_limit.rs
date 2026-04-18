@@ -170,6 +170,22 @@ impl OpenAiRateLimiter {
     }
 }
 
+#[cfg(test)]
+impl OpenAiRateLimiter {
+    /// Test-only inspection of the per-model cooldown. Returns `Some(_)`
+    /// when a `Retry-After` window has been applied (via header or
+    /// `apply_retry_after`) and is still in effect.
+    pub(crate) fn cooldown_for_test(
+        &self,
+        model: &str,
+        tokens_per_minute: Option<u64>,
+    ) -> Option<Instant> {
+        let entry = self.entry(model, tokens_per_minute);
+        let state = entry.state.lock().expect("rate limit lock poisoned");
+        state.cooldown_until
+    }
+}
+
 impl OpenAiRateLimitPermit {
     pub(crate) fn update_from_headers(&mut self, headers: &HeaderMap, status: StatusCode) {
         let snapshot = if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
@@ -293,6 +309,7 @@ fn fingerprint_api_key(api_key: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio_util::sync::CancellationToken;
     use reqwest::header::HeaderMap;
     // `OpenAiReservation` is re-exported into scope by `use super::*;` via the
@@ -664,6 +681,104 @@ mod tests {
         assert_eq!(
             state.reserved.requests, 0,
             "Drop must release reservation even without an explicit update_from_headers",
+        );
+    }
+
+    // AC2.1 Stream startup: acquire(model, _, Some(tpm)) creates a token
+    // window with that TPM ceiling.
+    #[tokio::test]
+    async fn acquire_with_tpm_some_creates_token_window_at_that_ceiling() {
+        let lim = limiter("key-tpm-startup", "https://api.openai.com");
+        let permit = lim
+            .acquire(
+                "gpt-5",
+                OpenAiReservation { requests: 1, tokens: 1 },
+                Some(123_456),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("acquire");
+
+        let entry = lim.entry("gpt-5", Some(123_456));
+        let state = entry.state.lock().expect("lock");
+        let window = state
+            .tokens
+            .as_ref()
+            .expect("acquire with TPM Some must seed a token window");
+        assert_eq!(window.limit, 123_456);
+        drop(state);
+        drop(permit);
+    }
+
+    // AC2.2 Mid-stream observer: apply_retry_after with Some(tpm) sets a
+    // cooldown that subsequent acquires honor.
+    #[tokio::test]
+    async fn apply_retry_after_with_tpm_some_sets_cooldown() {
+        let lim = limiter("key-tpm-midstream", "https://api.openai.com");
+        // Seed an entry first.
+        let permit = lim
+            .acquire(
+                "gpt-5",
+                OpenAiReservation { requests: 1, tokens: 1 },
+                Some(500_000),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("acquire");
+        drop(permit);
+
+        // Apply a retry-after as if the observer had seen a mid-stream
+        // rate-limit error.
+        lim.apply_retry_after("gpt-5", Some(500_000), Duration::from_millis(50));
+
+        let entry = lim.entry("gpt-5", Some(500_000));
+        let state = entry.state.lock().expect("lock");
+        assert!(
+            state.cooldown_until.is_some(),
+            "apply_retry_after with TPM Some must set cooldown",
+        );
+    }
+
+    // AC2.4 No silent default: apply_retry_after with TPM None does not
+    // clobber an existing token window seeded by a prior Some(tpm) call.
+    #[tokio::test]
+    async fn apply_retry_after_with_tpm_none_does_not_clobber_existing_window() {
+        let lim = limiter("key-tpm-nonclobber", "https://api.openai.com");
+
+        // First call: seed token window with Some(500_000).
+        {
+            let permit = lim
+                .acquire(
+                    "gpt-5",
+                    OpenAiReservation { requests: 1, tokens: 1 },
+                    Some(500_000),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("acquire");
+            drop(permit);
+        }
+
+        let window_before = {
+            let entry = lim.entry("gpt-5", Some(500_000));
+            let state = entry.state.lock().expect("lock");
+            state.tokens.as_ref().map(|w| w.limit)
+        };
+        assert_eq!(window_before, Some(500_000));
+
+        // Now apply_retry_after with None.
+        lim.apply_retry_after("gpt-5", None, Duration::from_millis(10));
+
+        // Token window must NOT have been replaced with None / dropped.
+        let window_after = {
+            let entry = lim.entry("gpt-5", None);
+            let state = entry.state.lock().expect("lock");
+            state.tokens.as_ref().map(|w| w.limit)
+        };
+        assert_eq!(
+            window_after,
+            Some(500_000),
+            "apply_retry_after(None) must not clobber an existing token window",
         );
     }
 }
