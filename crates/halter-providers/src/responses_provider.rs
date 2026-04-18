@@ -333,6 +333,69 @@ fn validate_responses_compaction_request(
     Ok(())
 }
 
+fn provider_error_from_stream_error(error: OpenAIError) -> ProviderError {
+    match error {
+        OpenAIError::ApiError(api_error) => ProviderError::new(
+            format!("failed to execute provider request: {}", api_error.message),
+            openai_api_error_is_rate_limit(&api_error),
+        ),
+        OpenAIError::JSONDeserialize(json_error, content) => {
+            if let Some(api_error) = parse_openai_stream_error(&content) {
+                return ProviderError::new(
+                    format!("failed to execute provider request: {}", api_error.message),
+                    openai_api_error_is_rate_limit(&api_error),
+                );
+            }
+            ProviderError::new(
+                format!(
+                    "failed to execute provider request: failed to deserialize api response: error:{json_error} content:{content}"
+                ),
+                false,
+            )
+        }
+        other => {
+            let retryable = matches!(other, OpenAIError::Reqwest(_) | OpenAIError::StreamError(_));
+            ProviderError::new(
+                format!("failed to execute provider request: {other}"),
+                retryable,
+            )
+        }
+    }
+}
+
+fn provider_error_from_transport_error(error: anyhow::Error) -> ProviderError {
+    let message = error.to_string();
+    ProviderError::new(message.clone(), openai_message_is_rate_limit(&message))
+}
+
+fn stream_error_is_retryable(error: &OpenAIError) -> bool {
+    match error {
+        OpenAIError::ApiError(api_error) => openai_api_error_is_rate_limit(api_error),
+        OpenAIError::JSONDeserialize(_, content) => parse_openai_stream_error(content)
+            .as_ref()
+            .is_some_and(openai_api_error_is_rate_limit),
+        OpenAIError::Reqwest(_)
+        | OpenAIError::StreamError(_)
+        | OpenAIError::FileSaveError(_)
+        | OpenAIError::FileReadError(_)
+        | OpenAIError::InvalidArgument(_) => false,
+    }
+}
+
+fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::TextDelta { .. }
+            | StreamEvent::ThinkingDelta { .. }
+            | StreamEvent::ToolCallStart { .. }
+            | StreamEvent::ToolArgsDelta { .. }
+            | StreamEvent::ToolCallEnd { .. }
+            | StreamEvent::MessageEnd { .. }
+            | StreamEvent::ProviderWarning { .. }
+            | StreamEvent::Error { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use halter_protocol::{
@@ -397,67 +460,4 @@ mod tests {
             instructions: "Summarize".to_owned(),
         }
     }
-}
-
-fn provider_error_from_stream_error(error: OpenAIError) -> ProviderError {
-    match error {
-        OpenAIError::ApiError(api_error) => ProviderError::new(
-            format!("failed to execute provider request: {}", api_error.message),
-            openai_api_error_is_rate_limit(&api_error),
-        ),
-        OpenAIError::JSONDeserialize(json_error, content) => {
-            if let Some(api_error) = parse_openai_stream_error(&content) {
-                return ProviderError::new(
-                    format!("failed to execute provider request: {}", api_error.message),
-                    openai_api_error_is_rate_limit(&api_error),
-                );
-            }
-            ProviderError::new(
-                format!(
-                    "failed to execute provider request: failed to deserialize api response: error:{json_error} content:{content}"
-                ),
-                false,
-            )
-        }
-        other => {
-            let retryable = matches!(other, OpenAIError::Reqwest(_) | OpenAIError::StreamError(_));
-            ProviderError::new(
-                format!("failed to execute provider request: {other}"),
-                retryable,
-            )
-        }
-    }
-}
-
-fn provider_error_from_transport_error(error: anyhow::Error) -> ProviderError {
-    let message = error.to_string();
-    ProviderError::new(message.clone(), openai_message_is_rate_limit(&message))
-}
-
-fn stream_error_is_retryable(error: &OpenAIError) -> bool {
-    match error {
-        OpenAIError::ApiError(api_error) => openai_api_error_is_rate_limit(api_error),
-        OpenAIError::JSONDeserialize(_, content) => parse_openai_stream_error(content)
-            .as_ref()
-            .is_some_and(openai_api_error_is_rate_limit),
-        OpenAIError::Reqwest(_)
-        | OpenAIError::StreamError(_)
-        | OpenAIError::FileSaveError(_)
-        | OpenAIError::FileReadError(_)
-        | OpenAIError::InvalidArgument(_) => false,
-    }
-}
-
-fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
-    matches!(
-        event,
-        StreamEvent::TextDelta { .. }
-            | StreamEvent::ThinkingDelta { .. }
-            | StreamEvent::ToolCallStart { .. }
-            | StreamEvent::ToolArgsDelta { .. }
-            | StreamEvent::ToolCallEnd { .. }
-            | StreamEvent::MessageEnd { .. }
-            | StreamEvent::ProviderWarning { .. }
-            | StreamEvent::Error { .. }
-    )
 }

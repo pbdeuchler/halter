@@ -181,11 +181,11 @@ impl ResponsesTransport {
                 request_meta.provider_label
             ))?;
             let error = decode_openai_error(status, &body);
-            if let OpenAIError::ApiError(api_error) = &error {
-                if let Some(retry_after) = openai_api_error_retry_after(api_error) {
-                    self.openai_rate_limiter
-                        .apply_retry_after(&request_meta.model, retry_after);
-                }
+            if let OpenAIError::ApiError(api_error) = &error
+                && let Some(retry_after) = openai_api_error_retry_after(api_error)
+            {
+                self.openai_rate_limiter
+                    .apply_retry_after(&request_meta.model, retry_after);
             }
             anyhow::bail!("failed to execute provider request: {error}");
         }
@@ -288,15 +288,15 @@ fn decode_stream_event(
         return Err(OpenAIError::ApiError(api_error));
     }
 
-    if let Ok(raw) = serde_json::from_str::<Value>(data) {
-        if let Some(event) = NonStandardStreamEvent::parse(&raw) {
-            match event {
-                NonStandardStreamEvent::Keepalive { sequence_number } => {
-                    info!(sequence_number, "received keepalive from responses stream");
-                }
+    if let Ok(raw) = serde_json::from_str::<Value>(data)
+        && let Some(event) = NonStandardStreamEvent::parse(&raw)
+    {
+        match event {
+            NonStandardStreamEvent::Keepalive { sequence_number } => {
+                info!(sequence_number, "received keepalive from responses stream");
             }
-            return Ok(None);
         }
+        return Ok(None);
     }
 
     serde_json::from_str::<ResponseStreamEvent>(data)

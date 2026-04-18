@@ -587,4 +587,3 @@ fn visit_simple_strict(simple: &ast::SimpleCommand) -> Result<(), PolicyError> {
         _ => Ok(()),
     }
 }
-

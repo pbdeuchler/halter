@@ -24,7 +24,9 @@ async fn ac1_13_capability_surface_compile_fence(p: &dyn ToolPolicy) {
     let _ = p.check_write_path(path).await;
     let _ = p.check_process_signal(123).await;
     let _ = p.check_shell_enabled().await;
-    let _ = p.check_shell_command_strict("true", ShellMode::Strict).await;
+    let _ = p
+        .check_shell_command_strict("true", ShellMode::Strict)
+        .await;
     let _ = p.check_network("https://example.com").await;
     let _ = p.check_subagent_spawn_typed(0, 0).await;
     let _: ShellMode = p.shell_mode();
@@ -150,7 +152,10 @@ async fn ac1_5_symlink_suffix_escape_is_rejected() {
         .expect_err("symlink-traversed write path must be denied");
 
     assert!(
-        matches!(err, PolicyError::NotInRoot { .. } | PolicyError::SymlinkEscape { .. }),
+        matches!(
+            err,
+            PolicyError::NotInRoot { .. } | PolicyError::SymlinkEscape { .. }
+        ),
         "expected NotInRoot/SymlinkEscape, got {err:?}"
     );
 }

@@ -328,10 +328,10 @@ fn commit_with_conn(
         .with_context(|| format!("failed to update state for session '{}'", session_id.0))?;
     }
 
-    let mut next_sequence = next_event_sequence(&tx, session_id)?;
+    let starting_sequence = next_event_sequence(&tx, session_id)?;
     let mut committed = Vec::with_capacity(events.len());
-    for event in events {
-        let sequence = next_sequence;
+    for (offset, event) in events.into_iter().enumerate() {
+        let sequence = starting_sequence + offset as u64;
         let payload_json = serde_json::to_string(&event.payload)
             .context("failed to serialize session event payload")?;
         tx.execute(
@@ -357,7 +357,6 @@ fn commit_with_conn(
             delivery: event.delivery,
             payload: event.payload,
         });
-        next_sequence += 1;
     }
 
     tx.commit()

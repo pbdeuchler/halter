@@ -656,6 +656,11 @@ pub enum SessionEventPayload {
     TurnFailed {
         turn_id: TurnId,
         error: String,
+        /// Whether the underlying provider error advertised itself as
+        /// retryable. Defaults to `false` so historical replays without this
+        /// field deserialize cleanly.
+        #[serde(default)]
+        retryable: bool,
     },
     Lagged {
         dropped_events: u64,
@@ -1019,20 +1024,15 @@ pub enum MessageSignal {
 }
 
 #[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+    Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PruneSignalThreshold {
     VeryLow,
     Low,
+    #[default]
     Normal,
     High,
-}
-
-impl Default for PruneSignalThreshold {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

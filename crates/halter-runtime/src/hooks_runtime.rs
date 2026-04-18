@@ -823,6 +823,11 @@ async fn run_agent(
         prompt_assembler: sess.services().prompt_assembler.clone(),
         context_manager: sess.services().context_manager.clone(),
         event_bus: sess.services().event_bus.clone(),
+        // Hook-spawned agents get their own (isolated) turn registry so
+        // that draining the parent runtime does not race with cooperative
+        // hook agent shutdown. The hook agent's own session lifecycle
+        // governs when its turns drain.
+        turn_registry: Arc::new(crate::TurnRegistry::new()),
         max_tool_output_bytes: sess.services().max_tool_output_bytes,
         shell_timeout_secs: sess.services().shell_timeout_secs,
     });

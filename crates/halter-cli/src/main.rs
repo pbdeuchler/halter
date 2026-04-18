@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, LineWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -134,6 +135,10 @@ async fn show_resources(path: &Path, output: &mut dyn Write) -> anyhow::Result<(
     )
 }
 
+/// Bound on how long the runtime gets to drain in-flight turns after a
+/// SIGINT/SIGTERM. The CLI sets this; embedders can pick their own.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
+
 async fn run_once(
     path: &Path,
     task: &str,
@@ -148,6 +153,31 @@ async fn run_once(
     );
     let harness = Halter::from_config_file(path).await?;
     let session = harness.new_session(SessionInit::default()).await?;
+    let result = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => {
+            info!("ctrl-c received, draining runtime before exit");
+            let report = harness.shutdown(SHUTDOWN_DRAIN).await;
+            info!(
+                drained = report.turns_drained,
+                aborted = report.turns_aborted,
+                timed_out = report.timed_out,
+                "runtime drained on signal"
+            );
+            return Err(anyhow::anyhow!("interrupted by signal"));
+        }
+        result = run_once_body(&session, task, output_mode, output) => result,
+    };
+    let _ = harness.shutdown(SHUTDOWN_DRAIN).await;
+    result
+}
+
+async fn run_once_body(
+    session: &HalterSession,
+    task: &str,
+    output_mode: RunOutputMode,
+    output: &mut dyn Write,
+) -> anyhow::Result<()> {
     let mut events = session.submit_turn(Turn::user(task)).await?;
 
     match output_mode {
@@ -178,6 +208,26 @@ async fn chat(path: &Path, output: &mut dyn Write) -> anyhow::Result<()> {
     info!(path = %path.display(), "starting chat session");
     let harness = Halter::from_config_file(path).await?;
     let session = harness.new_session(SessionInit::default()).await?;
+
+    let result = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => {
+            info!("ctrl-c received, draining runtime before exit");
+            Err(anyhow::anyhow!("interrupted by signal"))
+        }
+        result = chat_body(&session, output) => result,
+    };
+    let report = harness.shutdown(SHUTDOWN_DRAIN).await;
+    info!(
+        drained = report.turns_drained,
+        aborted = report.turns_aborted,
+        timed_out = report.timed_out,
+        "runtime drained on chat exit"
+    );
+    result
+}
+
+async fn chat_body(session: &HalterSession, output: &mut dyn Write) -> anyhow::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
@@ -264,9 +314,10 @@ impl SharedFileWriter {
         &self,
         f: impl FnOnce(&mut LineWriter<File>) -> io::Result<T>,
     ) -> io::Result<T> {
-        let mut writer = self.inner.lock().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "shared output writer mutex poisoned")
-        })?;
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("shared output writer mutex poisoned"))?;
         f(&mut writer)
     }
 }

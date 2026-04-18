@@ -26,6 +26,7 @@ pub struct CompactionOutcome {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait ContextManager: Send + Sync {
     async fn plan(
         &self,
@@ -82,6 +83,7 @@ impl DefaultContextManager {
         self.settings
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_compaction(
         &self,
         blueprint: &SessionBlueprint,

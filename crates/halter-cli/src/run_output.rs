@@ -201,6 +201,7 @@ mod tests {
             .observe(&SessionEventPayload::TurnFailed {
                 turn_id: halter_protocol::TurnId::from("turn-1"),
                 error: "provider exploded".to_owned(),
+                retryable: false,
             })
             .expect_err("turn failure should surface");
         assert_eq!(error, "provider exploded");

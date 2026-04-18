@@ -67,19 +67,15 @@ impl CanonicalPath {
             .ok_or_else(|| PolicyError::ParentTraversal {
                 attempted: absolute.to_path_buf(),
             })?;
-        let canonical_parent = std::fs::canonicalize(parent)
-            .map_err(|e| PolicyError::io(parent.to_path_buf(), e))?;
+        let canonical_parent =
+            std::fs::canonicalize(parent).map_err(|e| PolicyError::io(parent.to_path_buf(), e))?;
         let fd = open_dir_nofollow(&canonical_parent)?;
         let canonical = canonical_parent.join(leaf);
         Ok(Self::from_parts(canonical, fd, canonical_parent))
     }
 
     #[cfg(unix)]
-    fn from_parts(
-        path: PathBuf,
-        fd: std::os::fd::OwnedFd,
-        _parent: PathBuf,
-    ) -> Self {
+    fn from_parts(path: PathBuf, fd: std::os::fd::OwnedFd, _parent: PathBuf) -> Self {
         Self {
             path,
             parent_dir_fd: fd,
