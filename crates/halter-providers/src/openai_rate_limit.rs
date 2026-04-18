@@ -184,6 +184,20 @@ impl OpenAiRateLimiter {
         let state = entry.state.lock().expect("rate limit lock poisoned");
         state.cooldown_until
     }
+
+    /// Test-only inspection of the per-model token window limit. Returns
+    /// `Some(limit)` when a token window has been seeded (via `apply_retry_after`
+    /// with `Some(tpm)` or via header reconciliation), or `None` if the window
+    /// does not exist.
+    pub(crate) fn token_window_limit_for_test(
+        &self,
+        model: &str,
+        tokens_per_minute: Option<u64>,
+    ) -> Option<u64> {
+        let entry = self.entry(model, tokens_per_minute);
+        let state = entry.state.lock().expect("rate limit lock poisoned");
+        state.tokens.as_ref().map(|w| w.limit)
+    }
 }
 
 impl OpenAiRateLimitPermit {

@@ -722,4 +722,52 @@ mod tests {
             "send_json_request error branch must thread TPM into apply_retry_after",
         );
     }
+
+    /// AC2.2: Observer-side TPM-passthrough unit test. Constructs an
+    /// `OpenAiStreamRateLimitObserver` directly with `Some(500_000)` TPM,
+    /// calls `record_api_error` with a rate-limit ApiError, and asserts:
+    /// 1. Cooldown was set (proving apply_retry_after was called)
+    /// 2. The token window was seeded with the observer's TPM, not None
+    ///
+    /// This pins the observer-side wiring: if a future refactor swapped
+    /// `self.tokens_per_minute` for `None` in `record_api_error`, the
+    /// token_window_limit assertion would fail.
+    #[test]
+    fn observer_record_api_error_threads_tpm_to_apply_retry_after() {
+        // Construct a limiter directly.
+        let limiter = OpenAiRateLimiter::new("test-key", "https://api.openai.com");
+
+        // Construct an observer with explicit Some(500_000) TPM.
+        let observer = OpenAiStreamRateLimitObserver {
+            limiter: limiter.clone(),
+            model: "gpt-5".to_owned(),
+            tokens_per_minute: Some(500_000),
+        };
+
+        // Construct a rate-limit ApiError carrying a retry-after hint.
+        let api_error = ApiError {
+            message: "Rate limit reached. Please try again in 0.05s.".to_owned(),
+            r#type: Some("tokens".to_owned()),
+            param: None,
+            code: Some("rate_limit_exceeded".to_owned()),
+        };
+
+        // Call record_api_error, which should thread tokens_per_minute to
+        // apply_retry_after.
+        observer.record_api_error(&api_error);
+
+        // Assert cooldown was set (proves apply_retry_after was called).
+        assert!(
+            limiter.cooldown_for_test("gpt-5", Some(500_000)).is_some(),
+            "observer must call apply_retry_after",
+        );
+
+        // Assert the token window was seeded with the OBSERVER's TPM,
+        // not None. This pins that the observer threaded Some(500_000).
+        assert_eq!(
+            limiter.token_window_limit_for_test("gpt-5", Some(500_000)),
+            Some(500_000),
+            "observer must thread Some(500_000) TPM, not None",
+        );
+    }
 }
