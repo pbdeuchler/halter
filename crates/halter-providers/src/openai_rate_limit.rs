@@ -1,7 +1,7 @@
 // pattern: Imperative Shell
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
@@ -19,9 +19,6 @@ use crate::openai_rate_limit_policy::{
     parse_retry_after_duration, reconcile_rate_limit_snapshot, try_acquire_reservation,
 };
 
-static OPENAI_RATE_LIMITS: OnceLock<Mutex<HashMap<OpenAiRateLimitKey, Arc<OpenAiRateLimitEntry>>>> =
-    OnceLock::new();
-
 const HEADER_LIMIT_REQUESTS: &str = "x-ratelimit-limit-requests";
 const HEADER_LIMIT_TOKENS: &str = "x-ratelimit-limit-tokens";
 const HEADER_REMAINING_REQUESTS: &str = "x-ratelimit-remaining-requests";
@@ -34,6 +31,7 @@ const HEADER_RETRY_AFTER_MS: &str = "retry-after-ms";
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiRateLimiter {
     scope: OpenAiRateLimitScope,
+    registry: Arc<Mutex<HashMap<OpenAiRateLimitKey, Arc<OpenAiRateLimitEntry>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +68,7 @@ impl OpenAiRateLimiter {
                 base_url: base_url.trim_end_matches('/').to_owned(),
                 credential_fingerprint: fingerprint_api_key(api_key),
             },
+            registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -125,8 +124,7 @@ impl OpenAiRateLimiter {
             credential_fingerprint: self.scope.credential_fingerprint.clone(),
             model: model.to_owned(),
         };
-        let registry = OPENAI_RATE_LIMITS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry = registry.lock().expect("rate limit registry lock poisoned");
+        let mut registry = self.registry.lock().expect("rate limit registry lock poisoned");
         registry
             .entry(key)
             .or_insert_with(|| {
