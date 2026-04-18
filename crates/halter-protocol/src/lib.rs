@@ -732,12 +732,33 @@ pub struct ProviderError {
 }
 
 impl ProviderError {
+    /// Sentinel message produced by `ProviderError::cancelled` and recognized
+    /// by `is_cancelled`. New consumers should prefer the constructor /
+    /// predicate over inline message comparison.
+    pub const CANCELLED_MESSAGE: &str = "failed to execute provider request: request cancelled";
+
     #[must_use]
     pub fn new(message: impl Into<String>, retryable: bool) -> Self {
         Self {
             message: message.into(),
             retryable,
         }
+    }
+
+    /// Construct a non-retryable cancellation error with the canonical
+    /// message. Existing consumers that match on message text continue to
+    /// work; new consumers should use `is_cancelled()` to distinguish.
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            message: Self::CANCELLED_MESSAGE.to_owned(),
+            retryable: false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.message == Self::CANCELLED_MESSAGE
     }
 }
 

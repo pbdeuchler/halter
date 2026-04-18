@@ -11,12 +11,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::openai_codec::{self, ResponsesRequestOptions};
-use crate::openai_error::{
-    openai_api_error_is_rate_limit, openai_message_is_rate_limit, parse_openai_stream_error,
-};
+use crate::openai_error::classify;
 use crate::openai_rate_limit_policy::estimate_openai_request_cost;
 use crate::responses_transport::{
-    ResponsesRateLimitStrategy, ResponsesTransport, ResponsesTransportRequest,
+    ResponsesRateLimitStrategy, ResponsesTransport, ResponsesTransportRequest, TransportError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,17 +127,25 @@ impl ResponsesProvider {
                     .await
                 {
                     Ok(stream) => stream,
-                    Err(error) => {
-                        let message = error.to_string();
-                        if openai_message_is_rate_limit(&message) {
-                            warn!(
-                                provider = provider_label,
-                                error = %message,
-                                "retrying responses request after rate limit"
-                            );
-                            continue;
-                        }
-                        let _ = tx.unbounded_send(Err(provider_error_from_transport_error(error)));
+                    Err(TransportError::Cancelled) => {
+                        warn!(provider = provider_label, "responses request cancelled");
+                        let _ = tx.unbounded_send(Err(ProviderError::cancelled()));
+                        return;
+                    }
+                    Err(TransportError::Retryable {
+                        source,
+                        backoff_hint,
+                    }) => {
+                        warn!(
+                            provider = provider_label,
+                            error = %source,
+                            backoff_hint = ?backoff_hint,
+                            "retrying responses request after retryable transport failure"
+                        );
+                        continue;
+                    }
+                    Err(TransportError::Fatal { source }) => {
+                        let _ = tx.unbounded_send(Err(provider_error_from_openai(source, false)));
                         return;
                     }
                 };
@@ -152,10 +158,7 @@ impl ResponsesProvider {
                     select! {
                         _ = cancel.cancelled() => {
                             warn!(provider = provider_label, "responses request cancelled");
-                            let _ = tx.unbounded_send(Err(ProviderError::new(
-                                "failed to execute provider request: request cancelled",
-                                false,
-                            )));
+                            let _ = tx.unbounded_send(Err(ProviderError::cancelled()));
                             return;
                         }
                         item = response_stream.next() => {
@@ -188,16 +191,21 @@ impl ResponsesProvider {
                                     }
                                 },
                                 Some(Err(error)) => {
-                                    if !committed && stream_error_is_retryable(&error) {
+                                    let retryability = classify(&error);
+                                    if !committed && retryability.is_retryable() {
                                         warn!(
                                             provider = provider_label,
                                             error = %error,
-                                            "retrying responses stream after rate limit"
+                                            backoff_hint = ?retryability.backoff_hint(),
+                                            "retrying responses stream after retryable failure"
                                         );
                                         break;
                                     }
                                     warn!(provider = provider_label, error = %error, "responses stream returned provider error");
-                                    let _ = tx.unbounded_send(Err(provider_error_from_stream_error(error)));
+                                    let _ = tx.unbounded_send(Err(provider_error_from_openai(
+                                        error,
+                                        retryability.is_retryable(),
+                                    )));
                                     return;
                                 }
                                 None => {
@@ -333,53 +341,20 @@ fn validate_responses_compaction_request(
     Ok(())
 }
 
-fn provider_error_from_stream_error(error: OpenAIError) -> ProviderError {
-    match error {
-        OpenAIError::ApiError(api_error) => ProviderError::new(
-            format!("failed to execute provider request: {}", api_error.message),
-            openai_api_error_is_rate_limit(&api_error),
+/// Convert an `OpenAIError` to a `ProviderError`, using the caller-provided
+/// `retryable` flag (already decided by `classify`). Centralizing the
+/// formatting here ensures every error string has the same prefix.
+fn provider_error_from_openai(error: OpenAIError, retryable: bool) -> ProviderError {
+    let message = match &error {
+        OpenAIError::ApiError(api_error) => {
+            format!("failed to execute provider request: {}", api_error.message)
+        }
+        OpenAIError::JSONDeserialize(json_error, content) => format!(
+            "failed to execute provider request: failed to deserialize api response: error:{json_error} content:{content}"
         ),
-        OpenAIError::JSONDeserialize(json_error, content) => {
-            if let Some(api_error) = parse_openai_stream_error(&content) {
-                return ProviderError::new(
-                    format!("failed to execute provider request: {}", api_error.message),
-                    openai_api_error_is_rate_limit(&api_error),
-                );
-            }
-            ProviderError::new(
-                format!(
-                    "failed to execute provider request: failed to deserialize api response: error:{json_error} content:{content}"
-                ),
-                false,
-            )
-        }
-        other => {
-            let retryable = matches!(other, OpenAIError::Reqwest(_) | OpenAIError::StreamError(_));
-            ProviderError::new(
-                format!("failed to execute provider request: {other}"),
-                retryable,
-            )
-        }
-    }
-}
-
-fn provider_error_from_transport_error(error: anyhow::Error) -> ProviderError {
-    let message = error.to_string();
-    ProviderError::new(message.clone(), openai_message_is_rate_limit(&message))
-}
-
-fn stream_error_is_retryable(error: &OpenAIError) -> bool {
-    match error {
-        OpenAIError::ApiError(api_error) => openai_api_error_is_rate_limit(api_error),
-        OpenAIError::JSONDeserialize(_, content) => parse_openai_stream_error(content)
-            .as_ref()
-            .is_some_and(openai_api_error_is_rate_limit),
-        OpenAIError::Reqwest(_)
-        | OpenAIError::StreamError(_)
-        | OpenAIError::FileSaveError(_)
-        | OpenAIError::FileReadError(_)
-        | OpenAIError::InvalidArgument(_) => false,
-    }
+        other => format!("failed to execute provider request: {other}"),
+    };
+    ProviderError::new(message, retryable)
 }
 
 fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
@@ -459,5 +434,82 @@ mod tests {
             tools: Vec::new(),
             instructions: "Summarize".to_owned(),
         }
+    }
+
+    /// Contract test: the unified `classify` and the resulting
+    /// `provider_error_from_openai` must agree with the previous
+    /// hand-written `provider_error_from_stream_error` /
+    /// `stream_error_is_retryable` pair on the retryability of canonical
+    /// errors. Locks AC3.7 so subsequent refactors of the classifier do not
+    /// silently regress the field semantics consumers depend on.
+    #[test]
+    fn provider_error_retryability_matches_classify() {
+        use async_openai::error::{ApiError, OpenAIError, StreamError};
+
+        let cases: Vec<(&str, OpenAIError, bool)> = vec![
+            (
+                "rate-limit api error",
+                OpenAIError::ApiError(ApiError {
+                    message: "rate limit reached".to_owned(),
+                    r#type: Some("tokens".to_owned()),
+                    param: None,
+                    code: Some("rate_limit_exceeded".to_owned()),
+                }),
+                true,
+            ),
+            (
+                "synthetic 5xx",
+                OpenAIError::ApiError(ApiError {
+                    message: "Internal Server Error".to_owned(),
+                    r#type: None,
+                    param: None,
+                    code: Some(crate::openai_error::SYNTHETIC_SERVER_ERROR_CODE.to_owned()),
+                }),
+                true,
+            ),
+            (
+                "client error",
+                OpenAIError::ApiError(ApiError {
+                    message: "missing required parameter".to_owned(),
+                    r#type: Some("invalid_request".to_owned()),
+                    param: None,
+                    code: Some("invalid_request_error".to_owned()),
+                }),
+                false,
+            ),
+            (
+                "stream framing",
+                OpenAIError::StreamError(Box::new(StreamError::EventStream("eof".to_owned()))),
+                true,
+            ),
+        ];
+
+        for (label, error, expected_retryable) in cases {
+            let retryability = classify(&error);
+            let provider_error = provider_error_from_openai(error, retryability.is_retryable());
+            assert_eq!(
+                retryability.is_retryable(),
+                expected_retryable,
+                "{label}: classify mismatch"
+            );
+            assert_eq!(
+                provider_error.retryable, expected_retryable,
+                "{label}: ProviderError.retryable disagrees with classify"
+            );
+            assert!(
+                provider_error
+                    .message
+                    .starts_with("failed to execute provider request:"),
+                "{label}: message missing canonical prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_error_cancelled_is_distinguishable() {
+        let err = ProviderError::cancelled();
+        assert!(err.is_cancelled());
+        assert!(!err.retryable);
+        assert_eq!(err.message, ProviderError::CANCELLED_MESSAGE);
     }
 }
