@@ -171,8 +171,20 @@ impl OpenAiRateLimiter {
 }
 
 impl OpenAiRateLimitPermit {
-    pub(crate) fn update_from_headers(&mut self, headers: &HeaderMap, _status: StatusCode) {
-        self.resolve(snapshot_from_headers(headers));
+    pub(crate) fn update_from_headers(&mut self, headers: &HeaderMap, status: StatusCode) {
+        let snapshot = if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
+            // 2xx success and 429 rate-limit responses both carry
+            // authoritative budget headers — reconcile per-model windows
+            // from them.
+            snapshot_from_headers(headers)
+        } else {
+            // Other 4xx and all 5xx: release the reservation but do not
+            // reconcile windows. A non-rate-limit 4xx may have rejected
+            // the request before the server applied budget; a 5xx may
+            // carry stale or fabricated headers from an upstream proxy.
+            None
+        };
+        self.resolve(snapshot);
     }
 
     pub(crate) fn release_without_headers(&mut self) {
@@ -282,6 +294,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+    use reqwest::header::HeaderMap;
     // `OpenAiReservation` is re-exported into scope by `use super::*;` via the
     // file-level `use crate::openai_rate_limit_policy::{OpenAiReservation, ...}`
     // at openai_rate_limit.rs:16-20. Do not add a duplicate `use` here — clippy
@@ -411,6 +424,246 @@ mod tests {
         assert!(
             Arc::ptr_eq(&entry_orig, &entry_clone),
             "Clone must share the registry — observer construction relies on this",
+        );
+    }
+
+    // Task 2 helpers and tests for status-aware header reconcile -----------
+
+    // Helper: build a HeaderMap that snapshot_from_headers() will parse
+    // into a non-None snapshot. We use the same headers shape as
+    // spawn_sse_server in responses_transport.rs.
+    fn rate_limit_headers(remaining_requests: &str, reset_requests: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+        h.insert(
+            "x-ratelimit-remaining-requests",
+            remaining_requests.parse().unwrap(),
+        );
+        h.insert(
+            "x-ratelimit-reset-requests",
+            reset_requests.parse().unwrap(),
+        );
+        h
+    }
+
+    // Read the per-model `remaining` count for the requests window via
+    // the entry registry. `OpenAiRateLimitState` exposes its windows as
+    // bare `pub` fields (`pub requests: Option<OpenAiWindowState>`), so
+    // we use `.as_ref().map(...)` directly — there is no
+    // `requests_window()` accessor method.
+    fn remaining_requests_for(lim: &OpenAiRateLimiter, model: &str) -> Option<u64> {
+        let entry = lim.entry(model, Some(500_000));
+        let state = entry.state.lock().expect("lock");
+        state.requests.as_ref().map(|w| w.remaining)
+    }
+
+    // AC3.1 2xx reconciles ---------------------------------------------
+
+    #[tokio::test]
+    async fn update_from_headers_with_2xx_status_reconciles_windows() {
+        let lim = limiter("key-2xx", "https://api.openai.com");
+        let mut permit = lim
+            .acquire(
+                "gpt-5",
+                OpenAiReservation { requests: 1, tokens: 1 },
+                Some(500_000),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("acquire");
+
+        let headers = rate_limit_headers("42", "60s");
+        permit.update_from_headers(&headers, StatusCode::OK);
+
+        let remaining = remaining_requests_for(&lim, "gpt-5");
+        assert_eq!(
+            remaining,
+            Some(42),
+            "2xx must reconcile per-model windows from headers",
+        );
+    }
+
+    // AC3.2 429 reconciles ---------------------------------------------
+
+    #[tokio::test]
+    async fn update_from_headers_with_429_status_reconciles_windows() {
+        let lim = limiter("key-429", "https://api.openai.com");
+        let mut permit = lim
+            .acquire(
+                "gpt-5",
+                OpenAiReservation { requests: 1, tokens: 1 },
+                Some(500_000),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("acquire");
+
+        let headers = rate_limit_headers("0", "30s");
+        permit.update_from_headers(&headers, StatusCode::TOO_MANY_REQUESTS);
+
+        let remaining = remaining_requests_for(&lim, "gpt-5");
+        assert_eq!(
+            remaining,
+            Some(0),
+            "429 must reconcile per-model windows from headers (limit hint is authoritative)",
+        );
+    }
+
+    // AC3.3 5xx skips reconcile ----------------------------------------
+
+    #[tokio::test]
+    async fn update_from_headers_with_5xx_status_skips_reconcile() {
+        let lim = limiter("key-5xx", "https://api.openai.com");
+
+        // First, prime the window via a successful 2xx so we have a
+        // known "remaining" baseline.
+        let mut prime = lim
+            .acquire(
+                "gpt-5",
+                OpenAiReservation { requests: 1, tokens: 1 },
+                Some(500_000),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("acquire prime");
+        prime.update_from_headers(&rate_limit_headers("99", "60s"), StatusCode::OK);
+        let baseline = remaining_requests_for(&lim, "gpt-5");
+        assert_eq!(baseline, Some(99));
+
+        // Now: a 5xx with bogus "remaining=1" must NOT reconcile.
+        let mut permit = lim
+            .acquire(
+                "gpt-5",
+                OpenAiReservation { requests: 1, tokens: 1 },
+                Some(500_000),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("acquire 5xx");
+        permit.update_from_headers(
+            &rate_limit_headers("1", "60s"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+
+        // Window state must remain at the baseline; the bogus header is
+        // ignored.
+        assert_eq!(
+            remaining_requests_for(&lim, "gpt-5"),
+            baseline,
+            "5xx must not reconcile per-model windows",
+        );
+    }
+
+    // AC3.4 Other 4xx skips reconcile ----------------------------------
+
+    #[tokio::test]
+    async fn update_from_headers_with_non_429_4xx_skips_reconcile() {
+        let lim = limiter("key-4xx", "https://api.openai.com");
+
+        let mut prime = lim
+            .acquire(
+                "gpt-5",
+                OpenAiReservation { requests: 1, tokens: 1 },
+                Some(500_000),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("acquire prime");
+        prime.update_from_headers(&rate_limit_headers("99", "60s"), StatusCode::OK);
+        let baseline = remaining_requests_for(&lim, "gpt-5");
+
+        let mut permit = lim
+            .acquire(
+                "gpt-5",
+                OpenAiReservation { requests: 1, tokens: 1 },
+                Some(500_000),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("acquire 4xx");
+        permit.update_from_headers(
+            &rate_limit_headers("1", "60s"),
+            StatusCode::BAD_REQUEST,
+        );
+
+        assert_eq!(
+            remaining_requests_for(&lim, "gpt-5"),
+            baseline,
+            "non-429 4xx must not reconcile per-model windows",
+        );
+    }
+
+    // AC3.5 Reservation always released --------------------------------
+
+    #[tokio::test]
+    async fn update_from_headers_releases_reservation_for_every_status() {
+        // Every supported status path must drop the reserved budget.
+        // We count `state.reserved.requests` after each call and assert
+        // it returns to 0.
+        for (label, status) in [
+            ("200", StatusCode::OK),
+            ("429", StatusCode::TOO_MANY_REQUESTS),
+            ("500", StatusCode::INTERNAL_SERVER_ERROR),
+            ("400", StatusCode::BAD_REQUEST),
+        ] {
+            let lim = limiter(&format!("key-{label}"), "https://api.openai.com");
+            let mut permit = lim
+                .acquire(
+                    "gpt-5",
+                    OpenAiReservation { requests: 1, tokens: 1 },
+                    Some(500_000),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("acquire");
+
+            // Sanity: reservation is recorded.
+            {
+                let entry = lim.entry("gpt-5", Some(500_000));
+                let state = entry.state.lock().expect("lock");
+                assert_eq!(
+                    state.reserved.requests, 1,
+                    "{label}: reservation should be recorded after acquire",
+                );
+            }
+
+            permit.update_from_headers(&rate_limit_headers("50", "60s"), status);
+
+            let entry = lim.entry("gpt-5", Some(500_000));
+            let state = entry.state.lock().expect("lock");
+            assert_eq!(
+                state.reserved.requests, 0,
+                "{label}: reservation must be released by update_from_headers",
+            );
+        }
+    }
+
+    // AC3.5 (bis) Drop also releases when permit was never resolved -----
+
+    #[tokio::test]
+    async fn drop_releases_reservation_when_update_from_headers_was_not_called() {
+        let lim = limiter("key-drop", "https://api.openai.com");
+        {
+            let _permit = lim
+                .acquire(
+                    "gpt-5",
+                    OpenAiReservation { requests: 1, tokens: 1 },
+                    Some(500_000),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("acquire");
+
+            let entry = lim.entry("gpt-5", Some(500_000));
+            let state = entry.state.lock().expect("lock");
+            assert_eq!(state.reserved.requests, 1);
+        } // _permit drops here
+
+        let entry = lim.entry("gpt-5", Some(500_000));
+        let state = entry.state.lock().expect("lock");
+        assert_eq!(
+            state.reserved.requests, 0,
+            "Drop must release reservation even without an explicit update_from_headers",
         );
     }
 }
