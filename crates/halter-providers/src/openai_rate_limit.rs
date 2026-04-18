@@ -142,8 +142,19 @@ impl OpenAiRateLimiter {
             .clone()
     }
 
-    pub(crate) fn apply_retry_after(&self, model: &str, retry_after: Duration) {
-        let entry = self.entry(model, None);
+    /// Push a server-supplied retry-after hint into the limiter window for
+    /// `model`. `tokens_per_minute` (H20) is plumbed in so a first-touch
+    /// `apply_retry_after` for an entry that doesn't yet exist initializes
+    /// the token window with the model's TPM ceiling. Without this the
+    /// fresh entry is created with `tokens: None`, silently dropping the
+    /// caller's TPM context until the next successful header reconcile.
+    pub(crate) fn apply_retry_after(
+        &self,
+        model: &str,
+        tokens_per_minute: Option<u64>,
+        retry_after: Duration,
+    ) {
+        let entry = self.entry(model, tokens_per_minute);
         {
             let mut state = entry.state.lock().expect("rate limit lock poisoned");
             reconcile_rate_limit_snapshot(

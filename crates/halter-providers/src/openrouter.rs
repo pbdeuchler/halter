@@ -12,6 +12,7 @@ use crate::Provider;
 use crate::responses_provider::{
     CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
+use crate::retry::RetryPolicy;
 
 #[derive(Debug, Clone)]
 pub struct OpenRouterProvider {
@@ -76,6 +77,7 @@ fn config() -> ResponsesProviderConfig {
         },
         compact_strategy: Some(CompactStrategy::InlineResponses),
         rate_limit_strategy: None,
+        retry_policy: RetryPolicy::default(),
     }
 }
 

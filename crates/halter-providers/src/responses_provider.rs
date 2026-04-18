@@ -1,13 +1,14 @@
 // pattern: Imperative Shell
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use async_openai::error::OpenAIError;
 use futures::{Stream, StreamExt, channel::mpsc, stream::BoxStream};
 use halter_protocol::{
-    ApiKind, ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse,
-    ProviderError, ProviderRequest, StreamEvent,
+    ApiKind, MessageId, ProviderCapabilities, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent,
 };
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +20,7 @@ use crate::openai_rate_limit_policy::estimate_openai_request_cost;
 use crate::responses_transport::{
     ResponsesRateLimitStrategy, ResponsesTransport, ResponsesTransportRequest, TransportError,
 };
+use crate::retry::{RetryGate, RetryPolicy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactStrategy {
@@ -41,6 +43,9 @@ pub(crate) struct ResponsesProviderConfig {
     pub request: ResponsesProviderRequestConfig,
     pub compact_strategy: Option<CompactStrategy>,
     pub rate_limit_strategy: Option<ResponsesRateLimitStrategy>,
+    /// Retry budget for the streaming pipeline. Defaults are appropriate
+    /// for production; tests inject smaller values to keep the suite fast.
+    pub retry_policy: RetryPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +123,7 @@ impl ResponsesProvider {
         let (tx, rx) = mpsc::unbounded();
         let provider_label = self.config.label;
         let transport = self.transport.clone();
+        let retry_policy = self.config.retry_policy;
         // Stream-scoped child token: cancellable by either the caller's
         // outer `cancel` or by `CancelOnDrop` when the consumer drops the
         // returned stream. Cancelling this child does not affect siblings
@@ -127,56 +133,80 @@ impl ResponsesProvider {
 
         tokio::spawn(async move {
             let cancel = task_cancel;
-            loop {
-                let mut response_stream = match transport
-                    .responses_stream(
-                        request_body.clone(),
-                        request_meta.clone(),
-                        cancel.child_token(),
-                    )
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(TransportError::Cancelled) => {
-                        warn!(provider = provider_label, "responses request cancelled");
-                        let _ = tx.unbounded_send(Err(ProviderError::cancelled()));
-                        return;
-                    }
-                    Err(TransportError::Retryable {
-                        source,
-                        backoff_hint,
-                    }) => {
-                        warn!(
-                            provider = provider_label,
-                            error = %source,
-                            backoff_hint = ?backoff_hint,
-                            "retrying responses request after retryable transport failure"
-                        );
-                        continue;
-                    }
-                    Err(TransportError::Fatal { source }) => {
-                        let _ = tx.unbounded_send(Err(provider_error_from_openai(source, false)));
-                        return;
-                    }
-                };
-                let mut decoder =
-                    openai_codec::ResponsesStreamDecoder::new(&request, track_response_id);
-                let mut pending_events = Vec::new();
-                let mut committed = false;
+            // Single retry gate spans both startup failures and mid-stream
+            // pre-commit failures (AC3.4). Without a single gate, a stream
+            // that reliably failed *after* connecting could loop forever
+            // even though the transport startup retry counter was bounded.
+            let mut gate = RetryGate::new(retry_policy);
+            // Cross-attempt MessageStart dedup (AC3.6). When an earlier
+            // attempt's `pending_events` buffer is discarded by retry, the
+            // next attempt's decoder will re-emit `MessageStart` for the
+            // same response; we suppress the duplicate before forwarding.
+            let mut commit_dedup = CommitDedup::default();
 
-                loop {
-                    select! {
-                        _ = cancel.cancelled() => {
+            loop {
+                let attempt_id = gate.next_attempt_id();
+                // Single attempt: try to start the stream, then consume
+                // events. Returns `Some((source, hint))` when this attempt
+                // failed *retryably* (either at startup or pre-commit) and
+                // the outer loop should consult the gate. Terminal outcomes
+                // (cancellation, fatal failure, post-commit failure, normal
+                // completion) handle their own consumer emissions and
+                // `return` directly out of the spawned task.
+                let retry_reason: Option<(OpenAIError, Option<std::time::Duration>)> = 'attempt: {
+                    let mut response_stream = match transport
+                        .responses_stream(
+                            request_body.clone(),
+                            request_meta.clone(),
+                            cancel.child_token(),
+                        )
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(TransportError::Cancelled) => {
                             warn!(provider = provider_label, "responses request cancelled");
                             let _ = tx.unbounded_send(Err(ProviderError::cancelled()));
                             return;
                         }
-                        item = response_stream.next() => {
-                            match item {
+                        Err(TransportError::Fatal { source }) => {
+                            let _ =
+                                tx.unbounded_send(Err(provider_error_from_openai(source, false)));
+                            return;
+                        }
+                        Err(TransportError::Retryable {
+                            source,
+                            backoff_hint,
+                        }) => {
+                            warn!(
+                                provider = provider_label,
+                                attempt = attempt_id,
+                                error = %source,
+                                backoff_hint = ?backoff_hint,
+                                "retryable transport startup failure"
+                            );
+                            break 'attempt Some((source, backoff_hint));
+                        }
+                    };
+                    let mut decoder =
+                        openai_codec::ResponsesStreamDecoder::new(&request, track_response_id);
+                    let mut pending_events = Vec::new();
+                    let mut committed = false;
+
+                    loop {
+                        select! {
+                            _ = cancel.cancelled() => {
+                                warn!(provider = provider_label, "responses request cancelled");
+                                let _ = tx.unbounded_send(Err(ProviderError::cancelled()));
+                                return;
+                            }
+                            item = response_stream.next() => match item {
                                 Some(Ok(event)) => match decoder.decode(event) {
                                     Ok(events) => {
                                         if committed {
                                             for event in events {
+                                                if !commit_dedup.allow(&event) {
+                                                    continue;
+                                                }
                                                 if tx.unbounded_send(Ok(event)).is_err() {
                                                     return;
                                                 }
@@ -188,6 +218,9 @@ impl ResponsesProvider {
                                         if pending_events.iter().any(stream_event_commits_attempt) {
                                             committed = true;
                                             for event in pending_events.drain(..) {
+                                                if !commit_dedup.allow(&event) {
+                                                    continue;
+                                                }
                                                 if tx.unbounded_send(Ok(event)).is_err() {
                                                     return;
                                                 }
@@ -203,13 +236,15 @@ impl ResponsesProvider {
                                 Some(Err(error)) => {
                                     let retryability = classify(&error);
                                     if !committed && retryability.is_retryable() {
+                                        let hint = retryability.backoff_hint();
                                         warn!(
                                             provider = provider_label,
+                                            attempt = attempt_id,
                                             error = %error,
-                                            backoff_hint = ?retryability.backoff_hint(),
-                                            "retrying responses stream after retryable failure"
+                                            backoff_hint = ?hint,
+                                            "retryable pre-commit stream failure"
                                         );
-                                        break;
+                                        break 'attempt Some((error, hint));
                                     }
                                     warn!(provider = provider_label, error = %error, "responses stream returned provider error");
                                     let _ = tx.unbounded_send(Err(provider_error_from_openai(
@@ -221,6 +256,9 @@ impl ResponsesProvider {
                                 None => {
                                     if !pending_events.is_empty() {
                                         for event in pending_events.drain(..) {
+                                            if !commit_dedup.allow(&event) {
+                                                continue;
+                                            }
                                             if tx.unbounded_send(Ok(event)).is_err() {
                                                 return;
                                             }
@@ -230,6 +268,34 @@ impl ResponsesProvider {
                                     return;
                                 }
                             }
+                        }
+                    }
+                };
+
+                // Retry decision: consult the gate, sleep, and loop. On
+                // exhaustion, surface the latest source as a non-retryable
+                // ProviderError (the retryable signal has been "spent" by
+                // the budget; further retries would be unbounded).
+                if let Some((source, hint)) = retry_reason {
+                    match gate.record_failure_and_next_backoff(hint) {
+                        Some(delay) => {
+                            info!(
+                                provider = provider_label,
+                                attempt = attempt_id,
+                                retry_in_ms = delay.as_millis() as u64,
+                                "retrying responses request"
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                        None => {
+                            warn!(
+                                provider = provider_label,
+                                attempt = attempt_id,
+                                "responses retry budget exhausted"
+                            );
+                            let _ =
+                                tx.unbounded_send(Err(provider_error_from_openai(source, false)));
+                            return;
                         }
                     }
                 }
@@ -399,6 +465,24 @@ impl<S> Drop for CancelOnDrop<S> {
     }
 }
 
+/// Cross-attempt dedup for commit-eligible boundary events. When an attempt
+/// fails before commit, the next attempt's decoder will re-emit the same
+/// `MessageStart` for the same response id; without suppression, downstream
+/// consumers would see two starts for one logical message (AC3.6).
+#[derive(Debug, Default)]
+struct CommitDedup {
+    seen_message_starts: HashSet<MessageId>,
+}
+
+impl CommitDedup {
+    fn allow(&mut self, event: &StreamEvent) -> bool {
+        if let StreamEvent::MessageStart { id } = event {
+            return self.seen_message_starts.insert(id.clone());
+        }
+        true
+    }
+}
+
 fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
     matches!(
         event,
@@ -415,9 +499,17 @@ fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures::StreamExt;
     use halter_protocol::{
-        ModelId, ModelRole, ProviderKind, ProviderName, ResolvedModel, SessionId,
+        AssembledPrompt, BlockId, MessageId, ModelId, ModelRole, ProviderKind, ProviderName,
+        ResolvedModel, SessionId, TurnId,
     };
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::*;
 
@@ -438,6 +530,7 @@ mod tests {
                 },
                 compact_strategy: None,
                 rate_limit_strategy: None,
+                retry_policy: RetryPolicy::default(),
             },
             "test-key",
             "http://127.0.0.1:1",
@@ -572,6 +665,36 @@ mod tests {
         assert!(token.is_cancelled());
     }
 
+    /// AC3.6: When a pre-commit attempt fails and is retried, the next
+    /// attempt's decoder will re-emit `MessageStart` for the same response;
+    /// `CommitDedup` must suppress the duplicate so consumers see exactly one
+    /// start per logical message id. Distinct ids must still pass through —
+    /// otherwise a multi-message conversation would be silently truncated.
+    #[test]
+    fn commit_dedup_suppresses_duplicate_message_start() {
+        let mut dedup = CommitDedup::default();
+        let id = MessageId::from("msg_alpha");
+        let other = MessageId::from("msg_beta");
+
+        assert!(dedup.allow(&StreamEvent::MessageStart { id: id.clone() }));
+        assert!(!dedup.allow(&StreamEvent::MessageStart { id: id.clone() }));
+        assert!(dedup.allow(&StreamEvent::MessageStart { id: other }));
+    }
+
+    /// `CommitDedup` must only intercept `MessageStart`. All other events —
+    /// in particular repeats of the same `BlockId` for `TextStart` /
+    /// `TextDelta` — must always pass through, since the codec uses block
+    /// identity for normal in-stream segmentation, not for retry suppression.
+    #[test]
+    fn commit_dedup_passes_through_non_message_start_events() {
+        let mut dedup = CommitDedup::default();
+        let block = BlockId::from("blk_one");
+        let event = StreamEvent::TextStart { id: block.clone() };
+        assert!(dedup.allow(&event));
+        assert!(dedup.allow(&event));
+        assert!(dedup.allow(&StreamEvent::TextEnd { id: block }));
+    }
+
     /// `CancelOnDrop` must remain a transparent stream proxy — adding the
     /// drop side-effect should not perturb forward iteration semantics.
     #[tokio::test]
@@ -588,5 +711,187 @@ mod tests {
         assert!(!token.is_cancelled());
         drop(wrapper);
         assert!(token.is_cancelled());
+    }
+
+    /// AC3.4: When every attempt fails with a retryable error, the bounded
+    /// `RetryPolicy::max_attempts` budget must be honored — the provider
+    /// must stop after exactly that many requests, not loop forever, and the
+    /// final emitted `ProviderError` must be `retryable=false` (the budget
+    /// has been "spent"; further retries are no longer authorized).
+    #[tokio::test]
+    async fn responses_provider_stops_after_retry_budget() {
+        let attempts = Arc::new(tokio::sync::Mutex::new(0u32));
+        let base_url = spawn_always_failing_stream_server(attempts.clone()).await;
+
+        let max_attempts = 3u32;
+        let provider = ResponsesProvider::new(
+            ResponsesProviderConfig {
+                label: "responses-budget",
+                capabilities: ProviderCapabilities::default(),
+                request: ResponsesProviderRequestConfig {
+                    store: Some(false),
+                    include_prompt_cache_key: false,
+                    include_encrypted_reasoning: false,
+                    reasoning_summary: None,
+                },
+                compact_strategy: None,
+                rate_limit_strategy: None,
+                retry_policy: RetryPolicy {
+                    max_attempts,
+                    base_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(5),
+                    deadline: Duration::from_secs(60),
+                    jitter_pct: 0,
+                },
+            },
+            "test-key",
+            base_url,
+        );
+
+        let mut stream = provider
+            .stream(sample_responses_request(), CancellationToken::new())
+            .await
+            .expect("provider stream");
+
+        let mut errors = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => {}
+                Err(error) => errors.push(error),
+            }
+        }
+
+        let final_error = errors
+            .pop()
+            .expect("provider should surface a final error after exhausting budget");
+        assert!(
+            !final_error.retryable,
+            "final error after budget exhaustion must be non-retryable: {final_error:?}"
+        );
+        assert!(
+            final_error
+                .message
+                .starts_with("failed to execute provider request:"),
+            "final error message missing canonical prefix: {final_error:?}"
+        );
+
+        let attempts = *attempts.lock().await;
+        assert_eq!(
+            attempts, max_attempts,
+            "expected exactly {max_attempts} requests, observed {attempts}"
+        );
+    }
+
+    fn sample_responses_request() -> ProviderRequest {
+        ProviderRequest {
+            session_id: SessionId::new(),
+            turn_id: TurnId::new(),
+            model: ResolvedModel {
+                role: ModelRole::default(),
+                id: ModelId::from("default"),
+                provider: ProviderName::from("responses-budget"),
+                provider_kind: ProviderKind::OpenAi,
+                api_kind: ApiKind::OpenAiResponses,
+                model: "gpt-5".to_owned(),
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(8_192),
+                reasoning: None,
+                tokens_per_minute: None,
+            },
+            prompt: AssembledPrompt {
+                segments: Vec::new(),
+                transcript: Vec::new(),
+                ordered_segments: Vec::new(),
+                prefix_cache_key: "cache-key".to_owned(),
+                rendered_prefix: String::new(),
+                rendered_transcript: String::new(),
+                rendered: String::new(),
+            },
+            compacted_prefix: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            previous_response_id: None,
+            new_messages_start: 0,
+        }
+    }
+
+    /// Test fixture: HTTP/SSE server that returns an in-stream rate-limit
+    /// error on every connection. Models the worst-case where every retry
+    /// attempt fails with a retryable error so we can verify the budget caps
+    /// the loop. Accepts up to 16 connections so a misconfigured (unbounded)
+    /// retry would eventually trip an assertion rather than hang the test.
+    async fn spawn_always_failing_stream_server(attempts: Arc<tokio::sync::Mutex<u32>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            for _ in 0..16 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                if read_http_request(&mut socket).await.is_err() {
+                    return;
+                }
+                *attempts.lock().await += 1;
+                let error = json!({
+                    "type": "error",
+                    "error": {
+                        "type": "tokens",
+                        "code": "rate_limit_exceeded",
+                        "message": "Rate limit reached. Please try again in 0.01s.",
+                        "param": null
+                    },
+                    "sequence_number": 0
+                });
+                let body = format!("data: {error}\n\ndata: [DONE]\n\n");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        format!("http://{address}")
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<()> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+
+        loop {
+            let read = socket.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(headers_end) = find_headers_end(&buffer) {
+                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(0);
+                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
+                if body_bytes >= content_length {
+                    return Ok(());
+                }
+            }
+        }
+
+        anyhow::bail!("incomplete http request")
+    }
+
+    fn find_headers_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
     }
 }

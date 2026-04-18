@@ -14,6 +14,7 @@ mod openrouter;
 mod registry;
 mod responses_provider;
 mod responses_transport;
+mod retry;
 mod unsupported;
 
 use async_trait::async_trait;
