@@ -301,8 +301,8 @@ mod tests {
 
     // AC1.1 Isolation ----------------------------------------------------
 
-    #[tokio::test]
-    async fn separate_limiters_with_different_credentials_have_separate_entries() {
+    #[test]
+    fn separate_limiters_with_different_credentials_have_separate_entries() {
         let a = limiter("key-a", "https://api.openai.com");
         let b = limiter("key-b", "https://api.openai.com");
 
@@ -319,24 +319,25 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_limiter_drops_its_registry() {
-        // Construct, take an entry, drop. Then construct a new limiter with
-        // the same scope and confirm the new entry is a fresh Arc — proving
-        // the prior limiter's registry was not leaked into a static.
-        let entry_arc_id_first = {
+        // Construct a limiter, apply a cooldown via apply_retry_after, then drop it.
+        // Create a new limiter with the same scope. If the registry were leaked into
+        // a static, the new limiter's entry would still have the cooldown. With
+        // per-instance registries, the new entry's state is fresh (cooldown_until is None).
+        {
             let lim = limiter("key-shared", "https://api.openai.com");
-            let entry = lim.entry("gpt-5", Some(500_000));
-            // Capture identity by raw pointer; safe to compare for equality
-            // because we don't dereference after lim is dropped.
-            Arc::as_ptr(&entry) as usize
-        };
+            lim.apply_retry_after("gpt-5", Some(500_000), Duration::from_secs(60));
+        }
 
+        // Create a fresh limiter with the same scope.
         let lim = limiter("key-shared", "https://api.openai.com");
         let entry = lim.entry("gpt-5", Some(500_000));
-        let entry_arc_id_second = Arc::as_ptr(&entry) as usize;
 
-        assert_ne!(
-            entry_arc_id_first, entry_arc_id_second,
-            "a fresh limiter must allocate a new entry — no static may persist across limiter lifetimes",
+        // Lock the entry's state and verify cooldown_until is None.
+        // If a static leaked state across limiter drops, cooldown_until would be set.
+        let state = entry.state.lock().expect("state lock poisoned");
+        assert!(
+            state.cooldown_until.is_none(),
+            "a fresh limiter's entry must have no cooldown — registry was leaked into a static",
         );
     }
 
@@ -344,32 +345,41 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_limiters_for_same_model_do_not_interfere() {
-        // Run two acquires concurrently on independent limiters with the
-        // same scope and model. Both must succeed without contention.
+        // Set a cooldown on lim_a, then verify lim_b acquires immediately.
+        // With a shared registry, lim_b would see lim_a's cooldown and block.
+        // With isolated registries, lim_b acquires without waiting.
         let lim_a = limiter("key-iso", "https://api.openai.com");
         let lim_b = limiter("key-iso", "https://api.openai.com");
 
+        // Apply a long cooldown to lim_a.
+        lim_a.apply_retry_after("gpt-5", Some(500_000), Duration::from_secs(100));
+
+        // Try to acquire from lim_b. With isolated registries, this should
+        // succeed immediately (no cooldown visible). With shared state, it
+        // would wait. We measure wall time to confirm "immediately".
         let cancel = CancellationToken::new();
-        let permit_a = lim_a
-            .acquire("gpt-5", small_reservation(), Some(500_000), cancel.clone())
-            .await
-            .expect("limiter a acquire");
+        let start = Instant::now();
         let permit_b = lim_b
             .acquire("gpt-5", small_reservation(), Some(500_000), cancel)
             .await
             .expect("limiter b acquire");
+        let elapsed = start.elapsed();
 
-        // Independent registries → independent entries.
-        // (Released on drop; we just need both acquires to have succeeded
-        // without one's reservation showing up in the other's window.)
-        drop(permit_a);
+        // If lim_b saw lim_a's cooldown, elapsed would be ~100s.
+        // With isolation, it should be << 1s.
+        assert!(
+            elapsed.as_secs() < 1,
+            "lim_b must not see lim_a's cooldown — acquired in {}ms, expected <1000ms",
+            elapsed.as_millis()
+        );
+
         drop(permit_b);
     }
 
     // AC1.4 Per-credential keying preserved ------------------------------
 
-    #[tokio::test]
-    async fn one_limiter_with_two_models_keeps_separate_entries() {
+    #[test]
+    fn one_limiter_with_two_models_keeps_separate_entries() {
         let lim = limiter("key-multi", "https://api.openai.com");
 
         let gpt5 = lim.entry("gpt-5", Some(500_000));
@@ -386,11 +396,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cloned_limiter_shares_registry_with_original() {
-        // Observer-clone contract: cloning the limiter must hand back the
-        // same Arc-backed registry, so the observer and the transport see
-        // the same per-model entry.
+    // Observer-clone contract -----------------------------------------------
+
+    #[test]
+    fn cloned_limiter_shares_registry_with_original() {
+        // Cloning the limiter must hand back the same Arc-backed registry,
+        // so the observer and the transport see the same per-model entry.
         let lim = limiter("key-clone", "https://api.openai.com");
         let cloned = lim.clone();
 
