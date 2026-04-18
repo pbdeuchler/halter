@@ -403,7 +403,16 @@ impl RuntimeSubagentControl {
             }
         }
 
-        Ok(continuation)
+        // The loop body always either returns or `continue`s. Reaching this
+        // line would mean a future refactor accidentally let the loop fall
+        // through; surface that as an error rather than silently reporting
+        // success (H16: previous shape returned Ok(continuation) and erased
+        // the conflict).
+        let _ = continuation;
+        Err(anyhow::anyhow!(
+            "hook dispatch exhausted {} retries due to session commit conflict",
+            PARENT_HOOK_DISPATCH_MAX_RETRIES
+        ))
     }
 
     async fn run_subagent_start_hooks(

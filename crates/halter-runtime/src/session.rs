@@ -209,7 +209,7 @@ impl ToolEventSink for SessionToolEventSink {
         }
         self.events
             .lock()
-            .expect("tool event lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(event);
     }
 }
@@ -222,7 +222,7 @@ impl ToolEventDrain {
     fn into_events(self) -> Vec<ToolRuntimeEvent> {
         self.events
             .lock()
-            .expect("tool event lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain(..)
             .collect()
     }

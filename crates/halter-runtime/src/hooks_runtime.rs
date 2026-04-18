@@ -853,17 +853,19 @@ async fn run_agent(
     let payload_json = serde_json::to_string_pretty(&request.payload)?;
     let agent_cancel = cancel.child_token();
     let turn_cancel = agent_cancel.clone();
-    let runtime_handle = tokio::runtime::Handle::current();
-    let mut agent_task = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
-            runtime_handle.block_on(async move {
-                let stream = agent_session
-                    .submit_turn_with_cancel(Turn::user(payload_json), turn_cancel)
-                    .await?;
-                stream.try_collect::<Vec<_>>().await
-            })
-        },
-    );
+    // Hook agents run on the ambient tokio runtime via `tokio::spawn`. The
+    // earlier `spawn_blocking + Handle::block_on` pattern only worked when the
+    // outer caller was itself blocking; any future async caller would
+    // deadlock. AC2.8 requires the dispatch path to stay fully async.
+    //
+    // `run_hook_agent_turn` returns a typed `BoxFuture` so `tokio::spawn`'s
+    // auto-`Send` check is satisfied by the concrete pointer type and does
+    // not have to recurse through `run_agent`'s own opaque return.
+    let mut agent_task = tokio::spawn(run_hook_agent_turn(
+        agent_session,
+        payload_json,
+        turn_cancel,
+    ));
     let events = tokio::select! {
         _ = cancel.cancelled() => {
             agent_cancel.cancel();
@@ -885,6 +887,24 @@ async fn run_agent(
     Ok(HandlerExecution::completed(parse_json_hook_output(
         &output,
     )?))
+}
+
+// Returns a `BoxFuture` rather than `async fn` so the spawn caller has a
+// concrete `Pin<Box<dyn Future + Send>>` to hand to `tokio::spawn`. Returning
+// `impl Future` would force `tokio::spawn`'s `Send` check to recurse through
+// `submit_turn_with_cancel` -> hook dispatch -> `run_agent`, producing an
+// inference cycle on `run_agent`'s own opaque return type.
+fn run_hook_agent_turn(
+    agent_session: HalterSession,
+    payload_json: String,
+    turn_cancel: CancellationToken,
+) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<halter_protocol::SessionEvent>>> {
+    Box::pin(async move {
+        let stream = agent_session
+            .submit_turn_with_cancel(Turn::user(payload_json), turn_cancel)
+            .await?;
+        stream.try_collect::<Vec<_>>().await
+    })
 }
 
 fn resolve_prompt_model(

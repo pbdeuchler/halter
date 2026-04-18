@@ -123,14 +123,14 @@ impl ToolRuntime {
         debug!(tool_name = %spec.name, "registering tool");
         self.tools
             .write()
-            .expect("tool runtime lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(spec.name.0, tool);
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools
             .read()
-            .expect("tool runtime lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
             .map(|tool| tool.spec())
             .collect()
@@ -143,7 +143,7 @@ impl ToolRuntime {
         let tools = self
             .tools
             .read()
-            .expect("tool runtime lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .filter(|(name, _)| allow_all || allowed.contains(name))
             .map(|(name, tool)| (name.clone(), tool.clone()))
@@ -162,7 +162,7 @@ impl ToolRuntime {
         let tool = self
             .tools
             .read()
-            .expect("tool runtime lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(name)
             .cloned()
             .ok_or_else(|| {
