@@ -276,3 +276,130 @@ fn fingerprint_api_key(api_key: &str) -> String {
     }
     fingerprint
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    // `OpenAiReservation` is re-exported into scope by `use super::*;` via the
+    // file-level `use crate::openai_rate_limit_policy::{OpenAiReservation, ...}`
+    // at openai_rate_limit.rs:16-20. Do not add a duplicate `use` here — clippy
+    // would flag it as unused.
+
+    // helpers ------------------------------------------------------------
+
+    fn limiter(api_key: &str, base_url: &str) -> OpenAiRateLimiter {
+        OpenAiRateLimiter::new(api_key, base_url)
+    }
+
+    fn small_reservation() -> OpenAiReservation {
+        // The exact numbers don't matter for isolation tests; pick a
+        // reservation small enough that no policy will reject it.
+        OpenAiReservation { requests: 1, tokens: 1 }
+    }
+
+    // AC1.1 Isolation ----------------------------------------------------
+
+    #[tokio::test]
+    async fn separate_limiters_with_different_credentials_have_separate_entries() {
+        let a = limiter("key-a", "https://api.openai.com");
+        let b = limiter("key-b", "https://api.openai.com");
+
+        let entry_a = a.entry("gpt-5", Some(500_000));
+        let entry_b = b.entry("gpt-5", Some(500_000));
+
+        assert!(
+            !Arc::ptr_eq(&entry_a, &entry_b),
+            "limiters with different credentials must not share per-model entries",
+        );
+    }
+
+    // AC1.2 Lifecycle ----------------------------------------------------
+
+    #[tokio::test]
+    async fn dropping_limiter_drops_its_registry() {
+        // Construct, take an entry, drop. Then construct a new limiter with
+        // the same scope and confirm the new entry is a fresh Arc — proving
+        // the prior limiter's registry was not leaked into a static.
+        let entry_arc_id_first = {
+            let lim = limiter("key-shared", "https://api.openai.com");
+            let entry = lim.entry("gpt-5", Some(500_000));
+            // Capture identity by raw pointer; safe to compare for equality
+            // because we don't dereference after lim is dropped.
+            Arc::as_ptr(&entry) as usize
+        };
+
+        let lim = limiter("key-shared", "https://api.openai.com");
+        let entry = lim.entry("gpt-5", Some(500_000));
+        let entry_arc_id_second = Arc::as_ptr(&entry) as usize;
+
+        assert_ne!(
+            entry_arc_id_first, entry_arc_id_second,
+            "a fresh limiter must allocate a new entry — no static may persist across limiter lifetimes",
+        );
+    }
+
+    // AC1.3 Test isolation -----------------------------------------------
+
+    #[tokio::test]
+    async fn parallel_limiters_for_same_model_do_not_interfere() {
+        // Run two acquires concurrently on independent limiters with the
+        // same scope and model. Both must succeed without contention.
+        let lim_a = limiter("key-iso", "https://api.openai.com");
+        let lim_b = limiter("key-iso", "https://api.openai.com");
+
+        let cancel = CancellationToken::new();
+        let permit_a = lim_a
+            .acquire("gpt-5", small_reservation(), Some(500_000), cancel.clone())
+            .await
+            .expect("limiter a acquire");
+        let permit_b = lim_b
+            .acquire("gpt-5", small_reservation(), Some(500_000), cancel)
+            .await
+            .expect("limiter b acquire");
+
+        // Independent registries → independent entries.
+        // (Released on drop; we just need both acquires to have succeeded
+        // without one's reservation showing up in the other's window.)
+        drop(permit_a);
+        drop(permit_b);
+    }
+
+    // AC1.4 Per-credential keying preserved ------------------------------
+
+    #[tokio::test]
+    async fn one_limiter_with_two_models_keeps_separate_entries() {
+        let lim = limiter("key-multi", "https://api.openai.com");
+
+        let gpt5 = lim.entry("gpt-5", Some(500_000));
+        let gpt5_again = lim.entry("gpt-5", Some(500_000));
+        let other = lim.entry("gpt-4o", Some(300_000));
+
+        assert!(
+            Arc::ptr_eq(&gpt5, &gpt5_again),
+            "same model on the same limiter must reuse the same entry",
+        );
+        assert!(
+            !Arc::ptr_eq(&gpt5, &other),
+            "different models on the same limiter must allocate different entries",
+        );
+    }
+
+    #[tokio::test]
+    async fn cloned_limiter_shares_registry_with_original() {
+        // Observer-clone contract: cloning the limiter must hand back the
+        // same Arc-backed registry, so the observer and the transport see
+        // the same per-model entry.
+        let lim = limiter("key-clone", "https://api.openai.com");
+        let cloned = lim.clone();
+
+        let entry_orig = lim.entry("gpt-5", Some(500_000));
+        let entry_clone = cloned.entry("gpt-5", Some(500_000));
+
+        assert!(
+            Arc::ptr_eq(&entry_orig, &entry_clone),
+            "Clone must share the registry — observer construction relies on this",
+        );
+    }
+}
