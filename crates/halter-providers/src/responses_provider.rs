@@ -1,7 +1,10 @@
 // pattern: Imperative Shell
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use async_openai::error::OpenAIError;
-use futures::{StreamExt, channel::mpsc, stream::BoxStream};
+use futures::{Stream, StreamExt, channel::mpsc, stream::BoxStream};
 use halter_protocol::{
     ApiKind, ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse,
     ProviderError, ProviderRequest, StreamEvent,
@@ -115,8 +118,15 @@ impl ResponsesProvider {
         let (tx, rx) = mpsc::unbounded();
         let provider_label = self.config.label;
         let transport = self.transport.clone();
+        // Stream-scoped child token: cancellable by either the caller's
+        // outer `cancel` or by `CancelOnDrop` when the consumer drops the
+        // returned stream. Cancelling this child does not affect siblings
+        // of the caller's broader scope.
+        let stream_cancel = cancel.child_token();
+        let task_cancel = stream_cancel.clone();
 
         tokio::spawn(async move {
+            let cancel = task_cancel;
             loop {
                 let mut response_stream = match transport
                     .responses_stream(
@@ -226,7 +236,17 @@ impl ResponsesProvider {
             }
         });
 
-        Ok(rx.boxed())
+        // Wrap the receiver so that consumer drop fires `stream_cancel`,
+        // which propagates to the spawned worker and to the cancel-aware
+        // SSE decode task in `ResponsesTransport::stream_response`. Without
+        // this wrapper, dropping the stream would only signal back-pressure
+        // to the worker via channel send failure on the *next* event —
+        // leaving the SSE task parked on `byte_stream.next()` indefinitely.
+        Ok(CancelOnDrop {
+            inner: rx.boxed(),
+            cancel: stream_cancel,
+        }
+        .boxed())
     }
 
     pub(crate) async fn compact(
@@ -355,6 +375,28 @@ fn provider_error_from_openai(error: OpenAIError, retryable: bool) -> ProviderEr
         other => format!("failed to execute provider request: {other}"),
     };
     ProviderError::new(message, retryable)
+}
+
+/// Stream wrapper that cancels its `CancellationToken` when dropped. Used to
+/// propagate consumer drop back into the spawned SSE decode task so the task
+/// exits promptly instead of leaking on a parked `byte_stream.next()` (AC3.1).
+struct CancelOnDrop<S> {
+    inner: S,
+    cancel: CancellationToken,
+}
+
+impl<S: Stream + Unpin> Stream for CancelOnDrop<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for CancelOnDrop<S> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
@@ -511,5 +553,40 @@ mod tests {
         assert!(err.is_cancelled());
         assert!(!err.retryable);
         assert_eq!(err.message, ProviderError::CANCELLED_MESSAGE);
+    }
+
+    /// AC3.1 wiring: `CancelOnDrop` must cancel its token on `Drop` so that
+    /// the parent token's downstream listeners (the spawned worker loop and
+    /// the cancel-aware SSE decoder) observe consumer drop without depending
+    /// on the channel surfacing a failed send.
+    #[test]
+    fn cancel_on_drop_cancels_token_on_drop() {
+        let token = CancellationToken::new();
+        {
+            let _wrapper = CancelOnDrop {
+                inner: futures::stream::empty::<i32>(),
+                cancel: token.clone(),
+            };
+            assert!(!token.is_cancelled());
+        }
+        assert!(token.is_cancelled());
+    }
+
+    /// `CancelOnDrop` must remain a transparent stream proxy — adding the
+    /// drop side-effect should not perturb forward iteration semantics.
+    #[tokio::test]
+    async fn cancel_on_drop_passes_through_stream_items() {
+        let token = CancellationToken::new();
+        let mut wrapper = CancelOnDrop {
+            inner: futures::stream::iter(vec![1, 2, 3]),
+            cancel: token.clone(),
+        };
+        assert_eq!(wrapper.next().await, Some(1));
+        assert_eq!(wrapper.next().await, Some(2));
+        assert_eq!(wrapper.next().await, Some(3));
+        assert_eq!(wrapper.next().await, None);
+        assert!(!token.is_cancelled());
+        drop(wrapper);
+        assert!(token.is_cancelled());
     }
 }

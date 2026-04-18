@@ -146,7 +146,12 @@ impl ResponsesTransport {
         cancel: CancellationToken,
     ) -> Result<ResponseStream, TransportError> {
         let response = self
-            .send_json_request(RESPONSES_PATH, request, request_meta.clone(), cancel)
+            .send_json_request(
+                RESPONSES_PATH,
+                request,
+                request_meta.clone(),
+                cancel.clone(),
+            )
             .await?;
         Ok(stream_response(
             response,
@@ -154,6 +159,7 @@ impl ResponsesTransport {
                 limiter: self.openai_rate_limiter.clone(),
                 model: request_meta.model,
             },
+            cancel,
         ))
     }
 
@@ -304,43 +310,53 @@ impl OpenAiStreamRateLimitObserver {
 fn stream_response(
     response: Response,
     rate_limits: OpenAiStreamRateLimitObserver,
+    cancel: CancellationToken,
 ) -> ResponseStream {
     let stream = response.bytes_stream().eventsource();
     let (tx, rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
         let mut stream = Box::pin(stream);
-        while let Some(event) = stream.next().await {
-            match event {
-                Err(error) => {
-                    if tx
-                        .send(Err(OpenAIError::StreamError(Box::new(
-                            StreamError::EventStream(error.to_string()),
-                        ))))
-                        .is_err()
-                    {
-                        break;
+        loop {
+            // Bias cancellation over the byte stream so a dropped consumer
+            // (which fires `CancelOnDrop` upstream) takes precedence over an
+            // already-buffered SSE chunk. Without `biased`, a noisy stream
+            // could starve the cancel arm and leak the spawned task.
+            select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                event = stream.next() => match event {
+                    None => break,
+                    Some(Err(error)) => {
+                        if tx
+                            .send(Err(OpenAIError::StreamError(Box::new(
+                                StreamError::EventStream(error.to_string()),
+                            ))))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
-                Ok(event) => {
-                    if event.data == "[DONE]" {
-                        break;
-                    }
+                    Some(Ok(event)) => {
+                        if event.data == "[DONE]" {
+                            break;
+                        }
 
-                    match decode_stream_event(&event.data, &rate_limits) {
-                        Ok(Some(event)) => {
-                            if tx.send(Ok(event)).is_err() {
-                                break;
+                        match decode_stream_event(&event.data, &rate_limits) {
+                            Ok(Some(event)) => {
+                                if tx.send(Ok(event)).is_err() {
+                                    break;
+                                }
                             }
-                        }
-                        Ok(None) => {} // non-standard event already handled (e.g. keepalive)
-                        Err(err) => {
-                            if tx.send(Err(err)).is_err() {
-                                break;
+                            Ok(None) => {} // non-standard event already handled (e.g. keepalive)
+                            Err(err) => {
+                                if tx.send(Err(err)).is_err() {
+                                    break;
+                                }
                             }
                         }
                     }
-                }
+                },
             }
         }
     });
@@ -499,6 +515,87 @@ mod tests {
         });
 
         format!("http://{address}")
+    }
+
+    /// AC3.1 / AC3.2 leak test. With cancel-aware select biased over the SSE
+    /// reader, cancelling the parent token mid-stream must close the channel
+    /// promptly even when the upstream socket is still alive (no bytes flowing).
+    #[tokio::test]
+    async fn responses_stream_exits_when_token_is_cancelled_mid_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let stall = Arc::new(tokio::sync::Notify::new());
+        let stall_signal = stall.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            // Drain the request so the client can transition to receiving.
+            let _ = read_http_request(&mut socket).await;
+            // Send headers + one event so the consumer can confirm the stream
+            // is live, then hold the socket open without further data so the
+            // SSE decoder is parked on `byte_stream.next()`.
+            let event = json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_test",
+                    "created_at": 0,
+                    "model": "gpt-5",
+                    "object": "response",
+                    "output": [],
+                    "status": "in_progress"
+                }
+            });
+            let body = format!("data: {event}\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n{:x}\r\n{}\r\n",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write headers");
+            // Park until the test releases us.
+            stall_signal.notified().await;
+        });
+
+        let transport = ResponsesTransport::new("test-key", format!("http://{address}"));
+        let request = json!({
+            "model": "gpt-5",
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }],
+            "stream": true,
+        });
+        let request_meta = ResponsesTransportRequest {
+            provider_label: "openai",
+            model: "gpt-5".to_owned(),
+            reservation: estimate_openai_request_cost(request.to_string().len(), Some(32)),
+            rate_limit_strategy: None,
+            tokens_per_minute: None,
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = transport
+            .responses_stream(request, request_meta, cancel.clone())
+            .await
+            .expect("stream");
+
+        // Confirm the spawned task has produced its first event before we
+        // exercise cancellation; otherwise we'd be testing the request-startup
+        // cancel arm (covered separately) instead of the SSE decode loop.
+        stream.next().await.expect("first event").expect("ok event");
+
+        cancel.cancel();
+
+        // The cancel-aware select biases on cancel; the channel should close
+        // and surface as `None` in well under 50ms.
+        let result = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
+        assert!(
+            matches!(result, Ok(None)),
+            "stream did not exit promptly after cancel: {result:?}"
+        );
+
+        // Release the server task so the test cleanly tears down.
+        stall.notify_one();
+        let _ = server.await;
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<()> {
