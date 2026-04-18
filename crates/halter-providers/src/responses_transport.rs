@@ -1,5 +1,7 @@
 // pattern: Imperative Shell
 
+use std::time::Duration;
+
 use async_openai::{
     error::{ApiError, OpenAIError, StreamError},
     types::responses::{ResponseStream, ResponseStreamEvent},
@@ -8,6 +10,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::{Client as ReqwestClient, Response, StatusCode};
 use serde_json::Value;
+use thiserror::Error;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -15,10 +18,65 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::openai_error::{
-    openai_api_error_retry_after, parse_openai_http_error, parse_openai_stream_error,
+    Retryability, SYNTHETIC_SERVER_ERROR_CODE, classify, openai_api_error_retry_after,
+    parse_openai_http_error, parse_openai_stream_error,
 };
 use crate::openai_rate_limit::{OpenAiRateLimitPermit, OpenAiRateLimiter};
 use crate::openai_rate_limit_policy::OpenAiReservation;
+
+/// Result of a transport-layer call. The variant carries the retryability
+/// decision so callers do not re-classify by inspecting message text.
+#[derive(Debug, Error)]
+pub(crate) enum TransportError {
+    /// Client-initiated cancellation. Maps to `ProviderError::cancelled()`
+    /// at the provider boundary; never retried.
+    #[error("failed to execute provider request: request cancelled")]
+    Cancelled,
+    /// Upstream signaled a transient failure (rate limit, 5xx, network
+    /// blip). Caller may retry; `backoff_hint` carries any server-supplied
+    /// delay (e.g. `Please try again in 1.25s`).
+    #[error("retryable provider failure: {source}")]
+    Retryable {
+        #[source]
+        source: OpenAIError,
+        backoff_hint: Option<Duration>,
+    },
+    /// Upstream signaled a permanent failure (4xx, malformed request,
+    /// non-retryable decode error). Caller must propagate.
+    #[error("fatal provider failure: {source}")]
+    Fatal {
+        #[source]
+        source: OpenAIError,
+    },
+}
+
+impl TransportError {
+    pub(crate) fn from_openai(source: OpenAIError) -> Self {
+        match classify(&source) {
+            Retryability::Retryable { backoff_hint } => Self::Retryable {
+                source,
+                backoff_hint,
+            },
+            Retryability::Fatal => Self::Fatal { source },
+        }
+    }
+
+    pub(crate) fn from_reqwest(error: reqwest::Error, label: &str) -> Self {
+        let wrapped = OpenAIError::Reqwest(error);
+        match classify(&wrapped) {
+            Retryability::Retryable { backoff_hint } => Self::Retryable {
+                source: OpenAIError::ApiError(ApiError {
+                    message: format!("failed to execute {label} request: {wrapped}"),
+                    r#type: None,
+                    param: None,
+                    code: Some(SYNTHETIC_SERVER_ERROR_CODE.to_owned()),
+                }),
+                backoff_hint,
+            },
+            Retryability::Fatal => Self::Fatal { source: wrapped },
+        }
+    }
+}
 
 const RESPONSES_PATH: &str = "/v1/responses";
 const RESPONSES_COMPACT_PATH: &str = "/v1/responses/compact";
@@ -86,7 +144,7 @@ impl ResponsesTransport {
         request: Value,
         request_meta: ResponsesTransportRequest,
         cancel: CancellationToken,
-    ) -> anyhow::Result<ResponseStream> {
+    ) -> Result<ResponseStream, TransportError> {
         let response = self
             .send_json_request(RESPONSES_PATH, request, request_meta.clone(), cancel)
             .await?;
@@ -113,7 +171,8 @@ impl ResponsesTransport {
                 request_meta,
                 cancel.child_token(),
             )
-            .await?;
+            .await
+            .map_err(transport_error_to_anyhow)?;
         select! {
             _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),
             result = response.json::<Value>() => result,
@@ -133,7 +192,8 @@ impl ResponsesTransport {
         let provider_label = request_meta.provider_label;
         let response = self
             .send_json_request(RESPONSES_PATH, request, request_meta, cancel.child_token())
-            .await?;
+            .await
+            .map_err(transport_error_to_anyhow)?;
         select! {
             _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),
             result = response.json::<Value>() => result,
@@ -147,10 +207,18 @@ impl ResponsesTransport {
         request: Value,
         request_meta: ResponsesTransportRequest,
         cancel: CancellationToken,
-    ) -> anyhow::Result<Response> {
+    ) -> Result<Response, TransportError> {
         let mut permit = self
             .rate_limit_permit(&request_meta, cancel.child_token())
-            .await?;
+            .await
+            .map_err(|error| TransportError::Fatal {
+                source: OpenAIError::ApiError(ApiError {
+                    message: format!("failed to acquire rate-limit permit: {error}"),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                }),
+            })?;
         let request_builder = self
             .client
             .post(provider_url(&self.base_url, path))
@@ -158,13 +226,10 @@ impl ResponsesTransport {
             .json(&request);
 
         let response = select! {
-            _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),
+            _ = cancel.cancelled() => return Err(TransportError::Cancelled),
             result = request_builder.send() => result,
         }
-        .map_err(|error| anyhow::anyhow!(
-            "failed to execute {} request: {error}",
-            request_meta.provider_label
-            ))?;
+        .map_err(|error| TransportError::from_reqwest(error, request_meta.provider_label))?;
         let status = response.status();
         let headers = response.headers().clone();
         if let Some(permit) = permit.as_mut() {
@@ -173,21 +238,21 @@ impl ResponsesTransport {
 
         if !status.is_success() {
             let body = select! {
-                _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),
+                _ = cancel.cancelled() => return Err(TransportError::Cancelled),
                 result = response.bytes() => result,
             }
-            .map_err(|error| anyhow::anyhow!(
-                "failed to read {} response body: {error}",
-                request_meta.provider_label
-            ))?;
+            .map_err(|error| TransportError::from_reqwest(error, request_meta.provider_label))?;
             let error = decode_openai_error(status, &body);
+            // Push the server-supplied backoff hint into the rate limiter
+            // here (single classification source). The classifier extracts
+            // the same hint downstream when callers retry.
             if let OpenAIError::ApiError(api_error) = &error
                 && let Some(retry_after) = openai_api_error_retry_after(api_error)
             {
                 self.openai_rate_limiter
                     .apply_retry_after(&request_meta.model, retry_after);
             }
-            anyhow::bail!("failed to execute provider request: {error}");
+            return Err(TransportError::from_openai(error));
         }
 
         Ok(response)
@@ -212,6 +277,10 @@ impl ResponsesTransport {
             None => Ok(None),
         }
     }
+}
+
+fn transport_error_to_anyhow(error: TransportError) -> anyhow::Error {
+    anyhow::anyhow!("failed to execute provider request: {error}")
 }
 
 fn provider_url(base_url: &str, path: &str) -> String {
@@ -305,13 +374,16 @@ fn decode_stream_event(
 }
 
 fn decode_openai_error(status: StatusCode, body: &[u8]) -> OpenAIError {
+    // 5xx without a parseable JSON body → stamp the synthetic code so the
+    // shared `classify` routes it as Retryable without needing the original
+    // HTTP status. This replaces ad-hoc substring tests on the message.
     if status.is_server_error() {
         let message = String::from_utf8_lossy(body).trim().to_owned();
         return OpenAIError::ApiError(ApiError {
             message,
             r#type: None,
             param: None,
-            code: None,
+            code: Some(SYNTHETIC_SERVER_ERROR_CODE.to_owned()),
         });
     }
 
