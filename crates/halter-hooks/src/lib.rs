@@ -2,6 +2,7 @@
 
 mod config;
 mod engine;
+mod matcher;
 mod merge;
 mod sdk;
 
@@ -9,6 +10,7 @@ pub use config::{
     AgentHookConfig, CommandHookConfig, HookEventName, HookHandler, HookHandlerConfig,
     HookMatcherGroup, HookShell, HooksFile, HooksLoadWarning, HttpHookConfig, PromptHookConfig,
 };
+pub use matcher::{CompiledMatcher, MatcherCompileError};
 pub use engine::{
     ConfiguredHandler, ConfiguredHandlerConfig, HOOK_PROTOCOL_VERSION, HookDispatchOutcome,
     HookDispatchRequest, HookRegistrySource, Hooks, PreparedHookDispatch,

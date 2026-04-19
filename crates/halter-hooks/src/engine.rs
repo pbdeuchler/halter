@@ -8,10 +8,10 @@ use std::time::Duration;
 use anyhow::Context;
 use chrono::Utc;
 use halter_protocol::{HookHandlerType, HookRunStatus, HookRunSummary, PluginId};
-use regex::Regex;
 use serde_json::Value;
 
 use crate::config::{HookEventName, HookHandlerConfig as FileHookHandlerConfig, HooksFile};
+use crate::matcher::CompiledMatcher;
 use crate::merge::{HandlerPriority, HandlerPriorityGroup, HookMergedOutcome};
 use crate::sdk::{HookCallback, HookKind, RegisteredHook, RegisteredHookPriority};
 
@@ -42,13 +42,7 @@ impl Hooks {
             {
                 for (matcher_index, matcher_group) in matcher_groups.iter().enumerate() {
                     for (hook_index, hook) in matcher_group.hooks.iter().enumerate() {
-                        let matcher = matcher_group
-                            .matcher
-                            .as_deref()
-                            .map(Regex::new)
-                            .transpose()
-                            .ok()
-                            .flatten();
+                        let matcher = matcher_group.matcher.clone();
                         let handler_id = format!(
                             "{}:{}:{}:{}:{}",
                             source.plugin_id,
@@ -103,7 +97,7 @@ impl Hooks {
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(Regex::new)
+                .map(CompiledMatcher::compile_regex)
                 .transpose()
                 .with_context(|| {
                     format!(
@@ -254,7 +248,7 @@ pub struct ConfiguredHandler {
     pub status_message: Option<String>,
     pub if_condition: Option<String>,
     pub once: bool,
-    pub matcher: Option<Regex>,
+    pub matcher: Option<CompiledMatcher>,
     pub config: ConfiguredHandlerConfig,
     pub priority: HandlerPriority,
 }
@@ -272,7 +266,7 @@ impl ConfiguredHandler {
 
     fn matches_matcher(&self, candidate: Option<&str>) -> bool {
         match (&self.matcher, self.event_name.matcher_field()) {
-            (Some(regex), Some(_)) => candidate.is_some_and(|value| regex.is_match(value)),
+            (Some(matcher), Some(_)) => candidate.is_some_and(|value| matcher.is_match(value)),
             (Some(_), None) => true,
             (None, _) => true,
         }
@@ -328,7 +322,7 @@ fn matches_if_condition(condition: &str, request: &HookDispatchRequest) -> bool 
     };
 
     if let Some((tool_pattern, input_pattern)) = parse_if_condition(trimmed) {
-        if !matches_text_pattern(tool_pattern, tool_name, true) {
+        if !matches_text_pattern(tool_pattern, tool_name) {
             return false;
         }
 
@@ -337,10 +331,10 @@ fn matches_if_condition(condition: &str, request: &HookDispatchRequest) -> bool 
             .get("tool_input")
             .and_then(render_if_input_text)
             .unwrap_or_default();
-        return matches_text_pattern(input_pattern, &input_text, false);
+        return matches_text_pattern(input_pattern, &input_text);
     }
 
-    matches_text_pattern(trimmed, tool_name, true)
+    matches_text_pattern(trimmed, tool_name)
 }
 
 fn parse_if_condition(condition: &str) -> Option<(&str, &str)> {
@@ -365,77 +359,18 @@ fn render_if_input_text(value: &Value) -> Option<String> {
     }
 }
 
-fn matches_text_pattern(pattern: &str, candidate: &str, case_insensitive: bool) -> bool {
+fn matches_text_pattern(pattern: &str, candidate: &str) -> bool {
     let pattern = pattern.trim();
     if pattern.is_empty() || pattern == "*" {
         return true;
     }
 
-    if looks_like_regex(pattern)
-        && let Ok(regex) = Regex::new(pattern)
-    {
-        return regex.is_match(candidate);
+    // Runtime match for `if_condition` patterns. These aren't validated at
+    // config-load time, so an invalid pattern fails closed (no match).
+    match CompiledMatcher::compile(pattern) {
+        Ok(matcher) => matcher.is_match(candidate),
+        Err(_) => false,
     }
-
-    wildcard_match(pattern, candidate, case_insensitive)
-}
-
-fn looks_like_regex(pattern: &str) -> bool {
-    pattern.chars().any(|ch| {
-        matches!(
-            ch,
-            '[' | ']' | '(' | ')' | '{' | '}' | '+' | '?' | '^' | '$' | '\\' | '|'
-        )
-    })
-}
-
-fn wildcard_match(pattern: &str, candidate: &str, case_insensitive: bool) -> bool {
-    let (pattern, candidate) = if case_insensitive {
-        (pattern.to_ascii_lowercase(), candidate.to_ascii_lowercase())
-    } else {
-        (pattern.to_owned(), candidate.to_owned())
-    };
-
-    wildcard_match_impl(pattern.as_bytes(), candidate.as_bytes())
-}
-
-fn wildcard_match_impl(pattern: &[u8], candidate: &[u8]) -> bool {
-    let mut pattern_index = 0usize;
-    let mut candidate_index = 0usize;
-    let mut last_star = None;
-    let mut backtrack_candidate = 0usize;
-
-    while candidate_index < candidate.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == b'*'
-                || pattern[pattern_index] == candidate[candidate_index])
-        {
-            if pattern[pattern_index] == b'*' {
-                last_star = Some(pattern_index);
-                pattern_index += 1;
-                backtrack_candidate = candidate_index;
-            } else {
-                pattern_index += 1;
-                candidate_index += 1;
-            }
-            continue;
-        }
-
-        if let Some(star_index) = last_star {
-            pattern_index = star_index + 1;
-            backtrack_candidate += 1;
-            candidate_index = backtrack_candidate;
-            continue;
-        }
-
-        return false;
-    }
-
-    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-        pattern_index += 1;
-    }
-
-    pattern_index == pattern.len()
 }
 
 #[cfg(test)]
@@ -447,9 +382,40 @@ mod tests {
 
     #[test]
     fn wildcard_match_supports_globs() {
-        assert!(wildcard_match("git *", "git status", false));
-        assert!(wildcard_match("shell", "Shell", true));
-        assert!(!wildcard_match("git *", "cargo test", false));
+        assert!(matches_text_pattern("git *", "git status"));
+        assert!(matches_text_pattern("shell", "Shell"));
+        assert!(!matches_text_pattern("git *", "cargo test"));
+    }
+
+    /// AC3.5: an invalid matcher cannot reach the engine. `HooksFile::from_raw`
+    /// rejects the config at load, so `Hooks::from_sources` never sees a raw
+    /// string matcher. Defense-in-depth via the type system (H22/H27).
+    #[test]
+    fn review_hook_runtime_ac3_5_engine_never_sees_invalid_matcher() {
+        let error = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "(",
+                            "hooks": [
+                                {
+                                    "type": "prompt",
+                                    "prompt": "never reached"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect_err("invalid matcher must hard-fail at load");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("invalid matcher regex")
+                || rendered.contains("invalid regex pattern"),
+            "expected compile error, got: {rendered}",
+        );
     }
 
     #[test]

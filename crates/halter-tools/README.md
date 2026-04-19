@@ -148,7 +148,8 @@ Defaults:
 - shell allowlist = `git`, `cargo`, `rg`, `ls`, `find`
 - shell timeout = `30`
 - network enabled = `false`
-- `allowed_loopback_services = []` (loopback addresses require an explicit entry to be reached)
+- `allowed_loopback = []` (loopback addresses require an explicit entry to be reached)
+- `allowed_hosts = ["*"]` (wildcard — remote hosts allowed when `network_enabled = true`)
 - `process_tree_root = None` (Phase 2 threads the live session's root)
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`

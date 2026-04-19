@@ -19,7 +19,10 @@ pub use builtin::{
     EditTool, GlobTool, GrepTool, ProcessTool, ReadTool, ShellTool, WriteTool,
     register_builtin_tools,
 };
-pub use policy::{DefaultToolPolicy, PolicySettings, ToolPolicy};
+pub use policy::{
+    CanonicalPath, DefaultToolPolicy, LoopbackAllow, Pid, PolicyError, PolicySettings, ShellMode,
+    ToolPolicy,
+};
 pub use runtime::{
     NoopSubagentControl, NoopToolEventSink, SubagentControl, SubagentParentContext, Tool,
     ToolContext, ToolEventSink, ToolRuntime, ToolRuntimeEvent,

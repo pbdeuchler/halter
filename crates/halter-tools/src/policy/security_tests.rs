@@ -241,7 +241,7 @@ async fn ac1_12_loopback_ip_denied_by_default() {
 async fn ac1_12_loopback_ip_allowed_when_allowlisted() {
     let policy = DefaultToolPolicy::new(PolicySettings {
         network_enabled: true,
-        allowed_loopback_services: vec![LoopbackAllow {
+        allowed_loopback: vec![LoopbackAllow {
             host: "127.0.0.53".to_owned(),
             port: None,
         }],
@@ -348,6 +348,124 @@ async fn ac1_9_shell_disabled_blocks_pty_and_command_paths() {
         .await
         .expect_err("command path must be denied when shell disabled");
     assert!(matches!(err, PolicyError::ShellDisabled));
+}
+
+// ------------- AC2: universal NetworkPolicy semantics
+
+#[tokio::test]
+async fn review_hook_runtime_ac2_1_loopback_denied_when_allowed_loopback_empty() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        network_enabled: true,
+        ..PolicySettings::default()
+    });
+    let err = policy
+        .check_network("http://127.0.0.1:8080/")
+        .await
+        .expect_err("loopback must be denied when allowed_loopback is empty");
+    assert!(matches!(err, PolicyError::NetworkDenied { .. }));
+}
+
+#[tokio::test]
+async fn review_hook_runtime_ac2_2_loopback_allowed_when_entry_matches() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        network_enabled: true,
+        allowed_loopback: vec![LoopbackAllow {
+            host: "127.0.0.1".to_owned(),
+            port: None,
+        }],
+        ..PolicySettings::default()
+    });
+    policy
+        .check_network("http://127.0.0.1:8080/")
+        .await
+        .expect("matching loopback entry should allow");
+}
+
+#[tokio::test]
+async fn review_hook_runtime_ac2_3_loopback_denied_when_port_mismatches() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        network_enabled: true,
+        allowed_loopback: vec![LoopbackAllow {
+            host: "localhost".to_owned(),
+            port: Some(9090),
+        }],
+        ..PolicySettings::default()
+    });
+    let err = policy
+        .check_network("http://localhost:8080/")
+        .await
+        .expect_err("wrong port must be denied");
+    assert!(matches!(err, PolicyError::NetworkDenied { .. }));
+}
+
+#[tokio::test]
+async fn review_hook_runtime_ac2_4_loopback_allows_any_port_when_port_none() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        network_enabled: true,
+        allowed_loopback: vec![LoopbackAllow {
+            host: "localhost".to_owned(),
+            port: None,
+        }],
+        ..PolicySettings::default()
+    });
+    policy
+        .check_network("http://localhost:8080/")
+        .await
+        .expect("port None should allow any port");
+    policy
+        .check_network("http://localhost:9090/")
+        .await
+        .expect("port None should allow any port");
+}
+
+#[tokio::test]
+async fn review_hook_runtime_ac2_5_default_star_allows_remote_host() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        network_enabled: true,
+        ..PolicySettings::default()
+    });
+    policy
+        .check_network("https://api.example.com/")
+        .await
+        .expect("default allowed_hosts=[\"*\"] should allow any remote host");
+}
+
+#[tokio::test]
+async fn review_hook_runtime_ac2_6_narrowed_allowed_hosts_denies_mismatch() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        network_enabled: true,
+        allowed_hosts: vec!["only.example.com".to_owned()],
+        ..PolicySettings::default()
+    });
+    let err = policy
+        .check_network("https://api.example.com/")
+        .await
+        .expect_err("narrowed allowlist must deny mismatched host");
+    assert!(matches!(err, PolicyError::NetworkDenied { .. }));
+}
+
+#[tokio::test]
+async fn review_hook_runtime_ac2_7_kill_switch_denies_everything() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        network_enabled: false,
+        allowed_hosts: vec!["*".to_owned()],
+        allowed_loopback: vec![LoopbackAllow {
+            host: "localhost".to_owned(),
+            port: None,
+        }],
+        ..PolicySettings::default()
+    });
+    for url in [
+        "https://api.example.com/",
+        "http://localhost:8080/",
+        "http://127.0.0.1/",
+    ] {
+        let err = policy
+            .check_network(url)
+            .await
+            .expect_err("kill switch must deny every request");
+        assert!(matches!(err, PolicyError::NetworkDenied { .. }));
+    }
 }
 
 // ------------- AC1.14: nonexistent root produces typed error
