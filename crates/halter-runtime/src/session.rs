@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -12,7 +11,7 @@ use futures::stream::{BoxStream, StreamExt};
 use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
     AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash, Delivery,
-    HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState,
+    HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState, PendingEvent,
     PendingToolCall, PromptSegment, PromptSegmentId, ProviderError, ProviderRequest, ReplayMeta,
     ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState,
     StopReason, StreamEvent, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult,
@@ -195,18 +194,11 @@ pub struct SessionHandle {
 pub type HalterSession = SessionHandle;
 
 struct SessionToolEventSink {
-    call_id: halter_protocol::ToolCallId,
     events: Arc<Mutex<Vec<ToolRuntimeEvent>>>,
-    live: Option<LiveTurnStream>,
 }
 
 impl ToolEventSink for SessionToolEventSink {
     fn emit(&self, event: ToolRuntimeEvent) {
-        if let Some(live) = self.live.as_ref()
-            && let Some(payload) = tool_runtime_event_payload(&self.call_id, event.clone())
-        {
-            live.emit_payload(payload);
-        }
         self.events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -228,37 +220,18 @@ impl ToolEventDrain {
     }
 }
 
+/// Sink for the in-turn live event stream. Only receives events *after*
+/// `commit_and_publish` has assigned sequences; preserves the commit-then-
+/// publish invariant by forbidding sequence allocation outside the session
+/// store.
 #[derive(Clone)]
 struct LiveTurnStream {
-    session_id: SessionId,
     tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>,
-    next_sequence: Arc<AtomicU64>,
 }
 
 impl LiveTurnStream {
-    fn new(
-        session_id: SessionId,
-        tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>,
-        next_sequence: u64,
-    ) -> Self {
-        Self {
-            session_id,
-            tx,
-            next_sequence: Arc::new(AtomicU64::new(next_sequence)),
-        }
-    }
-
-    fn emit_payload(&self, payload: SessionEventPayload) {
-        if !should_emit_live_payload(&payload) {
-            return;
-        }
-        let event = SessionEvent {
-            session_id: self.session_id.clone(),
-            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
-            delivery: Delivery::Lossless,
-            payload,
-        };
-        let _ = self.tx.send(Ok(event));
+    fn new(tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>) -> Self {
+        Self { tx }
     }
 
     fn emit_committed(&self, event: SessionEvent) {
@@ -268,16 +241,6 @@ impl LiveTurnStream {
     fn emit_error(&self, error: anyhow::Error) {
         let _ = self.tx.send(Err(error));
     }
-}
-
-fn live_hook_reporter(
-    live: Option<LiveTurnStream>,
-) -> Option<crate::hooks_runtime::HookEventReporter> {
-    live.map(|live| {
-        Arc::new(move |payload| {
-            live.emit_payload(payload);
-        }) as crate::hooks_runtime::HookEventReporter
-    })
 }
 
 fn track_fired_hook_ids(fired_hook_ids: &mut BTreeSet<String>, dispatch: &ExecutedHookDispatch) {
@@ -450,9 +413,8 @@ impl SessionHandle {
             );
         }
 
-        let base_sequence = self.services.sessions.replay(&self.session_id).await?.len() as u64 + 1;
         let (tx, rx) = mpsc::unbounded_channel();
-        let live = LiveTurnStream::new(self.session_id.clone(), tx, base_sequence);
+        let live = LiveTurnStream::new(tx);
         let session = self.clone();
 
         let registry = session.services.turn_registry.clone();
@@ -476,30 +438,17 @@ impl SessionHandle {
                 turn_id: turn_id_for_dereg,
             };
 
-            live.emit_payload(SessionEventPayload::TurnStarted {
-                turn_id: turn.id.clone(),
-            });
-
-            match session
-                .run_turn(stored, turn.clone(), task_cancel, Some(live.clone()))
-                .await
-            {
-                Ok(turn_commit) => match session
-                    .commit_and_publish(
-                        Some(turn_commit.snapshot),
-                        Some(turn_commit.state),
-                        turn_commit.events,
-                    )
-                    .await
-                {
-                    Ok(committed) => {
-                        for event in committed {
-                            if matches!(event.payload, SessionEventPayload::TurnCompleted { .. }) {
-                                live.emit_committed(event);
-                            }
-                        }
-                    }
-                    Err(error) => {
+            match session.run_turn(stored, turn.clone(), task_cancel).await {
+                Ok(turn_commit) => {
+                    if let Err(error) = session
+                        .commit_and_publish(
+                            Some(turn_commit.snapshot),
+                            Some(turn_commit.state),
+                            turn_commit.events,
+                            Some(&live),
+                        )
+                        .await
+                    {
                         error!(
                             session_id = %session.session_id,
                             turn_id = %turn.id,
@@ -508,7 +457,7 @@ impl SessionHandle {
                         );
                         live.emit_error(error);
                     }
-                },
+                }
                 Err(error) => {
                     let retryable = error
                         .downcast_ref::<ProviderError>()
@@ -523,41 +472,26 @@ impl SessionHandle {
                     );
                     let turn_snapshot = session.services.resources.snapshot();
                     let failure_events = vec![
-                        session.make_event(
-                            0,
-                            SessionEventPayload::TurnStarted {
-                                turn_id: turn.id.clone(),
-                            },
-                        ),
-                        session.make_event(
-                            0,
-                            SessionEventPayload::TurnFailed {
-                                turn_id: turn.id.clone(),
-                                error: error.to_string(),
-                                retryable,
-                            },
-                        ),
+                        session.make_event(SessionEventPayload::TurnStarted {
+                            turn_id: turn.id.clone(),
+                        }),
+                        session.make_event(SessionEventPayload::TurnFailed {
+                            turn_id: turn.id.clone(),
+                            error: error.to_string(),
+                            retryable,
+                        }),
                     ];
-                    match session
-                        .commit_and_publish(Some(turn_snapshot), None, failure_events)
+                    if let Err(commit_error) = session
+                        .commit_and_publish(Some(turn_snapshot), None, failure_events, Some(&live))
                         .await
                     {
-                        Ok(committed) => {
-                            for event in committed {
-                                if matches!(event.payload, SessionEventPayload::TurnFailed { .. }) {
-                                    live.emit_committed(event);
-                                }
-                            }
-                        }
-                        Err(commit_error) => {
-                            error!(
-                                session_id = %session.session_id,
-                                turn_id = %turn.id,
-                                error = %commit_error,
-                                "failed to commit failed turn"
-                            );
-                            live.emit_error(commit_error);
-                        }
+                        error!(
+                            session_id = %session.session_id,
+                            turn_id = %turn.id,
+                            error = %commit_error,
+                            "failed to commit failed turn"
+                        );
+                        live.emit_error(commit_error);
                     }
                 }
             }
@@ -606,24 +540,18 @@ impl SessionHandle {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let dispatch = run_session_end(self, &fired_hook_ids, hook_ctx, reason, None).await?;
-        self.record_hook_dispatch(&mut events, &dispatch, None);
+        let dispatch = run_session_end(self, &fired_hook_ids, hook_ctx, reason).await?;
+        self.record_hook_dispatch(&mut events, &dispatch);
         if dispatch.merged.block_reason.is_some() || dispatch.merged.stop_reason.is_some() {
             warn!(session_id = %self.session_id, reason, "hooks.ignored_block");
         }
         for message in apply_hook_side_effects(&mut state, &dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                None,
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
-        self.push_event(
-            &mut events,
-            SessionEventPayload::SessionShutdownComplete,
-            None,
-        );
-        let _ = self.commit_and_publish(None, Some(state), events).await?;
+        self.push_event(&mut events, SessionEventPayload::SessionShutdownComplete);
+        let _ = self
+            .commit_and_publish(None, Some(state), events, None)
+            .await?;
         evict_session_hooks(&self.services, &self.session_id);
         Ok(())
     }
@@ -652,25 +580,16 @@ impl SessionHandle {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let dispatch = run_notification(
-            self,
-            &fired_hook_ids,
-            hook_ctx,
-            notification_type,
-            message,
-            None,
-        )
-        .await?;
+        let dispatch =
+            run_notification(self, &fired_hook_ids, hook_ctx, notification_type, message).await?;
         let mut events = Vec::new();
-        self.record_hook_dispatch(&mut events, &dispatch, None);
+        self.record_hook_dispatch(&mut events, &dispatch);
         for message in apply_hook_side_effects(&mut state, &dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                None,
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
-        let _ = self.commit_and_publish(None, Some(state), events).await?;
+        let _ = self
+            .commit_and_publish(None, Some(state), events, None)
+            .await?;
         Ok(())
     }
 
@@ -709,20 +628,17 @@ impl SessionHandle {
             hook_ctx,
             trigger,
             custom_instructions,
-            None,
         )
         .await?;
         track_fired_hook_ids(&mut fired_hook_ids, &pre_dispatch);
-        self.record_hook_dispatch(&mut events, &pre_dispatch, None);
+        self.record_hook_dispatch(&mut events, &pre_dispatch);
         for message in apply_hook_side_effects(&mut state, &pre_dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                None,
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
         if pre_dispatch.merged.block_reason.is_some() {
-            let _ = self.commit_and_publish(None, Some(state), events).await?;
+            let _ = self
+                .commit_and_publish(None, Some(state), events, None)
+                .await?;
             return Ok(());
         }
 
@@ -761,21 +677,18 @@ impl SessionHandle {
             SessionEventPayload::ContextCompacted {
                 summary: summary.clone(),
             },
-            None,
         );
 
         let post_dispatch =
-            run_post_compact(self, &fired_hook_ids, hook_ctx, trigger, &summary, None).await?;
-        self.record_hook_dispatch(&mut events, &post_dispatch, None);
+            run_post_compact(self, &fired_hook_ids, hook_ctx, trigger, &summary).await?;
+        self.record_hook_dispatch(&mut events, &post_dispatch);
         for message in apply_hook_side_effects(&mut state, &post_dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                None,
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
 
-        let _ = self.commit_and_publish(None, Some(state), events).await?;
+        let _ = self
+            .commit_and_publish(None, Some(state), events, None)
+            .await?;
         Ok(())
     }
 
@@ -784,23 +697,18 @@ impl SessionHandle {
         stored: StoredSession,
         turn: Turn,
         turn_cancel: CancellationToken,
-        live: Option<LiveTurnStream>,
     ) -> anyhow::Result<TurnCommit> {
         let snapshot = self.services.resources.snapshot();
         let mut state = stored.state;
-        let mut events = vec![self.make_event(
-            0,
-            SessionEventPayload::TurnStarted {
-                turn_id: turn.id.clone(),
-            },
-        )];
+        let mut events = vec![self.make_event(SessionEventPayload::TurnStarted {
+            turn_id: turn.id.clone(),
+        })];
         let mut turn_usage = Usage::default();
         let mut fired_hook_ids = state
             .fired_hook_ids
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let hook_reporter = live_hook_reporter(live.clone());
         let hook_model = turn
             .default_model
             .clone()
@@ -817,21 +725,13 @@ impl SessionHandle {
                 SessionEventPayload::Warning {
                     message: format_hook_warning(&warning),
                 },
-                live.as_ref(),
             );
         }
 
         if let Some(source) = state.pending_session_start_source.take() {
-            let hook_dispatch = run_session_start(
-                self,
-                &fired_hook_ids,
-                hook_ctx,
-                source,
-                hook_reporter.clone(),
-            )
-            .await?;
+            let hook_dispatch = run_session_start(self, &fired_hook_ids, hook_ctx, source).await?;
             track_fired_hook_ids(&mut fired_hook_ids, &hook_dispatch);
-            self.record_hook_dispatch(&mut events, &hook_dispatch, None);
+            self.record_hook_dispatch(&mut events, &hook_dispatch);
             if hook_dispatch.merged.block_reason.is_some()
                 || hook_dispatch.merged.stop_reason.is_some()
             {
@@ -842,11 +742,7 @@ impl SessionHandle {
                 );
             }
             for message in apply_hook_side_effects(&mut state, &hook_dispatch) {
-                self.push_event(
-                    &mut events,
-                    SessionEventPayload::MessageItem { message },
-                    live.as_ref(),
-                );
+                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
             }
         }
 
@@ -855,17 +751,12 @@ impl SessionHandle {
             &fired_hook_ids,
             hook_ctx,
             &turn.user_message.plain_text(),
-            hook_reporter.clone(),
         )
         .await?;
         track_fired_hook_ids(&mut fired_hook_ids, &prompt_dispatch);
-        self.record_hook_dispatch(&mut events, &prompt_dispatch, None);
+        self.record_hook_dispatch(&mut events, &prompt_dispatch);
         for message in apply_hook_side_effects(&mut state, &prompt_dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                live.as_ref(),
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
 
         if let Some(reason) = prompt_dispatch
@@ -883,15 +774,11 @@ impl SessionHandle {
             self.push_event(
                 &mut events,
                 SessionEventPayload::MessageItem { message: blocked },
-                live.as_ref(),
             );
-            events.push(self.make_event(
-                0,
-                SessionEventPayload::TurnCompleted {
-                    turn_id: turn.id,
-                    usage: turn_usage,
-                },
-            ));
+            events.push(self.make_event(SessionEventPayload::TurnCompleted {
+                turn_id: turn.id,
+                usage: turn_usage,
+            }));
             return Ok(TurnCommit {
                 snapshot,
                 state,
@@ -934,7 +821,6 @@ impl SessionHandle {
                     SessionEventPayload::ContextCompacted {
                         summary: compaction.summary.clone(),
                     },
-                    live.as_ref(),
                 );
             }
 
@@ -1004,14 +890,13 @@ impl SessionHandle {
             }
 
             for payload in materialized.events {
-                self.push_event(&mut events, payload, live.as_ref());
+                self.push_event(&mut events, payload);
             }
             self.push_event(
                 &mut events,
                 SessionEventPayload::MessageItem {
                     message: assistant_message,
                 },
-                live.as_ref(),
             );
 
             let post_response_observed = observe_state(stored.blueprint.working_dir.clone());
@@ -1038,7 +923,6 @@ impl SessionHandle {
                     SessionEventPayload::ContextCompacted {
                         summary: compaction.summary.clone(),
                     },
-                    live.as_ref(),
                 );
             }
 
@@ -1054,17 +938,12 @@ impl SessionHandle {
                     },
                     Some(&materialized.message),
                     true,
-                    hook_reporter.clone(),
                 )
                 .await?;
                 track_fired_hook_ids(&mut fired_hook_ids, &stop_dispatch);
-                self.record_hook_dispatch(&mut events, &stop_dispatch, None);
+                self.record_hook_dispatch(&mut events, &stop_dispatch);
                 for message in apply_hook_side_effects(&mut state, &stop_dispatch) {
-                    self.push_event(
-                        &mut events,
-                        SessionEventPayload::MessageItem { message },
-                        live.as_ref(),
-                    );
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
                 }
                 if let Some(reason) = stop_dispatch.merged.block_reason.clone() {
                     let continuation = Message::User(halter_protocol::UserMessage::text(
@@ -1080,7 +959,6 @@ impl SessionHandle {
                         SessionEventPayload::MessageItem {
                             message: continuation,
                         },
-                        live.as_ref(),
                     );
                     continue;
                 }
@@ -1092,13 +970,10 @@ impl SessionHandle {
                     output_tokens = turn_usage.output_tokens,
                     "turn completed without tool calls"
                 );
-                events.push(self.make_event(
-                    0,
-                    SessionEventPayload::TurnCompleted {
-                        turn_id: turn.id,
-                        usage: turn_usage,
-                    },
-                ));
+                events.push(self.make_event(SessionEventPayload::TurnCompleted {
+                    turn_id: turn.id,
+                    usage: turn_usage,
+                }));
                 return Ok(TurnCommit {
                     snapshot,
                     state,
@@ -1122,10 +997,8 @@ impl SessionHandle {
                     &selected_models.subagent_model,
                     &turn.id,
                     &mut fired_hook_ids,
-                    hook_reporter.clone(),
                     &mut state,
                     tool_calls,
-                    live.clone(),
                 )
                 .await?;
             events.extend(tool_events);
@@ -1142,11 +1015,9 @@ impl SessionHandle {
         effective_subagent_model: &ModelId,
         turn_id: &halter_protocol::TurnId,
         fired_hook_ids: &mut BTreeSet<String>,
-        hook_reporter: Option<crate::hooks_runtime::HookEventReporter>,
         state: &mut SessionState,
         tool_calls: Vec<ToolCall>,
-        live: Option<LiveTurnStream>,
-    ) -> anyhow::Result<Vec<SessionEvent>> {
+    ) -> anyhow::Result<Vec<PendingEvent>> {
         let mut events = Vec::new();
 
         for mut call in tool_calls {
@@ -1159,17 +1030,12 @@ impl SessionHandle {
                     working_dir: &blueprint.working_dir,
                 },
                 &call,
-                hook_reporter.clone(),
             )
             .await?;
             track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
-            self.record_hook_dispatch(&mut events, &pre_dispatch, None);
+            self.record_hook_dispatch(&mut events, &pre_dispatch);
             for message in apply_hook_side_effects(state, &pre_dispatch) {
-                self.push_event(
-                    &mut events,
-                    SessionEventPayload::MessageItem { message },
-                    live.as_ref(),
-                );
+                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
             }
             if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
                 call.arguments = updated_input;
@@ -1183,7 +1049,6 @@ impl SessionHandle {
             self.push_event(
                 &mut events,
                 SessionEventPayload::ToolExecutionStarted { call: call.clone() },
-                live.as_ref(),
             );
 
             if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
@@ -1203,17 +1068,12 @@ impl SessionHandle {
                 self.push_event(
                     &mut events,
                     SessionEventPayload::ToolExecutionCompleted { outcome },
-                    live.as_ref(),
                 );
-                self.push_event(
-                    &mut events,
-                    SessionEventPayload::MessageItem { message },
-                    live.as_ref(),
-                );
+                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
                 continue;
             }
 
-            let (emit, tool_event_drain) = self.spawn_tool_event_sink(&call, live.clone());
+            let (emit, tool_event_drain) = self.spawn_tool_event_sink();
             let context = halter_tools::ToolContext {
                 session_id: self.session_id.clone(),
                 working_dir: blueprint.working_dir.clone(),
@@ -1252,7 +1112,7 @@ impl SessionHandle {
                 .into_iter()
                 .filter_map(|event| tool_runtime_event_payload(&call.id, event))
             {
-                self.push_event(&mut events, payload, live.as_ref());
+                self.push_event(&mut events, payload);
             }
 
             let (mut content, error) = match execution {
@@ -1288,17 +1148,12 @@ impl SessionHandle {
                     },
                     &call,
                     &content,
-                    hook_reporter.clone(),
                 )
                 .await?;
                 track_fired_hook_ids(fired_hook_ids, &post_dispatch);
-                self.record_hook_dispatch(&mut events, &post_dispatch, None);
+                self.record_hook_dispatch(&mut events, &post_dispatch);
                 for message in apply_hook_side_effects(state, &post_dispatch) {
-                    self.push_event(
-                        &mut events,
-                        SessionEventPayload::MessageItem { message },
-                        live.as_ref(),
-                    );
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
                 }
                 if let Some(updated_output) = post_dispatch.merged.updated_output {
                     content = tool_result_from_hook_value(updated_output);
@@ -1314,17 +1169,12 @@ impl SessionHandle {
                     },
                     &call,
                     tool_error,
-                    hook_reporter.clone(),
                 )
                 .await?;
                 track_fired_hook_ids(fired_hook_ids, &post_dispatch);
-                self.record_hook_dispatch(&mut events, &post_dispatch, None);
+                self.record_hook_dispatch(&mut events, &post_dispatch);
                 for message in apply_hook_side_effects(state, &post_dispatch) {
-                    self.push_event(
-                        &mut events,
-                        SessionEventPayload::MessageItem { message },
-                        live.as_ref(),
-                    );
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
                 }
             }
             let outcome = ToolExecutionOutcome {
@@ -1344,13 +1194,8 @@ impl SessionHandle {
             self.push_event(
                 &mut events,
                 SessionEventPayload::ToolExecutionCompleted { outcome },
-                live.as_ref(),
             );
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                live.as_ref(),
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
 
         Ok(events)
@@ -1360,7 +1205,8 @@ impl SessionHandle {
         &self,
         snapshot: Option<Arc<ResourceSnapshot>>,
         state: Option<SessionState>,
-        events: Vec<SessionEvent>,
+        events: Vec<PendingEvent>,
+        live: Option<&LiveTurnStream>,
     ) -> anyhow::Result<Vec<SessionEvent>> {
         debug!(
             session_id = %self.session_id,
@@ -1374,69 +1220,54 @@ impl SessionHandle {
             .sessions
             .commit(&self.session_id, snapshot, None, state, events)
             .await?;
+        // Single commit-then-publish point. Events fan out to both sinks, but
+        // only *after* the store has assigned monotonic sequences; there is no
+        // pre-commit emission path that could race with the real sequence or
+        // deliver sentinel-sequenced events.
         for event in &committed {
+            if let Some(live) = live {
+                live.emit_committed(event.clone());
+            }
             self.services.event_bus.publish(event.clone());
         }
         Ok(committed)
     }
 
-    fn spawn_tool_event_sink(
-        &self,
-        call: &ToolCall,
-        live: Option<LiveTurnStream>,
-    ) -> (Arc<dyn ToolEventSink>, ToolEventDrain) {
+    fn spawn_tool_event_sink(&self) -> (Arc<dyn ToolEventSink>, ToolEventDrain) {
         let events = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(SessionToolEventSink {
-                call_id: call.id.clone(),
                 events: events.clone(),
-                live,
             }) as Arc<dyn ToolEventSink>,
             ToolEventDrain { events },
         )
     }
 
-    fn push_event(
-        &self,
-        events: &mut Vec<SessionEvent>,
-        payload: SessionEventPayload,
-        live: Option<&LiveTurnStream>,
-    ) {
-        if let Some(live) = live {
-            live.emit_payload(payload.clone());
-        }
-        events.push(self.make_event(0, payload));
+    fn push_event(&self, events: &mut Vec<PendingEvent>, payload: SessionEventPayload) {
+        events.push(self.make_event(payload));
     }
 
     fn record_hook_dispatch(
         &self,
-        events: &mut Vec<SessionEvent>,
+        events: &mut Vec<PendingEvent>,
         dispatch: &ExecutedHookDispatch,
-        live: Option<&LiveTurnStream>,
     ) {
         for run in &dispatch.preview_runs {
             self.push_event(
                 events,
                 SessionEventPayload::HookStarted { run: run.clone() },
-                live,
             );
         }
         for run in &dispatch.completed_runs {
             self.push_event(
                 events,
                 SessionEventPayload::HookCompleted { run: run.clone() },
-                live,
             );
         }
     }
 
-    fn make_event(&self, sequence: u64, payload: SessionEventPayload) -> SessionEvent {
-        SessionEvent {
-            session_id: self.session_id.clone(),
-            sequence,
-            delivery: Delivery::Lossless,
-            payload,
-        }
+    fn make_event(&self, payload: SessionEventPayload) -> PendingEvent {
+        PendingEvent::new(self.session_id.clone(), Delivery::Lossless, payload)
     }
 }
 
@@ -1456,20 +1287,11 @@ fn tool_runtime_event_payload(
     }
 }
 
-fn should_emit_live_payload(payload: &SessionEventPayload) -> bool {
-    !matches!(
-        payload,
-        SessionEventPayload::TurnStarted { .. }
-            | SessionEventPayload::TurnCompleted { .. }
-            | SessionEventPayload::TurnFailed { .. }
-    )
-}
-
 #[derive(Debug)]
 struct TurnCommit {
     snapshot: Arc<ResourceSnapshot>,
     state: SessionState,
-    events: Vec<SessionEvent>,
+    events: Vec<PendingEvent>,
 }
 
 #[derive(Debug, Default)]
@@ -1805,12 +1627,11 @@ pub(crate) async fn create_session_seeded(
         })
         .await?;
 
-    let started = SessionEvent {
-        session_id: session_id.clone(),
-        sequence: 0,
-        delivery: Delivery::Lossless,
-        payload: SessionEventPayload::SessionStarted,
-    };
+    let started = PendingEvent::new(
+        session_id.clone(),
+        Delivery::Lossless,
+        SessionEventPayload::SessionStarted,
+    );
     let committed = services
         .sessions
         .commit(&session_id, None, None, None, vec![started])
@@ -2550,23 +2371,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_started_events_stream_before_hook_completion() {
+    async fn hook_events_delivered_after_turn_commits() {
+        // Post-H6 single commit-then-publish: HookStarted/HookCompleted
+        // arrive at turn commit, not intra-turn. This test only asserts they
+        // are present in the post-commit stream.
         let temp = tempfile::tempdir().expect("tempdir");
-        let notify = Arc::new(Notify::new());
         let mut services = RuntimeServices::default();
         let mut hooks = RegisteredHooks::default();
         hooks.register(
             PluginId::from("test-plugin"),
             RegisteredHookPriority::AfterPlugins,
-            Hook::callback(HookEventName::UserPromptSubmit, {
-                let notify = notify.clone();
-                move |_input| {
-                    let notify = notify.clone();
-                    async move {
-                        notify.notified().await;
-                        HookResponse::passthrough()
-                    }
-                }
+            Hook::callback(HookEventName::UserPromptSubmit, move |_input| async move {
+                HookResponse::passthrough()
             }),
         );
         services.registered_hooks = Arc::new(hooks);
@@ -2586,31 +2402,19 @@ mod tests {
         let runtime = SessionRuntime::new(Arc::new(services));
         let session = new_session(&runtime, temp.path()).await;
 
-        let mut stream = session
+        let events = session
             .submit_turn(Turn::user("hello"))
             .await
-            .expect("submit turn");
-
-        let first = tokio::time::timeout(Duration::from_secs(1), stream.try_next())
-            .await
-            .expect("first event timeout")
-            .expect("first event result")
-            .expect("first event");
-        assert!(matches!(
-            first.payload,
-            SessionEventPayload::HookStarted { .. }
-        ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), stream.try_next())
-                .await
-                .is_err()
-        );
-
-        notify.notify_waiters();
-        let events = stream
+            .expect("submit turn")
             .try_collect::<Vec<_>>()
             .await
             .expect("collect events");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::HookStarted { .. }))
+        );
         assert!(
             events
                 .iter()
@@ -2927,38 +2731,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_turn_streams_tool_output_before_tool_completion() {
+    async fn submit_turn_delivers_tool_output_after_turn_commits() {
+        // Post-H6: tool output chunks collected during tool execution are
+        // flushed alongside other turn events at commit. This test asserts
+        // the chunk is present in the committed stream, not that it arrives
+        // mid-tool.
         let temp = tempfile::tempdir().expect("tempdir");
         let services = configured_services(Arc::new(StreamingToolProvider), temp.path());
         services.tools.register(Arc::new(StreamingTestTool));
         let runtime = SessionRuntime::new(services);
         let session = new_session(&runtime, temp.path()).await;
 
-        let mut events = session
+        let events = session
             .submit_turn(Turn::user("stream tool output"))
             .await
-            .expect("submit turn");
-
-        let tool_output = tokio::time::timeout(Duration::from_millis(150), async {
-            while let Some(event) = events.next().await {
-                let event = event.expect("stream event");
-                if let SessionEventPayload::ToolOutput { chunk, .. } = event.payload {
-                    return chunk;
-                }
-            }
-            panic!("tool output never arrived");
-        })
-        .await
-        .expect("tool output should stream before tool completion");
-
-        assert_eq!(tool_output, "streamed chunk");
-
-        let remaining = events
+            .expect("submit turn")
             .try_collect::<Vec<_>>()
             .await
-            .expect("collect remaining events");
+            .expect("collect events");
+
+        let tool_output = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::ToolOutput { chunk, .. } => Some(chunk.clone()),
+                _ => None,
+            })
+            .expect("tool output chunk present in committed events");
+        assert_eq!(tool_output, "streamed chunk");
         assert!(
-            remaining
+            events
                 .iter()
                 .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
         );

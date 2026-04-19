@@ -9,8 +9,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use halter_protocol::{
-    AgentId, AgentName, CloseSubagentRequest, CloseSubagentResponse, SendSubagentInputRequest,
-    SessionEvent, SessionEventPayload, SessionId, SpawnSubagentRequest, SubagentState,
+    AgentId, AgentName, CloseSubagentRequest, CloseSubagentResponse, PendingEvent,
+    SendSubagentInputRequest, SessionEventPayload, SessionId, SpawnSubagentRequest, SubagentState,
     SubagentStatus, Turn, TurnId, Usage, WaitSubagentRequest, WaitSubagentResponse,
 };
 use halter_session::SessionCommitConflict;
@@ -327,37 +327,26 @@ impl RuntimeSubagentControl {
             let expected_state = stored.state.clone();
             let mut next_state = expected_state.clone();
             let mut events = Vec::new();
-            events.extend(
-                dispatch
-                    .preview_runs
-                    .iter()
-                    .cloned()
-                    .map(|run| SessionEvent {
-                        session_id: parent_session_id.clone(),
-                        sequence: 0,
-                        delivery: halter_protocol::Delivery::Lossless,
-                        payload: SessionEventPayload::HookStarted { run },
-                    }),
-            );
-            events.extend(
-                dispatch
-                    .completed_runs
-                    .iter()
-                    .cloned()
-                    .map(|run| SessionEvent {
-                        session_id: parent_session_id.clone(),
-                        sequence: 0,
-                        delivery: halter_protocol::Delivery::Lossless,
-                        payload: SessionEventPayload::HookCompleted { run },
-                    }),
-            );
+            events.extend(dispatch.preview_runs.iter().cloned().map(|run| {
+                PendingEvent::new(
+                    parent_session_id.clone(),
+                    halter_protocol::Delivery::Lossless,
+                    SessionEventPayload::HookStarted { run },
+                )
+            }));
+            events.extend(dispatch.completed_runs.iter().cloned().map(|run| {
+                PendingEvent::new(
+                    parent_session_id.clone(),
+                    halter_protocol::Delivery::Lossless,
+                    SessionEventPayload::HookCompleted { run },
+                )
+            }));
             for message in apply_hook_side_effects(&mut next_state, &dispatch) {
-                events.push(SessionEvent {
-                    session_id: parent_session_id.clone(),
-                    sequence: 0,
-                    delivery: halter_protocol::Delivery::Lossless,
-                    payload: SessionEventPayload::MessageItem { message },
-                });
+                events.push(PendingEvent::new(
+                    parent_session_id.clone(),
+                    halter_protocol::Delivery::Lossless,
+                    SessionEventPayload::MessageItem { message },
+                ));
             }
 
             match self
@@ -454,7 +443,6 @@ impl RuntimeSubagentControl {
                 .as_ref()
                 .map_or("default", |agent_type| agent_type.0.as_str()),
             &parent.blueprint.session_id,
-            None,
         )
         .await?;
         let _ = self
@@ -503,7 +491,6 @@ impl RuntimeSubagentControl {
             agent_id,
             agent_type.map_or("default", |agent_type| agent_type.0.as_str()),
             transcript_path.as_deref(),
-            None,
         )
         .await?;
         self.run_parent_hook_dispatch(parent_session_id, dispatch, false)

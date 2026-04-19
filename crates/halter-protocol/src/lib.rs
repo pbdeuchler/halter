@@ -668,12 +668,74 @@ pub enum SessionEventPayload {
     SessionShutdownComplete,
 }
 
+/// An event that has been committed to the session store and therefore has
+/// been assigned a monotonic `sequence` by the commit boundary. Construct a
+/// `SessionEvent` only via `PendingEvent::into_committed`, `SessionEvent::new_committed`,
+/// or deserialization — the `sequence` field is intentionally not publicly
+/// settable.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SessionEvent {
     pub session_id: SessionId,
-    pub sequence: u64,
+    pub(crate) sequence: u64,
     pub delivery: Delivery,
     pub payload: SessionEventPayload,
+}
+
+impl SessionEvent {
+    /// Construct a committed event with an explicit sequence. This is the
+    /// only public constructor that sets the `sequence` field; call sites
+    /// outside commit boundaries must use `PendingEvent`.
+    #[must_use]
+    pub fn new_committed(
+        session_id: SessionId,
+        sequence: u64,
+        delivery: Delivery,
+        payload: SessionEventPayload,
+    ) -> Self {
+        Self {
+            session_id,
+            sequence,
+            delivery,
+            payload,
+        }
+    }
+
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+/// An event produced during turn execution, before the session store has
+/// assigned a sequence. Convert to `SessionEvent` via `into_committed` once
+/// the store has allocated a sequence number. Holding `sequence`-less events
+/// until commit makes the commit-then-publish invariant type-enforced.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PendingEvent {
+    pub session_id: SessionId,
+    pub delivery: Delivery,
+    pub payload: SessionEventPayload,
+}
+
+impl PendingEvent {
+    #[must_use]
+    pub fn new(session_id: SessionId, delivery: Delivery, payload: SessionEventPayload) -> Self {
+        Self {
+            session_id,
+            delivery,
+            payload,
+        }
+    }
+
+    #[must_use]
+    pub fn into_committed(self, sequence: u64) -> SessionEvent {
+        SessionEvent {
+            session_id: self.session_id,
+            sequence,
+            delivery: self.delivery,
+            payload: self.payload,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1163,11 +1225,11 @@ mod tests {
 
     #[test]
     fn session_event_roundtrip() {
-        let event = SessionEvent {
-            session_id: SessionId::new(),
-            sequence: 1,
-            delivery: Delivery::Lossless,
-            payload: SessionEventPayload::TurnCompleted {
+        let event = SessionEvent::new_committed(
+            SessionId::new(),
+            1,
+            Delivery::Lossless,
+            SessionEventPayload::TurnCompleted {
                 turn_id: TurnId::new(),
                 usage: Usage {
                     input_tokens: 10,
@@ -1176,10 +1238,31 @@ mod tests {
                     cache_read_input_tokens: 0,
                 },
             },
-        };
+        );
         let encoded = serde_json::to_string(&event).expect("serialize event");
         let decoded: SessionEvent = serde_json::from_str(&encoded).expect("deserialize event");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn pending_event_into_committed_preserves_fields() {
+        let session_id = SessionId::from("session-42");
+        let payload = SessionEventPayload::ContextCompacted {
+            summary: "summary".to_owned(),
+        };
+        let pending = PendingEvent::new(session_id.clone(), Delivery::Lossless, payload.clone());
+
+        let committed = pending.clone().into_committed(7);
+
+        assert_eq!(committed.session_id, session_id);
+        assert_eq!(committed.sequence(), 7);
+        assert_eq!(committed.delivery, Delivery::Lossless);
+        assert_eq!(committed.payload, payload);
+
+        // PendingEvent is still unsequenced; we reject post-hoc mutation of
+        // committed events by keeping the sequence field crate-private.
+        let encoded = serde_json::to_string(&pending).expect("serialize pending");
+        assert!(!encoded.contains("sequence"));
     }
 
     #[test]

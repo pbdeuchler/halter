@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use halter_protocol::{
-    Delivery, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload, SessionId,
-    SessionState,
+    Delivery, PendingEvent, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload,
+    SessionId, SessionState,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use tracing::{debug, info};
@@ -129,7 +129,7 @@ impl SessionStore for SqliteSessionStore {
         snapshot: Option<Arc<ResourceSnapshot>>,
         expected_state: Option<SessionState>,
         state: Option<SessionState>,
-        events: Vec<SessionEvent>,
+        events: Vec<PendingEvent>,
     ) -> Result<Vec<SessionEvent>> {
         let session_id = session_id.clone();
         self.with_conn(move |conn| {
@@ -265,7 +265,7 @@ fn commit_with_conn(
     snapshot: Option<Arc<ResourceSnapshot>>,
     expected_state: Option<SessionState>,
     state: Option<SessionState>,
-    events: Vec<SessionEvent>,
+    events: Vec<PendingEvent>,
 ) -> Result<Vec<SessionEvent>> {
     let started_at = Instant::now();
     let tx = conn
@@ -351,12 +351,14 @@ fn commit_with_conn(
             )
         })?;
 
-        committed.push(SessionEvent {
-            session_id: session_id.clone(),
-            sequence,
-            delivery: event.delivery,
-            payload: event.payload,
-        });
+        committed.push(
+            PendingEvent {
+                session_id: session_id.clone(),
+                delivery: event.delivery,
+                payload: event.payload,
+            }
+            .into_committed(sequence),
+        );
     }
 
     tx.commit()
@@ -397,12 +399,12 @@ fn replay_with_conn(conn: &mut Connection, session_id: &SessionId) -> Result<Vec
         let (raw_session_id, raw_sequence, raw_delivery, raw_payload) = row?;
         let payload: SessionEventPayload = serde_json::from_str(&raw_payload)
             .context("failed to deserialize session event payload")?;
-        events.push(SessionEvent {
-            session_id: SessionId::from(raw_session_id),
-            sequence: sequence_from_sql(raw_sequence)?,
-            delivery: delivery_from_sql(&raw_delivery)?,
+        events.push(SessionEvent::new_committed(
+            SessionId::from(raw_session_id),
+            sequence_from_sql(raw_sequence)?,
+            delivery_from_sql(&raw_delivery)?,
             payload,
-        });
+        ));
     }
     Ok(events)
 }
@@ -715,8 +717,8 @@ mod tests {
             .expect("commit session");
 
         assert_eq!(committed.len(), 2);
-        assert_eq!(committed[0].sequence, 1);
-        assert_eq!(committed[1].sequence, 2);
+        assert_eq!(committed[0].sequence(), 1);
+        assert_eq!(committed[1].sequence(), 2);
         assert_eq!(committed[0].session_id, session.blueprint.session_id);
         assert_eq!(committed[1].session_id, session.blueprint.session_id);
 
@@ -936,13 +938,13 @@ mod tests {
             .expect("second commit");
 
         assert_eq!(
-            first.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            first.iter().map(SessionEvent::sequence).collect::<Vec<_>>(),
             vec![1, 2]
         );
         assert_eq!(
             second
                 .iter()
-                .map(|event| event.sequence)
+                .map(|event| event.sequence())
                 .collect::<Vec<_>>(),
             vec![3]
         );
@@ -953,7 +955,7 @@ mod tests {
         assert_eq!(
             replayed
                 .iter()
-                .map(|event| event.sequence)
+                .map(|event| event.sequence())
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
@@ -1111,14 +1113,13 @@ mod tests {
         snapshot
     }
 
-    fn test_event(summary: &str, delivery: Delivery) -> SessionEvent {
-        SessionEvent {
-            session_id: SessionId::from("ignored"),
-            sequence: 0,
+    fn test_event(summary: &str, delivery: Delivery) -> PendingEvent {
+        PendingEvent::new(
+            SessionId::from("ignored"),
             delivery,
-            payload: SessionEventPayload::ContextCompacted {
+            SessionEventPayload::ContextCompacted {
                 summary: summary.to_owned(),
             },
-        }
+        )
     }
 }
