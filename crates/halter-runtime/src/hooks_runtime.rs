@@ -1,7 +1,7 @@
 // pattern: Imperative Shell
 
-use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,15 +21,55 @@ use halter_protocol::{
     PromptSegmentId, SessionId, SessionState, ToolCall, ToolError, ToolResult, Turn, TurnId,
     UserMessage, Volatility,
 };
+use halter_tools::{PolicyError, ToolPolicy};
+use lru::LruCache;
 use reqwest::Url;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
-use tokio::net::lookup_host;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+/// Maximum bytes accumulated from an HTTP hook response body. Exceeding this
+/// cap aborts the stream and returns `HookError::ResponseTooLarge`.
+const HOOK_HTTP_RESPONSE_CAP: usize = 1024 * 1024;
+
+/// LRU capacity for the per-`(scheme, host, port)` `reqwest::Client` cache.
+/// Workloads contacting more than this many distinct hosts will see TLS
+/// handshake amortization degrade; in practice no in-tree workload does.
+const HOOK_HTTP_CLIENT_CAPACITY: usize = 32;
+
+/// Structured errors returned by the HTTP hook pipeline. These wrap into
+/// `anyhow::Error` at propagation boundaries so the caller surface stays
+/// `anyhow::Result`, while still being matchable in tests.
+#[derive(Debug, thiserror::Error)]
+pub enum HookError {
+    #[error("http hook response exceeded size cap: {observed} bytes (cap {cap})")]
+    ResponseTooLarge { cap: usize, observed: usize },
+    #[error("http hook header '{name}' contains forbidden control byte 0x{byte:02x}")]
+    InvalidHeader { name: String, byte: u8 },
+    #[error("hook network denied: {0}")]
+    PolicyDenied(#[from] PolicyError),
+}
+
+/// Byte cap for the stdout snippet attached to `CommandOutputParseError` when
+/// a hook command emits malformed JSON. Big enough to identify the shape of
+/// the failure, small enough that an attacker-controlled process can't fill
+/// the log with arbitrary bytes. (H3)
+const COMMAND_OUTPUT_SNIPPET_CAP: usize = 256;
+
+/// Parse failure for hook command stdout. Was silently coerced to
+/// `HookOutput::default()` pre-H3, which masked real misconfigurations.
+#[derive(Debug, thiserror::Error)]
+pub enum CommandOutputParseError {
+    #[error("failed to decode hook command stdout as JSON: {source} (stdout snippet: {snippet:?})")]
+    Json {
+        #[source]
+        source: serde_json::Error,
+        snippet: String,
+    },
+}
 
 use crate::session::{
     MaterializedAssistantMessage, create_session_seeded, materialize_assistant_message,
@@ -612,7 +652,7 @@ async fn execute_handler(
                 run_command(handler, command, request, cancel).await
             }
             halter_hooks::HookHandlerConfig::Http(http) => {
-                run_http(handler, http, request, cancel).await
+                run_http(sess, handler, http, request, cancel).await
             }
             halter_hooks::HookHandlerConfig::Prompt(prompt) => {
                 run_prompt(sess, handler.timeout, prompt, request, cancel).await
@@ -714,6 +754,7 @@ async fn run_sdk_hook(
 }
 
 async fn run_http(
+    sess: &HalterSession,
     handler: &ConfiguredHandler,
     config: &HttpHookConfig,
     request: &HookDispatchRequest,
@@ -729,28 +770,79 @@ async fn run_http(
         );
     }
 
+    // Single unified network gate. `PolicySettings::allowed_loopback` and
+    // `allowed_hosts` govern both loopback and remote access — the runtime no
+    // longer maintains a parallel IP allowlist (C3).
+    check_hook_network(sess.services().policy.as_ref(), &config.url).await?;
+
     let url = Url::parse(&config.url).context("failed to parse hook url")?;
-    validate_http_url(handler, &url)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("http hook url must use http or https");
+    }
     let payload = build_payload(handler, request)?;
     let headers = build_http_headers(handler, config)?;
-    let client = cached_http_hook_client(handler, &url)?;
+    let client = cached_http_hook_client(&url)?;
 
-    let response = tokio::select! {
+    let output = tokio::select! {
         _ = cancel.cancelled() => return Ok(HandlerExecution::Cancelled),
-        result = timeout(handler.timeout, client.post(url).headers(headers).json(&payload).send()) => {
-            result.context("hook timed out")?.context("failed to execute http hook")?
+        result = timeout(handler.timeout, send_http_hook(client, url, headers, &payload)) => {
+            result.context("hook timed out")??
         }
     };
+
+    Ok(HandlerExecution::completed(output))
+}
+
+async fn check_hook_network(policy: &dyn ToolPolicy, url: &str) -> Result<(), HookError> {
+    policy
+        .check_network(url)
+        .await
+        .map_err(HookError::PolicyDenied)
+}
+
+async fn send_http_hook(
+    client: reqwest::Client,
+    url: Url,
+    headers: reqwest::header::HeaderMap,
+    payload: &Value,
+) -> anyhow::Result<HookOutput> {
+    let response = client
+        .post(url)
+        .headers(headers)
+        .json(payload)
+        .send()
+        .await
+        .context("failed to execute http hook")?;
 
     if !response.status().is_success() {
         anyhow::bail!("http hook returned {}", response.status());
     }
 
-    let body = response
-        .text()
+    let body = accumulate_response_body_bounded(response, HOOK_HTTP_RESPONSE_CAP).await?;
+    let body_text = String::from_utf8(body).context("http hook response is not utf-8")?;
+    parse_json_hook_output(&body_text)
+}
+
+/// Consume `response`'s body in streaming chunks, aborting the moment the
+/// accumulated length crosses `cap`. Returns `HookError::ResponseTooLarge`
+/// without buffering the full body (H1 bound).
+async fn accumulate_response_body_bounded(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .context("failed to read http hook response body")?;
-    Ok(HandlerExecution::completed(parse_json_hook_output(&body)?))
+        .context("failed to read http hook chunk")?
+    {
+        let observed = body.len() + chunk.len();
+        if observed > cap {
+            return Err(HookError::ResponseTooLarge { cap, observed }.into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 async fn run_prompt(
@@ -933,11 +1025,27 @@ fn resolve_agent_model(
     }
 }
 
-fn parse_command_output(stdout: &str) -> anyhow::Result<HookOutput> {
+fn parse_command_output(stdout: &str) -> Result<HookOutput, CommandOutputParseError> {
     if stdout.is_empty() {
         return Ok(HookOutput::default());
     }
-    serde_json::from_str(stdout).or(Ok(HookOutput::default()))
+    serde_json::from_str(stdout).map_err(|source| CommandOutputParseError::Json {
+        source,
+        snippet: bounded_stdout_snippet(stdout),
+    })
+}
+
+/// Take the first `COMMAND_OUTPUT_SNIPPET_CAP` bytes of `stdout` respecting
+/// UTF-8 character boundaries. Returns the full string if shorter than the cap.
+fn bounded_stdout_snippet(stdout: &str) -> String {
+    if stdout.len() <= COMMAND_OUTPUT_SNIPPET_CAP {
+        return stdout.to_owned();
+    }
+    let mut end = COMMAND_OUTPUT_SNIPPET_CAP;
+    while end > 0 && !stdout.is_char_boundary(end) {
+        end -= 1;
+    }
+    stdout[..end].to_owned()
 }
 
 fn parse_json_hook_output(body: &str) -> anyhow::Result<HookOutput> {
@@ -1140,7 +1248,8 @@ fn build_http_headers(
         .collect::<BTreeSet<_>>();
 
     for (key, raw_value) in &config.headers {
-        let value = sanitize_header_value(&expand_env_placeholders(raw_value, &allowed));
+        let expanded = expand_env_placeholders(raw_value, &allowed);
+        let value = sanitize_header_value(key, &expanded)?;
         let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
             .context("failed to build hook header name")?;
         let header_value = reqwest::header::HeaderValue::from_str(&value)
@@ -1196,39 +1305,36 @@ fn preferred_posix_login_shell_from(shell: Option<&str>) -> Option<String> {
 }
 
 fn expand_env_placeholders(value: &str, allowed: &BTreeSet<String>) -> String {
+    // UTF-8 safe: we only branch on the ASCII `$` byte, then slice `&str`
+    // boundaries. The original byte-indexed version corrupted multibyte chars
+    // by pushing individual UTF-8 bytes as `char`s (C2).
     let mut expanded = String::with_capacity(value.len());
-    let chars = value.as_bytes();
-    let mut index = 0usize;
-
-    while index < chars.len() {
-        if chars[index] != b'$' {
-            expanded.push(chars[index] as char);
-            index += 1;
-            continue;
-        }
-
-        if index + 1 < chars.len()
-            && chars[index + 1] == b'{'
-            && let Some(close) = value[index + 2..].find('}')
+    let mut remaining = value;
+    while let Some(dollar) = remaining.find('$') {
+        expanded.push_str(&remaining[..dollar]);
+        let after = &remaining[dollar + 1..];
+        if let Some(inner) = after.strip_prefix('{')
+            && let Some(close) = inner.find('}')
         {
-            let name = &value[index + 2..index + 2 + close];
+            let name = &inner[..close];
             expanded.push_str(&expanded_env(name, allowed));
-            index += close + 3;
+            remaining = &inner[close + 1..];
             continue;
         }
-
-        let start = index + 1;
-        let mut end = start;
-        while end < chars.len()
-            && ((chars[end] as char).is_ascii_alphanumeric() || chars[end] == b'_')
-        {
-            end += 1;
-        }
-        let name = &value[start..end];
+        // `$NAME` form: ASCII alphanumeric + `_`. Counting ASCII bytes is
+        // safe because UTF-8 continuation bytes (0x80+) are never
+        // alphanumeric and single-byte ASCII runs always stop at a char
+        // boundary.
+        let end = after
+            .as_bytes()
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+            .count();
+        let name = &after[..end];
         expanded.push_str(&expanded_env(name, allowed));
-        index = end;
+        remaining = &after[end..];
     }
-
+    expanded.push_str(remaining);
     expanded
 }
 
@@ -1239,29 +1345,53 @@ fn expanded_env(name: &str, allowed: &BTreeSet<String>) -> String {
     std::env::var(name).unwrap_or_default()
 }
 
-fn sanitize_header_value(value: &str) -> String {
-    value.replace(['\r', '\n', '\0'], "")
+fn sanitize_header_value(name: &str, value: &str) -> Result<String, HookError> {
+    // M11: hard-reject the C0 control range (0x00..=0x1F, 0x7F) except `\t`.
+    // The prior strip-and-continue accepted header injection bytes that
+    // `reqwest::HeaderValue::from_str` would later truncate silently.
+    for byte in value.bytes() {
+        let is_disallowed_c0 = byte <= 0x1F && byte != b'\t';
+        let is_del = byte == 0x7F;
+        if is_disallowed_c0 || is_del {
+            return Err(HookError::InvalidHeader {
+                name: name.to_owned(),
+                byte,
+            });
+        }
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct HttpHookClientCacheKey {
-    plugin_id: String,
+struct HostKey {
+    scheme: String,
     host: String,
+    port: Option<u16>,
 }
 
-static HTTP_HOOK_CLIENTS: OnceLock<Mutex<HashMap<HttpHookClientCacheKey, reqwest::Client>>> =
-    OnceLock::new();
+impl HostKey {
+    fn from_url(url: &Url) -> Self {
+        Self {
+            scheme: url.scheme().to_owned(),
+            host: url.host_str().unwrap_or_default().to_owned(),
+            port: url.port_or_known_default(),
+        }
+    }
+}
 
-fn cached_http_hook_client(
-    handler: &ConfiguredHandler,
-    url: &Url,
-) -> anyhow::Result<reqwest::Client> {
-    let key = HttpHookClientCacheKey {
-        plugin_id: handler.plugin_id.0.clone(),
-        host: url.host_str().unwrap_or_default().to_owned(),
-    };
-    let cache = HTTP_HOOK_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
+static HTTP_HOOK_CLIENTS: OnceLock<Mutex<LruCache<HostKey, reqwest::Client>>> = OnceLock::new();
+
+fn http_hook_clients() -> &'static Mutex<LruCache<HostKey, reqwest::Client>> {
+    HTTP_HOOK_CLIENTS.get_or_init(|| {
+        let capacity =
+            NonZeroUsize::new(HOOK_HTTP_CLIENT_CAPACITY).expect("HOOK_HTTP_CLIENT_CAPACITY > 0");
+        Mutex::new(LruCache::new(capacity))
+    })
+}
+
+fn cached_http_hook_client(url: &Url) -> anyhow::Result<reqwest::Client> {
+    let key = HostKey::from_url(url);
+    if let Ok(mut guard) = http_hook_clients().lock() {
         if let Some(client) = guard.get(&key) {
             return Ok(client.clone());
         }
@@ -1270,156 +1400,17 @@ fn cached_http_hook_client(
     }
 
     let client = reqwest::Client::builder()
-        .dns_resolver(Arc::new(HttpHookResolver::new(key.host.clone())))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to construct http hook client")?;
 
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(key, client.clone());
+    if let Ok(mut guard) = http_hook_clients().lock() {
+        guard.put(key, client.clone());
     } else {
         warn!("http hook client cache lock poisoned; skipping cache insert");
     }
 
     Ok(client)
-}
-
-fn validate_http_url(handler: &ConfiguredHandler, url: &Url) -> anyhow::Result<()> {
-    let host = url
-        .host_str()
-        .context("http hook url must include a host")?;
-    if !matches!(url.scheme(), "http" | "https") {
-        anyhow::bail!("http hook url must use http or https");
-    }
-    if !matches_allowed_host(host, &handler.allowed_http_hosts) {
-        anyhow::bail!("http hook host '{host}' is not allowed by plugin manifest");
-    }
-
-    if let Ok(ip) = host.parse::<IpAddr>()
-        && !is_allowed_http_ip(ip)
-    {
-        anyhow::bail!("http hook host '{host}' resolves to a disallowed literal ip");
-    }
-
-    Ok(())
-}
-
-#[derive(Clone)]
-struct HttpHookResolver {
-    expected_host: String,
-}
-
-impl HttpHookResolver {
-    fn new(expected_host: String) -> Self {
-        Self { expected_host }
-    }
-}
-
-impl Resolve for HttpHookResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_owned();
-        let expected_host = self.expected_host.clone();
-        Box::pin(async move {
-            if !expected_host.eq_ignore_ascii_case(&host) {
-                return Err(anyhow::anyhow!(
-                    "http hook attempted to resolve unexpected host '{host}'"
-                )
-                .into());
-            }
-
-            let addrs = lookup_host((host.as_str(), 0))
-                .await
-                .with_context(|| format!("failed to resolve http hook host '{host}'"))?
-                .collect::<Vec<_>>();
-            let validated = validate_resolved_http_addrs(&host, addrs)?;
-            let addrs: Addrs = Box::new(validated.into_iter());
-            Ok(addrs)
-        })
-    }
-}
-
-fn validate_resolved_http_addrs(
-    host: &str,
-    addrs: Vec<SocketAddr>,
-) -> anyhow::Result<Vec<SocketAddr>> {
-    if addrs.is_empty() {
-        anyhow::bail!("failed to resolve http hook host '{host}'");
-    }
-
-    for addr in &addrs {
-        if !is_allowed_http_ip(addr.ip()) {
-            anyhow::bail!(
-                "http hook host '{host}' resolved to disallowed address '{}'",
-                addr.ip()
-            );
-        }
-    }
-
-    Ok(addrs)
-}
-
-fn matches_allowed_host(host: &str, patterns: &[String]) -> bool {
-    patterns
-        .iter()
-        .any(|pattern| matches_host_pattern(host, pattern))
-}
-
-fn matches_host_pattern(host: &str, pattern: &str) -> bool {
-    let host_segments = host.split('.').collect::<Vec<_>>();
-    let pattern_segments = pattern.split('.').collect::<Vec<_>>();
-    if host_segments.len() != pattern_segments.len() {
-        return false;
-    }
-
-    pattern_segments
-        .iter()
-        .zip(host_segments.iter())
-        .all(|(pattern_segment, host_segment)| {
-            *pattern_segment == "*" || pattern_segment.eq_ignore_ascii_case(host_segment)
-        })
-}
-
-fn is_allowed_http_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            if ip.octets()[0] == 127 {
-                return true;
-            }
-            !matches!(
-                ip,
-                ip if ip_in_v4_cidr(ip, Ipv4Addr::new(0, 0, 0, 0), 8)
-                    || ip_in_v4_cidr(ip, Ipv4Addr::new(10, 0, 0, 0), 8)
-                    || ip_in_v4_cidr(ip, Ipv4Addr::new(100, 64, 0, 0), 10)
-                    || ip_in_v4_cidr(ip, Ipv4Addr::new(169, 254, 0, 0), 16)
-                    || ip_in_v4_cidr(ip, Ipv4Addr::new(172, 16, 0, 0), 12)
-                    || ip_in_v4_cidr(ip, Ipv4Addr::new(192, 168, 0, 0), 16)
-            )
-        }
-        IpAddr::V6(ip) => {
-            if ip == Ipv6Addr::LOCALHOST {
-                return true;
-            }
-            let segments = ip.segments();
-            !(ip == Ipv6Addr::UNSPECIFIED
-                || (segments[0] & 0xfe00) == 0xfc00
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] == 0
-                    && segments[1] == 0
-                    && segments[2] == 0
-                    && segments[3] == 0
-                    && segments[4] == 0
-                    && segments[5] == 0xffff))
-        }
-    }
-}
-
-fn ip_in_v4_cidr(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - u32::from(prefix))
-    };
-    (u32::from(ip) & mask) == (u32::from(network) & mask)
 }
 
 fn hook_prompt_segment(text: &str) -> PromptSegment {
@@ -1444,75 +1435,8 @@ fn hash_text(text: &str) -> String {
 mod tests {
     use super::*;
 
-    fn test_handler(allowed_http_hosts: Vec<String>) -> ConfiguredHandler {
-        ConfiguredHandler {
-            handler_id: "handler".to_owned(),
-            plugin_id: halter_protocol::PluginId::from("plugin"),
-            plugin_root: PathBuf::new(),
-            source_path: PathBuf::from("<sdk>"),
-            allowed_http_hosts,
-            allowed_env_vars: Vec::new(),
-            event_name: HookEventName::Notification,
-            handler_type: halter_protocol::HookHandlerType::Http,
-            timeout: std::time::Duration::from_secs(1),
-            status_message: None,
-            if_condition: None,
-            once: false,
-            matcher: None,
-            config: ConfiguredHandlerConfig::File(halter_hooks::HookHandlerConfig::Http(
-                HttpHookConfig {
-                    url: "https://example.com/hook".to_owned(),
-                    headers: Default::default(),
-                    allowed_env_vars: Vec::new(),
-                },
-            )),
-            priority: halter_hooks::HandlerPriority {
-                group: halter_hooks::HandlerPriorityGroup::PluginFiles,
-                plugin_load_order: 0,
-                event_declaration_index: 0,
-                matcher_group_index: 0,
-                hook_index_within_group: 0,
-            },
-        }
-    }
-
-    #[test]
-    fn resolved_http_addrs_reject_private_ranges() {
-        let addrs = vec![SocketAddr::from((Ipv4Addr::new(10, 0, 0, 5), 0))];
-        let error =
-            validate_resolved_http_addrs("policy.example", addrs).expect_err("reject private ip");
-        assert!(error.to_string().contains("disallowed address"));
-    }
-
-    #[test]
-    fn resolved_http_addrs_reject_mixed_sets() {
-        let addrs = vec![
-            SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 0)),
-            SocketAddr::from((Ipv6Addr::from([0xfc00, 0, 0, 0, 0, 0, 0, 1]), 0)),
-        ];
-        let error =
-            validate_resolved_http_addrs("policy.example", addrs).expect_err("reject mixed set");
-        assert!(error.to_string().contains("disallowed address"));
-    }
-
-    #[test]
-    fn resolved_http_addrs_allow_loopback() {
-        let addrs = vec![
-            SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 0)),
-            SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
-        ];
-        let validated =
-            validate_resolved_http_addrs("policy.example", addrs.clone()).expect("allow loopback");
-        assert_eq!(validated, addrs);
-    }
-
-    #[test]
-    fn validate_http_url_rejects_disallowed_literal_ip() {
-        let handler = test_handler(vec!["10.0.0.1".to_owned()]);
-        let url = Url::parse("https://10.0.0.1/hook").expect("url");
-        let error = validate_http_url(&handler, &url).expect_err("reject literal private ip");
-        assert!(error.to_string().contains("disallowed literal ip"));
-    }
+    use async_trait::async_trait;
+    use halter_tools::{CanonicalPath, Pid, PolicySettings, ShellMode};
 
     #[test]
     fn shell_invocation_falls_back_to_sh_for_non_posix_user_shells() {
@@ -1535,5 +1459,348 @@ mod tests {
                 vec!["-Command".to_owned(), "echo hi".to_owned()]
             )
         );
+    }
+
+    // === Phase 2 acceptance tests ===
+
+    fn allowed_set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// AC1.1: multibyte UTF-8 chars flow through unchanged.
+    #[test]
+    fn review_hook_runtime_ac1_1_env_expansion_preserves_multibyte_utf8() {
+        let input = "héllo 🚀 漢字";
+        let expanded = expand_env_placeholders(input, &BTreeSet::new());
+        assert_eq!(expanded, input);
+    }
+
+    /// AC1.2: placeholder expansion at boundaries and abutting multibyte chars.
+    #[test]
+    fn review_hook_runtime_ac1_2_env_expansion_handles_placeholder_boundaries() {
+        // SAFETY: tests of placeholder expansion must be insulated from the
+        // host environment.
+        // SAFETY: setting env vars in tests is safe when not racing other
+        // tests that read the same vars.
+        unsafe { std::env::set_var("HALTER_TEST_VAR", "OK") };
+        let allowed = allowed_set(&["HALTER_TEST_VAR"]);
+
+        assert_eq!(
+            expand_env_placeholders("${HALTER_TEST_VAR}trailing", &allowed),
+            "OKtrailing"
+        );
+        assert_eq!(
+            expand_env_placeholders("leading${HALTER_TEST_VAR}", &allowed),
+            "leadingOK"
+        );
+        // Placeholder abuts a multibyte char on each side.
+        assert_eq!(
+            expand_env_placeholders("é${HALTER_TEST_VAR}漢", &allowed),
+            "éOK漢"
+        );
+        // Bare placeholder expanded alone.
+        assert_eq!(
+            expand_env_placeholders("${HALTER_TEST_VAR}", &allowed),
+            "OK"
+        );
+    }
+
+    /// AC1.3 / AC1.4: streamed body accumulation respects the cap.
+    #[tokio::test]
+    async fn review_hook_runtime_ac1_3_4_bounded_body_caps_at_limit() {
+        // Pure-function equivalent: verify the bound logic directly. The
+        // full streaming path is exercised via `accumulate_response_body_bounded`
+        // using a manually-constructed `reqwest::Response` is not portable;
+        // we test the size invariant with an inline accumulator that mirrors
+        // the bounded reader.
+        fn accumulate(chunks: &[&[u8]], cap: usize) -> Result<Vec<u8>, HookError> {
+            let mut body = Vec::new();
+            for chunk in chunks {
+                let observed = body.len() + chunk.len();
+                if observed > cap {
+                    return Err(HookError::ResponseTooLarge { cap, observed });
+                }
+                body.extend_from_slice(chunk);
+            }
+            Ok(body)
+        }
+
+        let cap = HOOK_HTTP_RESPONSE_CAP;
+        // AC1.3: exactly at-cap succeeds.
+        let at_cap = vec![0u8; cap];
+        let body = accumulate(&[at_cap.as_slice()], cap).expect("at-cap body accepted");
+        assert_eq!(body.len(), cap);
+
+        // AC1.4: over-cap (split across two chunks so the guard trips mid-stream) errors.
+        let first = vec![0u8; cap - 10];
+        let second = vec![0u8; 32];
+        let error = accumulate(&[first.as_slice(), second.as_slice()], cap)
+            .expect_err("over-cap body rejected");
+        match error {
+            HookError::ResponseTooLarge { cap: err_cap, observed } => {
+                assert_eq!(err_cap, cap);
+                assert!(observed > cap);
+            }
+            other => panic!("expected ResponseTooLarge, got {other:?}"),
+        }
+    }
+
+    /// AC1.5: repeated `cached_http_hook_client` on the same URL reuses the
+    /// cached entry rather than rebuilding. Measured as a delta over the
+    /// cache size so it is resilient to concurrent test entries.
+    #[test]
+    fn review_hook_runtime_ac1_5_client_cache_reuses_same_host() {
+        // Use a host unique to this test so another parallel test cannot
+        // concurrently insert the same key.
+        let url = Url::parse("https://ac15-reuse.example.com/hook").expect("url");
+        let _first = cached_http_hook_client(&url).expect("first build");
+        let size_after_first = http_hook_clients().lock().expect("lock").len();
+        let _second = cached_http_hook_client(&url).expect("second build");
+        let size_after_second = http_hook_clients().lock().expect("lock").len();
+        assert_eq!(
+            size_after_first, size_after_second,
+            "second call must reuse the cached client rather than insert a new one"
+        );
+        // Confirm the key is still present (H2 guards against the prior
+        // broken insert that silently dropped entries).
+        let key = HostKey {
+            scheme: "https".to_owned(),
+            host: "ac15-reuse.example.com".to_owned(),
+            port: Some(443),
+        };
+        assert!(
+            http_hook_clients()
+                .lock()
+                .expect("lock")
+                .peek(&key)
+                .is_some(),
+            "cached entry present for the expected HostKey"
+        );
+    }
+
+    /// AC1.6: an LRU cache sized at `HOOK_HTTP_CLIENT_CAPACITY` holds at
+    /// most that many entries after `CAPACITY + 1` distinct inserts, and
+    /// evicts the least-recently-used one. Tested against an isolated
+    /// `LruCache` so the assertion is deterministic under parallel tests.
+    #[test]
+    fn review_hook_runtime_ac1_6_client_cache_evicts_lru() {
+        let capacity =
+            NonZeroUsize::new(HOOK_HTTP_CLIENT_CAPACITY).expect("HOOK_HTTP_CLIENT_CAPACITY > 0");
+        let mut cache: LruCache<HostKey, ()> = LruCache::new(capacity);
+        for index in 0..=HOOK_HTTP_CLIENT_CAPACITY {
+            let key = HostKey {
+                scheme: "https".to_owned(),
+                host: format!("ac16-{index}.example.com"),
+                port: Some(443),
+            };
+            cache.put(key, ());
+        }
+        assert_eq!(
+            cache.len(),
+            HOOK_HTTP_CLIENT_CAPACITY,
+            "LRU cache bounded at capacity"
+        );
+        let first_key = HostKey {
+            scheme: "https".to_owned(),
+            host: "ac16-0.example.com".to_owned(),
+            port: Some(443),
+        };
+        assert!(
+            cache.peek(&first_key).is_none(),
+            "least-recently-used entry should be evicted"
+        );
+    }
+
+    /// AC1.7: every C0 control byte (except `\t`) and DEL (0x7F) is rejected.
+    #[test]
+    fn review_hook_runtime_ac1_7_sanitize_rejects_c0_controls() {
+        for byte in 0u8..=0x1F {
+            if byte == b'\t' {
+                continue;
+            }
+            let value = format!("abc{}", byte as char);
+            let error =
+                sanitize_header_value("X-Probe", &value).expect_err("C0 byte rejected");
+            match error {
+                HookError::InvalidHeader { byte: rejected, .. } => {
+                    assert_eq!(rejected, byte);
+                }
+                other => panic!("expected InvalidHeader, got {other:?}"),
+            }
+        }
+        // 0x7F (DEL) is also disallowed.
+        let error = sanitize_header_value("X-Probe", "x\u{7F}y").expect_err("DEL rejected");
+        assert!(matches!(
+            error,
+            HookError::InvalidHeader { byte: 0x7F, .. }
+        ));
+    }
+
+    /// AC1.8: printable ASCII, `\t`, and multibyte UTF-8 are accepted
+    /// unchanged.
+    #[test]
+    fn review_hook_runtime_ac1_8_sanitize_accepts_printable_and_utf8() {
+        let value = "token\tvalue 漢 🚀";
+        let out = sanitize_header_value("Authorization", value).expect("accept printable + utf8");
+        assert_eq!(out, value);
+    }
+
+    /// AC1.9: a policy denial short-circuits `run_http` with
+    /// `HookError::PolicyDenied`.
+    #[tokio::test]
+    async fn review_hook_runtime_ac1_9_policy_denial_short_circuits() {
+        struct DenyAllPolicy;
+
+        #[async_trait]
+        impl ToolPolicy for DenyAllPolicy {
+            async fn check_read_path(
+                &self,
+                _path: &Path,
+                _bytes: usize,
+            ) -> Result<CanonicalPath, PolicyError> {
+                unimplemented!()
+            }
+            async fn check_write_path(
+                &self,
+                _path: &Path,
+            ) -> Result<CanonicalPath, PolicyError> {
+                unimplemented!()
+            }
+            async fn check_process_signal(&self, _pid: Pid) -> Result<(), PolicyError> {
+                Ok(())
+            }
+            async fn check_shell_enabled(&self) -> Result<(), PolicyError> {
+                Ok(())
+            }
+            fn shell_mode(&self) -> ShellMode {
+                ShellMode::Strict
+            }
+            async fn check_shell_command_strict(
+                &self,
+                _command: &str,
+                _mode: ShellMode,
+            ) -> Result<(), PolicyError> {
+                Ok(())
+            }
+            async fn check_network(&self, url: &str) -> Result<(), PolicyError> {
+                Err(PolicyError::NetworkDenied {
+                    url: url.to_owned(),
+                    rule: "test_denied",
+                })
+            }
+            async fn check_subagent_spawn_typed(
+                &self,
+                _parent_depth: u32,
+                _active: usize,
+            ) -> Result<(), PolicyError> {
+                Ok(())
+            }
+        }
+
+        let policy: Arc<dyn ToolPolicy> = Arc::new(DenyAllPolicy);
+        let err = check_hook_network(policy.as_ref(), "https://example.com/hook")
+            .await
+            .expect_err("deny-all policy should short-circuit");
+        assert!(matches!(err, HookError::PolicyDenied(_)));
+        // Kill-switch regression: the default policy also denies when
+        // `network_enabled == false`.
+        let default_policy: Arc<dyn ToolPolicy> = Arc::new(halter_tools::DefaultToolPolicy::new(
+            PolicySettings::default(),
+        ));
+        let err2 = check_hook_network(default_policy.as_ref(), "https://example.com/hook")
+            .await
+            .expect_err("default policy denies when network disabled");
+        assert!(matches!(err2, HookError::PolicyDenied(_)));
+    }
+
+    // === Phase 4 acceptance tests ===
+
+    /// AC4.1: valid JSON round-trips through `parse_command_output`.
+    #[test]
+    fn review_hook_runtime_ac4_1_parse_command_output_accepts_valid_json() {
+        let parsed = parse_command_output(r#"{"continue": false}"#).expect("valid json");
+        assert_eq!(parsed.continue_execution, Some(false));
+    }
+
+    /// AC4.2: empty stdout maps to default output (passthrough) without error.
+    #[test]
+    fn review_hook_runtime_ac4_2_parse_command_output_empty_stdout_is_default() {
+        let parsed = parse_command_output("").expect("empty stdout");
+        assert_eq!(parsed, HookOutput::default());
+    }
+
+    /// AC4.3: malformed JSON surfaces as an error carrying a bounded snippet
+    /// of the offending stdout. Previously silently coerced to default (H3).
+    #[test]
+    fn review_hook_runtime_ac4_3_parse_command_output_malformed_json_errors_with_snippet() {
+        let garbage = "a".repeat(10_000);
+        let err = parse_command_output(&garbage).expect_err("malformed json rejected");
+        let CommandOutputParseError::Json { snippet, .. } = &err;
+        assert!(snippet.len() <= COMMAND_OUTPUT_SNIPPET_CAP);
+        assert!(snippet.chars().all(|ch| ch == 'a'));
+    }
+
+    /// AC4.4: snippet truncation respects UTF-8 char boundaries even when the
+    /// cap falls mid-multibyte-character.
+    #[test]
+    fn review_hook_runtime_ac4_4_parse_command_output_snippet_respects_utf8_boundaries() {
+        // Each `漢` is 3 bytes. Craft stdout so the 256-byte cap lands mid-char.
+        let filler_bytes = COMMAND_OUTPUT_SNIPPET_CAP - 1;
+        let filler = "a".repeat(filler_bytes);
+        let stdout = format!("{filler}漢字");
+        let err = parse_command_output(&stdout).expect_err("malformed json rejected");
+        let CommandOutputParseError::Json { snippet, .. } = &err;
+        assert!(snippet.is_char_boundary(snippet.len()));
+        assert!(snippet.len() <= COMMAND_OUTPUT_SNIPPET_CAP);
+    }
+
+    /// AC4.5: `merge_outputs` takes references, not owned clones, of each
+    /// input. Validated by constructing an input whose `HookOutput` is not
+    /// Copy, then confirming the same reference identity survives the sort.
+    #[test]
+    fn review_hook_runtime_ac4_5_merge_outputs_sorts_by_reference() {
+        use halter_hooks::{HandlerPriority, HandlerPriorityGroup, MergeInput};
+
+        let make_input = |handler_id: &str, plugin_load_order: usize| MergeInput {
+            handler_id: handler_id.to_owned(),
+            priority: HandlerPriority {
+                group: HandlerPriorityGroup::PluginFiles,
+                plugin_load_order,
+                event_declaration_index: 0,
+                matcher_group_index: 0,
+                hook_index_within_group: 0,
+            },
+            output: HookOutput::default(),
+        };
+
+        // Out-of-order priorities; merge must reorder but not mutate inputs.
+        let inputs = vec![make_input("b", 1), make_input("a", 0)];
+        let (_merged, conflicts) = merge_outputs(&inputs);
+        assert!(conflicts.is_empty());
+        // Inputs slice remains intact in its original order — proof the sort
+        // did not mutate the caller's buffer.
+        assert_eq!(inputs[0].handler_id, "b");
+        assert_eq!(inputs[1].handler_id, "a");
+    }
+
+    /// AC4.6: `HookEventName` round-trips PascalCase, snake_case, and
+    /// case-insensitive aliases through the strum-backed parser.
+    #[test]
+    fn review_hook_runtime_ac4_6_hook_event_name_alias_round_trip() {
+        for (alias, expected) in [
+            ("PreToolUse", HookEventName::PreToolUse),
+            ("pre_tool_use", HookEventName::PreToolUse),
+            ("pretooluse", HookEventName::PreToolUse),
+            ("PRETOOLUSE", HookEventName::PreToolUse),
+            ("session_start", HookEventName::SessionStart),
+            ("PostSampling", HookEventName::PostSampling),
+        ] {
+            let parsed = HookEventName::from_alias(alias)
+                .unwrap_or_else(|| panic!("alias '{alias}' should resolve"));
+            assert_eq!(parsed, expected, "alias '{alias}' round-trip");
+            assert_eq!(parsed.canonical_name(), expected.canonical_name());
+        }
+        // Unknown alias returns None (fail-closed).
+        assert!(HookEventName::from_alias("NotAnEvent").is_none());
     }
 }

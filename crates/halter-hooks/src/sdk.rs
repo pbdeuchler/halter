@@ -331,7 +331,7 @@ impl RegisteredHooks {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                regex::Regex::new(matcher).with_context(|| {
+                crate::matcher::CompiledMatcher::compile_regex(matcher).with_context(|| {
                     format!(
                         "failed to compile sdk hook matcher for plugin '{}' event '{}'",
                         hook.plugin_id,

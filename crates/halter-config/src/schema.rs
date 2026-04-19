@@ -522,6 +522,18 @@ pub struct NetworkPolicyConfig {
     pub enabled: bool,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Loopback sidecar allowlist. Accepts the legacy TOML key
+    /// `allowed_loopback_services` as an alias (Phase 1 rename).
+    #[serde(default, alias = "allowed_loopback_services")]
+    pub allowed_loopback: Vec<LoopbackAllowConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopbackAllowConfig {
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -686,5 +698,24 @@ mod tests {
                 .to_string()
                 .contains("sessions.sqlite_path requires the 'sqlite' cargo feature")
         );
+    }
+
+    // AC2.8: the legacy key `allowed_loopback_services` deserializes into the
+    // new `allowed_loopback` field via a serde alias.
+    #[test]
+    fn review_hook_runtime_ac2_8_loopback_alias_migrates() {
+        let toml = r#"
+enabled = true
+allowed_hosts = []
+
+[[allowed_loopback_services]]
+host = "localhost"
+port = 9090
+"#;
+        let parsed: NetworkPolicyConfig = toml::from_str(toml).expect("parse alias");
+        assert!(parsed.enabled);
+        assert_eq!(parsed.allowed_loopback.len(), 1);
+        assert_eq!(parsed.allowed_loopback[0].host, "localhost");
+        assert_eq!(parsed.allowed_loopback[0].port, Some(9090));
     }
 }

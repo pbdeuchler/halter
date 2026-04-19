@@ -662,6 +662,7 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
             network: NetworkPolicyConfig {
                 enabled: false,
                 allowed_hosts: Vec::new(),
+                allowed_loopback: Vec::new(),
             },
         },
         sessions: SessionsConfig {

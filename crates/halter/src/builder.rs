@@ -22,8 +22,8 @@ use halter_runtime::{
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
-    DefaultToolPolicy, PathLockMap, PolicySettings, Tool, ToolRuntime, ToolSessionStore,
-    register_builtin_tools, register_subagent_tools,
+    DefaultToolPolicy, LoopbackAllow, PathLockMap, PolicySettings, Tool, ToolRuntime,
+    ToolSessionStore, register_builtin_tools, register_subagent_tools,
 };
 use tracing::{debug, info};
 
@@ -476,8 +476,14 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
     // time so process-signal checks (AC1.6 / AC1.7) can reject signals
     // aimed at PIDs that aren't descendants of this process. Other newer
     // fields (`allowed_read_roots`, `sensitive_path_patterns`,
-    // `shell_mode`, `allowed_loopback_services`) still inherit from
-    // `PolicySettings::default()` until the surface lands in user config.
+    // `shell_mode`) still inherit from `PolicySettings::default()` until
+    // the surface lands in user config.
+    let defaults = PolicySettings::default();
+    let allowed_hosts = if config.network.allowed_hosts.is_empty() {
+        defaults.allowed_hosts.clone()
+    } else {
+        config.network.allowed_hosts.clone()
+    };
     PolicySettings {
         allowed_write_roots: config.allowed_write_roots.clone(),
         max_read_bytes: config.max_read_bytes,
@@ -486,11 +492,20 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
         allowed_shell_commands: config.shell.allow.clone(),
         shell_timeout_secs: config.shell.timeout_secs,
         network_enabled: config.network.enabled,
-        allowed_hosts: config.network.allowed_hosts.clone(),
+        allowed_hosts,
+        allowed_loopback: config
+            .network
+            .allowed_loopback
+            .iter()
+            .map(|entry| LoopbackAllow {
+                host: entry.host.clone(),
+                port: entry.port,
+            })
+            .collect(),
         max_subagent_depth: config.max_subagent_depth,
         max_concurrent_subagents: config.max_concurrent_subagents,
         process_tree_root: Some(std::process::id() as i32),
-        ..PolicySettings::default()
+        ..defaults
     }
 }
 

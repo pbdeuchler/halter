@@ -42,8 +42,8 @@ pub enum ShellMode {
 
 /// A permitted sidecar at a loopback address (for e.g. a local
 /// development proxy or a container-bound service). Presence in
-/// `PolicySettings::allowed_loopback_services` is the only way loopback IPs
-/// reach the network after Phase 1.
+/// `PolicySettings::allowed_loopback` is the only way loopback IPs reach the
+/// network after the Phase 1 `NetworkPolicy` refactor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopbackAllow {
     pub host: String,
@@ -67,8 +67,15 @@ pub struct PolicySettings {
     pub allowed_shell_commands: Vec<String>,
     pub shell_timeout_secs: u64,
     pub network_enabled: bool,
+    /// Remote-host allowlist. Default is `vec!["*"]` (allow any non-loopback
+    /// host when `network_enabled` is true). The `*` entry is short-circuited
+    /// to allow; any other entry must match the request host case-insensitively
+    /// as a literal.
     pub allowed_hosts: Vec<String>,
-    pub allowed_loopback_services: Vec<LoopbackAllow>,
+    /// Loopback sidecar allowlist. Default is `Vec::new()` (deny). Loopback
+    /// hosts (`localhost`, `127/8`, `::1`) flow through this gate exclusively,
+    /// even when `allowed_hosts` contains `*`.
+    pub allowed_loopback: Vec<LoopbackAllow>,
     pub process_tree_root: Option<Pid>,
     pub max_subagent_depth: u32,
     pub max_concurrent_subagents: usize,
@@ -93,8 +100,8 @@ impl Default for PolicySettings {
             ],
             shell_timeout_secs: 30,
             network_enabled: false,
-            allowed_hosts: Vec::new(),
-            allowed_loopback_services: Vec::new(),
+            allowed_hosts: vec!["*".to_owned()],
+            allowed_loopback: Vec::new(),
             process_tree_root: None,
             max_subagent_depth: 3,
             max_concurrent_subagents: 8,
@@ -161,7 +168,9 @@ pub trait ToolPolicy: Send + Sync {
     ) -> Result<(), PolicyError>;
 
     /// Authorize a network request to `url`. Loopback addresses are denied
-    /// unless an entry in `allowed_loopback_services` matches.
+    /// unless an entry in `allowed_loopback` matches; other hosts must match
+    /// `allowed_hosts` (the `*` wildcard short-circuits to allow). A
+    /// `network_enabled == false` kill switch denies every request.
     async fn check_network(&self, url: &str) -> Result<(), PolicyError>;
 
     /// Capability-typed subagent spawn check. Parallel to the deprecated
@@ -315,30 +324,32 @@ impl ToolPolicy for DefaultToolPolicy {
     }
 
     async fn check_network(&self, url: &str) -> Result<(), PolicyError> {
-        let host = extract_host(url).ok_or_else(|| PolicyError::NetworkDenied {
-            url: url.to_owned(),
-            rule: "unparseable_url",
-        })?;
-        if let Ok(addr) = host.parse::<IpAddr>()
-            && addr.is_loopback()
-        {
-            return self.allow_loopback(url, &host, None);
-        }
-        if host.eq_ignore_ascii_case("localhost") {
-            return self.allow_loopback(url, &host, None);
-        }
         if !self.settings.network_enabled {
             return Err(PolicyError::NetworkDenied {
                 url: url.to_owned(),
                 rule: "network_disabled",
             });
         }
-        if !self.settings.allowed_hosts.is_empty()
-            && !self
-                .settings
-                .allowed_hosts
-                .iter()
-                .any(|h| h.eq_ignore_ascii_case(&host))
+        let (host, port) = extract_host_and_port(url).ok_or_else(|| PolicyError::NetworkDenied {
+            url: url.to_owned(),
+            rule: "unparseable_url",
+        })?;
+        if is_loopback_host(&host) {
+            return self.allow_loopback(url, &host, port);
+        }
+        if self
+            .settings
+            .allowed_hosts
+            .iter()
+            .any(|entry| entry.trim() == "*")
+        {
+            return Ok(());
+        }
+        if !self
+            .settings
+            .allowed_hosts
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(&host))
         {
             return Err(PolicyError::NetworkDenied {
                 url: url.to_owned(),
@@ -373,7 +384,7 @@ impl ToolPolicy for DefaultToolPolicy {
 
 impl DefaultToolPolicy {
     fn allow_loopback(&self, url: &str, host: &str, port: Option<u16>) -> Result<(), PolicyError> {
-        let matches = self.settings.allowed_loopback_services.iter().any(|entry| {
+        let matches = self.settings.allowed_loopback.iter().any(|entry| {
             entry.host.eq_ignore_ascii_case(host) && (entry.port.is_none() || entry.port == port)
         });
         if matches {
@@ -385,6 +396,16 @@ impl DefaultToolPolicy {
             })
         }
     }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<IpAddr>() {
+        return addr.is_loopback();
+    }
+    false
 }
 
 /// Canonicalize a list of configured roots. A nonexistent root produces a
@@ -446,23 +467,36 @@ fn resolve_write_target_typed(absolute: &Path) -> Result<CanonicalPath, PolicyEr
     CanonicalPath::for_target(&full)
 }
 
-fn extract_host(url: &str) -> Option<String> {
+fn extract_host_and_port(url: &str) -> Option<(String, Option<u16>)> {
     let (_scheme, rest) = url.split_once("://")?;
     let host_part = rest.split(['/', '?', '#']).next()?;
-    // Strip user:pass@
     let after_auth = match host_part.rsplit_once('@') {
         Some((_, hp)) => hp,
         None => host_part,
     };
-    // Strip :port
-    let host = match after_auth.rsplit_once(':') {
-        Some((h, _)) => h,
-        None => after_auth,
-    };
-    if host.is_empty() {
+    if let Some(after_bracket) = after_auth.strip_prefix('[') {
+        let end = after_bracket.find(']')?;
+        let host = &after_bracket[..end];
+        let tail = &after_bracket[end + 1..];
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|value| value.parse::<u16>().ok());
+        if host.is_empty() {
+            return None;
+        }
+        return Some((host.to_owned(), port));
+    }
+    if let Some((host, port_str)) = after_auth.rsplit_once(':') {
+        if host.is_empty() {
+            return None;
+        }
+        let port = port_str.parse::<u16>().ok();
+        return Some((host.to_owned(), port));
+    }
+    if after_auth.is_empty() {
         None
     } else {
-        Some(host.to_owned())
+        Some((after_auth.to_owned(), None))
     }
 }
 

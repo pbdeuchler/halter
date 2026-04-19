@@ -54,6 +54,7 @@ image = { version = "0.24.9", default-features = false, features = ["gif", "jpeg
 inferno = { version = "0.12.3", default-features = false }
 indexmap = { version = "2.11.4", features = ["serde"] }
 libc = "0.2.177"
+lru = "0.12.5"
 memmap2 = "0.9.9"
 os_pipe = "1.2.3"
 parking_lot = { version = "0.12.5", features = ["arc_lock"] }
@@ -67,6 +68,8 @@ serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 smallvec = { version = "1.15.1", features = ["const_new"] }
+strum = "0.27.2"
+strum_macros = "0.27.2"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }

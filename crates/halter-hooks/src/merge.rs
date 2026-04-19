@@ -98,7 +98,9 @@ pub enum PermissionDecision {
 }
 
 pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConflict>) {
-    let mut ordered = inputs.to_vec();
+    // Sort references, not values — `HookOutput` carries `serde_json::Value`
+    // payloads whose clones can be large. (M24)
+    let mut ordered: Vec<&MergeInput> = inputs.iter().collect();
     ordered.sort_by(|left, right| left.priority.cmp(&right.priority));
 
     let mut merged = HookMergedOutcome::default();
