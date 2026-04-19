@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use halter_protocol::{SessionBlueprint, SessionEvent, SessionId, SessionState};
+use halter_protocol::{PendingEvent, SessionBlueprint, SessionEvent, SessionId, SessionState};
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -51,7 +51,7 @@ impl SessionStore for InMemorySessionStore {
         snapshot: Option<Arc<halter_protocol::ResourceSnapshot>>,
         expected_state: Option<SessionState>,
         state: Option<SessionState>,
-        mut events: Vec<SessionEvent>,
+        events: Vec<PendingEvent>,
     ) -> anyhow::Result<Vec<SessionEvent>> {
         debug!(
             session_id = %session_id,
@@ -88,13 +88,28 @@ impl SessionStore for InMemorySessionStore {
         }
 
         let existing = store.events.entry(session_id.0.clone()).or_default();
-        let base_sequence = existing.len() as u64;
-        for (index, event) in events.iter_mut().enumerate() {
-            event.sequence = base_sequence + index as u64 + 1;
-            event.session_id = session_id.clone();
-        }
-        existing.extend(events.iter().cloned());
-        Ok(events)
+        // Base sequences on the max previously-assigned sequence rather than
+        // on existing.len(). Parity with sqlite's COALESCE(MAX(sequence), 0) + 1;
+        // preserves gap-free monotonicity even if a future feature prunes
+        // committed events from the in-memory store.
+        let starting_sequence = existing
+            .iter()
+            .map(SessionEvent::sequence)
+            .max()
+            .map_or(1, |max| max + 1);
+        let committed: Vec<SessionEvent> = events
+            .into_iter()
+            .enumerate()
+            .map(|(offset, pending)| {
+                PendingEvent {
+                    session_id: session_id.clone(),
+                    ..pending
+                }
+                .into_committed(starting_sequence + offset as u64)
+            })
+            .collect();
+        existing.extend(committed.iter().cloned());
+        Ok(committed)
     }
 
     async fn replay(&self, session_id: &SessionId) -> anyhow::Result<Vec<SessionEvent>> {

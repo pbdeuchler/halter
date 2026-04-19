@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use halter_protocol::{ResourceSnapshot, SessionBlueprint, SessionEvent, SessionId, SessionState};
+use halter_protocol::{
+    PendingEvent, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionId, SessionState,
+};
 use thiserror::Error;
 
 pub use memory::InMemorySessionStore;
@@ -39,7 +41,7 @@ pub trait SessionStore: Send + Sync {
         snapshot: Option<Arc<ResourceSnapshot>>,
         expected_state: Option<SessionState>,
         state: Option<SessionState>,
-        events: Vec<SessionEvent>,
+        events: Vec<PendingEvent>,
     ) -> Result<Vec<SessionEvent>>;
     async fn replay(&self, session_id: &SessionId) -> Result<Vec<SessionEvent>>;
     async fn list_sessions(&self) -> Result<Vec<SessionBlueprint>>;

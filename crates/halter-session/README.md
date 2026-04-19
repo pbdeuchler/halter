@@ -147,9 +147,9 @@ Characteristics:
 
 ### Event numbering
 
-In-memory commits assign event sequence numbers based on the current event count.
-
-That makes replay deterministic within the lifetime of the process.
+In-memory commits assign event sequence numbers by taking `max(existing sequence) + 1`,
+matching the sqlite backend's `COALESCE(MAX(sequence), 0) + 1` semantics. This keeps
+replay deterministic and preserves gap-free monotonicity across commit batches.
 
 ### Example
 

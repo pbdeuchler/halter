@@ -90,14 +90,11 @@ pub struct ExecutedHookDispatch {
     pub fired_hook_ids: Vec<String>,
 }
 
-pub(crate) type HookEventReporter = Arc<dyn Fn(halter_protocol::SessionEventPayload) + Send + Sync>;
-
 pub async fn run_session_start(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     source: HookSessionStartSource,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -115,7 +112,6 @@ pub async fn run_session_start(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -125,7 +121,6 @@ pub async fn run_session_end(
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     reason: &str,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -142,7 +137,6 @@ pub async fn run_session_end(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -152,7 +146,6 @@ pub async fn run_user_prompt_submit(
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     prompt: &str,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -169,7 +162,6 @@ pub async fn run_user_prompt_submit(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -179,7 +171,6 @@ pub async fn run_pre_tool_use(
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     call: &ToolCall,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -198,7 +189,6 @@ pub async fn run_pre_tool_use(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -209,7 +199,6 @@ pub async fn run_post_tool_use(
     ctx: HookInvocationContext<'_>,
     call: &ToolCall,
     result: &ToolResult,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -229,7 +218,6 @@ pub async fn run_post_tool_use(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -240,7 +228,6 @@ pub async fn run_post_tool_use_failure(
     ctx: HookInvocationContext<'_>,
     call: &ToolCall,
     error: &ToolError,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -260,7 +247,6 @@ pub async fn run_post_tool_use_failure(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -271,7 +257,6 @@ pub async fn run_stop(
     ctx: HookInvocationContext<'_>,
     last_message: Option<&AssistantMessage>,
     stop_hook_active: bool,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -289,7 +274,6 @@ pub async fn run_stop(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -301,7 +285,6 @@ pub async fn run_subagent_start(
     agent_id: &halter_protocol::AgentId,
     agent_type: &str,
     parent_session_id: &halter_protocol::SessionId,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -320,7 +303,6 @@ pub async fn run_subagent_start(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -332,7 +314,6 @@ pub async fn run_subagent_stop(
     agent_id: &halter_protocol::AgentId,
     agent_type: &str,
     transcript_path: Option<&Path>,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     let mut extra = serde_json::Map::new();
     extra.insert("agent_id".to_owned(), serde_json::to_value(agent_id)?);
@@ -360,7 +341,6 @@ pub async fn run_subagent_stop(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -371,7 +351,6 @@ pub async fn run_pre_compact(
     ctx: HookInvocationContext<'_>,
     trigger: &str,
     custom_instructions: Option<&str>,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -389,7 +368,6 @@ pub async fn run_pre_compact(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -400,7 +378,6 @@ pub async fn run_post_compact(
     ctx: HookInvocationContext<'_>,
     trigger: &str,
     summary: &str,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -418,7 +395,6 @@ pub async fn run_post_compact(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -429,7 +405,6 @@ pub async fn run_notification(
     ctx: HookInvocationContext<'_>,
     notification_type: &str,
     message: &str,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     execute_hooks(
         sess,
@@ -447,7 +422,6 @@ pub async fn run_notification(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
-        reporter,
     )
     .await
 }
@@ -455,7 +429,6 @@ pub async fn run_notification(
 async fn execute_hooks(
     sess: &HalterSession,
     request: HookDispatchRequest,
-    reporter: Option<HookEventReporter>,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     let hooks = sess.services().resources.hooks();
     let prepared = Hooks::prepare_many([hooks.as_ref(), sess.session_hooks().as_ref()], request);
@@ -475,12 +448,6 @@ async fn execute_hooks(
         .zip(preview_runs.iter_mut())
     {
         preview.started_at = chrono::Utc::now();
-        emit_hook_event(
-            &reporter,
-            halter_protocol::SessionEventPayload::HookStarted {
-                run: preview.clone(),
-            },
-        );
         let token = cancel.child_token();
         let request = request.clone();
         let preview = preview.clone();
@@ -488,12 +455,6 @@ async fn execute_hooks(
     }
 
     while let Some(result) = running.next().await {
-        emit_hook_event(
-            &reporter,
-            halter_protocol::SessionEventPayload::HookCompleted {
-                run: result.summary.clone(),
-            },
-        );
         if result.handler.once {
             fired_hook_ids.push(result.handler.handler_id.clone());
         }
@@ -526,15 +487,6 @@ async fn execute_hooks(
         merged,
         fired_hook_ids,
     })
-}
-
-fn emit_hook_event(
-    reporter: &Option<HookEventReporter>,
-    payload: halter_protocol::SessionEventPayload,
-) {
-    if let Some(reporter) = reporter {
-        reporter(payload);
-    }
 }
 
 struct HandlerRunResult {
@@ -1537,7 +1489,10 @@ mod tests {
         let error = accumulate(&[first.as_slice(), second.as_slice()], cap)
             .expect_err("over-cap body rejected");
         match error {
-            HookError::ResponseTooLarge { cap: err_cap, observed } => {
+            HookError::ResponseTooLarge {
+                cap: err_cap,
+                observed,
+            } => {
                 assert_eq!(err_cap, cap);
                 assert!(observed > cap);
             }
@@ -1619,8 +1574,7 @@ mod tests {
                 continue;
             }
             let value = format!("abc{}", byte as char);
-            let error =
-                sanitize_header_value("X-Probe", &value).expect_err("C0 byte rejected");
+            let error = sanitize_header_value("X-Probe", &value).expect_err("C0 byte rejected");
             match error {
                 HookError::InvalidHeader { byte: rejected, .. } => {
                     assert_eq!(rejected, byte);
@@ -1630,10 +1584,7 @@ mod tests {
         }
         // 0x7F (DEL) is also disallowed.
         let error = sanitize_header_value("X-Probe", "x\u{7F}y").expect_err("DEL rejected");
-        assert!(matches!(
-            error,
-            HookError::InvalidHeader { byte: 0x7F, .. }
-        ));
+        assert!(matches!(error, HookError::InvalidHeader { byte: 0x7F, .. }));
     }
 
     /// AC1.8: printable ASCII, `\t`, and multibyte UTF-8 are accepted
@@ -1660,10 +1611,7 @@ mod tests {
             ) -> Result<CanonicalPath, PolicyError> {
                 unimplemented!()
             }
-            async fn check_write_path(
-                &self,
-                _path: &Path,
-            ) -> Result<CanonicalPath, PolicyError> {
+            async fn check_write_path(&self, _path: &Path) -> Result<CanonicalPath, PolicyError> {
                 unimplemented!()
             }
             async fn check_process_signal(&self, _pid: Pid) -> Result<(), PolicyError> {
