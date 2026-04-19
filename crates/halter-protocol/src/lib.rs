@@ -116,29 +116,45 @@ string_wrapper!(AgentName);
 string_wrapper!(ProviderName);
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
-pub struct ModelRole(pub String);
+#[serde(rename_all = "snake_case")]
+pub enum ModelRole {
+    Default,
+    Plan,
+    Subagent,
+    Small,
+}
 
 impl ModelRole {
     #[must_use]
-    pub fn default_role() -> Self {
-        Self("default".to_owned())
+    pub const fn default_role() -> Self {
+        Self::Default
     }
 
     #[must_use]
-    pub fn plan() -> Self {
-        Self("plan".to_owned())
+    pub const fn plan() -> Self {
+        Self::Plan
     }
 
     #[must_use]
-    pub fn subagent() -> Self {
-        Self("subagent".to_owned())
+    pub const fn subagent() -> Self {
+        Self::Subagent
     }
 
     #[must_use]
-    pub fn small() -> Self {
-        Self("small".to_owned())
+    pub const fn small() -> Self {
+        Self::Small
+    }
+
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+            Self::Subagent => "subagent",
+            Self::Small => "small",
+        }
     }
 }
 
@@ -148,15 +164,25 @@ impl Default for ModelRole {
     }
 }
 
-impl From<&str> for ModelRole {
-    fn from(value: &str) -> Self {
-        Self(value.to_owned())
+impl std::str::FromStr for ModelRole {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "plan" => Ok(Self::Plan),
+            "subagent" => Ok(Self::Subagent),
+            "small" => Ok(Self::Small),
+            other => Err(format!(
+                "unknown ModelRole '{other}'; expected one of: default, plan, subagent, small"
+            )),
+        }
     }
 }
 
 impl fmt::Display for ModelRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 

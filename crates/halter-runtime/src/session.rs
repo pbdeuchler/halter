@@ -1020,182 +1020,212 @@ impl SessionHandle {
     ) -> anyhow::Result<Vec<PendingEvent>> {
         let mut events = Vec::new();
 
-        for mut call in tool_calls {
-            let pre_dispatch = run_pre_tool_use(
-                self,
-                fired_hook_ids,
-                HookInvocationContext {
-                    turn_id,
-                    model: effective_model,
-                    working_dir: &blueprint.working_dir,
-                },
-                &call,
-            )
-            .await?;
-            track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
-            self.record_hook_dispatch(&mut events, &pre_dispatch);
-            for message in apply_hook_side_effects(state, &pre_dispatch) {
-                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
-            }
-            if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
-                call.arguments = updated_input;
-            }
-            info!(
-                session_id = %self.session_id,
-                tool_call_id = %call.id,
-                tool_name = %call.name,
-                "executing tool call"
-            );
-            self.push_event(
-                &mut events,
-                SessionEventPayload::ToolExecutionStarted { call: call.clone() },
-            );
+        let tools = self.services.tools.clone();
+        for batch in
+            batch_tool_calls_by_concurrency(|name| tools.concurrency_for(&name.0), tool_calls)
+        {
+            // Phase A: pre-hook + block check + context build (sequential per call,
+            // because each mutates `state` and may change `call.arguments`).
+            let mut prepared: Vec<PreparedToolCall> = Vec::with_capacity(batch.len());
+            for mut call in batch {
+                let pre_dispatch = run_pre_tool_use(
+                    self,
+                    fired_hook_ids,
+                    HookInvocationContext {
+                        turn_id,
+                        model: effective_model,
+                        working_dir: &blueprint.working_dir,
+                    },
+                    &call,
+                )
+                .await?;
+                track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
+                self.record_hook_dispatch(&mut events, &pre_dispatch);
+                for message in apply_hook_side_effects(state, &pre_dispatch) {
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                }
+                if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
+                    call.arguments = updated_input;
+                }
+                info!(
+                    session_id = %self.session_id,
+                    tool_call_id = %call.id,
+                    tool_name = %call.name,
+                    "executing tool call"
+                );
+                self.push_event(
+                    &mut events,
+                    SessionEventPayload::ToolExecutionStarted { call: call.clone() },
+                );
 
-            if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
-                let error = ToolError::new(reason);
+                if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
+                    let error = ToolError::new(reason);
+                    let outcome = ToolExecutionOutcome {
+                        call: call.clone(),
+                        result: Err(error.clone()),
+                    };
+                    let message = Message::Tool(ToolResultMessage {
+                        id: MessageId::new(),
+                        call_id: call.id.clone(),
+                        content: ToolResult::Empty,
+                        error: Some(error),
+                        created_at: Utc::now(),
+                    });
+                    state.messages.push(message.clone());
+                    self.push_event(
+                        &mut events,
+                        SessionEventPayload::ToolExecutionCompleted { outcome },
+                    );
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    continue;
+                }
+
+                let (emit, tool_event_drain) = self.spawn_tool_event_sink();
+                let context = halter_tools::ToolContext {
+                    session_id: self.session_id.clone(),
+                    working_dir: blueprint.working_dir.clone(),
+                    path_locks: self.services.path_locks.clone(),
+                    tool_sessions: self.services.tool_sessions.clone(),
+                    file_view: Arc::new(state.file_view_cache.clone()),
+                    snapshot: snapshot.clone(),
+                    cancel: cancel.child_token(),
+                    emit,
+                    policy: self.services.policy.clone(),
+                    max_tool_output_bytes: self.services.max_tool_output_bytes,
+                    shell_timeout_secs: self.services.shell_timeout_secs,
+                    subagent_parent: Some(Arc::new(SubagentParentContext {
+                        blueprint: blueprint.clone(),
+                        state: state.clone(),
+                        snapshot: snapshot.clone(),
+                        subagent_model: effective_subagent_model.clone(),
+                    })),
+                };
+                state.pending_tool_calls.insert(
+                    call.id.clone(),
+                    PendingToolCall {
+                        call: call.clone(),
+                        submitted_at: Utc::now(),
+                    },
+                );
+
+                prepared.push(PreparedToolCall {
+                    call,
+                    context,
+                    tool_event_drain,
+                });
+            }
+
+            // Phase B: dispatch execution. For Exclusive or single-call batches this
+            // is serial; for ReadOnly/ParallelSafe batches of >1, runs concurrently.
+            let tools = self.services.tools.clone();
+            let executions: Vec<anyhow::Result<ToolResult>> =
+                futures::future::join_all(prepared.iter().map(|p| {
+                    let tools = tools.clone();
+                    let context = p.context.clone();
+                    let args = p.call.arguments.clone();
+                    let name = p.call.name.0.clone();
+                    async move { tools.execute(&name, context, args).await }
+                }))
+                .await;
+
+            // Phase C: post-hook + state mutation (sequential, original order).
+            for (prep, execution) in prepared.into_iter().zip(executions) {
+                let PreparedToolCall {
+                    call,
+                    context,
+                    tool_event_drain,
+                } = prep;
+                drop(context);
+                for payload in tool_event_drain
+                    .into_events()
+                    .into_iter()
+                    .filter_map(|event| tool_runtime_event_payload(&call.id, event))
+                {
+                    self.push_event(&mut events, payload);
+                }
+
+                let (mut content, error) = match execution {
+                    Ok(result) => {
+                        debug!(
+                            session_id = %self.session_id,
+                            tool_call_id = %call.id,
+                            tool_name = %call.name,
+                            result_kind = tool_result_kind(&result),
+                            "tool call completed"
+                        );
+                        (result, None)
+                    }
+                    Err(error) => {
+                        warn!(
+                            session_id = %self.session_id,
+                            tool_call_id = %call.id,
+                            tool_name = %call.name,
+                            error = %error,
+                            "tool call failed"
+                        );
+                        (ToolResult::Empty, Some(ToolError::new(error.to_string())))
+                    }
+                };
+                if error.is_none() {
+                    let post_dispatch = run_post_tool_use(
+                        self,
+                        fired_hook_ids,
+                        HookInvocationContext {
+                            turn_id,
+                            model: effective_model,
+                            working_dir: &blueprint.working_dir,
+                        },
+                        &call,
+                        &content,
+                    )
+                    .await?;
+                    track_fired_hook_ids(fired_hook_ids, &post_dispatch);
+                    self.record_hook_dispatch(&mut events, &post_dispatch);
+                    for message in apply_hook_side_effects(state, &post_dispatch) {
+                        self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    }
+                    if let Some(updated_output) = post_dispatch.merged.updated_output {
+                        content = tool_result_from_hook_value(updated_output);
+                    }
+                } else if let Some(tool_error) = error.as_ref() {
+                    let post_dispatch = run_post_tool_use_failure(
+                        self,
+                        fired_hook_ids,
+                        HookInvocationContext {
+                            turn_id,
+                            model: effective_model,
+                            working_dir: &blueprint.working_dir,
+                        },
+                        &call,
+                        tool_error,
+                    )
+                    .await?;
+                    track_fired_hook_ids(fired_hook_ids, &post_dispatch);
+                    self.record_hook_dispatch(&mut events, &post_dispatch);
+                    for message in apply_hook_side_effects(state, &post_dispatch) {
+                        self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    }
+                }
                 let outcome = ToolExecutionOutcome {
                     call: call.clone(),
-                    result: Err(error.clone()),
+                    result: error.clone().map_or_else(|| Ok(content.clone()), Err),
                 };
                 let message = Message::Tool(ToolResultMessage {
                     id: MessageId::new(),
                     call_id: call.id.clone(),
-                    content: ToolResult::Empty,
-                    error: Some(error),
+                    content,
+                    error,
                     created_at: Utc::now(),
                 });
+
+                state.pending_tool_calls.shift_remove(&call.id);
                 state.messages.push(message.clone());
                 self.push_event(
                     &mut events,
                     SessionEventPayload::ToolExecutionCompleted { outcome },
                 );
                 self.push_event(&mut events, SessionEventPayload::MessageItem { message });
-                continue;
             }
-
-            let (emit, tool_event_drain) = self.spawn_tool_event_sink();
-            let context = halter_tools::ToolContext {
-                session_id: self.session_id.clone(),
-                working_dir: blueprint.working_dir.clone(),
-                path_locks: self.services.path_locks.clone(),
-                tool_sessions: self.services.tool_sessions.clone(),
-                file_view: Arc::new(state.file_view_cache.clone()),
-                snapshot: snapshot.clone(),
-                cancel: cancel.child_token(),
-                emit,
-                policy: self.services.policy.clone(),
-                max_tool_output_bytes: self.services.max_tool_output_bytes,
-                shell_timeout_secs: self.services.shell_timeout_secs,
-                subagent_parent: Some(Arc::new(SubagentParentContext {
-                    blueprint: blueprint.clone(),
-                    state: state.clone(),
-                    snapshot: snapshot.clone(),
-                    subagent_model: effective_subagent_model.clone(),
-                })),
-            };
-            state.pending_tool_calls.insert(
-                call.id.clone(),
-                PendingToolCall {
-                    call: call.clone(),
-                    submitted_at: Utc::now(),
-                },
-            );
-
-            let execution = self
-                .services
-                .tools
-                .execute(&call.name.0, context.clone(), call.arguments.clone())
-                .await;
-            drop(context);
-            for payload in tool_event_drain
-                .into_events()
-                .into_iter()
-                .filter_map(|event| tool_runtime_event_payload(&call.id, event))
-            {
-                self.push_event(&mut events, payload);
-            }
-
-            let (mut content, error) = match execution {
-                Ok(result) => {
-                    debug!(
-                        session_id = %self.session_id,
-                        tool_call_id = %call.id,
-                        tool_name = %call.name,
-                        result_kind = tool_result_kind(&result),
-                        "tool call completed"
-                    );
-                    (result, None)
-                }
-                Err(error) => {
-                    warn!(
-                        session_id = %self.session_id,
-                        tool_call_id = %call.id,
-                        tool_name = %call.name,
-                        error = %error,
-                        "tool call failed"
-                    );
-                    (ToolResult::Empty, Some(ToolError::new(error.to_string())))
-                }
-            };
-            if error.is_none() {
-                let post_dispatch = run_post_tool_use(
-                    self,
-                    fired_hook_ids,
-                    HookInvocationContext {
-                        turn_id,
-                        model: effective_model,
-                        working_dir: &blueprint.working_dir,
-                    },
-                    &call,
-                    &content,
-                )
-                .await?;
-                track_fired_hook_ids(fired_hook_ids, &post_dispatch);
-                self.record_hook_dispatch(&mut events, &post_dispatch);
-                for message in apply_hook_side_effects(state, &post_dispatch) {
-                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
-                }
-                if let Some(updated_output) = post_dispatch.merged.updated_output {
-                    content = tool_result_from_hook_value(updated_output);
-                }
-            } else if let Some(tool_error) = error.as_ref() {
-                let post_dispatch = run_post_tool_use_failure(
-                    self,
-                    fired_hook_ids,
-                    HookInvocationContext {
-                        turn_id,
-                        model: effective_model,
-                        working_dir: &blueprint.working_dir,
-                    },
-                    &call,
-                    tool_error,
-                )
-                .await?;
-                track_fired_hook_ids(fired_hook_ids, &post_dispatch);
-                self.record_hook_dispatch(&mut events, &post_dispatch);
-                for message in apply_hook_side_effects(state, &post_dispatch) {
-                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
-                }
-            }
-            let outcome = ToolExecutionOutcome {
-                call: call.clone(),
-                result: error.clone().map_or_else(|| Ok(content.clone()), Err),
-            };
-            let message = Message::Tool(ToolResultMessage {
-                id: MessageId::new(),
-                call_id: call.id.clone(),
-                content,
-                error,
-                created_at: Utc::now(),
-            });
-
-            state.pending_tool_calls.shift_remove(&call.id);
-            state.messages.push(message.clone());
-            self.push_event(
-                &mut events,
-                SessionEventPayload::ToolExecutionCompleted { outcome },
-            );
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
 
         Ok(events)
@@ -1696,13 +1726,108 @@ fn format_hook_warning(warning: &HookWarning) -> String {
 }
 
 fn observe_state(working_dir: PathBuf) -> ObservedState {
+    let (git_branch, git_dirty) = probe_git(&working_dir);
     ObservedState {
         cwd: working_dir,
-        git_branch: None,
-        git_dirty: None,
+        git_branch,
+        git_dirty,
         now_utc: Utc::now(),
         env_facts: Default::default(),
     }
+}
+
+struct PreparedToolCall {
+    call: ToolCall,
+    context: halter_tools::ToolContext,
+    tool_event_drain: ToolEventDrain,
+}
+
+/// Partition `tool_calls` into concurrency-compatible batches per the
+/// `ToolConcurrency` protocol variant declared for each tool:
+///
+/// - `Exclusive` tools are emitted in batches of size 1.
+/// - Runs of `ReadOnly` and `ParallelSafe` tools are grouped into one batch
+///   and may execute concurrently.
+///
+/// Concurrency is resolved via a caller-supplied closure. Tools the resolver
+/// cannot classify are treated as `Exclusive` (safe default). Within a batch,
+/// original order is preserved so hook and event sequencing remain
+/// deterministic.
+fn batch_tool_calls_by_concurrency(
+    mut resolve: impl FnMut(&halter_protocol::ToolName) -> Option<halter_protocol::ToolConcurrency>,
+    tool_calls: Vec<ToolCall>,
+) -> Vec<Vec<ToolCall>> {
+    use halter_protocol::ToolConcurrency;
+
+    let mut concurrency_of = |call: &ToolCall| -> ToolConcurrency {
+        resolve(&call.name).unwrap_or(ToolConcurrency::Exclusive)
+    };
+
+    let mut batches: Vec<Vec<ToolCall>> = Vec::new();
+    let mut current: Vec<ToolCall> = Vec::new();
+
+    for call in tool_calls {
+        let concurrency = concurrency_of(&call);
+        if matches!(concurrency, ToolConcurrency::Exclusive) {
+            if !current.is_empty() {
+                batches.push(std::mem::take(&mut current));
+            }
+            batches.push(vec![call]);
+        } else {
+            current.push(call);
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Probe the git branch and dirty flag for `working_dir`.
+///
+/// Returns `(None, None)` when the directory is not a git working tree or
+/// `git` is not available. A detached HEAD returns the abbreviated commit as
+/// the branch name. `git_dirty` is `Some(false)` for a clean tree, `Some(true)`
+/// when any tracked or untracked change is present.
+fn probe_git(working_dir: &std::path::Path) -> (Option<String>, Option<bool>) {
+    use std::process::Command;
+
+    let branch_output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(working_dir)
+        .output();
+    let branch = match branch_output {
+        Ok(out) if out.status.success() => {
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if name.is_empty() {
+                return (None, None);
+            }
+            if name == "HEAD" {
+                // detached HEAD — resolve to short commit
+                Command::new("git")
+                    .args(["rev-parse", "--short", "HEAD"])
+                    .current_dir(working_dir)
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                    .filter(|s| !s.is_empty())
+            } else {
+                Some(name)
+            }
+        }
+        _ => return (None, None),
+    };
+
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(working_dir)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| !out.stdout.is_empty());
+
+    (branch, dirty)
 }
 
 #[cfg(test)]
@@ -1771,6 +1896,96 @@ mod tests {
             init.system_prompt_seed[0].text,
             crate::prompt::default_system_prompt_text()
         );
+    }
+
+    #[test]
+    fn batch_tool_calls_isolates_exclusive_tools() {
+        use halter_protocol::ToolCallId;
+
+        let mut declared: HashMap<String, ToolConcurrency> = HashMap::new();
+        for (name, concurrency) in [
+            ("read_a", ToolConcurrency::ReadOnly),
+            ("read_b", ToolConcurrency::ReadOnly),
+            ("exclusive", ToolConcurrency::Exclusive),
+            ("parallel", ToolConcurrency::ParallelSafe),
+        ] {
+            declared.insert(name.into(), concurrency);
+        }
+
+        let mk = |tool: &str, id: &str| ToolCall {
+            id: ToolCallId::from(id),
+            name: ToolName::from(tool),
+            arguments: serde_json::Value::Null,
+        };
+        let batches = super::batch_tool_calls_by_concurrency(
+            |name| declared.get(&name.0).copied(),
+            vec![
+                mk("read_a", "1"),
+                mk("read_b", "2"),
+                mk("exclusive", "3"),
+                mk("parallel", "4"),
+                mk("read_a", "5"),
+            ],
+        );
+        assert_eq!(batches.len(), 3, "three batches: [r,r], [excl], [p,r]");
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 1);
+        assert_eq!(batches[1][0].name.0, "exclusive");
+        assert_eq!(batches[2].len(), 2);
+    }
+
+    #[test]
+    fn batch_tool_calls_treats_unknown_tools_as_exclusive() {
+        use halter_protocol::ToolCallId;
+
+        let mk = |name: &str, id: &str| ToolCall {
+            id: ToolCallId::from(id),
+            name: ToolName::from(name),
+            arguments: serde_json::Value::Null,
+        };
+        let batches = super::batch_tool_calls_by_concurrency(
+            |_| None,
+            vec![mk("mystery_a", "1"), mk("mystery_b", "2")],
+        );
+        assert_eq!(batches.len(), 2, "unknown tools must be exclusive");
+    }
+
+    #[test]
+    fn probe_git_returns_none_outside_working_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (branch, dirty) = super::probe_git(tmp.path());
+        assert_eq!(branch, None);
+        assert_eq!(dirty, None);
+    }
+
+    #[test]
+    fn probe_git_reports_branch_and_dirty_flag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(status.status.success(), "git {:?} failed", args);
+        };
+
+        git(&["init", "--initial-branch=trunk"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test User"]);
+        std::fs::write(root.join("seed.txt"), b"initial").expect("write seed");
+        git(&["add", "seed.txt"]);
+        git(&["commit", "-m", "seed"]);
+
+        let (branch, dirty) = super::probe_git(root);
+        assert_eq!(branch.as_deref(), Some("trunk"));
+        assert_eq!(dirty, Some(false));
+
+        std::fs::write(root.join("dirty.txt"), b"unstaged").expect("write dirty");
+        let (branch, dirty) = super::probe_git(root);
+        assert_eq!(branch.as_deref(), Some("trunk"));
+        assert_eq!(dirty, Some(true));
     }
 
     mod test_support {
@@ -3466,6 +3681,196 @@ mod tests {
                 value: json!({ "ok": true }),
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct ParallelBatchProvider {
+        tool_name: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for ParallelBatchProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            if request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool(_)))
+            {
+                return Ok(stream::iter(vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: halter_protocol::MessageId::new(),
+                    }),
+                    Ok(StreamEvent::TextStart { id: BlockId::new() }),
+                    Ok(StreamEvent::TextDelta {
+                        id: BlockId::new(),
+                        delta: "done".to_owned(),
+                    }),
+                    Ok(StreamEvent::TextEnd { id: BlockId::new() }),
+                    Ok(StreamEvent::MessageEnd {
+                        id: halter_protocol::MessageId::new(),
+                        stop_reason: StopReason::EndTurn,
+                        response_id: None,
+                    }),
+                ])
+                .boxed());
+            }
+            let first_block = BlockId::new();
+            let second_block = BlockId::new();
+            Ok(stream::iter(vec![
+                Ok(StreamEvent::MessageStart {
+                    id: halter_protocol::MessageId::new(),
+                }),
+                Ok(StreamEvent::ToolCallStart {
+                    id: first_block.clone(),
+                    tool_call_id: ToolCallId::new(),
+                    name: ToolName::from(self.tool_name),
+                }),
+                Ok(StreamEvent::ToolArgsDelta {
+                    id: first_block.clone(),
+                    delta: json!({}).to_string(),
+                }),
+                Ok(StreamEvent::ToolCallEnd { id: first_block }),
+                Ok(StreamEvent::ToolCallStart {
+                    id: second_block.clone(),
+                    tool_call_id: ToolCallId::new(),
+                    name: ToolName::from(self.tool_name),
+                }),
+                Ok(StreamEvent::ToolArgsDelta {
+                    id: second_block.clone(),
+                    delta: json!({}).to_string(),
+                }),
+                Ok(StreamEvent::ToolCallEnd { id: second_block }),
+                Ok(StreamEvent::MessageEnd {
+                    id: halter_protocol::MessageId::new(),
+                    stop_reason: StopReason::ToolUse,
+                    response_id: None,
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[derive(Debug)]
+    struct BarrierTool {
+        barrier: Arc<tokio::sync::Barrier>,
+        concurrency: ToolConcurrency,
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for BarrierTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: ToolName::from(self.name),
+                description: "barrier-synchronized tool".to_owned(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+                concurrency: self.concurrency,
+                capabilities: ToolCapabilities::default(),
+                provider_aliases: Default::default(),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _context: ToolContext,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<ToolResult> {
+            self.barrier.wait().await;
+            Ok(ToolResult::Empty)
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_safe_tools_execute_concurrently() {
+        // Two ParallelSafe tool calls in a single batch must run concurrently:
+        // each awaits a 2-party barrier that only resolves when both are in
+        // flight simultaneously. Serial execution would deadlock the barrier.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(
+            Arc::new(ParallelBatchProvider {
+                tool_name: "parallel_barrier",
+            }),
+            temp.path(),
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        services.tools.register(Arc::new(BarrierTool {
+            barrier: barrier.clone(),
+            concurrency: ToolConcurrency::ParallelSafe,
+            name: "parallel_barrier",
+        }));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            session
+                .submit_turn(Turn::user("run in parallel"))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("parallel-safe tools must not deadlock the barrier")
+        .expect("collect events");
+
+        let completed = result
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.payload,
+                    SessionEventPayload::ToolExecutionCompleted { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            completed, 2,
+            "both parallel-safe tool executions must complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusive_tools_run_serially_in_batch() {
+        // Two Exclusive tool calls in a single provider response must run in
+        // distinct batches. Giving them a 2-party barrier means concurrent
+        // execution would succeed and serial execution would hang — the
+        // timeout branch catches the happy path and asserts serialization.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(
+            Arc::new(ParallelBatchProvider {
+                tool_name: "exclusive_barrier",
+            }),
+            temp.path(),
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        services.tools.register(Arc::new(BarrierTool {
+            barrier: barrier.clone(),
+            concurrency: ToolConcurrency::Exclusive,
+            name: "exclusive_barrier",
+        }));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let timed = tokio::time::timeout(
+            Duration::from_millis(500),
+            session
+                .submit_turn(Turn::user("serialize exclusive"))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>(),
+        )
+        .await;
+        assert!(
+            timed.is_err(),
+            "exclusive tools must serialize; barrier should deadlock"
+        );
     }
 
     #[async_trait]

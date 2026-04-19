@@ -136,6 +136,19 @@ impl ToolRuntime {
             .collect()
     }
 
+    /// Look up the declared [`ToolConcurrency`] for a registered tool by name.
+    ///
+    /// Returns `None` when the tool is not registered, letting the caller pick
+    /// a conservative default (e.g. `Exclusive`) rather than guessing.
+    #[must_use]
+    pub fn concurrency_for(&self, name: &str) -> Option<halter_protocol::ToolConcurrency> {
+        self.tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .map(|tool| tool.spec().concurrency)
+    }
+
     #[must_use]
     pub fn clone_filtered(&self, allowed: &[String]) -> Self {
         let allow_all = allowed.is_empty();

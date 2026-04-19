@@ -679,10 +679,7 @@ mod tests {
                 body.len(),
                 body,
             );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("write");
+            socket.write_all(response.as_bytes()).await.expect("write");
         });
 
         let transport = ResponsesTransport::new("test-key", format!("http://{address}"));
@@ -692,7 +689,10 @@ mod tests {
         let request_meta = ResponsesTransportRequest {
             provider_label: "openai",
             model: "gpt-5".to_owned(),
-            reservation: OpenAiReservation { requests: 1, tokens: 1 },
+            reservation: OpenAiReservation {
+                requests: 1,
+                tokens: 1,
+            },
             rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
             tokens_per_minute: Some(500_000),
         };
@@ -707,10 +707,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert!(
-            result.is_err(),
-            "expected anyhow error from 429 response",
-        );
+        assert!(result.is_err(), "expected anyhow error from 429 response",);
 
         // The error-branch must have wired TPM into apply_retry_after.
         // Verify cooldown was set on the (scope, "gpt-5") entry.

@@ -330,10 +330,11 @@ impl ToolPolicy for DefaultToolPolicy {
                 rule: "network_disabled",
             });
         }
-        let (host, port) = extract_host_and_port(url).ok_or_else(|| PolicyError::NetworkDenied {
-            url: url.to_owned(),
-            rule: "unparseable_url",
-        })?;
+        let (host, port) =
+            extract_host_and_port(url).ok_or_else(|| PolicyError::NetworkDenied {
+                url: url.to_owned(),
+                rule: "unparseable_url",
+            })?;
         if is_loopback_host(&host) {
             return self.allow_loopback(url, &host, port);
         }

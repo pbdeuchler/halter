@@ -174,8 +174,7 @@ mod tests {
     /// AC3.4: invalid regex fails at compile time with a parse error.
     #[test]
     fn review_hook_runtime_ac3_4_invalid_regex_rejected_at_compile() {
-        let error = CompiledMatcher::compile_regex("(")
-            .expect_err("invalid regex must reject");
+        let error = CompiledMatcher::compile_regex("(").expect_err("invalid regex must reject");
         assert!(matches!(error, MatcherCompileError::Regex { .. }));
     }
 

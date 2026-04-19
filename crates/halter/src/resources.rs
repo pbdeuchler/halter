@@ -363,7 +363,7 @@ fn load_skill_root(root: &Path) -> anyhow::Result<LoadedSkill> {
     });
     let description = frontmatter.get("description").cloned().unwrap_or_default();
     Ok(LoadedSkill {
-        id: SkillId::new(),
+        id: stable_skill_id(root),
         name,
         description,
         root: root.to_path_buf(),
@@ -372,6 +372,12 @@ fn load_skill_root(root: &Path) -> anyhow::Result<LoadedSkill> {
         supporting_files: Vec::new(),
         scripts: load_scripts(root)?,
     })
+}
+
+fn stable_skill_id(root: &Path) -> SkillId {
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let fingerprint = canonical_root.display().to_string();
+    SkillId::from(format!("skill-{}", hash_bytes(fingerprint.as_bytes())))
 }
 
 fn load_scripts(root: &Path) -> anyhow::Result<Vec<LoadedExecutable>> {
@@ -842,5 +848,55 @@ description: reviews code
             .expect("plugin id");
 
         assert_eq!(first_id, second_id);
+    }
+
+    #[tokio::test]
+    async fn resource_compiler_uses_stable_skill_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join("skills/hello");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: hello
+description: says hello
+---
+
+# Hello
+"#,
+        )
+        .expect("write skill");
+
+        let mut config = HarnessConfig::default();
+        config.resources.skills.roots = vec![temp.path().join("skills")];
+
+        let first = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect("compile resources");
+        let second = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect("compile resources again");
+
+        let first_id = first
+            .snapshot
+            .skills
+            .get(&SkillName::from("hello"))
+            .map(|s| s.id.clone())
+            .expect("first skill id");
+        let second_id = second
+            .snapshot
+            .skills
+            .get(&SkillName::from("hello"))
+            .map(|s| s.id.clone())
+            .expect("second skill id");
+
+        assert_eq!(first_id, second_id);
+        assert!(
+            first_id.0.starts_with("skill-"),
+            "skill id should be content-addressed: {}",
+            first_id.0
+        );
     }
 }

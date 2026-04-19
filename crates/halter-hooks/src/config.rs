@@ -277,9 +277,7 @@ pub enum HookShell {
     Pwsh,
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, IntoStaticStr,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, IntoStaticStr)]
 #[strum(ascii_case_insensitive)]
 pub enum HookEventName {
     SessionStart,
