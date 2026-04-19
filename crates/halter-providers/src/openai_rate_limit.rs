@@ -124,7 +124,10 @@ impl OpenAiRateLimiter {
             credential_fingerprint: self.scope.credential_fingerprint.clone(),
             model: model.to_owned(),
         };
-        let mut registry = self.registry.lock().expect("rate limit registry lock poisoned");
+        let mut registry = self
+            .registry
+            .lock()
+            .expect("rate limit registry lock poisoned");
         registry
             .entry(key)
             .or_insert_with(|| {
@@ -322,10 +325,10 @@ fn fingerprint_api_key(api_key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::HeaderMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
-    use reqwest::header::HeaderMap;
     // `OpenAiReservation` is re-exported into scope by `use super::*;` via the
     // file-level `use crate::openai_rate_limit_policy::{OpenAiReservation, ...}`
     // at openai_rate_limit.rs:16-20. Do not add a duplicate `use` here — clippy
@@ -340,7 +343,10 @@ mod tests {
     fn small_reservation() -> OpenAiReservation {
         // The exact numbers don't matter for isolation tests; pick a
         // reservation small enough that no policy will reject it.
-        OpenAiReservation { requests: 1, tokens: 1 }
+        OpenAiReservation {
+            requests: 1,
+            tokens: 1,
+        }
     }
 
     // AC1.1 Isolation ----------------------------------------------------
@@ -496,7 +502,10 @@ mod tests {
         let mut permit = lim
             .acquire(
                 "gpt-5",
-                OpenAiReservation { requests: 1, tokens: 1 },
+                OpenAiReservation {
+                    requests: 1,
+                    tokens: 1,
+                },
                 Some(500_000),
                 CancellationToken::new(),
             )
@@ -522,7 +531,10 @@ mod tests {
         let mut permit = lim
             .acquire(
                 "gpt-5",
-                OpenAiReservation { requests: 1, tokens: 1 },
+                OpenAiReservation {
+                    requests: 1,
+                    tokens: 1,
+                },
                 Some(500_000),
                 CancellationToken::new(),
             )
@@ -551,7 +563,10 @@ mod tests {
         let mut prime = lim
             .acquire(
                 "gpt-5",
-                OpenAiReservation { requests: 1, tokens: 1 },
+                OpenAiReservation {
+                    requests: 1,
+                    tokens: 1,
+                },
                 Some(500_000),
                 CancellationToken::new(),
             )
@@ -565,7 +580,10 @@ mod tests {
         let mut permit = lim
             .acquire(
                 "gpt-5",
-                OpenAiReservation { requests: 1, tokens: 1 },
+                OpenAiReservation {
+                    requests: 1,
+                    tokens: 1,
+                },
                 Some(500_000),
                 CancellationToken::new(),
             )
@@ -594,7 +612,10 @@ mod tests {
         let mut prime = lim
             .acquire(
                 "gpt-5",
-                OpenAiReservation { requests: 1, tokens: 1 },
+                OpenAiReservation {
+                    requests: 1,
+                    tokens: 1,
+                },
                 Some(500_000),
                 CancellationToken::new(),
             )
@@ -606,16 +627,16 @@ mod tests {
         let mut permit = lim
             .acquire(
                 "gpt-5",
-                OpenAiReservation { requests: 1, tokens: 1 },
+                OpenAiReservation {
+                    requests: 1,
+                    tokens: 1,
+                },
                 Some(500_000),
                 CancellationToken::new(),
             )
             .await
             .expect("acquire 4xx");
-        permit.update_from_headers(
-            &rate_limit_headers("1", "60s"),
-            StatusCode::BAD_REQUEST,
-        );
+        permit.update_from_headers(&rate_limit_headers("1", "60s"), StatusCode::BAD_REQUEST);
 
         assert_eq!(
             remaining_requests_for(&lim, "gpt-5"),
@@ -641,7 +662,10 @@ mod tests {
             let mut permit = lim
                 .acquire(
                     "gpt-5",
-                    OpenAiReservation { requests: 1, tokens: 1 },
+                    OpenAiReservation {
+                        requests: 1,
+                        tokens: 1,
+                    },
                     Some(500_000),
                     CancellationToken::new(),
                 )
@@ -678,7 +702,10 @@ mod tests {
             let _permit = lim
                 .acquire(
                     "gpt-5",
-                    OpenAiReservation { requests: 1, tokens: 1 },
+                    OpenAiReservation {
+                        requests: 1,
+                        tokens: 1,
+                    },
                     Some(500_000),
                     CancellationToken::new(),
                 )
@@ -706,7 +733,10 @@ mod tests {
         let permit = lim
             .acquire(
                 "gpt-5",
-                OpenAiReservation { requests: 1, tokens: 1 },
+                OpenAiReservation {
+                    requests: 1,
+                    tokens: 1,
+                },
                 Some(123_456),
                 CancellationToken::new(),
             )
@@ -733,7 +763,10 @@ mod tests {
         let permit = lim
             .acquire(
                 "gpt-5",
-                OpenAiReservation { requests: 1, tokens: 1 },
+                OpenAiReservation {
+                    requests: 1,
+                    tokens: 1,
+                },
                 Some(500_000),
                 CancellationToken::new(),
             )
@@ -764,7 +797,10 @@ mod tests {
             let permit = lim
                 .acquire(
                     "gpt-5",
-                    OpenAiReservation { requests: 1, tokens: 1 },
+                    OpenAiReservation {
+                        requests: 1,
+                        tokens: 1,
+                    },
                     Some(500_000),
                     CancellationToken::new(),
                 )
