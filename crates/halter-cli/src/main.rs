@@ -387,12 +387,23 @@ fn write_output_line(output: &mut dyn Write, line: impl std::fmt::Display) -> an
     writeln!(output, "{line}").context("failed to write output")
 }
 
+/// Third-party `tracing` targets that emit one DEBUG line per shell token,
+/// HTTP connection, or pool event. Promoting them to WARN keeps the harness's
+/// own DEBUG output readable when users opt into `RUST_LOG=debug`. Listed in
+/// the directive string *after* the user's filter so target-specific
+/// directives override the global level (per `EnvFilter` precedence).
+const NOISY_TARGET_SUPPRESSIONS: &str = "tokenize=warn,parse=warn,expansion=warn,commands=warn,pattern=warn,\
+     completion=warn,jobs=warn,unimplemented=warn,\
+     hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,rustls=warn";
+
 fn init_logging(writer: TraceWriter, json: bool) -> anyhow::Result<()> {
-    let filter = match env::var(EnvFilter::DEFAULT_ENV) {
-        Ok(value) => EnvFilter::try_new(value).context("invalid RUST_LOG filter")?,
-        Err(env::VarError::NotPresent) => EnvFilter::try_new("warn")?,
+    let user_directives = match env::var(EnvFilter::DEFAULT_ENV) {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => "warn".to_owned(),
         Err(env::VarError::NotUnicode(_)) => anyhow::bail!("invalid utf-8 in RUST_LOG"),
     };
+    let composed = format!("{user_directives},{NOISY_TARGET_SUPPRESSIONS}");
+    let filter = EnvFilter::try_new(&composed).context("invalid RUST_LOG filter")?;
     let base = fmt::layer().with_writer(writer).with_target(true);
     let registry = tracing_subscriber::registry().with(filter);
     if json {

@@ -7,10 +7,21 @@ use serde_json::Value;
 
 const RATE_LIMIT_CODE: &str = "rate_limit_exceeded";
 const RETRY_AFTER_PREFIX: &str = "Please try again in ";
+/// Sentinel substring OpenRouter uses to wrap upstream-provider failures
+/// (`{"error": {"message": "Provider returned error", "metadata": {...}}}`).
+/// These are typically transient — the upstream model rate-limited, timed
+/// out, or hiccuped — and should be retried instead of cascading into a
+/// fatal turn failure.
+const OPENROUTER_UPSTREAM_WRAPPER: &str = "Provider returned error";
 /// Synthetic code stamped by the transport layer when an HTTP 5xx response
 /// has no parseable JSON error body. `classify` treats this as `Retryable`
 /// without depending on substring matches against the error message.
 pub(crate) const SYNTHETIC_SERVER_ERROR_CODE: &str = "transport.server_error";
+/// Synthetic code stamped on OpenRouter's "Provider returned error" wrapper
+/// (HTTP body or SSE event), so `classify` retries the request instead of
+/// dying on the first transient upstream blip. Bounded retries (5 attempts /
+/// 60s) cap the cost when the underlying error is permanent.
+pub(crate) const UPSTREAM_PROVIDER_ERROR_CODE: &str = "transport.upstream_provider_error";
 
 /// Whether a transport/stream failure should be retried. Retryable variants
 /// optionally carry a backoff hint extracted from the upstream response
@@ -64,7 +75,10 @@ fn classify_api_error(api: &ApiError) -> Retryability {
         Retryability::Retryable {
             backoff_hint: openai_api_error_retry_after(api),
         }
-    } else if api.code.as_deref() == Some(SYNTHETIC_SERVER_ERROR_CODE) {
+    } else if matches!(
+        api.code.as_deref(),
+        Some(SYNTHETIC_SERVER_ERROR_CODE) | Some(UPSTREAM_PROVIDER_ERROR_CODE)
+    ) {
         Retryability::Retryable { backoff_hint: None }
     } else {
         Retryability::Fatal
@@ -126,26 +140,35 @@ fn parse_api_error_object(value: &Value) -> Option<ApiError> {
     // Without lifting `metadata.raw` into the user-facing message, every
     // upstream failure surfaces as the generic top-level string and the
     // real cause is lost.
-    let message = match (
-        value
-            .pointer("/metadata/provider_name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-        value
-            .pointer("/metadata/raw")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-    ) {
+    let provider_name = value
+        .pointer("/metadata/provider_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let raw_detail = value
+        .pointer("/metadata/raw")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let is_upstream_wrapper = message.starts_with(OPENROUTER_UPSTREAM_WRAPPER);
+    let composed_message = match (provider_name, raw_detail) {
         (Some(provider), Some(raw)) => format!("{message} ({provider}: {raw})"),
         (None, Some(raw)) => format!("{message}: {raw}"),
         (Some(provider), None) => format!("{message} ({provider})"),
         (None, None) => message.to_owned(),
     };
+    // OpenRouter's `code` is a numeric HTTP status (e.g. `400`); the existing
+    // `as_str()` extraction drops it. We only need the code path for
+    // classification, so stamp the synthetic upstream-error code when we
+    // recognize the wrapper, regardless of the raw `code` shape.
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| is_upstream_wrapper.then(|| UPSTREAM_PROVIDER_ERROR_CODE.to_owned()));
 
     Some(ApiError {
-        message,
+        message: composed_message,
         r#type: value
             .get("type")
             .and_then(Value::as_str)
@@ -155,10 +178,7 @@ fn parse_api_error_object(value: &Value) -> Option<ApiError> {
             .get("param")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        code: value
-            .get("code")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        code,
     })
 }
 
@@ -338,6 +358,48 @@ mod tests {
             openai_api_error_retry_after(&error),
             Some(Duration::from_millis(75))
         );
+    }
+
+    #[test]
+    fn classifies_openrouter_upstream_wrapper_as_retryable() {
+        // OpenRouter wraps transient upstream failures (rate limit, timeout,
+        // model hiccup) as `{"error": {"message": "Provider returned error",
+        // ...}}`. Previously these surfaced with no `code`, fell through to
+        // `Fatal`, and killed the main turn loop on a single blip — bypassing
+        // the bounded retry budget entirely.
+        let body = json!({
+            "error": {
+                "code": 400,
+                "message": "Provider returned error",
+                "metadata": {
+                    "provider_name": "Z.AI",
+                    "raw": "internal server error"
+                }
+            }
+        });
+        let api_error = parse_openai_http_error(body.to_string().as_bytes()).expect("api error");
+        assert_eq!(
+            api_error.code.as_deref(),
+            Some(UPSTREAM_PROVIDER_ERROR_CODE)
+        );
+        let err = OpenAIError::ApiError(api_error);
+        assert_eq!(
+            classify(&err),
+            Retryability::Retryable { backoff_hint: None }
+        );
+    }
+
+    #[test]
+    fn classifies_openrouter_upstream_wrapper_without_metadata_as_retryable() {
+        // The wrapper is sometimes returned without a populated `metadata`
+        // object — same upstream reality, just less detail. The classifier
+        // must still treat it as retryable, otherwise a single transient
+        // OpenRouter blip kills the turn.
+        let body = json!({
+            "error": { "message": "Provider returned error" }
+        });
+        let api_error = parse_openai_http_error(body.to_string().as_bytes()).expect("api error");
+        assert!(classify(&OpenAIError::ApiError(api_error)).is_retryable());
     }
 
     #[test]
