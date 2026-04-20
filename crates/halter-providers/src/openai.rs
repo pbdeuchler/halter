@@ -183,7 +183,10 @@ mod tests {
         let captured = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let base_url = spawn_header_capture_server(captured.clone()).await;
         let overrides = vec![
-            ("authorization".to_owned(), "Bearer override-token".to_owned()),
+            (
+                "authorization".to_owned(),
+                "Bearer override-token".to_owned(),
+            ),
             ("X-Trace-Id".to_owned(), "trace-1".to_owned()),
         ];
         let provider = OpenAiProvider::new_with_headers("default-key", base_url, &overrides)

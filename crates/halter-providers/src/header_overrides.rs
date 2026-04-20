@@ -59,17 +59,13 @@ impl HeaderOverrides {
             .into_iter()
             .filter(|(name, _)| !self.contains(name))
             .collect();
-        merged.extend(
-            self.entries
-                .iter()
-                .map(|(name, value)| {
-                    let value_str = value
-                        .to_str()
-                        .expect("HeaderOverrides values are constructed from &str")
-                        .to_owned();
-                    (name.as_str().to_owned(), value_str)
-                }),
-        );
+        merged.extend(self.entries.iter().map(|(name, value)| {
+            let value_str = value
+                .to_str()
+                .expect("HeaderOverrides values are constructed from &str")
+                .to_owned();
+            (name.as_str().to_owned(), value_str)
+        }));
         merged
     }
 }
@@ -100,16 +96,11 @@ mod tests {
 
     #[test]
     fn non_conflicting_override_is_appended() {
-        let overrides = HeaderOverrides::new(&[(
-            "x-trace-id".to_owned(),
-            "trace-123".to_owned(),
-        )])
-        .expect("valid overrides");
+        let overrides = HeaderOverrides::new(&[("x-trace-id".to_owned(), "trace-123".to_owned())])
+            .expect("valid overrides");
 
-        let merged = overrides.merge_string_pairs(vec![(
-            "x-api-key".to_owned(),
-            "secret".to_owned(),
-        )]);
+        let merged =
+            overrides.merge_string_pairs(vec![("x-api-key".to_owned(), "secret".to_owned())]);
 
         assert_eq!(
             merged,

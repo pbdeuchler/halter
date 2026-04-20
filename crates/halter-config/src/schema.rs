@@ -323,10 +323,7 @@ fn validate_provider_config(name: &str, provider: &ProviderConfig) -> anyhow::Re
         provider.api_key.as_deref(),
     )?;
     for (header_name, header_value) in &provider.headers {
-        validate_required_string(
-            &format!("providers.{name}.headers.<key>"),
-            header_name,
-        )?;
+        validate_required_string(&format!("providers.{name}.headers.<key>"), header_name)?;
         if !header_name
             .bytes()
             .all(|b| b.is_ascii_graphic() && b != b':')

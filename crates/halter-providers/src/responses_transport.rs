@@ -305,11 +305,9 @@ impl ResponsesTransport {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if !self.header_overrides.contains("authorization") {
-            let mut auth_value = HeaderValue::from_str(&format!(
-                "Bearer {}",
-                self.api_key.expose_secret()
-            ))
-            .context("failed to encode Authorization header")?;
+            let mut auth_value =
+                HeaderValue::from_str(&format!("Bearer {}", self.api_key.expose_secret()))
+                    .context("failed to encode Authorization header")?;
             auth_value.set_sensitive(true);
             headers.insert(AUTHORIZATION, auth_value);
         }
