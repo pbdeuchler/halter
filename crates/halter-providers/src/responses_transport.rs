@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context;
 use async_openai::{
     error::{ApiError, OpenAIError, StreamError},
     types::responses::{ResponseStream, ResponseStreamEvent},
@@ -23,6 +24,7 @@ use crate::openai_error::{
 };
 use crate::openai_rate_limit::{OpenAiRateLimitPermit, OpenAiRateLimiter};
 use crate::openai_rate_limit_policy::OpenAiReservation;
+use crate::secret::SecretString;
 
 /// Result of a transport-layer call. The variant carries the retryability
 /// decision so callers do not re-classify by inspecting message text.
@@ -116,27 +118,29 @@ pub(crate) struct ResponsesTransportRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesTransport {
     client: ReqwestClient,
-    api_key: String,
+    api_key: SecretString,
     base_url: String,
     openai_rate_limiter: OpenAiRateLimiter,
 }
 
 impl ResponsesTransport {
-    #[must_use]
-    pub(crate) fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
+    pub(crate) fn try_new(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+    ) -> anyhow::Result<Self> {
         let api_key = api_key.into();
         let base_url = base_url.into();
         let client = ReqwestClient::builder()
             .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
             .build()
-            .expect("responses transport client must build");
+            .context("failed to build responses transport client")?;
 
-        Self {
-            client,
+        Ok(Self {
             openai_rate_limiter: OpenAiRateLimiter::new(&api_key, &base_url),
+            client,
             api_key,
             base_url,
-        }
+        })
     }
 
     pub(crate) async fn responses_stream(
@@ -229,7 +233,7 @@ impl ResponsesTransport {
         let request_builder = self
             .client
             .post(provider_url(&self.base_url, path))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.api_key.expose_secret())
             .json(&request);
 
         let response = select! {
@@ -441,7 +445,8 @@ mod tests {
     async fn responses_stream_honors_openai_header_waits() {
         let request_times = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let base_url = spawn_sse_server(request_times.clone(), 2).await;
-        let transport = ResponsesTransport::new("test-key", base_url);
+        let transport =
+            ResponsesTransport::try_new("test-key", base_url).expect("responses transport");
         let request = json!({
             "model": "gpt-5",
             "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "hello" }] }],
@@ -569,7 +574,8 @@ mod tests {
             stall_signal.notified().await;
         });
 
-        let transport = ResponsesTransport::new("test-key", format!("http://{address}"));
+        let transport = ResponsesTransport::try_new("test-key", format!("http://{address}"))
+            .expect("responses transport");
         let request = json!({
             "model": "gpt-5",
             "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }],
@@ -682,7 +688,8 @@ mod tests {
             socket.write_all(response.as_bytes()).await.expect("write");
         });
 
-        let transport = ResponsesTransport::new("test-key", format!("http://{address}"));
+        let transport = ResponsesTransport::try_new("test-key", format!("http://{address}"))
+            .expect("responses transport");
 
         // Build the request_meta explicitly (struct does not implement
         // Default — definition at responses_transport.rs:107-114).
@@ -732,7 +739,8 @@ mod tests {
     #[test]
     fn observer_record_api_error_threads_tpm_to_apply_retry_after() {
         // Construct a limiter directly.
-        let limiter = OpenAiRateLimiter::new("test-key", "https://api.openai.com");
+        let limiter =
+            OpenAiRateLimiter::new(&SecretString::from("test-key"), "https://api.openai.com");
 
         // Construct an observer with explicit Some(500_000) TPM.
         let observer = OpenAiStreamRateLimitObserver {

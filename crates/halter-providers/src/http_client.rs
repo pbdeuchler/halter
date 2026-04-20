@@ -20,13 +20,13 @@ pub(crate) struct JsonHttpClient {
     client: Client,
 }
 
-impl Default for JsonHttpClient {
-    fn default() -> Self {
+impl JsonHttpClient {
+    pub(crate) fn try_new() -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
             .build()
-            .expect("provider client must build");
-        Self { client }
+            .context("failed to build provider http client")?;
+        Ok(Self { client })
     }
 }
 

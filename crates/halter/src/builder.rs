@@ -447,15 +447,15 @@ fn build_provider(
         ConfiguredProvider::Anthropic => Arc::new(AnthropicProvider::new(
             provider.api_key.clone(),
             provider.base_url.clone(),
-        )),
+        )?),
         ConfiguredProvider::OpenAi => Arc::new(OpenAiProvider::new(
             provider.api_key.clone(),
             provider.base_url.clone(),
-        )),
+        )?),
         ConfiguredProvider::OpenRouter => Arc::new(OpenRouterProvider::new(
             provider.api_key.clone(),
             provider.base_url.clone(),
-        )),
+        )?),
     };
     Ok(provider)
 }

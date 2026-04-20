@@ -15,6 +15,7 @@ mod registry;
 mod responses_provider;
 mod responses_transport;
 mod retry;
+mod secret;
 mod unsupported;
 
 use async_trait::async_trait;
@@ -30,6 +31,7 @@ pub use fake::FakeProvider;
 pub use openai::OpenAiProvider;
 pub use openrouter::OpenRouterProvider;
 pub use registry::ModelRegistry;
+pub use secret::SecretString;
 pub use unsupported::UnsupportedProvider;
 
 #[async_trait]

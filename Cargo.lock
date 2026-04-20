@@ -1297,6 +1297,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "halter-protocol",
+ "hex",
  "indexmap",
  "reqwest",
  "serde_json",

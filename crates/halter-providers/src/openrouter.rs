@@ -13,6 +13,7 @@ use crate::responses_provider::{
     CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
 use crate::retry::RetryPolicy;
+use crate::secret::SecretString;
 
 #[derive(Debug, Clone)]
 pub struct OpenRouterProvider {
@@ -20,11 +21,13 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    #[must_use]
-    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self {
-            inner: ResponsesProvider::new(config(), api_key, base_url),
-        }
+    pub fn new(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: ResponsesProvider::try_new(config(), api_key, base_url)?,
+        })
     }
 }
 
@@ -100,7 +103,8 @@ mod tests {
 
     #[tokio::test]
     async fn openrouter_provider_rejects_chat_api_kind() {
-        let provider = OpenRouterProvider::new("test-key", "https://openrouter.ai/api");
+        let provider = OpenRouterProvider::new("test-key", "https://openrouter.ai/api")
+            .expect("openrouter provider");
         let error = match provider
             .stream(
                 sample_request(ApiKind::OpenAiChat),
@@ -121,8 +125,9 @@ mod tests {
 
     #[test]
     fn openrouter_provider_reports_compaction_and_prompt_cache_support() {
-        let capabilities =
-            OpenRouterProvider::new("test-key", "https://openrouter.ai/api").capabilities();
+        let capabilities = OpenRouterProvider::new("test-key", "https://openrouter.ai/api")
+            .expect("openrouter provider")
+            .capabilities();
 
         assert!(capabilities.supports_prompt_cache);
         assert!(capabilities.supports_compaction);
@@ -206,7 +211,8 @@ mod tests {
                 .expect("write response");
         });
 
-        let provider = OpenRouterProvider::new("test-key", format!("http://{address}"));
+        let provider = OpenRouterProvider::new("test-key", format!("http://{address}"))
+            .expect("openrouter provider");
         let response = provider
             .compact(sample_compaction_request(), CancellationToken::new())
             .await
