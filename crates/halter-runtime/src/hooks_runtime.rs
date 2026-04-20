@@ -872,7 +872,6 @@ async fn run_agent(
         // hook agent shutdown. The hook agent's own session lifecycle
         // governs when its turns drain.
         turn_registry: Arc::new(crate::TurnRegistry::new()),
-        max_tool_output_bytes: sess.services().max_tool_output_bytes,
         shell_timeout_secs: sess.services().shell_timeout_secs,
     });
     let model = resolve_agent_model(sess, config.model.as_deref())?;

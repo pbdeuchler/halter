@@ -1,9 +1,7 @@
 // pattern: Functional Core
 
-use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -20,11 +18,6 @@ const MAX_SAMPLES: usize = 10_000;
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 static PROFILE_BUFFER: LazyLock<Mutex<CircularBuffer>> =
     LazyLock::new(|| Mutex::new(CircularBuffer::new(MAX_SAMPLES)));
-
-thread_local! {
-    static REGION_STACK: RefCell<SmallVec<[&'static str; 4]>> =
-        const { RefCell::new(SmallVec::new_const()) };
-}
 
 #[derive(Clone)]
 struct ProfileSample {
@@ -69,56 +62,6 @@ impl CircularBuffer {
             .cloned()
             .collect()
     }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub struct ProfileGuard {
-    region: &'static str,
-    session_id: String,
-    start: Instant,
-    _not_send: PhantomData<*const ()>,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl ProfileGuard {
-    fn new(region: &'static str, session_id: impl Into<String>) -> Self {
-        REGION_STACK.with(|stack| stack.borrow_mut().push(region));
-        Self {
-            region,
-            session_id: session_id.into(),
-            start: Instant::now(),
-            _not_send: PhantomData,
-        }
-    }
-}
-
-impl Drop for ProfileGuard {
-    fn drop(&mut self) {
-        let duration_us = self.start.elapsed().as_micros() as u64;
-        let timestamp_us = PROCESS_START.elapsed().as_micros() as u64;
-
-        REGION_STACK.with(|stack| {
-            let mut stack = stack.borrow_mut();
-            let sample = ProfileSample {
-                session_id: self.session_id.clone(),
-                stack: stack.iter().copied().collect(),
-                duration_us,
-                timestamp_us,
-            };
-
-            if stack.last() == Some(&self.region) {
-                stack.pop();
-            }
-
-            PROFILE_BUFFER.lock().push(sample);
-        });
-    }
-}
-
-#[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn profile_region(region: &'static str) -> ProfileGuard {
-    ProfileGuard::new(region, "test")
 }
 
 pub struct FlatProfileGuard {
@@ -324,19 +267,6 @@ fn generate_svg(_folded: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn records_profile_regions() {
-        {
-            let _outer = profile_region("outer");
-            let _inner = profile_region("inner");
-        }
-
-        let profile = get_work_profile_for_session(10.0, None);
-        assert!(profile.sample_count >= 2);
-        assert!(profile.folded.contains("outer"));
-        assert!(profile.summary.contains("outer"));
-    }
 
     #[test]
     fn filters_profile_by_session() {

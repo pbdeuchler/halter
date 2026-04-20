@@ -56,7 +56,6 @@ pub struct RuntimeServices {
     pub context_manager: Arc<dyn ContextManager>,
     pub event_bus: Arc<EventBus>,
     pub turn_registry: Arc<TurnRegistry>,
-    pub max_tool_output_bytes: usize,
     pub shell_timeout_secs: u64,
 }
 
@@ -1059,12 +1058,10 @@ impl SessionHandle {
                     working_dir: blueprint.working_dir.clone(),
                     path_locks: self.services.path_locks.clone(),
                     tool_sessions: self.services.tool_sessions.clone(),
-                    file_view: Arc::new(state.file_view_cache.clone()),
                     snapshot: snapshot.clone(),
                     cancel: cancel.child_token(),
                     emit,
                     policy: self.services.policy.clone(),
-                    max_tool_output_bytes: self.services.max_tool_output_bytes,
                     shell_timeout_secs: self.services.shell_timeout_secs,
                     subagent_parent: Some(Arc::new(SubagentParentContext {
                         blueprint: blueprint.clone(),
@@ -1825,7 +1822,6 @@ impl Default for RuntimeServices {
             context_manager: Arc::new(DefaultContextManager::default()),
             event_bus: Arc::new(EventBus::default()),
             turn_registry: Arc::new(TurnRegistry::new()),
-            max_tool_output_bytes: 262_144,
             shell_timeout_secs: 30,
         }
     }

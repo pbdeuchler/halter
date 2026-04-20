@@ -56,7 +56,6 @@ pub struct PolicySettings {
     pub allowed_read_roots: Vec<PathBuf>,
     pub sensitive_path_patterns: Vec<String>,
     pub max_read_bytes: usize,
-    pub max_tool_output_bytes: usize,
     pub shell_enabled: bool,
     pub shell_mode: ShellMode,
     /// Carried for forward compatibility with config files. The current
@@ -88,7 +87,6 @@ impl Default for PolicySettings {
             allowed_read_roots: default_read_roots(),
             sensitive_path_patterns: default_sensitive_patterns(),
             max_read_bytes: 1_048_576,
-            max_tool_output_bytes: 262_144,
             shell_enabled: true,
             shell_mode: ShellMode::Strict,
             allowed_shell_commands: vec![

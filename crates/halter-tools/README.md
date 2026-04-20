@@ -142,7 +142,6 @@ Defaults:
 - `allowed_read_roots = [".", $TMPDIR | "/tmp"]`
 - `sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.env", "**/.env.*", "/etc/shadow", "/etc/shadow.*"]`
 - `max_read_bytes = 1_048_576`
-- `max_tool_output_bytes = 262_144`
 - shell enabled = `true`
 - `shell_mode = Strict` (rejects `eval`, `exec`, `source`, `.`, and function definitions at the AST level)
 - shell allowlist = `git`, `cargo`, `rg`, `ls`, `find`
@@ -672,7 +671,6 @@ Typical sequence:
 - Keep shell allowlists tight.
 - Keep write roots narrow.
 - Prefer `edit` over broad `write` when patching existing files.
-- Tune `max_tool_output_bytes` to prevent transcript bloat.
 - Limit subagent depth and concurrency deliberately.
 - Enable optional tool families only if your deployment really needs them.
 
@@ -708,7 +706,6 @@ enabled = ["read", "glob", "grep", "write", "edit", "shell", "process"]
 [policy]
 allowed_write_roots = ["./"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 131072
 max_subagent_depth = 1
 max_concurrent_subagents = 2
 
@@ -730,7 +727,6 @@ enabled = [
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 262144
 max_subagent_depth = 3
 max_concurrent_subagents = 8
 

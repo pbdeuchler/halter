@@ -359,7 +359,6 @@ mod tests {
             working_dir: root.to_path_buf(),
             path_locks: Arc::new(PathLockMap::default()),
             tool_sessions: Arc::new(ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
@@ -368,7 +367,6 @@ mod tests {
                 allowed_shell_commands,
                 ..PolicySettings::default()
             })) as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: None,
         }

@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::{Tool, ToolContext, ToolRuntimeEvent};
 
 use super::common::{
-    ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string,
+    ToolScope, ensure_not_cancelled, optional_string, optional_u64, parse_env_map, required_string,
 };
 use super::process::{kill_process_group, kill_tree, process_group_id};
 
@@ -168,26 +168,6 @@ impl Tool for PtyTool {
             _ => anyhow::bail!("failed to execute pty tool: unknown action '{action}'"),
         }
     }
-}
-
-fn parse_env_map(value: Option<&Value>) -> anyhow::Result<Option<HashMap<String, String>>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(None);
-    }
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("invalid tool input: env must be an object"))?;
-    let mut env = HashMap::with_capacity(object.len());
-    for (key, value) in object {
-        let value = value
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("invalid tool input: env values must be strings"))?;
-        env.insert(key.clone(), value.to_owned());
-    }
-    Ok(Some(env))
 }
 
 fn start_session(
@@ -410,12 +390,10 @@ mod security_tests {
             working_dir: std::env::temp_dir(),
             path_locks: Arc::new(PathLockMap::default()),
             tool_sessions: Arc::new(ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
             policy,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: None,
         }
