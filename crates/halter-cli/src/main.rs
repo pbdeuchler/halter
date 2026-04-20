@@ -231,13 +231,10 @@ async fn chat_body(session: &HalterSession, output: &mut dyn Write) -> anyhow::R
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
-    write_output_line(
-        output,
-        "halter chat; submit an empty line or press ctrl-d to exit",
-    )?;
+    write_output_line(output, "halter chat; press ctrl-d to exit")?;
     while let Some(line) = lines.next_line().await.context("failed to read stdin")? {
         if line.trim().is_empty() {
-            break;
+            continue;
         }
 
         let mut events = session.submit_turn(Turn::user(line)).await?;
@@ -393,7 +390,7 @@ fn write_output_line(output: &mut dyn Write, line: impl std::fmt::Display) -> an
 fn init_logging(writer: TraceWriter, json: bool) -> anyhow::Result<()> {
     let filter = match env::var(EnvFilter::DEFAULT_ENV) {
         Ok(value) => EnvFilter::try_new(value).context("invalid RUST_LOG filter")?,
-        Err(env::VarError::NotPresent) => EnvFilter::try_new("off")?,
+        Err(env::VarError::NotPresent) => EnvFilter::try_new("warn")?,
         Err(env::VarError::NotUnicode(_)) => anyhow::bail!("invalid utf-8 in RUST_LOG"),
     };
     let base = fmt::layer().with_writer(writer).with_target(true);

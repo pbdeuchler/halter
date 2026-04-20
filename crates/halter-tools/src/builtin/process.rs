@@ -245,20 +245,31 @@ mod platform {
     }
 }
 
-pub fn kill_tree(pid: i32, signal: i32) -> u32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KillTreeEntry {
+    pub pid: i32,
+    pub killed: bool,
+}
+
+/// Kills `pid` and all descendants with `signal`. Returns per-PID results
+/// (descendants first, target last). Useful for debugging hung processes
+/// where a single count hides which PID refused the signal (finding M41).
+pub fn kill_tree(pid: i32, signal: i32) -> Vec<KillTreeEntry> {
     let mut descendants = Vec::new();
     platform::collect_descendants(pid, &mut descendants);
 
-    let mut killed = 0u32;
+    let mut report = Vec::with_capacity(descendants.len() + 1);
     for &child_pid in descendants.iter().rev() {
-        if platform::kill_pid(child_pid, signal) {
-            killed += 1;
-        }
+        report.push(KillTreeEntry {
+            pid: child_pid,
+            killed: platform::kill_pid(child_pid, signal),
+        });
     }
-    if platform::kill_pid(pid, signal) {
-        killed += 1;
-    }
-    killed
+    report.push(KillTreeEntry {
+        pid,
+        killed: platform::kill_pid(pid, signal),
+    });
+    report
 }
 
 #[cfg_attr(not(feature = "pty"), allow(dead_code))]
@@ -322,10 +333,22 @@ impl Tool for ProcessTool {
                 let signal = i32::try_from(signal).map_err(|_| {
                     anyhow::anyhow!("failed to execute process tool: signal is out of range")
                 })?;
+                let report = kill_tree(pid, signal);
+                let killed_count = report.iter().filter(|entry| entry.killed).count() as u64;
+                let per_pid: Vec<Value> = report
+                    .iter()
+                    .map(|entry| {
+                        json!({
+                            "pid": entry.pid,
+                            "killed": entry.killed,
+                        })
+                    })
+                    .collect();
                 json!({
                     "pid": pid,
                     "signal": signal,
-                    "killed": kill_tree(pid, signal),
+                    "killed": killed_count,
+                    "per_pid": per_pid,
                 })
             }
             "list_descendants" => json!({

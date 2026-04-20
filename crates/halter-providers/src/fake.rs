@@ -67,12 +67,7 @@ impl Provider for FakeProvider {
         let message_id = MessageId::new();
         let block_id = BlockId::new();
         let reply = self.render_reply(&request);
-        let usage = Usage {
-            input_tokens: request.messages.len() as u64 * 8,
-            output_tokens: reply.split_whitespace().count() as u64,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
+        let usage = Usage::default();
         let events = vec![
             Ok(StreamEvent::MessageStart {
                 id: message_id.clone(),
@@ -115,18 +110,17 @@ impl Provider for FakeProvider {
             .filter(|item| !item.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
+        // Mirror the OpenAI Responses `reasoning`-shaped envelope used for
+        // compacted context restoration. The earlier `type: "compaction"`
+        // item matched no real provider and would have caused cross-provider
+        // assertions to diverge unnecessarily. (finding L18)
         Ok(ProviderCompactionResponse {
             output: vec![json!({
-                "type": "compaction",
+                "type": "reasoning",
                 "id": format!("cmp_{}", request.session_id.0),
                 "encrypted_content": summary,
             })],
-            usage: Usage {
-                input_tokens: (request.compacted_prefix.len() + request.messages.len()) as u64 * 8,
-                output_tokens: 8,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-            },
+            usage: Usage::default(),
         })
     }
 }

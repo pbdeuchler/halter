@@ -21,7 +21,10 @@ use crate::codec_common::{
     tool_result_text, user_text,
 };
 
-const RESPONSES_ITEM_ID_MAX_LEN: usize = 64;
+// Alias the consolidated PROVIDER_ID_MAX_LEN from codec_common (finding L14).
+// Kept as a named alias because the local sites read more clearly with the
+// responses-item-specific identifier at the callsite.
+const RESPONSES_ITEM_ID_MAX_LEN: usize = crate::codec_common::PROVIDER_ID_MAX_LEN;
 const COMPACTED_CONTEXT_PREFIX: &str = "[Compacted context]\n\n";
 
 #[derive(Debug, Clone, Copy)]
@@ -532,6 +535,12 @@ impl ResponsesStreamDecoder {
             return;
         }
 
+        // Use `MessageId::new` explicitly rather than `unwrap_or_default`: the
+        // intent here is "mint a fresh unique id", not "fall back to whatever
+        // Default happens to produce". Default currently delegates to `new`,
+        // but binding us to that would make changing Default (e.g. to `""`) a
+        // silent correctness regression. (finding M23)
+        #[allow(clippy::unwrap_or_default)]
         let message_id = self.message_id.clone().unwrap_or_else(|| {
             message_id
                 .filter(|id| is_responses_message_item_id(id))
@@ -541,7 +550,7 @@ impl ResponsesStreamDecoder {
                         .as_deref()
                         .map(synthesized_responses_message_id)
                 })
-                .unwrap_or_default()
+                .unwrap_or_else(MessageId::new)
         });
         self.message_id = Some(message_id.clone());
         self.started = true;
@@ -1571,9 +1580,13 @@ fn response_failure_message(response: &Response) -> String {
 }
 
 fn tool_item_key(item_id: Option<&str>, output_index: u32) -> String {
+    // The synthesized prefix starts with `__halter_synth__` — a sentinel that
+    // OpenAI item ids can never match (real ids are `fc_...`/`msg_...`). This
+    // guarantees no collision if a later event arrives with a real id whose
+    // string happens to equal `output_index:N`.
     item_id
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("output_index:{output_index}"))
+        .unwrap_or_else(|| format!("__halter_synth__:output_index:{output_index}"))
 }
 
 #[cfg(test)]

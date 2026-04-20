@@ -129,12 +129,17 @@ fn build_glob_matcher(pattern: &str) -> anyhow::Result<GlobSet> {
 }
 
 fn matches_file_type(file_type: std::fs::FileType, expected: Option<&str>) -> bool {
+    // Unknown variants are rejected (return false) rather than panicking on
+    // `unreachable!`. Schema validation should have rejected the input
+    // upstream, but treating this as a soft rejection means a schema
+    // regression produces an empty result set instead of a runtime abort.
+    // (finding L32)
     match expected {
         None => true,
         Some("file") => file_type.is_file(),
         Some("dir") => file_type.is_dir(),
         Some("symlink") => file_type.is_symlink(),
-        Some(other) => unreachable!("schema already constrained file_type: {other}"),
+        Some(_) => false,
     }
 }
 

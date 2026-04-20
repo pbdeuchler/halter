@@ -31,6 +31,15 @@ impl JsonHttpClient {
 }
 
 impl JsonHttpClient {
+    /// Posts a JSON body and buffers the entire response into memory as a
+    /// `String` before decoding. Suitable for small unary endpoints
+    /// (Anthropic messages, OpenAI non-streaming responses) where the full
+    /// payload is bounded by the provider's per-request output cap.
+    ///
+    /// **Do not use for streaming endpoints** — it fully consumes the
+    /// response before returning, defeating SSE/chunked transport. Use
+    /// `ResponsesTransport` (or an Anthropic-equivalent streaming client)
+    /// for token-by-token delivery. (finding M26)
     pub(crate) async fn post_json(
         &self,
         request: JsonRequest,

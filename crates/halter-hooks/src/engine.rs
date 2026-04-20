@@ -254,22 +254,22 @@ pub struct ConfiguredHandler {
 }
 
 impl ConfiguredHandler {
+    /// Single-pass match: the regex matcher must hit (or be absent) and the
+    /// `if` expression must evaluate true (or be absent). Collapsed from two
+    /// methods to one chained expression (finding L19).
     fn matches(&self, request: &HookDispatchRequest) -> bool {
-        if !self.matches_matcher(request.matcher_value.as_deref()) {
-            return false;
-        }
-
-        self.if_condition
-            .as_deref()
-            .is_none_or(|condition| matches_if_condition(condition, request))
-    }
-
-    fn matches_matcher(&self, candidate: Option<&str>) -> bool {
-        match (&self.matcher, self.event_name.matcher_field()) {
-            (Some(matcher), Some(_)) => candidate.is_some_and(|value| matcher.is_match(value)),
-            (Some(_), None) => true,
-            (None, _) => true,
-        }
+        let matcher_hit = match (&self.matcher, self.event_name.matcher_field()) {
+            (Some(matcher), Some(_)) => request
+                .matcher_value
+                .as_deref()
+                .is_some_and(|value| matcher.is_match(value)),
+            (Some(_), None) | (None, _) => true,
+        };
+        matcher_hit
+            && self
+                .if_condition
+                .as_deref()
+                .is_none_or(|condition| matches_if_condition(condition, request))
     }
 }
 

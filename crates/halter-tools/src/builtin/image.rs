@@ -10,8 +10,7 @@ use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, T
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
-#[allow(deprecated)]
-use image::{DynamicImage, ImageOutputFormat, io::Reader as ImageReader};
+use image::{DynamicImage, ImageFormat as ImageCrateFormat, io::Reader as ImageReader};
 use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext};
@@ -245,9 +244,7 @@ fn render_output(
 fn encode_image(image: &DynamicImage, format: ImageFormat, quality: u8) -> anyhow::Result<Vec<u8>> {
     let mut buffer = Vec::new();
     match format {
-        ImageFormat::Png => {
-            image.write_to(&mut Cursor::new(&mut buffer), ImageOutputFormat::Png)?
-        }
+        ImageFormat::Png => image.write_to(&mut Cursor::new(&mut buffer), ImageCrateFormat::Png)?,
         ImageFormat::Jpeg => {
             let encoder = JpegEncoder::new_with_quality(&mut buffer, quality);
             image.write_with_encoder(encoder)?;
@@ -256,9 +253,7 @@ fn encode_image(image: &DynamicImage, format: ImageFormat, quality: u8) -> anyho
             let encoder = WebPEncoder::new_lossless(&mut buffer);
             image.write_with_encoder(encoder)?;
         }
-        ImageFormat::Gif => {
-            image.write_to(&mut Cursor::new(&mut buffer), ImageOutputFormat::Gif)?
-        }
+        ImageFormat::Gif => image.write_to(&mut Cursor::new(&mut buffer), ImageCrateFormat::Gif)?,
     }
     Ok(buffer)
 }

@@ -41,7 +41,7 @@ impl Tool for GrepTool {
                     "max_matches": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Maximum number of matches to return (default: 100)"
+                        "description": format!("Maximum number of matches to return (default: {DEFAULT_MAX_MATCHES})"),
                     },
                     "offset": { "type": "integer", "minimum": 0 },
                     "max_columns": { "type": "integer", "minimum": 1 },

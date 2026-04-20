@@ -62,37 +62,67 @@ pub(super) fn resolve_language(
     })
 }
 
+/// Canonical extension-to-language aliases. Ordered roughly by expected
+/// frequency so the linear scan in `infer_language_from_path` hits common
+/// cases first. Using a const table with `eq_ignore_ascii_case` avoids the
+/// per-file `to_ascii_lowercase` allocation that the prior `match` required
+/// (finding L26).
+const EXTENSION_ALIASES: &[(&str, &str)] = &[
+    ("rs", "rust"),
+    ("ts", "typescript"),
+    ("cts", "typescript"),
+    ("mts", "typescript"),
+    ("tsx", "tsx"),
+    ("js", "javascript"),
+    ("cjs", "javascript"),
+    ("jsx", "javascript"),
+    ("mjs", "javascript"),
+    ("py", "python"),
+    ("go", "go"),
+    ("rb", "ruby"),
+    ("java", "java"),
+    ("kt", "kotlin"),
+    ("kts", "kotlin"),
+    ("swift", "swift"),
+    ("scala", "scala"),
+    ("sc", "scala"),
+    ("c", "c"),
+    ("h", "c"),
+    ("cc", "cpp"),
+    ("cp", "cpp"),
+    ("cpp", "cpp"),
+    ("cxx", "cpp"),
+    ("hh", "cpp"),
+    ("hpp", "cpp"),
+    ("hxx", "cpp"),
+    ("cs", "csharp"),
+    ("css", "css"),
+    ("ex", "elixir"),
+    ("exs", "elixir"),
+    ("hs", "haskell"),
+    ("hcl", "hcl"),
+    ("tf", "hcl"),
+    ("tfvars", "hcl"),
+    ("htm", "html"),
+    ("html", "html"),
+    ("json", "json"),
+    ("lua", "lua"),
+    ("nix", "nix"),
+    ("php", "php"),
+    ("sh", "bash"),
+    ("bash", "bash"),
+    ("zsh", "bash"),
+    ("sol", "solidity"),
+    ("yaml", "yaml"),
+    ("yml", "yaml"),
+];
+
 pub(super) fn infer_language_from_path(path: &Path) -> Option<SupportLang> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    let alias = match extension.as_str() {
-        "sh" | "bash" | "zsh" => "bash",
-        "c" | "h" => "c",
-        "cc" | "cp" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => "cpp",
-        "cs" => "csharp",
-        "css" => "css",
-        "ex" | "exs" => "elixir",
-        "go" => "go",
-        "hs" => "haskell",
-        "hcl" | "tf" | "tfvars" => "hcl",
-        "htm" | "html" => "html",
-        "java" => "java",
-        "cjs" | "js" | "jsx" | "mjs" => "javascript",
-        "json" => "json",
-        "kt" | "kts" => "kotlin",
-        "lua" => "lua",
-        "nix" => "nix",
-        "php" => "php",
-        "py" => "python",
-        "rb" => "ruby",
-        "rs" => "rust",
-        "scala" | "sc" => "scala",
-        "sol" => "solidity",
-        "swift" => "swift",
-        "tsx" => "tsx",
-        "cts" | "mts" | "ts" => "typescript",
-        "yaml" | "yml" => "yaml",
-        _ => return None,
-    };
+    let extension = path.extension()?.to_str()?;
+    let alias = EXTENSION_ALIASES
+        .iter()
+        .find(|(candidate, _)| extension.eq_ignore_ascii_case(candidate))
+        .map(|(_, alias)| *alias)?;
     resolve_explicit_language(alias).ok()
 }
 

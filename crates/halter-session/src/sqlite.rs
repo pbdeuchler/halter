@@ -44,6 +44,21 @@ CREATE TABLE events (
 "#,
 )];
 
+// Compile-time guarantee that MIGRATIONS is sorted by strictly increasing
+// version. run_migrations skips any entry whose version is <= the current
+// schema version, so an unsorted table would silently drop migrations.
+// (finding L15)
+const _: () = {
+    let mut i = 1;
+    while i < MIGRATIONS.len() {
+        assert!(
+            MIGRATIONS[i - 1].0 < MIGRATIONS[i].0,
+            "MIGRATIONS must be strictly monotonic in version"
+        );
+        i += 1;
+    }
+};
+
 pub struct SqliteSessionStore {
     connection: Arc<Mutex<Connection>>,
 }
@@ -583,6 +598,18 @@ fn unix_timestamp_seconds() -> Result<i64> {
     i64::try_from(duration.as_secs()).context("failed to convert unix timestamp to i64")
 }
 
+/// Resolves the default sqlite session-store path.
+///
+/// Precedence (all platforms):
+/// 1. `$XDG_DATA_HOME/halter/sessions.db` if `XDG_DATA_HOME` is set and
+///    non-empty. This is checked **before** platform-native fallbacks, so a
+///    developer who exports `XDG_DATA_HOME` globally on Windows will see the
+///    XDG path used instead of `%LOCALAPPDATA%`. This is intentional —
+///    cross-platform dotfile/portable-install workflows benefit from a
+///    single consistent override. (finding M27)
+/// 2. Platform fallback:
+///    - Windows: `%LOCALAPPDATA%/halter/sessions.db`
+///    - Unix:    `$HOME/.local/share/halter/sessions.db`
 fn default_db_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path).join("halter").join("sessions.db"));

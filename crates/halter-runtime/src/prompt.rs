@@ -102,9 +102,13 @@ impl PromptAssembler for DefaultPromptAssembler {
 }
 
 fn render_message(message: &Message) -> String {
-    match message {
-        Message::System(message) => format!("system: {}", message.text),
-        Message::User(message) => format!("user: {}", message.plain_text()),
+    // Length-prefixed framing keeps rendered output unambiguous even when
+    // payloads contain literal role labels like "assistant:". Hashes or
+    // prompt-cache keys derived from rendered text cannot be spoofed by an
+    // attacker-controlled body that embeds a delimiter.
+    let (role, body) = match message {
+        Message::System(message) => ("system", message.text.clone()),
+        Message::User(message) => ("user", message.plain_text()),
         Message::Assistant(message) => {
             let body = message
                 .parts
@@ -118,14 +122,18 @@ fn render_message(message: &Message) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("assistant: {body}")
+            ("assistant", body)
         }
-        Message::Tool(message) => match &message.content {
-            halter_protocol::ToolResult::Empty => "tool: <empty>".to_owned(),
-            halter_protocol::ToolResult::Text { text } => format!("tool: {text}"),
-            halter_protocol::ToolResult::Json { value } => format!("tool: {value}"),
-        },
-    }
+        Message::Tool(message) => (
+            "tool",
+            match &message.content {
+                halter_protocol::ToolResult::Empty => "<empty>".to_owned(),
+                halter_protocol::ToolResult::Text { text } => text.clone(),
+                halter_protocol::ToolResult::Json { value } => value.to_string(),
+            },
+        ),
+    };
+    format!("[{role}:{} bytes]\n{body}", body.len())
 }
 
 fn hash_prompt_text(text: &str) -> ContentHash {

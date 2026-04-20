@@ -608,11 +608,10 @@ fn collect_entries(
         {
             return Ok(Vec::new());
         }
-        let display_path = search_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| search_root.to_string_lossy().into_owned());
+        // Use the full path (lossy-decoded) rather than just the file name so
+        // two searches against same-basename files in different directories
+        // produce distinguishable responses (finding M38).
+        let display_path = search_root.to_string_lossy().into_owned();
         return Ok(vec![FileEntry {
             absolute_path: search_root.to_path_buf(),
             display_path,
@@ -882,16 +881,16 @@ fn build_response(result: AggregateResult, config: &SearchConfig) -> Value {
 }
 
 fn build_content_response(result: AggregateResult, config: &SearchConfig) -> Value {
-    let mut skipped = 0u64;
+    // Offset is applied upstream: in the sequential path via
+    // `file_offset` passed into `SearchParams`, and in the parallel path
+    // by the `config.offset == 0` gate at the entry point. The emitted
+    // matches here are already post-offset, so only `max_matches`
+    // bounding is needed at this layer.
     let mut emitted = 0u64;
     let mut matches = Vec::new();
 
     'files: for file in &result.files {
         for matched in &file.matches {
-            if skipped < config.offset {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
             if emitted >= config.max_matches {
                 break 'files;
             }

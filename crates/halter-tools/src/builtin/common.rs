@@ -1,4 +1,8 @@
-// pattern: Imperative Shell
+// pattern: Functional Core
+//
+// This module holds pure helpers (input parsing, path resolution, ToolScope
+// RAII). The only side-effecting path — atomic_write_blocking — is scoped to
+// tmpfile + rename, not general I/O. (finding L30)
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

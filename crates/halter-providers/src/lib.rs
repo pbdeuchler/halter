@@ -1,4 +1,11 @@
-// pattern: Functional Core
+// pattern: Crate Boundary
+//
+// This file is the `halter-providers` crate root. It declares modules and
+// re-exports the public `Provider` trait + provider constructors. The trait
+// declaration is neither a "functional core" nor an "imperative shell"
+// (finding L9) — those labels apply to the concrete provider impls (e.g.
+// `anthropic_codec.rs` = Functional Core, `responses_transport.rs` =
+// Imperative Shell).
 
 mod anthropic;
 mod anthropic_codec;

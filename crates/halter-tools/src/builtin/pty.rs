@@ -57,6 +57,21 @@ fn pty_scrubbed_env(
     out
 }
 
+/// Reads a `u16` pty dimension from `input[key]`, falling back to `default`
+/// when unset. Rejects values that do not fit in `u16` instead of silently
+/// truncating via `as u16`. (finding L29)
+fn checked_u16(input: &Value, key: &str, default: u16) -> anyhow::Result<u16> {
+    let Some(raw) = optional_u64(input, key)? else {
+        return Ok(default);
+    };
+    u16::try_from(raw).map_err(|_| {
+        anyhow::anyhow!(
+            "failed to execute pty tool: '{key}' must fit in u16 (<= {}), got {raw}",
+            u16::MAX
+        )
+    })
+}
+
 pub struct PtySessionHandle {
     control_tx: mpsc::Sender<ControlMessage>,
 }
@@ -131,15 +146,15 @@ impl Tool for PtyTool {
                     cwd: optional_string(&input, "cwd").map(ToOwned::to_owned),
                     env: parse_env_map(input.get("env"))?,
                     timeout: optional_u64(&input, "timeout_ms")?.map(Duration::from_millis),
-                    cols: optional_u64(&input, "cols")?.unwrap_or(120) as u16,
-                    rows: optional_u64(&input, "rows")?.unwrap_or(40) as u16,
+                    cols: checked_u16(&input, "cols", 120)?,
+                    rows: checked_u16(&input, "rows", 40)?,
                 };
                 let mode = context.policy.shell_mode();
                 context
                     .policy
                     .check_shell_command_strict(&config.command, mode)
                     .await?;
-                start_session(session, config, context.emit.clone());
+                start_session(session, config, context.emit.clone()).await?;
                 Ok(ToolResult::Json {
                     value: json!({ "started": true }),
                 })
@@ -152,8 +167,8 @@ impl Tool for PtyTool {
                 })
             }
             "resize" => {
-                let cols = optional_u64(&input, "cols")?.unwrap_or(120) as u16;
-                let rows = optional_u64(&input, "rows")?.unwrap_or(40) as u16;
+                let cols = checked_u16(&input, "cols", 120)?;
+                let rows = checked_u16(&input, "rows", 40)?;
                 send_control(&session, ControlMessage::Resize { cols, rows })?;
                 Ok(ToolResult::Json {
                     value: json!({ "ok": true }),
@@ -170,21 +185,44 @@ impl Tool for PtyTool {
     }
 }
 
-fn start_session(
+async fn start_session(
     session: Arc<Mutex<Option<PtySessionHandle>>>,
     config: PtyConfig,
     emit: Arc<dyn crate::ToolEventSink>,
-) {
+) -> anyhow::Result<()> {
     let (control_tx, control_rx) = mpsc::channel();
-    {
-        let mut guard = session.lock();
-        *guard = Some(PtySessionHandle { control_tx });
-    }
+    // Use a one-shot blocking channel to surface the spawn result
+    // synchronously back to the async caller (finding M40). The blocking
+    // task first opens the pty + spawns the child; only on success does it
+    // publish the session handle and enter the event loop.
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(1);
+    let session_for_task = Arc::clone(&session);
+    tokio::task::spawn_blocking(move || {
+        let state = match prepare_pty(&config) {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        };
+        {
+            let mut guard = session_for_task.lock();
+            *guard = Some(PtySessionHandle { control_tx });
+        }
+        let _ = ready_tx.send(Ok(()));
+        let _ = run_pty_loop(state, config.timeout, control_rx, emit);
+        *session_for_task.lock() = None;
+    });
 
     tokio::task::spawn_blocking(move || {
-        let _ = run_pty(config, control_rx, emit);
-        *session.lock() = None;
-    });
+        ready_rx.recv().unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "pty tool: spawn task dropped ready channel"
+            ))
+        })
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("failed to execute pty tool: spawn await failed: {err}"))?
 }
 
 fn send_control(
@@ -201,11 +239,16 @@ fn send_control(
         .map_err(|_| anyhow::anyhow!("failed to execute pty tool: PTY session is unavailable"))
 }
 
-fn run_pty(
-    config: PtyConfig,
-    control_rx: mpsc::Receiver<ControlMessage>,
-    emit: Arc<dyn crate::ToolEventSink>,
-) -> anyhow::Result<()> {
+struct PtyRunState {
+    child: Box<dyn Child + Send + Sync>,
+    child_pid: Option<i32>,
+    process_group: Option<i32>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+fn prepare_pty(config: &PtyConfig) -> anyhow::Result<PtyRunState> {
     let system = native_pty_system();
     let pair = system.openpty(PtySize {
         rows: config.rows,
@@ -227,15 +270,37 @@ fn run_pty(
         command.env(key, value);
     }
 
-    let mut child = pair.slave.spawn_command(command)?;
+    let child = pair.slave.spawn_command(command)?;
     let child_pid = child.process_id().map(|pid| pid as i32);
     let process_group = child_pid.and_then(process_group_id);
 
     let reader = pair.master.try_clone_reader()?;
-    let mut writer = pair.master.take_writer()?;
-    let master = pair.master;
+    let writer = pair.master.take_writer()?;
+    Ok(PtyRunState {
+        child,
+        child_pid,
+        process_group,
+        reader,
+        writer,
+        master: pair.master,
+    })
+}
+
+fn run_pty_loop(
+    state: PtyRunState,
+    timeout: Option<Duration>,
+    control_rx: mpsc::Receiver<ControlMessage>,
+    emit: Arc<dyn crate::ToolEventSink>,
+) -> anyhow::Result<()> {
+    let PtyRunState {
+        mut child,
+        child_pid,
+        process_group,
+        reader,
+        mut writer,
+        master,
+    } = state;
     let start = Instant::now();
-    let timeout = config.timeout;
     let (reader_tx, reader_rx) = mpsc::channel();
     let reader_thread = spawn_reader_thread(reader, reader_tx);
     let mut reader_closed = false;

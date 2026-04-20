@@ -125,7 +125,10 @@ pub fn get_work_profile_for_session(last_seconds: f64, session_id: Option<&str>)
         folded,
         summary,
         total_ms: total_us as f64 / 1000.0,
-        sample_count: samples.len() as u32,
+        // Saturating cast: sample counts above u32::MAX are not actionable
+        // downstream, but silent truncation would hide a runaway buffer.
+        // Saturate and let the caller see a pinned ceiling. (finding L27)
+        sample_count: u32::try_from(samples.len()).unwrap_or(u32::MAX),
     }
 }
 
