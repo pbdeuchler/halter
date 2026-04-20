@@ -202,7 +202,6 @@ impl HalterBuilder {
             )),
             event_bus: Arc::new(EventBus::default()),
             turn_registry: Arc::new(halter_runtime::TurnRegistry::new()),
-            max_tool_output_bytes: config.policy.max_tool_output_bytes,
             shell_timeout_secs: config.policy.shell.timeout_secs,
         });
         let runtime = SessionRuntime::new(services.clone());
@@ -503,7 +502,6 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
     PolicySettings {
         allowed_write_roots: config.allowed_write_roots.clone(),
         max_read_bytes: config.max_read_bytes,
-        max_tool_output_bytes: config.max_tool_output_bytes,
         shell_enabled: config.shell.enabled,
         allowed_shell_commands: config.shell.allow.clone(),
         shell_timeout_secs: config.shell.timeout_secs,

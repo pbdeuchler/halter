@@ -307,7 +307,6 @@ Example:
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 262144
 max_subagent_depth = 3
 max_concurrent_subagents = 8
 
@@ -325,7 +324,6 @@ Defaults:
 
 - `allowed_write_roots = [".", "/tmp/halter"]`
 - `max_read_bytes = 1_048_576`
-- `max_tool_output_bytes = 262_144`
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
 - shell enabled by default
@@ -335,7 +333,6 @@ Defaults:
 Validation rules include:
 
 - `max_read_bytes > 0`
-- `max_tool_output_bytes > 0`
 
 ---
 
@@ -599,7 +596,6 @@ enabled = [
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 262144
 max_subagent_depth = 3
 max_concurrent_subagents = 8
 
@@ -630,7 +626,6 @@ reasoning = "medium"
 [policy]
 allowed_write_roots = ["./"]
 max_read_bytes = 524288
-max_tool_output_bytes = 131072
 max_subagent_depth = 2
 max_concurrent_subagents = 4
 

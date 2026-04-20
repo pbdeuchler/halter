@@ -908,7 +908,6 @@ mod tests {
             context_manager: Arc::new(DefaultContextManager::default()),
             event_bus: Arc::new(EventBus::default()),
             turn_registry: Arc::new(crate::TurnRegistry::new()),
-            max_tool_output_bytes: 262_144,
             shell_timeout_secs: 30,
         })
     }

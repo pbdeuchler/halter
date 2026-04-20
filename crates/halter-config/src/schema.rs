@@ -74,10 +74,6 @@ impl HarnessConfig {
             validate_model_config("models.subagent", model)?;
         }
 
-        if self.policy.max_tool_output_bytes == 0 {
-            anyhow::bail!("invalid configuration: max_tool_output_bytes must be greater than zero");
-        }
-
         if self.policy.max_read_bytes == 0 {
             anyhow::bail!("invalid configuration: max_read_bytes must be greater than zero");
         }
@@ -430,8 +426,6 @@ pub struct PolicyConfig {
     pub allowed_write_roots: Vec<PathBuf>,
     #[serde(default = "default_max_read_bytes")]
     pub max_read_bytes: usize,
-    #[serde(default = "default_max_tool_output_bytes")]
-    pub max_tool_output_bytes: usize,
     #[serde(default = "default_max_subagent_depth")]
     pub max_subagent_depth: u32,
     #[serde(default = "default_max_concurrent_subagents")]
@@ -447,7 +441,6 @@ impl Default for PolicyConfig {
         Self {
             allowed_write_roots: default_write_roots(),
             max_read_bytes: default_max_read_bytes(),
-            max_tool_output_bytes: default_max_tool_output_bytes(),
             max_subagent_depth: default_max_subagent_depth(),
             max_concurrent_subagents: default_max_concurrent_subagents(),
             shell: ShellPolicyConfig::default(),
@@ -462,10 +455,6 @@ fn default_write_roots() -> Vec<PathBuf> {
 
 const fn default_max_read_bytes() -> usize {
     1_048_576
-}
-
-const fn default_max_tool_output_bytes() -> usize {
-    262_144
 }
 
 const fn default_max_subagent_depth() -> u32 {

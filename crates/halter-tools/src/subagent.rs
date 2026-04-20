@@ -420,13 +420,11 @@ mod tests {
             working_dir: ".".into(),
             path_locks: Arc::new(crate::PathLockMap::default()),
             tool_sessions: Arc::new(crate::ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
                 as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: Some(Arc::new(SubagentParentContext {
                 blueprint: SessionBlueprint {
@@ -483,13 +481,11 @@ mod tests {
             working_dir: ".".into(),
             path_locks: Arc::new(crate::PathLockMap::default()),
             tool_sessions: Arc::new(crate::ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
                 as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: None,
         };
@@ -515,13 +511,11 @@ mod tests {
             working_dir: ".".into(),
             path_locks: Arc::new(crate::PathLockMap::default()),
             tool_sessions: Arc::new(crate::ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
                 as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: Some(Arc::new(SubagentParentContext {
                 blueprint: SessionBlueprint {
@@ -568,13 +562,11 @@ mod tests {
             working_dir: ".".into(),
             path_locks: Arc::new(crate::PathLockMap::default()),
             tool_sessions: Arc::new(crate::ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
                 as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: Some(Arc::new(SubagentParentContext {
                 blueprint: SessionBlueprint {
