@@ -21,7 +21,10 @@ use crate::codec_common::{
     tool_result_text, user_text,
 };
 
-const RESPONSES_ITEM_ID_MAX_LEN: usize = 64;
+// Alias the consolidated PROVIDER_ID_MAX_LEN from codec_common (finding L14).
+// Kept as a named alias because the local sites read more clearly with the
+// responses-item-specific identifier at the callsite.
+const RESPONSES_ITEM_ID_MAX_LEN: usize = crate::codec_common::PROVIDER_ID_MAX_LEN;
 const COMPACTED_CONTEXT_PREFIX: &str = "[Compacted context]\n\n";
 
 #[derive(Debug, Clone, Copy)]

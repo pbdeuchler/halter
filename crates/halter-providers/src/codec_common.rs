@@ -7,7 +7,12 @@ use halter_protocol::{
 };
 use sha2::{Digest, Sha256};
 
-const DEFAULT_PROVIDER_ID_MAX_LEN: usize = 64;
+/// Max byte length shared by all provider-facing identifier aliases (tool
+/// call ids, Responses item ids, etc.). Previously split into
+/// `DEFAULT_PROVIDER_ID_MAX_LEN` here and `RESPONSES_ITEM_ID_MAX_LEN` in
+/// `openai_codec.rs`; both were `64` (finding L14), so consolidate.
+pub(crate) const PROVIDER_ID_MAX_LEN: usize = 64;
+const DEFAULT_PROVIDER_ID_MAX_LEN: usize = PROVIDER_ID_MAX_LEN;
 
 pub(crate) fn collect_system_text(request: &ProviderRequest) -> Option<String> {
     let mut sections = Vec::new();

@@ -88,13 +88,18 @@ pub struct HookSpecificOutput {
     pub additional_context: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+/// Variants ordered **least-restrictive first** so the derived `Ord` matches
+/// the semantic "strength" of the decision: `Passthrough < Allow < Ask < Deny`.
+/// Merging two outputs picks the stronger decision with `.max(...)` rather
+/// than a hand-rolled rank table (finding L16). Serde uses variant names
+/// (snake_case), not declaration position, so the reordering is safe.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
-    Deny,
-    Ask,
-    Allow,
     Passthrough,
+    Allow,
+    Ask,
+    Deny,
 }
 
 pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConflict>) {
@@ -142,8 +147,7 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
                 .as_ref()
                 .and_then(|output| non_empty(output.permission_decision_reason.clone()));
             match &winning_permission {
-                Some((current, _, _))
-                    if permission_rank(*current) >= permission_rank(permission_decision) => {}
+                Some((current, _, _)) if *current >= permission_decision => {}
                 _ => {
                     winning_permission = Some((
                         permission_decision,
@@ -273,15 +277,6 @@ pub fn summary_entries(output: &HookOutput) -> Vec<HookOutputEntry> {
         });
     }
     entries
-}
-
-fn permission_rank(value: PermissionDecision) -> u8 {
-    match value {
-        PermissionDecision::Passthrough => 0,
-        PermissionDecision::Allow => 1,
-        PermissionDecision::Ask => 2,
-        PermissionDecision::Deny => 3,
-    }
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {

@@ -146,10 +146,10 @@ pub(super) fn run(
                     text: matched.text().into_owned(),
                     byte_start: range.start as u64,
                     byte_end: range.end as u64,
-                    start_line: start.line().saturating_add(1) as u64,
-                    start_column: start.column(matched.get_node()).saturating_add(1) as u64,
-                    end_line: end.line().saturating_add(1) as u64,
-                    end_column: end.column(matched.get_node()).saturating_add(1) as u64,
+                    start_line: one_based(start.line()),
+                    start_column: one_based(start.column(matched.get_node())),
+                    end_line: one_based(end.line()),
+                    end_column: one_based(end.column(matched.get_node())),
                     meta_variables: config
                         .include_meta
                         .then(|| HashMap::<String, String>::from(matched.get_env().clone())),
@@ -195,6 +195,13 @@ pub(super) fn run(
         "limit_reached": limit_reached,
         "parse_errors": (!parse_errors.is_empty()).then_some(parse_errors),
     }))
+}
+
+/// Converts an `ast-grep` zero-based line/column index to the one-based
+/// representation used downstream. Extracted to replace four copies of
+/// `.saturating_add(1) as u64` (finding L35).
+fn one_based(zero_based: usize) -> u64 {
+    (zero_based.saturating_add(1)) as u64
 }
 
 fn compile_pattern(

@@ -146,21 +146,18 @@ impl SpawnAgentTool {
 #[async_trait]
 impl Tool for SpawnAgentTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from("spawn_agent"),
-            description:
-                "Spawn a child session to work on a delegated task. Omit agent_type to use the default child session. If you set model, use a registered model id such as default, small, or subagent, not a provider model name."
-                    .to_owned(),
-            input_schema: self.input_schema(),
-            concurrency: ToolConcurrency::Exclusive,
-            capabilities: ToolCapabilities {
-                mutating: false,
-                requires_approval: false,
-                cancellable: false,
-                long_running: false,
-            },
-            provider_aliases: Default::default(),
-        }
+        subagent_spec(
+            "spawn_agent",
+            "Spawn a child session to work on a delegated task. Omit agent_type to use the default child session. If you set model, use a registered model id such as default, small, or subagent, not a provider model name.",
+            self.input_schema(),
+            ToolConcurrency::Exclusive,
+            // long_running=true: spawning a child session can involve
+            // provider handshakes and blueprint resolution that take
+            // seconds, not milliseconds. Previously flagged false, which
+            // caused the runtime to apply short-tool-timeout semantics to
+            // spawn_agent. (finding L34)
+            subagent_capabilities(true),
+        )
     }
 
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
@@ -195,10 +192,10 @@ impl SendInputTool {
 #[async_trait]
 impl Tool for SendInputTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from("send_input"),
-            description: "Send a follow-up task to an existing child session".to_owned(),
-            input_schema: json!({
+        subagent_spec(
+            "send_input",
+            "Send a follow-up task to an existing child session",
+            json!({
                 "type": "object",
                 "properties": {
                     "target": { "type": "string" },
@@ -206,15 +203,9 @@ impl Tool for SendInputTool {
                 },
                 "required": ["target", "message"],
             }),
-            concurrency: ToolConcurrency::Exclusive,
-            capabilities: ToolCapabilities {
-                mutating: false,
-                requires_approval: false,
-                cancellable: false,
-                long_running: false,
-            },
-            provider_aliases: Default::default(),
-        }
+            ToolConcurrency::Exclusive,
+            subagent_capabilities(false),
+        )
     }
 
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
@@ -244,11 +235,10 @@ impl WaitAgentTool {
 #[async_trait]
 impl Tool for WaitAgentTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from("wait_agent"),
-            description: "Wait for one of the target child sessions to reach a terminal state"
-                .to_owned(),
-            input_schema: json!({
+        subagent_spec(
+            "wait_agent",
+            "Wait for one of the target child sessions to reach a terminal state",
+            json!({
                 "type": "object",
                 "properties": {
                     "targets": {
@@ -259,15 +249,9 @@ impl Tool for WaitAgentTool {
                 },
                 "required": ["targets"],
             }),
-            concurrency: ToolConcurrency::ReadOnly,
-            capabilities: ToolCapabilities {
-                mutating: false,
-                requires_approval: false,
-                cancellable: false,
-                long_running: true,
-            },
-            provider_aliases: Default::default(),
-        }
+            ToolConcurrency::ReadOnly,
+            subagent_capabilities(true),
+        )
     }
 
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
@@ -297,26 +281,19 @@ impl CloseAgentTool {
 #[async_trait]
 impl Tool for CloseAgentTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from("close_agent"),
-            description: "Close an existing child session and stop accepting follow-up input"
-                .to_owned(),
-            input_schema: json!({
+        subagent_spec(
+            "close_agent",
+            "Close an existing child session and stop accepting follow-up input",
+            json!({
                 "type": "object",
                 "properties": {
                     "target": { "type": "string" }
                 },
                 "required": ["target"],
             }),
-            concurrency: ToolConcurrency::Exclusive,
-            capabilities: ToolCapabilities {
-                mutating: false,
-                requires_approval: false,
-                cancellable: false,
-                long_running: false,
-            },
-            provider_aliases: Default::default(),
-        }
+            ToolConcurrency::Exclusive,
+            subagent_capabilities(false),
+        )
     }
 
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
@@ -329,6 +306,37 @@ impl Tool for CloseAgentTool {
             value: serde_json::to_value(response)
                 .context("failed to execute close_agent tool: invalid response payload")?,
         })
+    }
+}
+
+/// Shared ToolSpec builder for the subagent tools. The four tools differ
+/// only in name, description, input_schema, concurrency, and long_running,
+/// so centralizing the scaffolding here (finding M45) removes four
+/// near-identical ToolSpec blocks and keeps their shared flags
+/// (mutating=false, approval=false, cancellable=false) in one place.
+fn subagent_spec(
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
+    concurrency: ToolConcurrency,
+    capabilities: ToolCapabilities,
+) -> ToolSpec {
+    ToolSpec {
+        name: ToolName::from(name),
+        description: description.to_owned(),
+        input_schema,
+        concurrency,
+        capabilities,
+        provider_aliases: Default::default(),
+    }
+}
+
+fn subagent_capabilities(long_running: bool) -> ToolCapabilities {
+    ToolCapabilities {
+        mutating: false,
+        requires_approval: false,
+        cancellable: false,
+        long_running,
     }
 }
 

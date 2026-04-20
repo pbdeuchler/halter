@@ -57,6 +57,21 @@ fn pty_scrubbed_env(
     out
 }
 
+/// Reads a `u16` pty dimension from `input[key]`, falling back to `default`
+/// when unset. Rejects values that do not fit in `u16` instead of silently
+/// truncating via `as u16`. (finding L29)
+fn checked_u16(input: &Value, key: &str, default: u16) -> anyhow::Result<u16> {
+    let Some(raw) = optional_u64(input, key)? else {
+        return Ok(default);
+    };
+    u16::try_from(raw).map_err(|_| {
+        anyhow::anyhow!(
+            "failed to execute pty tool: '{key}' must fit in u16 (<= {}), got {raw}",
+            u16::MAX
+        )
+    })
+}
+
 pub struct PtySessionHandle {
     control_tx: mpsc::Sender<ControlMessage>,
 }
@@ -131,8 +146,8 @@ impl Tool for PtyTool {
                     cwd: optional_string(&input, "cwd").map(ToOwned::to_owned),
                     env: parse_env_map(input.get("env"))?,
                     timeout: optional_u64(&input, "timeout_ms")?.map(Duration::from_millis),
-                    cols: optional_u64(&input, "cols")?.unwrap_or(120) as u16,
-                    rows: optional_u64(&input, "rows")?.unwrap_or(40) as u16,
+                    cols: checked_u16(&input, "cols", 120)?,
+                    rows: checked_u16(&input, "rows", 40)?,
                 };
                 let mode = context.policy.shell_mode();
                 context
@@ -152,8 +167,8 @@ impl Tool for PtyTool {
                 })
             }
             "resize" => {
-                let cols = optional_u64(&input, "cols")?.unwrap_or(120) as u16;
-                let rows = optional_u64(&input, "rows")?.unwrap_or(40) as u16;
+                let cols = checked_u16(&input, "cols", 120)?;
+                let rows = checked_u16(&input, "rows", 40)?;
                 send_control(&session, ControlMessage::Resize { cols, rows })?;
                 Ok(ToolResult::Json {
                     value: json!({ "ok": true }),
