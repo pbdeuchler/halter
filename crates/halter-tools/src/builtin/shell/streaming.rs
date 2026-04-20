@@ -83,8 +83,15 @@ pub async fn collect_output(
                 Err(error) => {
                     let valid_up_to = error.valid_up_to();
                     if valid_up_to > 0 {
-                        let valid = str::from_utf8(&available[..valid_up_to])
-                            .expect("utf-8 error valid prefix must decode");
+                        let Some(valid_bytes) = available.get(..valid_up_to) else {
+                            anyhow::bail!(
+                                "shell streaming: invalid valid_up_to {valid_up_to} > available {}",
+                                available.len()
+                            );
+                        };
+                        let valid = str::from_utf8(valid_bytes).map_err(|err| {
+                            anyhow::anyhow!("shell streaming: valid prefix failed to decode: {err}")
+                        })?;
                         emit_chunk(&mut collected, &emit, tool_name, valid);
                         buffer.copy_within(valid_up_to..pending, 0);
                         pending -= valid_up_to;

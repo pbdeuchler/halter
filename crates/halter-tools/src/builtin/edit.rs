@@ -110,10 +110,13 @@ impl Tool for EditTool {
         })
         .await??;
 
+        let occurrences_in_file = result.0;
+        let replacements_applied = if replace_all { occurrences_in_file } else { 1 };
         Ok(ToolResult::Json {
             value: json!({
                 "path": canonical_path,
-                "matches_replaced": if replace_all { result.0 } else { 1 },
+                "occurrences_in_file": occurrences_in_file,
+                "replacements_applied": replacements_applied,
                 "file_hash_before": result.1,
                 "file_hash_after": result.2,
             }),
@@ -173,7 +176,8 @@ mod tests {
             panic!("expected json result");
         };
 
-        assert_eq!(value["matches_replaced"], 1);
+        assert_eq!(value["occurrences_in_file"], 1);
+        assert_eq!(value["replacements_applied"], 1);
         assert_eq!(std::fs::read_to_string(path).expect("read"), "hello there");
     }
 

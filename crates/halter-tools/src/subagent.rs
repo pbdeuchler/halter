@@ -107,11 +107,14 @@ impl SpawnAgentTool {
 
     fn normalize_request(
         &self,
-        mut request: SpawnSubagentRequest,
+        request: SpawnSubagentRequest,
     ) -> anyhow::Result<SpawnSubagentRequest> {
         if let Some(agent_type) = request.agent_type.as_ref() {
             if self.available_agent_types.is_empty() {
-                request.agent_type = None;
+                anyhow::bail!(
+                    "failed to execute spawn_agent tool: agent_type '{}' requested but no named agent roles are registered; omit agent_type to spawn the default child session",
+                    agent_type.0
+                );
             } else if !self
                 .available_agent_types
                 .iter()
@@ -499,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_ignores_agent_type_when_no_roles_are_loaded() {
+    async fn spawn_agent_rejects_agent_type_when_no_roles_are_loaded() {
         let control = Arc::new(RecordingSubagentControl::default());
         let tool = SpawnAgentTool::new(
             control.clone(),
@@ -535,19 +538,24 @@ mod tests {
             })),
         };
 
-        tool.execute(
-            context,
-            json!({
-                "message": "delegate this",
-                "agent_type": "general"
-            }),
-        )
-        .await
-        .expect("spawn succeeds");
+        let error = tool
+            .execute(
+                context,
+                json!({
+                    "message": "delegate this",
+                    "agent_type": "general"
+                }),
+            )
+            .await
+            .expect_err("agent_type without registered roles should fail");
 
+        assert!(
+            error
+                .to_string()
+                .contains("no named agent roles are registered")
+        );
         let requests = control.requests.lock().expect("requests");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].agent_type, None);
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]

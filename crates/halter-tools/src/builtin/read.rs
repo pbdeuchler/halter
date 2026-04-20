@@ -13,8 +13,8 @@ use crate::{Tool, ToolContext};
 
 use super::common::{ToolScope, ensure_not_cancelled, optional_u64, required_string, resolve_path};
 
-const DEFAULT_READ_LIMIT: u64 = 500;
 const MAX_READ_LIMIT: u64 = 500;
+const DEFAULT_READ_LIMIT: u64 = MAX_READ_LIMIT;
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug)]
@@ -32,7 +32,7 @@ impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("read"),
-            description: "Read up to 500 UTF-8 lines from disk".to_owned(),
+            description: format!("Read up to {MAX_READ_LIMIT} UTF-8 lines from disk"),
             input_schema: json!({
                 "type": "object",
                 "properties": {

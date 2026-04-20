@@ -153,7 +153,7 @@ pub(super) fn run(
 
             for matched in ast.root().find_all(compiled.clone()) {
                 ensure_not_cancelled(&cancel)?;
-                if changes.len() as u64 + file_changes.len() as u64 == config.max_replacements {
+                if changes.len() as u64 + file_changes.len() as u64 >= config.max_replacements {
                     limit_reached = true;
                     break 'rules;
                 }
@@ -275,10 +275,11 @@ fn apply_edits(content: &str, edits: &[Edit<String>]) -> anyhow::Result<String> 
     Ok(output)
 }
 
-#[allow(dead_code)]
+/// RAII holder for either a read or write path lock. Only used for its
+/// `Drop`, so variant payloads are intentionally never read.
 enum PathGuard {
-    Read(crate::builtin::fs_lock::PathReadGuard),
-    Write(crate::builtin::fs_lock::PathWriteGuard),
+    Read(#[allow(dead_code)] crate::builtin::fs_lock::PathReadGuard),
+    Write(#[allow(dead_code)] crate::builtin::fs_lock::PathWriteGuard),
 }
 
 #[cfg(all(test, feature = "ast-tools"))]

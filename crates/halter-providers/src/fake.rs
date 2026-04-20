@@ -67,12 +67,7 @@ impl Provider for FakeProvider {
         let message_id = MessageId::new();
         let block_id = BlockId::new();
         let reply = self.render_reply(&request);
-        let usage = Usage {
-            input_tokens: request.messages.len() as u64 * 8,
-            output_tokens: reply.split_whitespace().count() as u64,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
+        let usage = Usage::default();
         let events = vec![
             Ok(StreamEvent::MessageStart {
                 id: message_id.clone(),
@@ -121,12 +116,7 @@ impl Provider for FakeProvider {
                 "id": format!("cmp_{}", request.session_id.0),
                 "encrypted_content": summary,
             })],
-            usage: Usage {
-                input_tokens: (request.compacted_prefix.len() + request.messages.len()) as u64 * 8,
-                output_tokens: 8,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-            },
+            usage: Usage::default(),
         })
     }
 }
