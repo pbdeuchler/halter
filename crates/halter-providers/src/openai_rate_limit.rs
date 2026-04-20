@@ -18,6 +18,7 @@ use crate::openai_rate_limit_policy::{
     OpenAiWindowSnapshot, initial_token_window, parse_openai_reset_duration,
     parse_retry_after_duration, reconcile_rate_limit_snapshot, try_acquire_reservation,
 };
+use crate::secret::SecretString;
 
 const HEADER_LIMIT_REQUESTS: &str = "x-ratelimit-limit-requests";
 const HEADER_LIMIT_TOKENS: &str = "x-ratelimit-limit-tokens";
@@ -62,11 +63,11 @@ pub(crate) struct OpenAiRateLimitPermit {
 
 impl OpenAiRateLimiter {
     #[must_use]
-    pub(crate) fn new(api_key: &str, base_url: &str) -> Self {
+    pub(crate) fn new(api_key: &SecretString, base_url: &str) -> Self {
         Self {
             scope: OpenAiRateLimitScope {
                 base_url: base_url.trim_end_matches('/').to_owned(),
-                credential_fingerprint: fingerprint_api_key(api_key),
+                credential_fingerprint: fingerprint_api_key(api_key.expose_secret()),
             },
             registry: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -313,13 +314,7 @@ fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
 fn fingerprint_api_key(api_key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(api_key.as_bytes());
-    let digest = hasher.finalize();
-    let mut fingerprint = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut fingerprint, "{byte:02x}");
-    }
-    fingerprint
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -337,7 +332,7 @@ mod tests {
     // helpers ------------------------------------------------------------
 
     fn limiter(api_key: &str, base_url: &str) -> OpenAiRateLimiter {
-        OpenAiRateLimiter::new(api_key, base_url)
+        OpenAiRateLimiter::new(&SecretString::from(api_key), base_url)
     }
 
     fn small_reservation() -> OpenAiReservation {

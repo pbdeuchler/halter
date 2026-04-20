@@ -1178,7 +1178,13 @@ fn encode_responses_message_item_id(message_id: &MessageId) -> Option<String> {
 }
 
 fn is_responses_message_item_id(id: &str) -> bool {
-    id.starts_with("msg_")
+    let Some(rest) = id.strip_prefix("msg_") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
 }
 
 fn validate_responses_input_item_ids(input: &[Value]) -> anyhow::Result<()> {
@@ -1603,6 +1609,25 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn is_responses_message_item_id_rejects_cross_provider_shapes() {
+        assert!(is_responses_message_item_id("msg_abc123"));
+        assert!(is_responses_message_item_id("msg_abcdef0123456789"));
+        assert!(is_responses_message_item_id("msg_abc-123_xyz"));
+
+        // Anthropic-style ids contain uppercase letters.
+        assert!(!is_responses_message_item_id("msg_01ABC"));
+        assert!(!is_responses_message_item_id("msg_01AbCdEf"));
+
+        // Missing prefix or empty body.
+        assert!(!is_responses_message_item_id("msg_"));
+        assert!(!is_responses_message_item_id("resp_abc"));
+        assert!(!is_responses_message_item_id(""));
+
+        // Disallowed punctuation.
+        assert!(!is_responses_message_item_id("msg_abc.def"));
+    }
 
     #[test]
     fn openai_responses_request_includes_prompt_cache_key_and_structured_history() {

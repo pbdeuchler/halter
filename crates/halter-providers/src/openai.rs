@@ -14,6 +14,7 @@ use crate::responses_provider::{
 };
 use crate::responses_transport::ResponsesRateLimitStrategy;
 use crate::retry::RetryPolicy;
+use crate::secret::SecretString;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -21,11 +22,13 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    #[must_use]
-    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self {
-            inner: ResponsesProvider::new(config(), api_key, base_url),
-        }
+    pub fn new(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: ResponsesProvider::try_new(config(), api_key, base_url)?,
+        })
     }
 }
 
@@ -100,7 +103,8 @@ mod tests {
 
     #[tokio::test]
     async fn openai_provider_rejects_chat_api_kind() {
-        let provider = OpenAiProvider::new("test-key", "https://api.openai.com");
+        let provider =
+            OpenAiProvider::new("test-key", "https://api.openai.com").expect("openai provider");
         let error = match provider
             .stream(
                 sample_request(ApiKind::OpenAiChat),
@@ -123,7 +127,7 @@ mod tests {
     async fn openai_provider_retries_streamed_token_rate_limits() {
         let request_times = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let base_url = spawn_retrying_stream_server(request_times.clone()).await;
-        let provider = OpenAiProvider::new("test-key", base_url);
+        let provider = OpenAiProvider::new("test-key", base_url).expect("openai provider");
         let mut stream = provider
             .stream(
                 sample_request(ApiKind::OpenAiResponses),

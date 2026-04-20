@@ -11,24 +11,27 @@ use tracing::{debug, info};
 use crate::Provider;
 use crate::anthropic_codec;
 use crate::http_client::{JsonHttpClient, JsonRequest};
+use crate::secret::SecretString;
 
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
-    api_key: String,
+    api_key: SecretString,
     base_url: String,
     client: JsonHttpClient,
 }
 
 impl AnthropicProvider {
-    #[must_use]
-    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self {
+    pub fn new(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            client: JsonHttpClient::default(),
-        }
+            client: JsonHttpClient::try_new()?,
+        })
     }
 }
 
@@ -80,7 +83,10 @@ impl Provider for AnthropicProvider {
                     provider_label: "anthropic",
                     url: provider_url(&self.base_url, ANTHROPIC_MESSAGES_PATH),
                     headers: vec![
-                        ("x-api-key".to_owned(), self.api_key.clone()),
+                        (
+                            "x-api-key".to_owned(),
+                            self.api_key.expose_secret().to_owned(),
+                        ),
                         ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
                     ],
                     body,

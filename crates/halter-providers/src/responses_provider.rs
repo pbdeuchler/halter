@@ -21,6 +21,7 @@ use crate::responses_transport::{
     ResponsesRateLimitStrategy, ResponsesTransport, ResponsesTransportRequest, TransportError,
 };
 use crate::retry::{RetryGate, RetryPolicy};
+use crate::secret::SecretString;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactStrategy {
@@ -55,16 +56,15 @@ pub(crate) struct ResponsesProvider {
 }
 
 impl ResponsesProvider {
-    #[must_use]
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         config: ResponsesProviderConfig,
-        api_key: impl Into<String>,
+        api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             config,
-            transport: ResponsesTransport::new(api_key, base_url),
-        }
+            transport: ResponsesTransport::try_new(api_key, base_url)?,
+        })
     }
 
     #[must_use]
@@ -515,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn responses_provider_without_compaction_strategy_rejects_compaction() {
-        let provider = ResponsesProvider::new(
+        let provider = ResponsesProvider::try_new(
             ResponsesProviderConfig {
                 label: "responses-test",
                 capabilities: ProviderCapabilities {
@@ -534,7 +534,8 @@ mod tests {
             },
             "test-key",
             "http://127.0.0.1:1",
-        );
+        )
+        .expect("responses provider");
 
         let error = provider
             .compact(sample_compaction_request(), CancellationToken::new())
@@ -724,7 +725,7 @@ mod tests {
         let base_url = spawn_always_failing_stream_server(attempts.clone()).await;
 
         let max_attempts = 3u32;
-        let provider = ResponsesProvider::new(
+        let provider = ResponsesProvider::try_new(
             ResponsesProviderConfig {
                 label: "responses-budget",
                 capabilities: ProviderCapabilities::default(),
@@ -746,7 +747,8 @@ mod tests {
             },
             "test-key",
             base_url,
-        );
+        )
+        .expect("responses provider");
 
         let mut stream = provider
             .stream(sample_responses_request(), CancellationToken::new())
