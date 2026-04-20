@@ -10,8 +10,7 @@ use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, T
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
-#[allow(deprecated)]
-use image::{DynamicImage, ImageOutputFormat, io::Reader as ImageReader};
+use image::{DynamicImage, ImageFormat as ImageCrateFormat, io::Reader as ImageReader};
 use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext};
@@ -91,10 +90,17 @@ impl Tool for ImageTool {
             .ok()
             .and_then(|metadata| usize::try_from(metadata.len()).ok())
             .unwrap_or(usize::MAX);
-        context.policy.check_read(&input_path, input_len).await?;
-        if let Some(output_path) = output_path.as_ref() {
-            context.policy.check_write(output_path).await?;
-        }
+        let canonical_input = context
+            .policy
+            .check_read_path(&input_path, input_len)
+            .await?;
+        let input_path = canonical_input.into_path();
+        let output_path = if let Some(output_path) = output_path {
+            let canonical_output = context.policy.check_write_path(&output_path).await?;
+            Some(canonical_output.into_path())
+        } else {
+            None
+        };
 
         let path_locks = context.path_locks.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -238,9 +244,7 @@ fn render_output(
 fn encode_image(image: &DynamicImage, format: ImageFormat, quality: u8) -> anyhow::Result<Vec<u8>> {
     let mut buffer = Vec::new();
     match format {
-        ImageFormat::Png => {
-            image.write_to(&mut Cursor::new(&mut buffer), ImageOutputFormat::Png)?
-        }
+        ImageFormat::Png => image.write_to(&mut Cursor::new(&mut buffer), ImageCrateFormat::Png)?,
         ImageFormat::Jpeg => {
             let encoder = JpegEncoder::new_with_quality(&mut buffer, quality);
             image.write_with_encoder(encoder)?;
@@ -249,9 +253,7 @@ fn encode_image(image: &DynamicImage, format: ImageFormat, quality: u8) -> anyho
             let encoder = WebPEncoder::new_lossless(&mut buffer);
             image.write_with_encoder(encoder)?;
         }
-        ImageFormat::Gif => {
-            image.write_to(&mut Cursor::new(&mut buffer), ImageOutputFormat::Gif)?
-        }
+        ImageFormat::Gif => image.write_to(&mut Cursor::new(&mut buffer), ImageCrateFormat::Gif)?,
     }
     Ok(buffer)
 }

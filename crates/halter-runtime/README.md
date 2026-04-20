@@ -170,9 +170,17 @@ The top-level `halter` crate wraps this with simpler convenience APIs.
 
 ---
 
-## `HalterSession`
+## `HalterSession` / `SessionHandle`
 
-`HalterSession` is the live control surface for a single session.
+`SessionHandle` is the live control surface for a single session.
+`HalterSession` is a backwards-compatible alias for `SessionHandle`.
+
+The handle is cheaply cloneable: each clone is an `Arc` bump on the
+shared session state. Hooks registered for the session are evicted from
+the runtime store only when the *last* clone of the handle is dropped,
+not when an arbitrary clone goes out of scope (this is the AC2.1
+guarantee — pre-Phase-3 a clone moved into the spawned turn loop would
+evict hooks under the still-live caller handle).
 
 Important methods:
 

@@ -13,6 +13,7 @@ use halter_protocol::{
     UserPart,
 };
 use serde_json::{Map, Value, json};
+use tracing::warn;
 
 use crate::codec_common::{
     assistant_text, bounded_provider_id, bounded_provider_id_with_prefix, canonical_tool_name,
@@ -20,7 +21,10 @@ use crate::codec_common::{
     tool_result_text, user_text,
 };
 
-const RESPONSES_ITEM_ID_MAX_LEN: usize = 64;
+// Alias the consolidated PROVIDER_ID_MAX_LEN from codec_common (finding L14).
+// Kept as a named alias because the local sites read more clearly with the
+// responses-item-specific identifier at the callsite.
+const RESPONSES_ITEM_ID_MAX_LEN: usize = crate::codec_common::PROVIDER_ID_MAX_LEN;
 const COMPACTED_CONTEXT_PREFIX: &str = "[Compacted context]\n\n";
 
 #[derive(Debug, Clone, Copy)]
@@ -531,6 +535,12 @@ impl ResponsesStreamDecoder {
             return;
         }
 
+        // Use `MessageId::new` explicitly rather than `unwrap_or_default`: the
+        // intent here is "mint a fresh unique id", not "fall back to whatever
+        // Default happens to produce". Default currently delegates to `new`,
+        // but binding us to that would make changing Default (e.g. to `""`) a
+        // silent correctness regression. (finding M23)
+        #[allow(clippy::unwrap_or_default)]
         let message_id = self.message_id.clone().unwrap_or_else(|| {
             message_id
                 .filter(|id| is_responses_message_item_id(id))
@@ -540,7 +550,7 @@ impl ResponsesStreamDecoder {
                         .as_deref()
                         .map(synthesized_responses_message_id)
                 })
-                .unwrap_or_default()
+                .unwrap_or_else(MessageId::new)
         });
         self.message_id = Some(message_id.clone());
         self.started = true;
@@ -644,6 +654,13 @@ impl ResponsesStreamDecoder {
             .expect("reasoning block initialized");
         if let Some(existing_mode) = block.mode {
             if existing_mode != mode {
+                warn!(
+                    reasoning_id = %block.id,
+                    existing_mode = ?existing_mode,
+                    dropped_mode = ?mode,
+                    dropped_chars = delta.chars().count(),
+                    "dropping reasoning delta: mode mismatch within a single reasoning block"
+                );
                 return;
             }
         } else {
@@ -1170,7 +1187,13 @@ fn encode_responses_message_item_id(message_id: &MessageId) -> Option<String> {
 }
 
 fn is_responses_message_item_id(id: &str) -> bool {
-    id.starts_with("msg_")
+    let Some(rest) = id.strip_prefix("msg_") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
 }
 
 fn validate_responses_input_item_ids(input: &[Value]) -> anyhow::Result<()> {
@@ -1557,9 +1580,13 @@ fn response_failure_message(response: &Response) -> String {
 }
 
 fn tool_item_key(item_id: Option<&str>, output_index: u32) -> String {
+    // The synthesized prefix starts with `__halter_synth__` — a sentinel that
+    // OpenAI item ids can never match (real ids are `fc_...`/`msg_...`). This
+    // guarantees no collision if a later event arrives with a real id whose
+    // string happens to equal `output_index:N`.
     item_id
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("output_index:{output_index}"))
+        .unwrap_or_else(|| format!("__halter_synth__:output_index:{output_index}"))
 }
 
 #[cfg(test)]
@@ -1595,6 +1622,25 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn is_responses_message_item_id_rejects_cross_provider_shapes() {
+        assert!(is_responses_message_item_id("msg_abc123"));
+        assert!(is_responses_message_item_id("msg_abcdef0123456789"));
+        assert!(is_responses_message_item_id("msg_abc-123_xyz"));
+
+        // Anthropic-style ids contain uppercase letters.
+        assert!(!is_responses_message_item_id("msg_01ABC"));
+        assert!(!is_responses_message_item_id("msg_01AbCdEf"));
+
+        // Missing prefix or empty body.
+        assert!(!is_responses_message_item_id("msg_"));
+        assert!(!is_responses_message_item_id("resp_abc"));
+        assert!(!is_responses_message_item_id(""));
+
+        // Disallowed punctuation.
+        assert!(!is_responses_message_item_id("msg_abc.def"));
+    }
 
     #[test]
     fn openai_responses_request_includes_prompt_cache_key_and_structured_history() {

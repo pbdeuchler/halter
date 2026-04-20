@@ -6,16 +6,15 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use halter_protocol::{
-    CloseSubagentRequest, CloseSubagentResponse, FileViewCache, ResourceSnapshot,
-    SendSubagentInputRequest, SessionBlueprint, SessionId, SessionState, SpawnSubagentRequest,
-    SubagentStatus, ToolResult, ToolSpec, WaitSubagentRequest, WaitSubagentResponse,
+    CloseSubagentRequest, CloseSubagentResponse, ResourceSnapshot, SendSubagentInputRequest,
+    SessionBlueprint, SessionId, SessionState, SpawnSubagentRequest, SubagentStatus, ToolResult,
+    ToolSpec, WaitSubagentRequest, WaitSubagentResponse,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::builtin::fs_lock::PathLockMap;
-use crate::{ToolPolicy, ToolSessionStore};
+use crate::{PathLockMap, ToolPolicy, ToolSessionStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolRuntimeEvent {
@@ -28,7 +27,7 @@ pub trait ToolEventSink: Send + Sync {
     fn emit(&self, event: ToolRuntimeEvent);
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct NoopToolEventSink;
 
 impl ToolEventSink for NoopToolEventSink {
@@ -91,12 +90,10 @@ pub struct ToolContext {
     pub working_dir: PathBuf,
     pub path_locks: Arc<PathLockMap>,
     pub tool_sessions: Arc<ToolSessionStore>,
-    pub file_view: Arc<FileViewCache>,
     pub snapshot: Arc<ResourceSnapshot>,
     pub cancel: CancellationToken,
     pub emit: Arc<dyn ToolEventSink>,
     pub policy: Arc<dyn ToolPolicy>,
-    pub max_tool_output_bytes: usize,
     pub shell_timeout_secs: u64,
     pub subagent_parent: Option<Arc<SubagentParentContext>>,
 }
@@ -123,17 +120,30 @@ impl ToolRuntime {
         debug!(tool_name = %spec.name, "registering tool");
         self.tools
             .write()
-            .expect("tool runtime lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(spec.name.0, tool);
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools
             .read()
-            .expect("tool runtime lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
             .map(|tool| tool.spec())
             .collect()
+    }
+
+    /// Look up the declared [`ToolConcurrency`] for a registered tool by name.
+    ///
+    /// Returns `None` when the tool is not registered, letting the caller pick
+    /// a conservative default (e.g. `Exclusive`) rather than guessing.
+    #[must_use]
+    pub fn concurrency_for(&self, name: &str) -> Option<halter_protocol::ToolConcurrency> {
+        self.tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .map(|tool| tool.spec().concurrency)
     }
 
     #[must_use]
@@ -143,7 +153,7 @@ impl ToolRuntime {
         let tools = self
             .tools
             .read()
-            .expect("tool runtime lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .filter(|(name, _)| allow_all || allowed.contains(name))
             .map(|(name, tool)| (name.clone(), tool.clone()))
@@ -162,7 +172,7 @@ impl ToolRuntime {
         let tool = self
             .tools
             .read()
-            .expect("tool runtime lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(name)
             .cloned()
             .ok_or_else(|| {

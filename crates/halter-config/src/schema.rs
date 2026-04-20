@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use halter_protocol::{ApiKind, ProviderKind, PruneSignalThreshold, ReasoningEffort};
+use indexmap::IndexMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -72,10 +73,6 @@ impl HarnessConfig {
         }
         if let Some(model) = self.subagent_model() {
             validate_model_config("models.subagent", model)?;
-        }
-
-        if self.policy.max_tool_output_bytes == 0 {
-            anyhow::bail!("invalid configuration: max_tool_output_bytes must be greater than zero");
         }
 
         if self.policy.max_read_bytes == 0 {
@@ -229,6 +226,11 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Optional HTTP headers applied to every request the provider emits.
+    /// Names collide case-insensitively; configured entries override any
+    /// default or hardcoded provider header (Authorization, x-api-key, etc.).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub headers: IndexMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -251,6 +253,9 @@ pub struct ResolvedProviderConfig {
     pub provider: ConfiguredProvider,
     pub base_url: String,
     pub api_key: String,
+    /// Ordered list of user-configured headers. The runtime applies these
+    /// over provider defaults using case-insensitive name matching.
+    pub headers: Vec<(String, String)>,
 }
 
 pub fn resolve_provider_runtime_config<F>(
@@ -290,10 +295,21 @@ where
         )
     })?;
 
+    let headers = configured
+        .map(|config| {
+            config
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(ResolvedProviderConfig {
         provider,
         base_url,
         api_key,
+        headers,
     })
 }
 
@@ -306,6 +322,21 @@ fn validate_provider_config(name: &str, provider: &ProviderConfig) -> anyhow::Re
         &format!("providers.{name}.api_key"),
         provider.api_key.as_deref(),
     )?;
+    for (header_name, header_value) in &provider.headers {
+        validate_required_string(&format!("providers.{name}.headers.<key>"), header_name)?;
+        if !header_name
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b':')
+        {
+            anyhow::bail!(
+                "invalid configuration: providers.{name}.headers name '{header_name}' is not a valid HTTP header name"
+            );
+        }
+        validate_optional_string(
+            &format!("providers.{name}.headers.{header_name}"),
+            Some(header_value),
+        )?;
+    }
     Ok(())
 }
 
@@ -430,8 +461,6 @@ pub struct PolicyConfig {
     pub allowed_write_roots: Vec<PathBuf>,
     #[serde(default = "default_max_read_bytes")]
     pub max_read_bytes: usize,
-    #[serde(default = "default_max_tool_output_bytes")]
-    pub max_tool_output_bytes: usize,
     #[serde(default = "default_max_subagent_depth")]
     pub max_subagent_depth: u32,
     #[serde(default = "default_max_concurrent_subagents")]
@@ -447,7 +476,6 @@ impl Default for PolicyConfig {
         Self {
             allowed_write_roots: default_write_roots(),
             max_read_bytes: default_max_read_bytes(),
-            max_tool_output_bytes: default_max_tool_output_bytes(),
             max_subagent_depth: default_max_subagent_depth(),
             max_concurrent_subagents: default_max_concurrent_subagents(),
             shell: ShellPolicyConfig::default(),
@@ -462,10 +490,6 @@ fn default_write_roots() -> Vec<PathBuf> {
 
 const fn default_max_read_bytes() -> usize {
     1_048_576
-}
-
-const fn default_max_tool_output_bytes() -> usize {
-    262_144
 }
 
 const fn default_max_subagent_depth() -> u32 {
@@ -522,6 +546,18 @@ pub struct NetworkPolicyConfig {
     pub enabled: bool,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Loopback sidecar allowlist. Accepts the legacy TOML key
+    /// `allowed_loopback_services` as an alias (Phase 1 rename).
+    #[serde(default, alias = "allowed_loopback_services")]
+    pub allowed_loopback: Vec<LoopbackAllowConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopbackAllowConfig {
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -608,6 +644,7 @@ mod tests {
             Some(&ProviderConfig {
                 base_url: Some("https://proxy.example.com".to_owned()),
                 api_key: Some("configured-key".to_owned()),
+                headers: IndexMap::new(),
             }),
             |_| Ok(Some("env-key".to_owned())),
         )
@@ -668,6 +705,7 @@ mod tests {
         config.providers.openai = Some(ProviderConfig {
             base_url: None,
             api_key: Some("test-key".to_owned()),
+            headers: IndexMap::new(),
         });
         config.sessions.sqlite_path = Some(PathBuf::from("/tmp/halter.db"));
 
@@ -686,5 +724,24 @@ mod tests {
                 .to_string()
                 .contains("sessions.sqlite_path requires the 'sqlite' cargo feature")
         );
+    }
+
+    // AC2.8: the legacy key `allowed_loopback_services` deserializes into the
+    // new `allowed_loopback` field via a serde alias.
+    #[test]
+    fn review_hook_runtime_ac2_8_loopback_alias_migrates() {
+        let toml = r#"
+enabled = true
+allowed_hosts = []
+
+[[allowed_loopback_services]]
+host = "localhost"
+port = 9090
+"#;
+        let parsed: NetworkPolicyConfig = toml::from_str(toml).expect("parse alias");
+        assert!(parsed.enabled);
+        assert_eq!(parsed.allowed_loopback.len(), 1);
+        assert_eq!(parsed.allowed_loopback[0].host, "localhost");
+        assert_eq!(parsed.allowed_loopback[0].port, Some(9090));
     }
 }

@@ -139,16 +139,30 @@ This struct defines the default policy envelope.
 Defaults:
 
 - `allowed_write_roots = [".", "/tmp/halter"]`
+- `allowed_read_roots = [".", $TMPDIR | "/tmp"]`
+- `sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.env", "**/.env.*", "/etc/shadow", "/etc/shadow.*"]`
 - `max_read_bytes = 1_048_576`
-- `max_tool_output_bytes = 262_144`
 - shell enabled = `true`
+- `shell_mode = Strict` (rejects `eval`, `exec`, `source`, `.`, and function definitions at the AST level)
 - shell allowlist = `git`, `cargo`, `rg`, `ls`, `find`
 - shell timeout = `30`
 - network enabled = `false`
+- `allowed_loopback = []` (loopback addresses require an explicit entry to be reached)
+- `allowed_hosts = ["*"]` (wildcard — remote hosts allowed when `network_enabled = true`)
+- `process_tree_root = None` (Phase 2 threads the live session's root)
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
 
 This is the main security and operability boundary for tool use.
+
+`ToolPolicy` exposes a capability-oriented surface
+(`check_read_path`, `check_write_path`, `check_process_signal`,
+`check_shell_enabled`, `check_shell_command_strict`, `check_network`,
+`check_subagent_spawn_typed`, `shell_mode`) that returns `PolicyError`
+and binds resolved paths to a parent-directory fd via `CanonicalPath`.
+Name-based bypass methods (`check_shell("shell")`,
+`check_shell("process")`) and the older string-error surface have been
+removed; built-in tools call the typed methods directly.
 
 ### Why policy lives here
 
@@ -373,6 +387,9 @@ Notes:
 - `kill_tree` requires process control to be allowed
 - internally this is checked through shell-style policy gating
 - useful for cleaning up runaway tasks or inspecting spawned subprocess trees
+- `kill_tree` response includes `per_pid: [{pid, killed}]` alongside the
+  aggregate `killed` count, so callers can see which descendant refused the
+  signal rather than just "3 of 5 killed"
 
 ---
 
@@ -657,7 +674,6 @@ Typical sequence:
 - Keep shell allowlists tight.
 - Keep write roots narrow.
 - Prefer `edit` over broad `write` when patching existing files.
-- Tune `max_tool_output_bytes` to prevent transcript bloat.
 - Limit subagent depth and concurrency deliberately.
 - Enable optional tool families only if your deployment really needs them.
 
@@ -693,7 +709,6 @@ enabled = ["read", "glob", "grep", "write", "edit", "shell", "process"]
 [policy]
 allowed_write_roots = ["./"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 131072
 max_subagent_depth = 1
 max_concurrent_subagents = 2
 
@@ -715,7 +730,6 @@ enabled = [
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 262144
 max_subagent_depth = 3
 max_concurrent_subagents = 8
 

@@ -298,11 +298,11 @@ mod tests {
 
     #[test]
     fn extract_subagent_output_reads_last_assistant_text() {
-        let events = vec![SessionEvent {
-            session_id: SessionId::from("child"),
-            sequence: 1,
-            delivery: halter_protocol::Delivery::Lossless,
-            payload: SessionEventPayload::MessageItem {
+        let events = vec![SessionEvent::new_committed(
+            SessionId::from("child"),
+            1,
+            halter_protocol::Delivery::Lossless,
+            SessionEventPayload::MessageItem {
                 message: Message::Assistant(AssistantMessage {
                     id: MessageId::new(),
                     created_at: chrono::Utc::now(),
@@ -320,7 +320,7 @@ mod tests {
                     replay_meta: halter_protocol::ReplayMeta::default(),
                 }),
             },
-        }];
+        )];
 
         assert_eq!(extract_subagent_output(&events), Some("done".to_owned()));
     }

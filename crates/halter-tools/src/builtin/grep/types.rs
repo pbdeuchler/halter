@@ -1,6 +1,7 @@
 // pattern: Functional Core
 
 use std::borrow::Cow;
+#[cfg(feature = "advanced-tools")]
 use std::fs::File;
 use std::io;
 use std::ops::Range;
@@ -237,6 +238,14 @@ impl Sink for MatchCollector {
         Ok(true)
     }
 }
+
+/// Files at or above this size are eligible for `memmap2`-backed reads (under
+/// the `advanced-tools` feature). Below it, we always fall through to
+/// `std::fs::read`, trading a bounded copy for the SIGBUS-on-truncate hazard
+/// that mmap presents when another process rewrites the file mid-scan
+/// (finding C15).
+#[cfg(feature = "advanced-tools")]
+const MMAP_MIN_FILE_BYTES: u64 = 64 * 1024;
 
 enum FileBytes {
     #[cfg(feature = "advanced-tools")]
@@ -582,12 +591,14 @@ fn collect_entries(
     let type_filter = resolve_type_filter(type_filter);
     let matcher = compile_glob(glob)?;
 
+    // Match the walker's `follow_links(false)` contract: if the entry itself
+    // is a symlink, we refuse to traverse it rather than silently resolving
+    // the target. This keeps the search-root gate and the inner walk
+    // self-consistent (finding M47).
     if metadata.file_type().is_symlink() {
-        let resolved = std::fs::metadata(search_root)?;
-        if !resolved.is_file() {
-            return Ok(Vec::new());
-        }
-    } else if !metadata.is_file() && !metadata.is_dir() {
+        return Ok(Vec::new());
+    }
+    if !metadata.is_file() && !metadata.is_dir() {
         return Ok(Vec::new());
     }
 
@@ -597,11 +608,10 @@ fn collect_entries(
         {
             return Ok(Vec::new());
         }
-        let display_path = search_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| search_root.to_string_lossy().into_owned());
+        // Use the full path (lossy-decoded) rather than just the file name so
+        // two searches against same-basename files in different directories
+        // produce distinguishable responses (finding M38).
+        let display_path = search_root.to_string_lossy().into_owned();
         return Ok(vec![FileEntry {
             absolute_path: search_root.to_path_buf(),
             display_path,
@@ -734,35 +744,38 @@ fn is_known_text_path(path: &Path) -> bool {
             .any(|candidate| extension.eq_ignore_ascii_case(candidate))
 }
 
+#[cfg(feature = "advanced-tools")]
+fn read_with_optional_mmap(path: &Path, file_bytes: u64) -> io::Result<FileBytes> {
+    if file_bytes < MMAP_MIN_FILE_BYTES {
+        return Ok(FileBytes::Owned(std::fs::read(path)?));
+    }
+    let file = File::open(path)?;
+    // SAFETY: we only mmap regular files above the configured threshold; the
+    // caller upstream has already asserted `metadata.is_file()`. The mmap
+    // reference is not exposed across await points and is dropped before any
+    // writer can contend for the backing pages.
+    match unsafe { memmap2::Mmap::map(&file) } {
+        Ok(mapped) => Ok(FileBytes::Mapped(mapped)),
+        Err(_) => Ok(FileBytes::Owned(std::fs::read(path)?)),
+    }
+}
+
 fn read_file_bytes(path: &Path, prefer_text_fast_path: bool) -> io::Result<Option<FileBytes>> {
     let metadata = std::fs::symlink_metadata(path)?;
-    let resolved_metadata = if metadata.file_type().is_symlink() {
-        let target_metadata = std::fs::metadata(path)?;
-        if !target_metadata.is_file() {
-            return Ok(None);
-        }
-        target_metadata
-    } else if metadata.is_file() {
-        metadata
-    } else {
+    // Consistent with `WalkBuilder::follow_links(false)`: symlinked files are
+    // skipped rather than silently resolved (finding M47).
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(None);
-    };
+    }
 
-    if resolved_metadata.len() == 0 {
+    if metadata.len() == 0 {
         return Ok(Some(FileBytes::Owned(Vec::new())));
     }
 
-    let file = File::open(path)?;
     #[cfg(feature = "advanced-tools")]
-    let bytes = match unsafe { memmap2::Mmap::map(&file) } {
-        Ok(mapped) => FileBytes::Mapped(mapped),
-        Err(_) => FileBytes::Owned(std::fs::read(path)?),
-    };
+    let bytes = read_with_optional_mmap(path, metadata.len())?;
     #[cfg(not(feature = "advanced-tools"))]
-    let bytes = {
-        let _ = file;
-        FileBytes::Owned(std::fs::read(path)?)
-    };
+    let bytes = FileBytes::Owned(std::fs::read(path)?);
 
     if prefer_text_fast_path && is_known_text_path(path) {
         let slice = bytes.as_slice();
@@ -868,16 +881,16 @@ fn build_response(result: AggregateResult, config: &SearchConfig) -> Value {
 }
 
 fn build_content_response(result: AggregateResult, config: &SearchConfig) -> Value {
-    let mut skipped = 0u64;
+    // Offset is applied upstream: in the sequential path via
+    // `file_offset` passed into `SearchParams`, and in the parallel path
+    // by the `config.offset == 0` gate at the entry point. The emitted
+    // matches here are already post-offset, so only `max_matches`
+    // bounding is needed at this layer.
     let mut emitted = 0u64;
     let mut matches = Vec::new();
 
     'files: for file in &result.files {
         for matched in &file.matches {
-            if skipped < config.offset {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
             if emitted >= config.max_matches {
                 break 'files;
             }
@@ -1075,6 +1088,71 @@ mod tests {
             escape_unescaped_parentheses("fetchAnthropicProvider(").as_ref(),
             r"fetchAnthropicProvider\("
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn m47_collect_entries_rejects_symlinked_search_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("real.txt");
+        std::fs::write(&target, "hello").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let entries = collect_entries(&link, None, None).expect("collect must succeed");
+        assert!(
+            entries.is_empty(),
+            "symlinked search root must be rejected for consistency with WalkBuilder",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn m47_read_file_bytes_skips_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("real.txt");
+        std::fs::write(&target, "payload").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let out = read_file_bytes(&link, false).expect("read must succeed");
+        assert!(
+            out.is_none(),
+            "symlinked file must be skipped for consistency with WalkBuilder",
+        );
+    }
+
+    #[test]
+    fn c15_read_file_bytes_small_file_uses_owned_buffer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, b"tiny").unwrap();
+
+        let bytes = read_file_bytes(&path, false)
+            .expect("small read succeeds")
+            .expect("returns bytes");
+        // Below the mmap threshold we must always produce an owned buffer;
+        // otherwise a concurrent truncate could SIGBUS the scanner.
+        assert!(matches!(bytes, FileBytes::Owned(_)));
+        assert_eq!(bytes.as_slice(), b"tiny");
+    }
+
+    #[test]
+    #[cfg(feature = "advanced-tools")]
+    fn c15_read_file_bytes_large_file_eligible_for_mmap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("large.bin");
+        let payload = vec![b'a'; (MMAP_MIN_FILE_BYTES as usize) + 1];
+        std::fs::write(&path, &payload).unwrap();
+
+        let bytes = read_file_bytes(&path, false)
+            .expect("large read succeeds")
+            .expect("returns bytes");
+        // Above the threshold, we expect mmap; on unusual filesystems the
+        // mmap call may fail and fall back to Owned. Both outcomes are sound,
+        // but at least one of them must apply.
+        assert!(matches!(bytes, FileBytes::Mapped(_) | FileBytes::Owned(_)));
+        assert_eq!(bytes.as_slice().len(), payload.len());
     }
 
     #[test]

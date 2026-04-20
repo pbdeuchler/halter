@@ -1,9 +1,5 @@
 // pattern: Imperative Shell
 
-#[cfg(feature = "advanced-tools")]
-mod advanced;
-#[cfg(not(feature = "advanced-tools"))]
-mod basic;
 mod types;
 
 use async_trait::async_trait;
@@ -16,6 +12,10 @@ use super::common::{
     ToolScope, ensure_not_cancelled, optional_bool, optional_string, optional_u64, required_string,
 };
 
+#[cfg(feature = "advanced-tools")]
+use self::types::run_advanced_search;
+#[cfg(not(feature = "advanced-tools"))]
+use self::types::run_basic_search;
 use self::types::{DEFAULT_MAX_MATCHES, OutputMode, SearchConfig};
 
 #[derive(Debug)]
@@ -41,7 +41,7 @@ impl Tool for GrepTool {
                     "max_matches": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Maximum number of matches to return (default: 100)"
+                        "description": format!("Maximum number of matches to return (default: {DEFAULT_MAX_MATCHES})"),
                     },
                     "offset": { "type": "integer", "minimum": 0 },
                     "max_columns": { "type": "integer", "minimum": 1 },
@@ -94,12 +94,12 @@ impl Tool for GrepTool {
         let response = tokio::task::spawn_blocking(move || {
             #[cfg(feature = "advanced-tools")]
             {
-                advanced::run(working_dir, path_locks, cancel, config)
+                run_advanced_search(working_dir, path_locks, cancel, config)
             }
 
             #[cfg(not(feature = "advanced-tools"))]
             {
-                basic::run(working_dir, path_locks, cancel, config)
+                run_basic_search(working_dir, path_locks, cancel, config)
             }
         })
         .await??;

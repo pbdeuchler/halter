@@ -8,9 +8,9 @@ pub use loader::{
     generate_starter_config, load_layered, load_path, schema_as_json_value,
 };
 pub use schema::{
-    ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelsConfig,
-    NetworkPolicyConfig, PolicyConfig, PromptsConfig, ProviderConfig, ProvidersConfig,
-    ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID,
-    SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig, ToolsConfig,
+    ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, HarnessConfig, LoopbackAllowConfig,
+    ModelConfig, ModelsConfig, NetworkPolicyConfig, PolicyConfig, PromptsConfig, ProviderConfig,
+    ProvidersConfig, ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID,
+    SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig, ToolsConfig,
     resolve_provider_runtime_config,
 };

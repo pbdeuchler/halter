@@ -12,6 +12,14 @@ members = [
 ]
 resolver = "3"
 
+# The [patch.crates-io] override points every transitive `brush-core`
+# dependency (most notably our own `brush-builtins` fork) at the vendored
+# copy in `vendor/brush-core-vendored`. Without the patch, Cargo would
+# resolve two distinct `brush-core` versions: the vendored fork used
+# directly by `halter-tools` and the crates.io release pulled in
+# transitively by `brush-builtins`. That split breaks cross-crate type
+# identity for shared types (e.g. shell-evaluator handles) and surfaces
+# as confusing `expected X, found X` errors. (finding M14)
 [patch.crates-io]
 brush-core = { path = "vendor/brush-core-vendored" }
 
@@ -25,7 +33,7 @@ repository = "https://github.com/pbdeuchler/halter"
 readme = "README.md"
 keywords = ["ai", "agent", "tools"]
 categories = ["development-tools"]
-rust-version = "1.93"
+rust-version = "1.95"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
@@ -47,6 +55,7 @@ globset = "0.4.16"
 grep-matcher = "0.1.7"
 grep-regex = "0.1.13"
 grep-searcher = "0.1.14"
+hex = "0.4.3"
 futures = "0.3.31"
 eventsource-stream = "0.2.3"
 ignore = "0.4.24"
@@ -54,6 +63,7 @@ image = { version = "0.24.9", default-features = false, features = ["gif", "jpeg
 inferno = { version = "0.12.3", default-features = false }
 indexmap = { version = "2.11.4", features = ["serde"] }
 libc = "0.2.177"
+lru = "0.12.5"
 memmap2 = "0.9.9"
 os_pipe = "1.2.3"
 parking_lot = { version = "0.12.5", features = ["arc_lock"] }
@@ -67,6 +77,8 @@ serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 smallvec = { version = "1.15.1", features = ["const_new"] }
+strum = "0.27.2"
+strum_macros = "0.27.2"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }

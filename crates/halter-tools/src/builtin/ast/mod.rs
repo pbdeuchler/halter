@@ -97,15 +97,11 @@ impl Tool for AstGrepTool {
                     config.glob.as_deref(),
                     config.lang.as_deref(),
                 )?;
-                if !config.dry_run {
-                    for candidate in &candidates {
-                        context.policy.check_write(&candidate.absolute_path).await?;
-                    }
-                }
                 let path_locks = context.path_locks.clone();
                 let cancel = context.cancel.clone();
+                let policy = context.policy.clone();
                 tokio::task::spawn_blocking(move || {
-                    replace::run(config, candidates, path_locks, cancel)
+                    replace::run(config, candidates, path_locks, cancel, policy)
                 })
                 .await??
             }

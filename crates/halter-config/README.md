@@ -141,6 +141,20 @@ base_url = "https://openrouter.ai/api"
 api_key = "..."
 ```
 
+Each provider also accepts an optional `headers` sub-table. Entries override
+the provider's default or hardcoded HTTP headers (`Authorization`, `x-api-key`,
+`anthropic-version`, `Content-Type`) case-insensitively, and any unrelated
+headers are appended verbatim:
+
+```toml
+[providers.openai.headers]
+Authorization = "Bearer org-specific-token"
+X-Trace-Id = "halter-dev"
+```
+
+Header names must be ASCII graphic characters with no colons; values must be
+non-empty. Validation rejects malformed entries at load time.
+
 ### Resolution rules
 
 `resolve_provider_runtime_config(...)` resolves provider settings this way:
@@ -307,7 +321,6 @@ Example:
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 262144
 max_subagent_depth = 3
 max_concurrent_subagents = 8
 
@@ -325,7 +338,6 @@ Defaults:
 
 - `allowed_write_roots = [".", "/tmp/halter"]`
 - `max_read_bytes = 1_048_576`
-- `max_tool_output_bytes = 262_144`
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
 - shell enabled by default
@@ -335,7 +347,6 @@ Defaults:
 Validation rules include:
 
 - `max_read_bytes > 0`
-- `max_tool_output_bytes > 0`
 
 ---
 
@@ -599,7 +610,6 @@ enabled = [
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 262144
 max_subagent_depth = 3
 max_concurrent_subagents = 8
 
@@ -630,7 +640,6 @@ reasoning = "medium"
 [policy]
 allowed_write_roots = ["./"]
 max_read_bytes = 524288
-max_tool_output_bytes = 131072
 max_subagent_depth = 2
 max_concurrent_subagents = 4
 

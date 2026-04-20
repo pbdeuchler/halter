@@ -10,25 +10,42 @@ use tracing::{debug, info};
 
 use crate::Provider;
 use crate::anthropic_codec;
+use crate::header_overrides::HeaderOverrides;
 use crate::http_client::{JsonHttpClient, JsonRequest};
+use crate::secret::SecretString;
 
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
-    api_key: String,
+    api_key: SecretString,
     base_url: String,
     client: JsonHttpClient,
+    header_overrides: HeaderOverrides,
 }
 
 impl AnthropicProvider {
-    #[must_use]
-    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self {
+    pub fn new(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_headers(api_key, base_url, &[])
+    }
+
+    /// Same as [`AnthropicProvider::new`] but also accepts user-configured
+    /// header overrides that replace any default or hardcoded header
+    /// (`x-api-key`, `anthropic-version`, `Content-Type`) case-insensitively.
+    pub fn new_with_headers(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            client: JsonHttpClient::default(),
-        }
+            client: JsonHttpClient::try_new()?,
+            header_overrides: HeaderOverrides::new(header_overrides)?,
+        })
     }
 }
 
@@ -73,16 +90,20 @@ impl Provider for AnthropicProvider {
         );
 
         let body = anthropic_codec::encode_request(&request)?;
+        let default_headers = vec![
+            (
+                "x-api-key".to_owned(),
+                self.api_key.expose_secret().to_owned(),
+            ),
+            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+        ];
         let response = self
             .client
             .post_json(
                 JsonRequest {
                     provider_label: "anthropic",
                     url: provider_url(&self.base_url, ANTHROPIC_MESSAGES_PATH),
-                    headers: vec![
-                        ("x-api-key".to_owned(), self.api_key.clone()),
-                        ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
-                    ],
+                    headers: self.header_overrides.merge_string_pairs(default_headers),
                     body,
                 },
                 cancel,

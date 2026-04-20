@@ -2,6 +2,7 @@
 
 mod config;
 mod engine;
+mod matcher;
 mod merge;
 mod sdk;
 
@@ -13,6 +14,7 @@ pub use engine::{
     ConfiguredHandler, ConfiguredHandlerConfig, HOOK_PROTOCOL_VERSION, HookDispatchOutcome,
     HookDispatchRequest, HookRegistrySource, Hooks, PreparedHookDispatch,
 };
+pub use matcher::{CompiledMatcher, MatcherCompileError};
 pub use merge::{
     HandlerPriority, HandlerPriorityGroup, HookDecision, HookMergedOutcome, HookOutput,
     HookSpecificOutput, MergeInput, PermissionDecision, merge_outputs, summary_entries,

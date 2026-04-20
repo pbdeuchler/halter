@@ -15,6 +15,7 @@ pub struct ModelRegistry {
     default_model: Option<ResolvedModel>,
     small_model: Option<ResolvedModel>,
     subagent_model: Option<ResolvedModel>,
+    plan_model: Option<ResolvedModel>,
     providers: HashMap<String, Arc<dyn Provider>>,
 }
 
@@ -64,6 +65,19 @@ impl ModelRegistry {
             .clone()
             .or_else(|| self.default_model.clone())
             .context("failed to resolve model: subagent model is not configured")
+    }
+
+    pub fn set_plan_model(&mut self, model: ResolvedModel) {
+        debug!(model_id = %model.id, provider = %model.provider, "setting plan model");
+        self.models.insert(model.id.0.clone(), model.clone());
+        self.plan_model = Some(model);
+    }
+
+    pub fn plan_model(&self) -> anyhow::Result<ResolvedModel> {
+        self.plan_model
+            .clone()
+            .or_else(|| self.default_model.clone())
+            .context("failed to resolve model: plan model is not configured")
     }
 
     pub fn model(&self, model_id: &ModelId) -> anyhow::Result<ResolvedModel> {

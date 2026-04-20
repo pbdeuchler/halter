@@ -5,10 +5,12 @@ use std::time::Duration;
 use anyhow::Context;
 use halter_protocol::HookHandlerType;
 use indexmap::{IndexMap, IndexSet};
-use regex::Regex;
 use serde::Deserialize;
+use strum_macros::{EnumString, IntoStaticStr};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+use crate::matcher::CompiledMatcher;
+
+#[derive(Debug, Clone, Default)]
 pub struct HooksFile {
     pub hooks: IndexMap<HookEventName, Vec<HookMatcherGroup>>,
 }
@@ -17,10 +19,10 @@ impl HooksFile {
     pub fn from_json_bytes(bytes: &[u8]) -> anyhow::Result<(Self, Vec<HooksLoadWarning>)> {
         let raw: HooksFileRaw =
             serde_json::from_slice(bytes).context("failed to parse hooks.json")?;
-        Ok(Self::from_raw(raw))
+        Self::from_raw(raw)
     }
 
-    fn from_raw(raw: HooksFileRaw) -> (Self, Vec<HooksLoadWarning>) {
+    fn from_raw(raw: HooksFileRaw) -> anyhow::Result<(Self, Vec<HooksLoadWarning>)> {
         let mut hooks = IndexMap::new();
         let mut warnings = Vec::new();
         let mut seen = IndexSet::new();
@@ -46,7 +48,14 @@ impl HooksFile {
 
             let mut parsed_groups = Vec::new();
             for matcher_group in matcher_groups {
-                if let Some(group) = HookMatcherGroup::from_raw(event, matcher_group, &mut warnings)
+                let group = HookMatcherGroup::from_raw(event, matcher_group, &mut warnings)
+                    .with_context(|| {
+                        format!(
+                            "failed to compile matcher for hook event '{}'",
+                            event.canonical_name()
+                        )
+                    })?;
+                if let Some(group) = group
                     && !group.hooks.is_empty()
                 {
                     parsed_groups.push(group);
@@ -58,13 +67,13 @@ impl HooksFile {
             }
         }
 
-        (Self { hooks }, warnings)
+        Ok((Self { hooks }, warnings))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct HookMatcherGroup {
-    pub matcher: Option<String>,
+    pub matcher: Option<CompiledMatcher>,
     pub hooks: Vec<HookHandler>,
 }
 
@@ -73,24 +82,21 @@ impl HookMatcherGroup {
         event: HookEventName,
         raw: HookMatcherGroupRaw,
         warnings: &mut Vec<HooksLoadWarning>,
-    ) -> Option<Self> {
-        let matcher = raw
+    ) -> anyhow::Result<Option<Self>> {
+        let raw_matcher = raw
             .matcher
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
 
-        if let Some(pattern) = matcher.as_deref()
-            && Regex::new(pattern).is_err()
-        {
-            warnings.push(HooksLoadWarning::new(
-                "invalid_matcher",
+        let matcher = match raw_matcher {
+            Some(pattern) => Some(CompiledMatcher::compile_regex(&pattern).with_context(|| {
                 format!(
                     "invalid matcher regex for '{}': {pattern}",
                     event.canonical_name()
-                ),
-            ));
-            return None;
-        }
+                )
+            })?),
+            None => None,
+        };
 
         let mut hooks = Vec::new();
         for handler in raw.hooks {
@@ -99,7 +105,7 @@ impl HookMatcherGroup {
             }
         }
 
-        Some(Self { matcher, hooks })
+        Ok(Some(Self { matcher, hooks }))
     }
 }
 
@@ -271,7 +277,8 @@ pub enum HookShell {
     Pwsh,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, IntoStaticStr)]
+#[strum(ascii_case_insensitive)]
 pub enum HookEventName {
     SessionStart,
     SessionEnd,
@@ -306,36 +313,9 @@ pub enum HookEventName {
 impl HookEventName {
     #[must_use]
     pub fn canonical_name(self) -> &'static str {
-        match self {
-            Self::SessionStart => "SessionStart",
-            Self::SessionEnd => "SessionEnd",
-            Self::UserPromptSubmit => "UserPromptSubmit",
-            Self::PreToolUse => "PreToolUse",
-            Self::PostToolUse => "PostToolUse",
-            Self::PostToolUseFailure => "PostToolUseFailure",
-            Self::Notification => "Notification",
-            Self::Stop => "Stop",
-            Self::SubagentStart => "SubagentStart",
-            Self::SubagentStop => "SubagentStop",
-            Self::PreCompact => "PreCompact",
-            Self::PostCompact => "PostCompact",
-            Self::PermissionRequest => "PermissionRequest",
-            Self::PermissionDenied => "PermissionDenied",
-            Self::Elicitation => "Elicitation",
-            Self::ElicitationResult => "ElicitationResult",
-            Self::WorktreeCreate => "WorktreeCreate",
-            Self::WorktreeRemove => "WorktreeRemove",
-            Self::FileChanged => "FileChanged",
-            Self::CwdChanged => "CwdChanged",
-            Self::InstructionsLoaded => "InstructionsLoaded",
-            Self::ConfigChange => "ConfigChange",
-            Self::Setup => "Setup",
-            Self::TeammateIdle => "TeammateIdle",
-            Self::TaskCreated => "TaskCreated",
-            Self::TaskCompleted => "TaskCompleted",
-            Self::StopFailure => "StopFailure",
-            Self::PostSampling => "PostSampling",
-        }
+        // `strum::IntoStaticStr` provides a `From<Self> for &'static str`
+        // impl that returns the variant's PascalCase identifier.
+        self.into()
     }
 
     #[must_use]
@@ -368,44 +348,14 @@ impl HookEventName {
         }
     }
 
+    /// Resolve an alias (PascalCase, snake_case, or camelCase) to its canonical
+    /// variant. `strum::EnumString` with `ascii_case_insensitive` handles case
+    /// variants; we strip underscores so `pre_tool_use` normalizes to
+    /// `PreToolUse` without per-variant serde aliases.
     #[must_use]
     pub fn from_alias(alias: &str) -> Option<Self> {
-        let normalized = alias
-            .chars()
-            .filter(|ch| *ch != '_')
-            .flat_map(char::to_lowercase)
-            .collect::<String>();
-        match normalized.as_str() {
-            "sessionstart" => Some(Self::SessionStart),
-            "sessionend" => Some(Self::SessionEnd),
-            "userpromptsubmit" => Some(Self::UserPromptSubmit),
-            "pretooluse" => Some(Self::PreToolUse),
-            "posttooluse" => Some(Self::PostToolUse),
-            "posttoolusefailure" => Some(Self::PostToolUseFailure),
-            "notification" => Some(Self::Notification),
-            "stop" => Some(Self::Stop),
-            "subagentstart" => Some(Self::SubagentStart),
-            "subagentstop" => Some(Self::SubagentStop),
-            "precompact" => Some(Self::PreCompact),
-            "postcompact" => Some(Self::PostCompact),
-            "permissionrequest" => Some(Self::PermissionRequest),
-            "permissiondenied" => Some(Self::PermissionDenied),
-            "elicitation" => Some(Self::Elicitation),
-            "elicitationresult" => Some(Self::ElicitationResult),
-            "worktreecreate" => Some(Self::WorktreeCreate),
-            "worktreeremove" => Some(Self::WorktreeRemove),
-            "filechanged" => Some(Self::FileChanged),
-            "cwdchanged" => Some(Self::CwdChanged),
-            "instructionsloaded" => Some(Self::InstructionsLoaded),
-            "configchange" => Some(Self::ConfigChange),
-            "setup" => Some(Self::Setup),
-            "teammateidle" => Some(Self::TeammateIdle),
-            "taskcreated" => Some(Self::TaskCreated),
-            "taskcompleted" => Some(Self::TaskCompleted),
-            "stopfailure" => Some(Self::StopFailure),
-            "postsampling" => Some(Self::PostSampling),
-            _ => None,
-        }
+        let normalized: String = alias.chars().filter(|ch| *ch != '_').collect();
+        normalized.parse().ok()
     }
 }
 

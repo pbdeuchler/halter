@@ -126,7 +126,6 @@ prune_signal_threshold = "low"
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 262144
 max_subagent_depth = 3
 max_concurrent_subagents = 8
 
@@ -642,7 +641,6 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
         policy: PolicyConfig {
             allowed_write_roots: vec![working_dir.clone(), temp_write_root],
             max_read_bytes: 1_048_576,
-            max_tool_output_bytes: 262_144,
             max_subagent_depth: 3,
             max_concurrent_subagents: 8,
             shell: ShellPolicyConfig {
@@ -662,6 +660,7 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
             network: NetworkPolicyConfig {
                 enabled: false,
                 allowed_hosts: Vec::new(),
+                allowed_loopback: Vec::new(),
             },
         },
         sessions: SessionsConfig {

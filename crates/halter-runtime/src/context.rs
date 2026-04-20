@@ -26,6 +26,7 @@ pub struct CompactionOutcome {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait ContextManager: Send + Sync {
     async fn plan(
         &self,
@@ -82,6 +83,7 @@ impl DefaultContextManager {
         self.settings
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_compaction(
         &self,
         blueprint: &SessionBlueprint,
@@ -212,21 +214,15 @@ impl ContextManager for DefaultContextManager {
             );
         }
 
-        let (previous_response_id, new_messages_start) = if outcome.compaction.is_none()
-            && outcome.compacted_prefix.is_empty()
-            && state.last_response_id.is_some()
-            && state.messages_seen_by_provider > 0
-        {
-            let seen = state.messages_seen_by_provider;
-            let total = state.messages.len();
-            let window_offset = total.saturating_sub(outcome.messages.len());
-            let new_start = seen
-                .saturating_sub(window_offset)
-                .min(outcome.messages.len());
-            (state.last_response_id.clone(), new_start)
-        } else {
-            (None, 0)
-        };
+        let (previous_response_id, new_messages_start) = resolve_response_chain(
+            state.last_response_id.as_deref(),
+            state.messages_seen_by_provider,
+            state.messages.len(),
+            outcome.messages.len(),
+            outcome.compaction.is_some(),
+            !outcome.compacted_prefix.is_empty(),
+        );
+        let previous_response_id = previous_response_id.map(|s| s.to_owned());
 
         Ok(ContextPlan {
             prompt_segments,
@@ -283,6 +279,60 @@ fn cache_boundary_hash() -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"transcript_boundary_v2");
     format!("{:x}", hasher.finalize())
+}
+
+/// Determines whether a request should reuse the provider's
+/// `previous_response_id` chain, and if so, from which message in the pruned
+/// transcript window the "new since the provider last saw us" slice begins.
+///
+/// Chaining requires that no compaction happened *this* turn and that no prior
+/// compacted prefix is in play — both conditions force a clean replay. When
+/// chaining is allowed, `new_messages_start` is the number of messages at the
+/// head of the window the provider has already observed; the caller sends the
+/// suffix only.
+///
+/// ```
+/// # use halter_runtime::resolve_response_chain;
+/// // No prior response: no chaining.
+/// assert_eq!(resolve_response_chain(None, 0, 0, 0, false, false), (None, 0));
+///
+/// // Clean turn, 6 total messages, provider saw 4, window has 6 → resume at 4.
+/// let (id, start) = resolve_response_chain(Some("resp_1"), 4, 6, 6, false, false);
+/// assert_eq!(id, Some("resp_1"));
+/// assert_eq!(start, 4);
+///
+/// // A 2-message head was pruned: window has 4, provider saw 4 of the original
+/// // 6 → the first 2 seen messages fell outside the window, resume at 2.
+/// let (_, start) = resolve_response_chain(Some("resp_1"), 4, 6, 4, false, false);
+/// assert_eq!(start, 2);
+///
+/// // Compaction fired this turn — must not chain.
+/// assert_eq!(resolve_response_chain(Some("resp_1"), 4, 6, 6, true, false), (None, 0));
+///
+/// // A compacted prefix is already carried — must not chain.
+/// assert_eq!(resolve_response_chain(Some("resp_1"), 4, 6, 6, false, true), (None, 0));
+/// ```
+#[must_use]
+pub fn resolve_response_chain(
+    last_response_id: Option<&str>,
+    messages_seen_by_provider: usize,
+    total_messages: usize,
+    window_messages: usize,
+    compacted_this_turn: bool,
+    has_compacted_prefix: bool,
+) -> (Option<&str>, usize) {
+    if compacted_this_turn
+        || has_compacted_prefix
+        || messages_seen_by_provider == 0
+        || last_response_id.is_none()
+    {
+        return (None, 0);
+    }
+    let window_offset = total_messages.saturating_sub(window_messages);
+    let new_start = messages_seen_by_provider
+        .saturating_sub(window_offset)
+        .min(window_messages);
+    (last_response_id, new_start)
 }
 
 fn compaction_instructions(custom_instructions: Option<&str>) -> String {

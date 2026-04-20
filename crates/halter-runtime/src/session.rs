@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -12,7 +11,7 @@ use futures::stream::{BoxStream, StreamExt};
 use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
     AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash, Delivery,
-    HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState,
+    HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState, PendingEvent,
     PendingToolCall, PromptSegment, PromptSegmentId, ProviderError, ProviderRequest, ReplayMeta,
     ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState,
     StopReason, StreamEvent, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult,
@@ -33,6 +32,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 use crate::DefaultContextManager;
 use crate::model_selection::select_models;
+use crate::turn_registry::TurnRegistry;
 use crate::{
     ContextManager, EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler,
     run_notification, run_post_compact, run_post_tool_use, run_post_tool_use_failure,
@@ -55,7 +55,7 @@ pub struct RuntimeServices {
     pub prompt_assembler: Arc<dyn PromptAssembler>,
     pub context_manager: Arc<dyn ContextManager>,
     pub event_bus: Arc<EventBus>,
-    pub max_tool_output_bytes: usize,
+    pub turn_registry: Arc<TurnRegistry>,
     pub shell_timeout_secs: u64,
 }
 
@@ -158,29 +158,49 @@ impl SessionInit {
     }
 }
 
+/// Drop-time hook eviction guard. Held inside an `Arc` on the session
+/// handle so eviction fires only when the *last* clone of the handle is
+/// dropped. Pre-Phase-3 code put `Drop` on `HalterSession` itself, which
+/// meant any short-lived clone (e.g. a clone moved into a `tokio::spawn`
+/// turn loop) would evict the hooks for the still-live original handle.
+struct EvictionGuard {
+    services: Arc<RuntimeServices>,
+    session_id: SessionId,
+}
+
+impl Drop for EvictionGuard {
+    fn drop(&mut self) {
+        evict_session_hooks(&self.services, &self.session_id);
+    }
+}
+
+/// Cheaply-cloneable handle to a halter session. Cloning bumps the inner
+/// `Arc`s; the session's hooks are only evicted from the runtime store
+/// when every clone of the handle has been dropped.
 #[derive(Clone)]
-pub struct HalterSession {
+pub struct SessionHandle {
     services: Arc<RuntimeServices>,
     session_id: SessionId,
     session_hooks: Arc<Hooks>,
+    /// Held only for its `Drop` side-effect on the last clone — see
+    /// `EvictionGuard`.
+    #[allow(dead_code)]
+    eviction: Arc<EvictionGuard>,
 }
 
+/// Backwards-compatible alias for the public session type. Prefer
+/// `SessionHandle` in new code.
+pub type HalterSession = SessionHandle;
+
 struct SessionToolEventSink {
-    call_id: halter_protocol::ToolCallId,
     events: Arc<Mutex<Vec<ToolRuntimeEvent>>>,
-    live: Option<LiveTurnStream>,
 }
 
 impl ToolEventSink for SessionToolEventSink {
     fn emit(&self, event: ToolRuntimeEvent) {
-        if let Some(live) = self.live.as_ref()
-            && let Some(payload) = tool_runtime_event_payload(&self.call_id, event.clone())
-        {
-            live.emit_payload(payload);
-        }
         self.events
             .lock()
-            .expect("tool event lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(event);
     }
 }
@@ -193,43 +213,24 @@ impl ToolEventDrain {
     fn into_events(self) -> Vec<ToolRuntimeEvent> {
         self.events
             .lock()
-            .expect("tool event lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain(..)
             .collect()
     }
 }
 
+/// Sink for the in-turn live event stream. Only receives events *after*
+/// `commit_and_publish` has assigned sequences; preserves the commit-then-
+/// publish invariant by forbidding sequence allocation outside the session
+/// store.
 #[derive(Clone)]
 struct LiveTurnStream {
-    session_id: SessionId,
     tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>,
-    next_sequence: Arc<AtomicU64>,
 }
 
 impl LiveTurnStream {
-    fn new(
-        session_id: SessionId,
-        tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>,
-        next_sequence: u64,
-    ) -> Self {
-        Self {
-            session_id,
-            tx,
-            next_sequence: Arc::new(AtomicU64::new(next_sequence)),
-        }
-    }
-
-    fn emit_payload(&self, payload: SessionEventPayload) {
-        if !should_emit_live_payload(&payload) {
-            return;
-        }
-        let event = SessionEvent {
-            session_id: self.session_id.clone(),
-            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
-            delivery: Delivery::Lossless,
-            payload,
-        };
-        let _ = self.tx.send(Ok(event));
+    fn new(tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>) -> Self {
+        Self { tx }
     }
 
     fn emit_committed(&self, event: SessionEvent) {
@@ -239,16 +240,6 @@ impl LiveTurnStream {
     fn emit_error(&self, error: anyhow::Error) {
         let _ = self.tx.send(Err(error));
     }
-}
-
-fn live_hook_reporter(
-    live: Option<LiveTurnStream>,
-) -> Option<crate::hooks_runtime::HookEventReporter> {
-    live.map(|live| {
-        Arc::new(move |payload| {
-            live.emit_payload(payload);
-        }) as crate::hooks_runtime::HookEventReporter
-    })
 }
 
 fn track_fired_hook_ids(fired_hook_ids: &mut BTreeSet<String>, dispatch: &ExecutedHookDispatch) {
@@ -332,18 +323,42 @@ impl SessionRuntime {
             .resources
             .replace(snapshot, hooks, hook_warnings);
     }
+
+    /// Mark the runtime as shutting down, cancel every in-flight turn,
+    /// and wait for the spawned task loops to settle (or be aborted)
+    /// within `drain`. After this returns, subsequent `submit_turn`
+    /// calls fail with a "runtime is shutting down" error.
+    ///
+    /// Idempotent: calling shutdown after the registry is already in
+    /// the shutting-down state still drains any newly raced-in turns.
+    pub async fn shutdown(&self, drain: std::time::Duration) -> crate::ShutdownReport {
+        let report = self.services.turn_registry.shutdown(drain).await;
+        info!(
+            drained = report.turns_drained,
+            aborted = report.turns_aborted,
+            timed_out = report.timed_out,
+            drain_ms = %drain.as_millis(),
+            "runtime shutdown"
+        );
+        report
+    }
 }
 
-impl HalterSession {
+impl SessionHandle {
     pub(crate) fn new(
         services: Arc<RuntimeServices>,
         session_id: SessionId,
     ) -> anyhow::Result<Self> {
         let session_hooks = lookup_or_create_session_hooks(&services, &session_id)?;
+        let eviction = Arc::new(EvictionGuard {
+            services: services.clone(),
+            session_id: session_id.clone(),
+        });
         Ok(Self {
             services,
             session_id,
             session_hooks,
+            eviction,
         })
     }
 
@@ -387,36 +402,52 @@ impl HalterSession {
                     self.session_id.0
                 )
             })?;
-        let base_sequence = self.services.sessions.replay(&self.session_id).await?.len() as u64 + 1;
+        // Reject new turns once the runtime is shutting down so callers
+        // get a structured error instead of a turn that gets aborted
+        // mid-flight.
+        if self.services.turn_registry.is_shutting_down() {
+            anyhow::bail!(
+                "failed to submit turn '{}': runtime is shutting down",
+                turn.id
+            );
+        }
+
         let (tx, rx) = mpsc::unbounded_channel();
-        let live = LiveTurnStream::new(self.session_id.clone(), tx, base_sequence);
+        let live = LiveTurnStream::new(tx);
         let session = self.clone();
 
-        tokio::spawn(async move {
-            live.emit_payload(SessionEventPayload::TurnStarted {
-                turn_id: turn.id.clone(),
-            });
+        let registry = session.services.turn_registry.clone();
+        let turn_id_for_dereg = turn.id.clone();
+        let turn_id_for_register = turn.id.clone();
+        let task_cancel = turn_cancel.clone();
+        let handle = tokio::spawn(async move {
+            // Always deregister, even if the turn body panics, so we don't
+            // leak entries that block shutdown drain.
+            struct DeregisterOnDrop {
+                registry: Arc<TurnRegistry>,
+                turn_id: TurnId,
+            }
+            impl Drop for DeregisterOnDrop {
+                fn drop(&mut self) {
+                    self.registry.deregister(&self.turn_id);
+                }
+            }
+            let _guard = DeregisterOnDrop {
+                registry: registry.clone(),
+                turn_id: turn_id_for_dereg,
+            };
 
-            match session
-                .run_turn(stored, turn.clone(), turn_cancel, Some(live.clone()))
-                .await
-            {
-                Ok(turn_commit) => match session
-                    .commit_and_publish(
-                        Some(turn_commit.snapshot),
-                        Some(turn_commit.state),
-                        turn_commit.events,
-                    )
-                    .await
-                {
-                    Ok(committed) => {
-                        for event in committed {
-                            if matches!(event.payload, SessionEventPayload::TurnCompleted { .. }) {
-                                live.emit_committed(event);
-                            }
-                        }
-                    }
-                    Err(error) => {
+            match session.run_turn(stored, turn.clone(), task_cancel).await {
+                Ok(turn_commit) => {
+                    if let Err(error) = session
+                        .commit_and_publish(
+                            Some(turn_commit.snapshot),
+                            Some(turn_commit.state),
+                            turn_commit.events,
+                            Some(&live),
+                        )
+                        .await
+                    {
                         error!(
                             session_id = %session.session_id,
                             turn_id = %turn.id,
@@ -425,54 +456,56 @@ impl HalterSession {
                         );
                         live.emit_error(error);
                     }
-                },
+                }
                 Err(error) => {
+                    let retryable = error
+                        .downcast_ref::<ProviderError>()
+                        .map(|provider_error| provider_error.retryable)
+                        .unwrap_or(false);
                     error!(
                         session_id = %session.session_id,
                         turn_id = %turn.id,
                         error = %error,
+                        retryable,
                         "turn failed before commit"
                     );
                     let turn_snapshot = session.services.resources.snapshot();
                     let failure_events = vec![
-                        session.make_event(
-                            0,
-                            SessionEventPayload::TurnStarted {
-                                turn_id: turn.id.clone(),
-                            },
-                        ),
-                        session.make_event(
-                            0,
-                            SessionEventPayload::TurnFailed {
-                                turn_id: turn.id.clone(),
-                                error: error.to_string(),
-                            },
-                        ),
+                        session.make_event(SessionEventPayload::TurnStarted {
+                            turn_id: turn.id.clone(),
+                        }),
+                        session.make_event(SessionEventPayload::TurnFailed {
+                            turn_id: turn.id.clone(),
+                            error: error.to_string(),
+                            retryable,
+                        }),
                     ];
-                    match session
-                        .commit_and_publish(Some(turn_snapshot), None, failure_events)
+                    if let Err(commit_error) = session
+                        .commit_and_publish(Some(turn_snapshot), None, failure_events, Some(&live))
                         .await
                     {
-                        Ok(committed) => {
-                            for event in committed {
-                                if matches!(event.payload, SessionEventPayload::TurnFailed { .. }) {
-                                    live.emit_committed(event);
-                                }
-                            }
-                        }
-                        Err(commit_error) => {
-                            error!(
-                                session_id = %session.session_id,
-                                turn_id = %turn.id,
-                                error = %commit_error,
-                                "failed to commit failed turn"
-                            );
-                            live.emit_error(commit_error);
-                        }
+                        error!(
+                            session_id = %session.session_id,
+                            turn_id = %turn.id,
+                            error = %commit_error,
+                            "failed to commit failed turn"
+                        );
+                        live.emit_error(commit_error);
                     }
                 }
             }
         });
+
+        if let Err(register_error) =
+            self.services
+                .turn_registry
+                .register(turn_id_for_register, turn_cancel, handle)
+        {
+            // The registry already cancelled the token and aborted the
+            // task before returning the error. Surface the same shutdown
+            // error to the caller as the upfront check would have.
+            anyhow::bail!("failed to register turn: {register_error}");
+        }
 
         Ok(UnboundedReceiverStream::new(rx).boxed())
     }
@@ -506,24 +539,18 @@ impl HalterSession {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let dispatch = run_session_end(self, &fired_hook_ids, hook_ctx, reason, None).await?;
-        self.record_hook_dispatch(&mut events, &dispatch, None);
+        let dispatch = run_session_end(self, &fired_hook_ids, hook_ctx, reason).await?;
+        self.record_hook_dispatch(&mut events, &dispatch);
         if dispatch.merged.block_reason.is_some() || dispatch.merged.stop_reason.is_some() {
             warn!(session_id = %self.session_id, reason, "hooks.ignored_block");
         }
         for message in apply_hook_side_effects(&mut state, &dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                None,
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
-        self.push_event(
-            &mut events,
-            SessionEventPayload::SessionShutdownComplete,
-            None,
-        );
-        let _ = self.commit_and_publish(None, Some(state), events).await?;
+        self.push_event(&mut events, SessionEventPayload::SessionShutdownComplete);
+        let _ = self
+            .commit_and_publish(None, Some(state), events, None)
+            .await?;
         evict_session_hooks(&self.services, &self.session_id);
         Ok(())
     }
@@ -552,25 +579,16 @@ impl HalterSession {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let dispatch = run_notification(
-            self,
-            &fired_hook_ids,
-            hook_ctx,
-            notification_type,
-            message,
-            None,
-        )
-        .await?;
+        let dispatch =
+            run_notification(self, &fired_hook_ids, hook_ctx, notification_type, message).await?;
         let mut events = Vec::new();
-        self.record_hook_dispatch(&mut events, &dispatch, None);
+        self.record_hook_dispatch(&mut events, &dispatch);
         for message in apply_hook_side_effects(&mut state, &dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                None,
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
-        let _ = self.commit_and_publish(None, Some(state), events).await?;
+        let _ = self
+            .commit_and_publish(None, Some(state), events, None)
+            .await?;
         Ok(())
     }
 
@@ -609,20 +627,17 @@ impl HalterSession {
             hook_ctx,
             trigger,
             custom_instructions,
-            None,
         )
         .await?;
         track_fired_hook_ids(&mut fired_hook_ids, &pre_dispatch);
-        self.record_hook_dispatch(&mut events, &pre_dispatch, None);
+        self.record_hook_dispatch(&mut events, &pre_dispatch);
         for message in apply_hook_side_effects(&mut state, &pre_dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                None,
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
         if pre_dispatch.merged.block_reason.is_some() {
-            let _ = self.commit_and_publish(None, Some(state), events).await?;
+            let _ = self
+                .commit_and_publish(None, Some(state), events, None)
+                .await?;
             return Ok(());
         }
 
@@ -661,21 +676,18 @@ impl HalterSession {
             SessionEventPayload::ContextCompacted {
                 summary: summary.clone(),
             },
-            None,
         );
 
         let post_dispatch =
-            run_post_compact(self, &fired_hook_ids, hook_ctx, trigger, &summary, None).await?;
-        self.record_hook_dispatch(&mut events, &post_dispatch, None);
+            run_post_compact(self, &fired_hook_ids, hook_ctx, trigger, &summary).await?;
+        self.record_hook_dispatch(&mut events, &post_dispatch);
         for message in apply_hook_side_effects(&mut state, &post_dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                None,
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
 
-        let _ = self.commit_and_publish(None, Some(state), events).await?;
+        let _ = self
+            .commit_and_publish(None, Some(state), events, None)
+            .await?;
         Ok(())
     }
 
@@ -684,23 +696,18 @@ impl HalterSession {
         stored: StoredSession,
         turn: Turn,
         turn_cancel: CancellationToken,
-        live: Option<LiveTurnStream>,
     ) -> anyhow::Result<TurnCommit> {
         let snapshot = self.services.resources.snapshot();
         let mut state = stored.state;
-        let mut events = vec![self.make_event(
-            0,
-            SessionEventPayload::TurnStarted {
-                turn_id: turn.id.clone(),
-            },
-        )];
+        let mut events = vec![self.make_event(SessionEventPayload::TurnStarted {
+            turn_id: turn.id.clone(),
+        })];
         let mut turn_usage = Usage::default();
         let mut fired_hook_ids = state
             .fired_hook_ids
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let hook_reporter = live_hook_reporter(live.clone());
         let hook_model = turn
             .default_model
             .clone()
@@ -717,21 +724,13 @@ impl HalterSession {
                 SessionEventPayload::Warning {
                     message: format_hook_warning(&warning),
                 },
-                live.as_ref(),
             );
         }
 
         if let Some(source) = state.pending_session_start_source.take() {
-            let hook_dispatch = run_session_start(
-                self,
-                &fired_hook_ids,
-                hook_ctx,
-                source,
-                hook_reporter.clone(),
-            )
-            .await?;
+            let hook_dispatch = run_session_start(self, &fired_hook_ids, hook_ctx, source).await?;
             track_fired_hook_ids(&mut fired_hook_ids, &hook_dispatch);
-            self.record_hook_dispatch(&mut events, &hook_dispatch, None);
+            self.record_hook_dispatch(&mut events, &hook_dispatch);
             if hook_dispatch.merged.block_reason.is_some()
                 || hook_dispatch.merged.stop_reason.is_some()
             {
@@ -742,11 +741,7 @@ impl HalterSession {
                 );
             }
             for message in apply_hook_side_effects(&mut state, &hook_dispatch) {
-                self.push_event(
-                    &mut events,
-                    SessionEventPayload::MessageItem { message },
-                    live.as_ref(),
-                );
+                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
             }
         }
 
@@ -755,17 +750,12 @@ impl HalterSession {
             &fired_hook_ids,
             hook_ctx,
             &turn.user_message.plain_text(),
-            hook_reporter.clone(),
         )
         .await?;
         track_fired_hook_ids(&mut fired_hook_ids, &prompt_dispatch);
-        self.record_hook_dispatch(&mut events, &prompt_dispatch, None);
+        self.record_hook_dispatch(&mut events, &prompt_dispatch);
         for message in apply_hook_side_effects(&mut state, &prompt_dispatch) {
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                live.as_ref(),
-            );
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
 
         if let Some(reason) = prompt_dispatch
@@ -783,15 +773,11 @@ impl HalterSession {
             self.push_event(
                 &mut events,
                 SessionEventPayload::MessageItem { message: blocked },
-                live.as_ref(),
             );
-            events.push(self.make_event(
-                0,
-                SessionEventPayload::TurnCompleted {
-                    turn_id: turn.id,
-                    usage: turn_usage,
-                },
-            ));
+            events.push(self.make_event(SessionEventPayload::TurnCompleted {
+                turn_id: turn.id,
+                usage: turn_usage,
+            }));
             return Ok(TurnCommit {
                 snapshot,
                 state,
@@ -834,7 +820,6 @@ impl HalterSession {
                     SessionEventPayload::ContextCompacted {
                         summary: compaction.summary.clone(),
                     },
-                    live.as_ref(),
                 );
             }
 
@@ -904,43 +889,14 @@ impl HalterSession {
             }
 
             for payload in materialized.events {
-                self.push_event(&mut events, payload, live.as_ref());
+                self.push_event(&mut events, payload);
             }
             self.push_event(
                 &mut events,
                 SessionEventPayload::MessageItem {
                     message: assistant_message,
                 },
-                live.as_ref(),
             );
-
-            let post_response_observed = observe_state(stored.blueprint.working_dir.clone());
-            let post_response_plan = self
-                .services
-                .context_manager
-                .plan(
-                    &stored.blueprint,
-                    &state,
-                    &post_response_observed,
-                    snapshot.as_ref(),
-                    &self.services.tools.specs(),
-                    &compaction_model,
-                    compaction_provider.as_ref(),
-                )
-                .await?;
-            if let Some(ref compaction) = post_response_plan.compaction {
-                state.compacted_prefix = post_response_plan.compacted_prefix.clone();
-                state.messages = post_response_plan.messages.clone();
-                state.last_response_id = None;
-                state.messages_seen_by_provider = 0;
-                self.push_event(
-                    &mut events,
-                    SessionEventPayload::ContextCompacted {
-                        summary: compaction.summary.clone(),
-                    },
-                    live.as_ref(),
-                );
-            }
 
             let tool_calls = assistant_tool_calls(&materialized.message);
             if tool_calls.is_empty() {
@@ -954,17 +910,12 @@ impl HalterSession {
                     },
                     Some(&materialized.message),
                     true,
-                    hook_reporter.clone(),
                 )
                 .await?;
                 track_fired_hook_ids(&mut fired_hook_ids, &stop_dispatch);
-                self.record_hook_dispatch(&mut events, &stop_dispatch, None);
+                self.record_hook_dispatch(&mut events, &stop_dispatch);
                 for message in apply_hook_side_effects(&mut state, &stop_dispatch) {
-                    self.push_event(
-                        &mut events,
-                        SessionEventPayload::MessageItem { message },
-                        live.as_ref(),
-                    );
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
                 }
                 if let Some(reason) = stop_dispatch.merged.block_reason.clone() {
                     let continuation = Message::User(halter_protocol::UserMessage::text(
@@ -980,7 +931,6 @@ impl HalterSession {
                         SessionEventPayload::MessageItem {
                             message: continuation,
                         },
-                        live.as_ref(),
                     );
                     continue;
                 }
@@ -992,13 +942,10 @@ impl HalterSession {
                     output_tokens = turn_usage.output_tokens,
                     "turn completed without tool calls"
                 );
-                events.push(self.make_event(
-                    0,
-                    SessionEventPayload::TurnCompleted {
-                        turn_id: turn.id,
-                        usage: turn_usage,
-                    },
-                ));
+                events.push(self.make_event(SessionEventPayload::TurnCompleted {
+                    turn_id: turn.id,
+                    usage: turn_usage,
+                }));
                 return Ok(TurnCommit {
                     snapshot,
                     state,
@@ -1022,10 +969,8 @@ impl HalterSession {
                     &selected_models.subagent_model,
                     &turn.id,
                     &mut fired_hook_ids,
-                    hook_reporter.clone(),
                     &mut state,
                     tool_calls,
-                    live.clone(),
                 )
                 .await?;
             events.extend(tool_events);
@@ -1042,215 +987,215 @@ impl HalterSession {
         effective_subagent_model: &ModelId,
         turn_id: &halter_protocol::TurnId,
         fired_hook_ids: &mut BTreeSet<String>,
-        hook_reporter: Option<crate::hooks_runtime::HookEventReporter>,
         state: &mut SessionState,
         tool_calls: Vec<ToolCall>,
-        live: Option<LiveTurnStream>,
-    ) -> anyhow::Result<Vec<SessionEvent>> {
+    ) -> anyhow::Result<Vec<PendingEvent>> {
         let mut events = Vec::new();
 
-        for mut call in tool_calls {
-            let pre_dispatch = run_pre_tool_use(
-                self,
-                fired_hook_ids,
-                HookInvocationContext {
-                    turn_id,
-                    model: effective_model,
-                    working_dir: &blueprint.working_dir,
-                },
-                &call,
-                hook_reporter.clone(),
-            )
-            .await?;
-            track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
-            self.record_hook_dispatch(&mut events, &pre_dispatch, None);
-            for message in apply_hook_side_effects(state, &pre_dispatch) {
+        let tools = self.services.tools.clone();
+        for batch in
+            batch_tool_calls_by_concurrency(|name| tools.concurrency_for(&name.0), tool_calls)
+        {
+            // Phase A: pre-hook + block check + context build (sequential per call,
+            // because each mutates `state` and may change `call.arguments`).
+            let mut prepared: Vec<PreparedToolCall> = Vec::with_capacity(batch.len());
+            for mut call in batch {
+                let pre_dispatch = run_pre_tool_use(
+                    self,
+                    fired_hook_ids,
+                    HookInvocationContext {
+                        turn_id,
+                        model: effective_model,
+                        working_dir: &blueprint.working_dir,
+                    },
+                    &call,
+                )
+                .await?;
+                track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
+                self.record_hook_dispatch(&mut events, &pre_dispatch);
+                for message in apply_hook_side_effects(state, &pre_dispatch) {
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                }
+                if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
+                    call.arguments = updated_input;
+                }
+                info!(
+                    session_id = %self.session_id,
+                    tool_call_id = %call.id,
+                    tool_name = %call.name,
+                    "executing tool call"
+                );
                 self.push_event(
                     &mut events,
-                    SessionEventPayload::MessageItem { message },
-                    live.as_ref(),
+                    SessionEventPayload::ToolExecutionStarted { call: call.clone() },
                 );
-            }
-            if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
-                call.arguments = updated_input;
-            }
-            info!(
-                session_id = %self.session_id,
-                tool_call_id = %call.id,
-                tool_name = %call.name,
-                "executing tool call"
-            );
-            self.push_event(
-                &mut events,
-                SessionEventPayload::ToolExecutionStarted { call: call.clone() },
-                live.as_ref(),
-            );
 
-            if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
-                let error = ToolError::new(reason);
+                if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
+                    let error = ToolError::new(reason);
+                    let outcome = ToolExecutionOutcome {
+                        call: call.clone(),
+                        result: Err(error.clone()),
+                    };
+                    let message = Message::Tool(ToolResultMessage {
+                        id: MessageId::new(),
+                        call_id: call.id.clone(),
+                        content: ToolResult::Empty,
+                        error: Some(error),
+                        created_at: Utc::now(),
+                    });
+                    state.messages.push(message.clone());
+                    self.push_event(
+                        &mut events,
+                        SessionEventPayload::ToolExecutionCompleted { outcome },
+                    );
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    continue;
+                }
+
+                let (emit, tool_event_drain) = self.spawn_tool_event_sink();
+                let context = halter_tools::ToolContext {
+                    session_id: self.session_id.clone(),
+                    working_dir: blueprint.working_dir.clone(),
+                    path_locks: self.services.path_locks.clone(),
+                    tool_sessions: self.services.tool_sessions.clone(),
+                    snapshot: snapshot.clone(),
+                    cancel: cancel.child_token(),
+                    emit,
+                    policy: self.services.policy.clone(),
+                    shell_timeout_secs: self.services.shell_timeout_secs,
+                    subagent_parent: Some(Arc::new(SubagentParentContext {
+                        blueprint: blueprint.clone(),
+                        state: state.clone(),
+                        snapshot: snapshot.clone(),
+                        subagent_model: effective_subagent_model.clone(),
+                    })),
+                };
+                state.pending_tool_calls.insert(
+                    call.id.clone(),
+                    PendingToolCall {
+                        call: call.clone(),
+                        submitted_at: Utc::now(),
+                    },
+                );
+
+                prepared.push(PreparedToolCall {
+                    call,
+                    context,
+                    tool_event_drain,
+                });
+            }
+
+            // Phase B: dispatch execution. For Exclusive or single-call batches this
+            // is serial; for ReadOnly/ParallelSafe batches of >1, runs concurrently.
+            let tools = self.services.tools.clone();
+            let executions: Vec<anyhow::Result<ToolResult>> =
+                futures::future::join_all(prepared.iter().map(|p| {
+                    let tools = tools.clone();
+                    let context = p.context.clone();
+                    let args = p.call.arguments.clone();
+                    let name = p.call.name.0.clone();
+                    async move { tools.execute(&name, context, args).await }
+                }))
+                .await;
+
+            // Phase C: post-hook + state mutation (sequential, original order).
+            for (prep, execution) in prepared.into_iter().zip(executions) {
+                let PreparedToolCall {
+                    call,
+                    context,
+                    tool_event_drain,
+                } = prep;
+                drop(context);
+                for payload in tool_event_drain
+                    .into_events()
+                    .into_iter()
+                    .filter_map(|event| tool_runtime_event_payload(&call.id, event))
+                {
+                    self.push_event(&mut events, payload);
+                }
+
+                let (mut content, error) = match execution {
+                    Ok(result) => {
+                        debug!(
+                            session_id = %self.session_id,
+                            tool_call_id = %call.id,
+                            tool_name = %call.name,
+                            result_kind = tool_result_kind(&result),
+                            "tool call completed"
+                        );
+                        (result, None)
+                    }
+                    Err(error) => {
+                        warn!(
+                            session_id = %self.session_id,
+                            tool_call_id = %call.id,
+                            tool_name = %call.name,
+                            error = %error,
+                            "tool call failed"
+                        );
+                        (ToolResult::Empty, Some(ToolError::new(error.to_string())))
+                    }
+                };
+                if error.is_none() {
+                    let post_dispatch = run_post_tool_use(
+                        self,
+                        fired_hook_ids,
+                        HookInvocationContext {
+                            turn_id,
+                            model: effective_model,
+                            working_dir: &blueprint.working_dir,
+                        },
+                        &call,
+                        &content,
+                    )
+                    .await?;
+                    track_fired_hook_ids(fired_hook_ids, &post_dispatch);
+                    self.record_hook_dispatch(&mut events, &post_dispatch);
+                    for message in apply_hook_side_effects(state, &post_dispatch) {
+                        self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    }
+                    if let Some(updated_output) = post_dispatch.merged.updated_output {
+                        content = tool_result_from_hook_value(updated_output);
+                    }
+                } else if let Some(tool_error) = error.as_ref() {
+                    let post_dispatch = run_post_tool_use_failure(
+                        self,
+                        fired_hook_ids,
+                        HookInvocationContext {
+                            turn_id,
+                            model: effective_model,
+                            working_dir: &blueprint.working_dir,
+                        },
+                        &call,
+                        tool_error,
+                    )
+                    .await?;
+                    track_fired_hook_ids(fired_hook_ids, &post_dispatch);
+                    self.record_hook_dispatch(&mut events, &post_dispatch);
+                    for message in apply_hook_side_effects(state, &post_dispatch) {
+                        self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    }
+                }
                 let outcome = ToolExecutionOutcome {
                     call: call.clone(),
-                    result: Err(error.clone()),
+                    result: error.clone().map_or_else(|| Ok(content.clone()), Err),
                 };
                 let message = Message::Tool(ToolResultMessage {
                     id: MessageId::new(),
                     call_id: call.id.clone(),
-                    content: ToolResult::Empty,
-                    error: Some(error),
+                    content,
+                    error,
                     created_at: Utc::now(),
                 });
+
+                state.pending_tool_calls.shift_remove(&call.id);
                 state.messages.push(message.clone());
                 self.push_event(
                     &mut events,
                     SessionEventPayload::ToolExecutionCompleted { outcome },
-                    live.as_ref(),
                 );
-                self.push_event(
-                    &mut events,
-                    SessionEventPayload::MessageItem { message },
-                    live.as_ref(),
-                );
-                continue;
+                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
             }
-
-            let (emit, tool_event_drain) = self.spawn_tool_event_sink(&call, live.clone());
-            let context = halter_tools::ToolContext {
-                session_id: self.session_id.clone(),
-                working_dir: blueprint.working_dir.clone(),
-                path_locks: self.services.path_locks.clone(),
-                tool_sessions: self.services.tool_sessions.clone(),
-                file_view: Arc::new(state.file_view_cache.clone()),
-                snapshot: snapshot.clone(),
-                cancel: cancel.child_token(),
-                emit,
-                policy: self.services.policy.clone(),
-                max_tool_output_bytes: self.services.max_tool_output_bytes,
-                shell_timeout_secs: self.services.shell_timeout_secs,
-                subagent_parent: Some(Arc::new(SubagentParentContext {
-                    blueprint: blueprint.clone(),
-                    state: state.clone(),
-                    snapshot: snapshot.clone(),
-                    subagent_model: effective_subagent_model.clone(),
-                })),
-            };
-            state.pending_tool_calls.insert(
-                call.id.clone(),
-                PendingToolCall {
-                    call: call.clone(),
-                    submitted_at: Utc::now(),
-                },
-            );
-
-            let execution = self
-                .services
-                .tools
-                .execute(&call.name.0, context.clone(), call.arguments.clone())
-                .await;
-            drop(context);
-            for payload in tool_event_drain
-                .into_events()
-                .into_iter()
-                .filter_map(|event| tool_runtime_event_payload(&call.id, event))
-            {
-                self.push_event(&mut events, payload, live.as_ref());
-            }
-
-            let (mut content, error) = match execution {
-                Ok(result) => {
-                    debug!(
-                        session_id = %self.session_id,
-                        tool_call_id = %call.id,
-                        tool_name = %call.name,
-                        result_kind = tool_result_kind(&result),
-                        "tool call completed"
-                    );
-                    (result, None)
-                }
-                Err(error) => {
-                    warn!(
-                        session_id = %self.session_id,
-                        tool_call_id = %call.id,
-                        tool_name = %call.name,
-                        error = %error,
-                        "tool call failed"
-                    );
-                    (ToolResult::Empty, Some(ToolError::new(error.to_string())))
-                }
-            };
-            if error.is_none() {
-                let post_dispatch = run_post_tool_use(
-                    self,
-                    fired_hook_ids,
-                    HookInvocationContext {
-                        turn_id,
-                        model: effective_model,
-                        working_dir: &blueprint.working_dir,
-                    },
-                    &call,
-                    &content,
-                    hook_reporter.clone(),
-                )
-                .await?;
-                track_fired_hook_ids(fired_hook_ids, &post_dispatch);
-                self.record_hook_dispatch(&mut events, &post_dispatch, None);
-                for message in apply_hook_side_effects(state, &post_dispatch) {
-                    self.push_event(
-                        &mut events,
-                        SessionEventPayload::MessageItem { message },
-                        live.as_ref(),
-                    );
-                }
-                if let Some(updated_output) = post_dispatch.merged.updated_output {
-                    content = tool_result_from_hook_value(updated_output);
-                }
-            } else if let Some(tool_error) = error.as_ref() {
-                let post_dispatch = run_post_tool_use_failure(
-                    self,
-                    fired_hook_ids,
-                    HookInvocationContext {
-                        turn_id,
-                        model: effective_model,
-                        working_dir: &blueprint.working_dir,
-                    },
-                    &call,
-                    tool_error,
-                    hook_reporter.clone(),
-                )
-                .await?;
-                track_fired_hook_ids(fired_hook_ids, &post_dispatch);
-                self.record_hook_dispatch(&mut events, &post_dispatch, None);
-                for message in apply_hook_side_effects(state, &post_dispatch) {
-                    self.push_event(
-                        &mut events,
-                        SessionEventPayload::MessageItem { message },
-                        live.as_ref(),
-                    );
-                }
-            }
-            let outcome = ToolExecutionOutcome {
-                call: call.clone(),
-                result: error.clone().map_or_else(|| Ok(content.clone()), Err),
-            };
-            let message = Message::Tool(ToolResultMessage {
-                id: MessageId::new(),
-                call_id: call.id.clone(),
-                content,
-                error,
-                created_at: Utc::now(),
-            });
-
-            state.pending_tool_calls.shift_remove(&call.id);
-            state.messages.push(message.clone());
-            self.push_event(
-                &mut events,
-                SessionEventPayload::ToolExecutionCompleted { outcome },
-                live.as_ref(),
-            );
-            self.push_event(
-                &mut events,
-                SessionEventPayload::MessageItem { message },
-                live.as_ref(),
-            );
         }
 
         Ok(events)
@@ -1260,7 +1205,8 @@ impl HalterSession {
         &self,
         snapshot: Option<Arc<ResourceSnapshot>>,
         state: Option<SessionState>,
-        events: Vec<SessionEvent>,
+        events: Vec<PendingEvent>,
+        live: Option<&LiveTurnStream>,
     ) -> anyhow::Result<Vec<SessionEvent>> {
         debug!(
             session_id = %self.session_id,
@@ -1274,69 +1220,54 @@ impl HalterSession {
             .sessions
             .commit(&self.session_id, snapshot, None, state, events)
             .await?;
+        // Single commit-then-publish point. Events fan out to both sinks, but
+        // only *after* the store has assigned monotonic sequences; there is no
+        // pre-commit emission path that could race with the real sequence or
+        // deliver sentinel-sequenced events.
         for event in &committed {
+            if let Some(live) = live {
+                live.emit_committed(event.clone());
+            }
             self.services.event_bus.publish(event.clone());
         }
         Ok(committed)
     }
 
-    fn spawn_tool_event_sink(
-        &self,
-        call: &ToolCall,
-        live: Option<LiveTurnStream>,
-    ) -> (Arc<dyn ToolEventSink>, ToolEventDrain) {
+    fn spawn_tool_event_sink(&self) -> (Arc<dyn ToolEventSink>, ToolEventDrain) {
         let events = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(SessionToolEventSink {
-                call_id: call.id.clone(),
                 events: events.clone(),
-                live,
             }) as Arc<dyn ToolEventSink>,
             ToolEventDrain { events },
         )
     }
 
-    fn push_event(
-        &self,
-        events: &mut Vec<SessionEvent>,
-        payload: SessionEventPayload,
-        live: Option<&LiveTurnStream>,
-    ) {
-        if let Some(live) = live {
-            live.emit_payload(payload.clone());
-        }
-        events.push(self.make_event(0, payload));
+    fn push_event(&self, events: &mut Vec<PendingEvent>, payload: SessionEventPayload) {
+        events.push(self.make_event(payload));
     }
 
     fn record_hook_dispatch(
         &self,
-        events: &mut Vec<SessionEvent>,
+        events: &mut Vec<PendingEvent>,
         dispatch: &ExecutedHookDispatch,
-        live: Option<&LiveTurnStream>,
     ) {
         for run in &dispatch.preview_runs {
             self.push_event(
                 events,
                 SessionEventPayload::HookStarted { run: run.clone() },
-                live,
             );
         }
         for run in &dispatch.completed_runs {
             self.push_event(
                 events,
                 SessionEventPayload::HookCompleted { run: run.clone() },
-                live,
             );
         }
     }
 
-    fn make_event(&self, sequence: u64, payload: SessionEventPayload) -> SessionEvent {
-        SessionEvent {
-            session_id: self.session_id.clone(),
-            sequence,
-            delivery: Delivery::Lossless,
-            payload,
-        }
+    fn make_event(&self, payload: SessionEventPayload) -> PendingEvent {
+        PendingEvent::new(self.session_id.clone(), Delivery::Lossless, payload)
     }
 }
 
@@ -1356,20 +1287,11 @@ fn tool_runtime_event_payload(
     }
 }
 
-fn should_emit_live_payload(payload: &SessionEventPayload) -> bool {
-    !matches!(
-        payload,
-        SessionEventPayload::TurnStarted { .. }
-            | SessionEventPayload::TurnCompleted { .. }
-            | SessionEventPayload::TurnFailed { .. }
-    )
-}
-
 #[derive(Debug)]
 struct TurnCommit {
     snapshot: Arc<ResourceSnapshot>,
     state: SessionState,
-    events: Vec<SessionEvent>,
+    events: Vec<PendingEvent>,
 }
 
 #[derive(Debug, Default)]
@@ -1491,7 +1413,7 @@ pub(crate) async fn materialize_assistant_message(
             }
             Ok(StreamEvent::Error { error }) | Err(error) => {
                 error!(provider = %model.provider, error = %error.message, "provider stream failed");
-                anyhow::bail!(error.message);
+                return Err(anyhow::Error::new(error));
             }
         }
     }
@@ -1705,12 +1627,11 @@ pub(crate) async fn create_session_seeded(
         })
         .await?;
 
-    let started = SessionEvent {
-        session_id: session_id.clone(),
-        sequence: 0,
-        delivery: Delivery::Lossless,
-        payload: SessionEventPayload::SessionStarted,
-    };
+    let started = PendingEvent::new(
+        session_id.clone(),
+        Delivery::Lossless,
+        SessionEventPayload::SessionStarted,
+    );
     let committed = services
         .sessions
         .commit(&session_id, None, None, None, vec![started])
@@ -1774,20 +1695,109 @@ fn format_hook_warning(warning: &HookWarning) -> String {
     format!("{prefix}: {}", warning.message)
 }
 
-impl Drop for HalterSession {
-    fn drop(&mut self) {
-        evict_session_hooks(&self.services, &self.session_id);
-    }
-}
-
 fn observe_state(working_dir: PathBuf) -> ObservedState {
+    let (git_branch, git_dirty) = probe_git(&working_dir);
     ObservedState {
         cwd: working_dir,
-        git_branch: None,
-        git_dirty: None,
+        git_branch,
+        git_dirty,
         now_utc: Utc::now(),
         env_facts: Default::default(),
     }
+}
+
+struct PreparedToolCall {
+    call: ToolCall,
+    context: halter_tools::ToolContext,
+    tool_event_drain: ToolEventDrain,
+}
+
+/// Partition `tool_calls` into concurrency-compatible batches per the
+/// `ToolConcurrency` protocol variant declared for each tool:
+///
+/// - `Exclusive` tools are emitted in batches of size 1.
+/// - Runs of `ReadOnly` and `ParallelSafe` tools are grouped into one batch
+///   and may execute concurrently.
+///
+/// Concurrency is resolved via a caller-supplied closure. Tools the resolver
+/// cannot classify are treated as `Exclusive` (safe default). Within a batch,
+/// original order is preserved so hook and event sequencing remain
+/// deterministic.
+fn batch_tool_calls_by_concurrency(
+    mut resolve: impl FnMut(&halter_protocol::ToolName) -> Option<halter_protocol::ToolConcurrency>,
+    tool_calls: Vec<ToolCall>,
+) -> Vec<Vec<ToolCall>> {
+    use halter_protocol::ToolConcurrency;
+
+    let mut concurrency_of = |call: &ToolCall| -> ToolConcurrency {
+        resolve(&call.name).unwrap_or(ToolConcurrency::Exclusive)
+    };
+
+    let mut batches: Vec<Vec<ToolCall>> = Vec::new();
+    let mut current: Vec<ToolCall> = Vec::new();
+
+    for call in tool_calls {
+        let concurrency = concurrency_of(&call);
+        if matches!(concurrency, ToolConcurrency::Exclusive) {
+            if !current.is_empty() {
+                batches.push(std::mem::take(&mut current));
+            }
+            batches.push(vec![call]);
+        } else {
+            current.push(call);
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Probe the git branch and dirty flag for `working_dir`.
+///
+/// Returns `(None, None)` when the directory is not a git working tree or
+/// `git` is not available. A detached HEAD returns the abbreviated commit as
+/// the branch name. `git_dirty` is `Some(false)` for a clean tree, `Some(true)`
+/// when any tracked or untracked change is present.
+fn probe_git(working_dir: &std::path::Path) -> (Option<String>, Option<bool>) {
+    use std::process::Command;
+
+    let branch_output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(working_dir)
+        .output();
+    let branch = match branch_output {
+        Ok(out) if out.status.success() => {
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if name.is_empty() {
+                return (None, None);
+            }
+            if name == "HEAD" {
+                // detached HEAD — resolve to short commit
+                Command::new("git")
+                    .args(["rev-parse", "--short", "HEAD"])
+                    .current_dir(working_dir)
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                    .filter(|s| !s.is_empty())
+            } else {
+                Some(name)
+            }
+        }
+        _ => return (None, None),
+    };
+
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(working_dir)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| !out.stdout.is_empty());
+
+    (branch, dirty)
 }
 
 #[cfg(test)]
@@ -1811,7 +1821,7 @@ impl Default for RuntimeServices {
             prompt_assembler: Arc::new(crate::DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::default()),
             event_bus: Arc::new(EventBus::default()),
-            max_tool_output_bytes: 262_144,
+            turn_registry: Arc::new(TurnRegistry::new()),
             shell_timeout_secs: 30,
         }
     }
@@ -1855,6 +1865,96 @@ mod tests {
             init.system_prompt_seed[0].text,
             crate::prompt::default_system_prompt_text()
         );
+    }
+
+    #[test]
+    fn batch_tool_calls_isolates_exclusive_tools() {
+        use halter_protocol::ToolCallId;
+
+        let mut declared: HashMap<String, ToolConcurrency> = HashMap::new();
+        for (name, concurrency) in [
+            ("read_a", ToolConcurrency::ReadOnly),
+            ("read_b", ToolConcurrency::ReadOnly),
+            ("exclusive", ToolConcurrency::Exclusive),
+            ("parallel", ToolConcurrency::ParallelSafe),
+        ] {
+            declared.insert(name.into(), concurrency);
+        }
+
+        let mk = |tool: &str, id: &str| ToolCall {
+            id: ToolCallId::from(id),
+            name: ToolName::from(tool),
+            arguments: serde_json::Value::Null,
+        };
+        let batches = super::batch_tool_calls_by_concurrency(
+            |name| declared.get(&name.0).copied(),
+            vec![
+                mk("read_a", "1"),
+                mk("read_b", "2"),
+                mk("exclusive", "3"),
+                mk("parallel", "4"),
+                mk("read_a", "5"),
+            ],
+        );
+        assert_eq!(batches.len(), 3, "three batches: [r,r], [excl], [p,r]");
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 1);
+        assert_eq!(batches[1][0].name.0, "exclusive");
+        assert_eq!(batches[2].len(), 2);
+    }
+
+    #[test]
+    fn batch_tool_calls_treats_unknown_tools_as_exclusive() {
+        use halter_protocol::ToolCallId;
+
+        let mk = |name: &str, id: &str| ToolCall {
+            id: ToolCallId::from(id),
+            name: ToolName::from(name),
+            arguments: serde_json::Value::Null,
+        };
+        let batches = super::batch_tool_calls_by_concurrency(
+            |_| None,
+            vec![mk("mystery_a", "1"), mk("mystery_b", "2")],
+        );
+        assert_eq!(batches.len(), 2, "unknown tools must be exclusive");
+    }
+
+    #[test]
+    fn probe_git_returns_none_outside_working_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (branch, dirty) = super::probe_git(tmp.path());
+        assert_eq!(branch, None);
+        assert_eq!(dirty, None);
+    }
+
+    #[test]
+    fn probe_git_reports_branch_and_dirty_flag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(status.status.success(), "git {:?} failed", args);
+        };
+
+        git(&["init", "--initial-branch=trunk"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test User"]);
+        std::fs::write(root.join("seed.txt"), b"initial").expect("write seed");
+        git(&["add", "seed.txt"]);
+        git(&["commit", "-m", "seed"]);
+
+        let (branch, dirty) = super::probe_git(root);
+        assert_eq!(branch.as_deref(), Some("trunk"));
+        assert_eq!(dirty, Some(false));
+
+        std::fs::write(root.join("dirty.txt"), b"unstaged").expect("write dirty");
+        let (branch, dirty) = super::probe_git(root);
+        assert_eq!(branch.as_deref(), Some("trunk"));
+        assert_eq!(dirty, Some(true));
     }
 
     mod test_support {
@@ -2152,6 +2252,72 @@ mod tests {
                 .as_ref()
                 .is_some_and(|error| error.message.contains("blocked by hook"))
         )));
+
+        // C4 / AC2.6: a turn that the pre-tool hook blocks must not leak the
+        // (uninvoked) call into the persisted `pending_tool_calls` map.
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session present");
+        assert!(
+            stored.state.pending_tool_calls.is_empty(),
+            "blocked-tool path left pending_tool_calls populated: {} entries",
+            stored.state.pending_tool_calls.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn ac2_1_dropping_a_clone_does_not_evict_hooks_from_the_original_handle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(ToolLoopProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let session_id = session.session_id().clone();
+
+        // Setup: the SessionHandle's hooks are registered in the runtime store.
+        {
+            let store = services
+                .session_hook_store
+                .lock()
+                .expect("session hook store lock");
+            assert!(
+                store.contains_key(&session_id),
+                "session hooks should be registered after new_session"
+            );
+        }
+
+        // Before Phase 3, `HalterSession: Clone + Drop` evicted the hook entry
+        // every time any clone was dropped (even an internal clone moved into
+        // the spawned turn loop). The pinned PR re-introduces the footgun if
+        // this assertion ever flips back to "absent".
+        let cloned = session.clone();
+        drop(cloned);
+
+        {
+            let store = services
+                .session_hook_store
+                .lock()
+                .expect("session hook store lock");
+            assert!(
+                store.contains_key(&session_id),
+                "dropping a clone evicted hooks; the original handle must keep them alive"
+            );
+        }
+
+        drop(session);
+
+        {
+            let store = services
+                .session_hook_store
+                .lock()
+                .expect("session hook store lock");
+            assert!(
+                !store.contains_key(&session_id),
+                "session hooks should be evicted once the last handle is dropped"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2389,23 +2555,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_started_events_stream_before_hook_completion() {
+    async fn hook_events_delivered_after_turn_commits() {
+        // Post-H6 single commit-then-publish: HookStarted/HookCompleted
+        // arrive at turn commit, not intra-turn. This test only asserts they
+        // are present in the post-commit stream.
         let temp = tempfile::tempdir().expect("tempdir");
-        let notify = Arc::new(Notify::new());
         let mut services = RuntimeServices::default();
         let mut hooks = RegisteredHooks::default();
         hooks.register(
             PluginId::from("test-plugin"),
             RegisteredHookPriority::AfterPlugins,
-            Hook::callback(HookEventName::UserPromptSubmit, {
-                let notify = notify.clone();
-                move |_input| {
-                    let notify = notify.clone();
-                    async move {
-                        notify.notified().await;
-                        HookResponse::passthrough()
-                    }
-                }
+            Hook::callback(HookEventName::UserPromptSubmit, move |_input| async move {
+                HookResponse::passthrough()
             }),
         );
         services.registered_hooks = Arc::new(hooks);
@@ -2425,31 +2586,19 @@ mod tests {
         let runtime = SessionRuntime::new(Arc::new(services));
         let session = new_session(&runtime, temp.path()).await;
 
-        let mut stream = session
+        let events = session
             .submit_turn(Turn::user("hello"))
             .await
-            .expect("submit turn");
-
-        let first = tokio::time::timeout(Duration::from_secs(1), stream.try_next())
-            .await
-            .expect("first event timeout")
-            .expect("first event result")
-            .expect("first event");
-        assert!(matches!(
-            first.payload,
-            SessionEventPayload::HookStarted { .. }
-        ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), stream.try_next())
-                .await
-                .is_err()
-        );
-
-        notify.notify_waiters();
-        let events = stream
+            .expect("submit turn")
             .try_collect::<Vec<_>>()
             .await
             .expect("collect events");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::HookStarted { .. }))
+        );
         assert!(
             events
                 .iter()
@@ -2766,38 +2915,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_turn_streams_tool_output_before_tool_completion() {
+    async fn submit_turn_delivers_tool_output_after_turn_commits() {
+        // Post-H6: tool output chunks collected during tool execution are
+        // flushed alongside other turn events at commit. This test asserts
+        // the chunk is present in the committed stream, not that it arrives
+        // mid-tool.
         let temp = tempfile::tempdir().expect("tempdir");
         let services = configured_services(Arc::new(StreamingToolProvider), temp.path());
         services.tools.register(Arc::new(StreamingTestTool));
         let runtime = SessionRuntime::new(services);
         let session = new_session(&runtime, temp.path()).await;
 
-        let mut events = session
+        let events = session
             .submit_turn(Turn::user("stream tool output"))
             .await
-            .expect("submit turn");
-
-        let tool_output = tokio::time::timeout(Duration::from_millis(150), async {
-            while let Some(event) = events.next().await {
-                let event = event.expect("stream event");
-                if let SessionEventPayload::ToolOutput { chunk, .. } = event.payload {
-                    return chunk;
-                }
-            }
-            panic!("tool output never arrived");
-        })
-        .await
-        .expect("tool output should stream before tool completion");
-
-        assert_eq!(tool_output, "streamed chunk");
-
-        let remaining = events
+            .expect("submit turn")
             .try_collect::<Vec<_>>()
             .await
-            .expect("collect remaining events");
+            .expect("collect events");
+
+        let tool_output = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::ToolOutput { chunk, .. } => Some(chunk.clone()),
+                _ => None,
+            })
+            .expect("tool output chunk present in committed events");
+        assert_eq!(tool_output, "streamed chunk");
         assert!(
-            remaining
+            events
                 .iter()
                 .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
         );
@@ -3055,6 +3201,304 @@ mod tests {
         }
     }
 
+    /// Provider whose error is flagged retryable. Used to verify the
+    /// runtime preserves the `retryable` bit on `TurnFailed`.
+    #[derive(Debug)]
+    struct RetryableFailingProvider;
+
+    #[async_trait]
+    impl Provider for RetryableFailingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            Ok(stream::iter(vec![Err(ProviderError::new("rate limited", true))]).boxed())
+        }
+    }
+
+    /// Provider that emits MessageStart and then blocks on its child
+    /// cancel token. Models a long-running provider that responds to
+    /// cancellation cooperatively — used for shutdown-drain tests.
+    #[derive(Debug)]
+    struct CancellableBlockingProvider {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for CancellableBlockingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            let started = self.started.clone();
+            let s = futures::stream::unfold(Some((cancel, started, false)), |state| async move {
+                let (cancel, started, emitted) = state?;
+                if !emitted {
+                    started.notify_one();
+                    return Some((
+                        Ok(StreamEvent::MessageStart {
+                            id: halter_protocol::MessageId::new(),
+                        }),
+                        Some((cancel, started, true)),
+                    ));
+                }
+                cancel.cancelled().await;
+                Some((Err(ProviderError::new("cancelled", false)), None))
+            });
+            Ok(s.boxed())
+        }
+    }
+
+    /// Provider that emits MessageStart and then sleeps forever, ignoring
+    /// the cancel token. Used to verify the shutdown drain deadline aborts
+    /// uncooperative provider streams.
+    #[derive(Debug)]
+    struct UncancellableBlockingProvider {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for UncancellableBlockingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            let started = self.started.clone();
+            let s = futures::stream::unfold(Some(started), |state| async move {
+                let started = state?;
+                started.notify_one();
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Some((
+                    Ok(StreamEvent::MessageStart {
+                        id: halter_protocol::MessageId::new(),
+                    }),
+                    None,
+                ))
+            });
+            Ok(s.boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_failed_carries_retryable_flag_from_provider_error() {
+        // AC2.5: when a provider error is flagged retryable, TurnFailed
+        // surfaces that flag rather than silently dropping it.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(RetryableFailingProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("retryable failure"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let live_failure = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { retryable, .. } => Some(*retryable),
+                _ => None,
+            })
+            .expect("TurnFailed in live stream");
+        assert!(live_failure, "live TurnFailed must preserve retryable=true");
+
+        let replay = services
+            .sessions
+            .replay(session.session_id())
+            .await
+            .expect("replay");
+        let persisted = replay
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { retryable, .. } => Some(*retryable),
+                _ => None,
+            })
+            .expect("TurnFailed in persisted store");
+        assert!(
+            persisted,
+            "persisted TurnFailed must preserve retryable=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_failed_non_retryable_default_path() {
+        // AC2.5 negative: a provider error with retryable=false stays
+        // false — guards against a misguided "default to true" patch.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FailingProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("non-retryable failure"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let retryable = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { retryable, .. } => Some(*retryable),
+                _ => None,
+            })
+            .expect("TurnFailed payload");
+        assert!(!retryable);
+    }
+
+    #[tokio::test]
+    async fn turn_failed_carries_originating_turn_id() {
+        // AC2.4: the TurnId on the streamed and persisted TurnFailed must
+        // match the TurnId of the submitted Turn.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FailingProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let turn = Turn::user("track id");
+        let expected_id = turn.id.clone();
+        let events = session
+            .submit_turn(turn)
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let live_id = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            })
+            .expect("TurnFailed in stream");
+        assert_eq!(live_id, expected_id, "stream turn_id must match submission");
+
+        let replay = services
+            .sessions
+            .replay(session.session_id())
+            .await
+            .expect("replay");
+        let persisted_id = replay
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            })
+            .expect("TurnFailed in store");
+        assert_eq!(
+            persisted_id, expected_id,
+            "persisted turn_id must match submission"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_cooperative_in_flight_turn() {
+        // AC2.3: shutdown cancels the provider stream's child token,
+        // the provider exits, the spawned turn task settles, and the
+        // drain reports completion within the deadline.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Arc::new(Notify::new());
+        let services = configured_services(
+            Arc::new(CancellableBlockingProvider {
+                started: started.clone(),
+            }),
+            temp.path(),
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let _stream = session
+            .submit_turn(Turn::user("blocking turn"))
+            .await
+            .expect("submit turn");
+
+        // Wait for the provider stream to actually start before signaling
+        // shutdown — otherwise we race the spawn and never observe the
+        // cooperative-cancellation path.
+        started.notified().await;
+
+        assert_eq!(services.turn_registry.in_flight_count(), 1);
+
+        let report = runtime.shutdown(Duration::from_secs(2)).await;
+        assert!(!report.timed_out, "cooperative drain must not time out");
+        assert_eq!(report.turns_drained, 1);
+        assert_eq!(report.turns_aborted, 0);
+        assert!(services.turn_registry.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_uncooperative_turn_after_deadline() {
+        // AC2.8: a turn whose provider stream ignores cancellation must
+        // still be aborted by the drain deadline rather than blocking
+        // shutdown forever.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Arc::new(Notify::new());
+        let services = configured_services(
+            Arc::new(UncancellableBlockingProvider {
+                started: started.clone(),
+            }),
+            temp.path(),
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let _stream = session
+            .submit_turn(Turn::user("stuck turn"))
+            .await
+            .expect("submit turn");
+        started.notified().await;
+
+        let report = runtime.shutdown(Duration::from_millis(100)).await;
+        assert!(report.timed_out, "uncooperative drain must time out");
+        assert!(
+            report.turns_aborted >= 1,
+            "at least one task must be aborted, got {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_turn_after_shutdown_is_rejected() {
+        // AC2.3 follow-on: the upfront shutdown check refuses to spawn
+        // new turns once the registry is shutting down so callers fail
+        // fast instead of seeing aborted-turn semantics.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let _ = runtime.shutdown(Duration::from_millis(0)).await;
+
+        let err = match session.submit_turn(Turn::user("late submission")).await {
+            Ok(_) => panic!("must reject post-shutdown submission"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("runtime is shutting down"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[derive(Debug)]
     struct RecordingProvider {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
@@ -3206,6 +3650,196 @@ mod tests {
                 value: json!({ "ok": true }),
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct ParallelBatchProvider {
+        tool_name: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for ParallelBatchProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            if request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool(_)))
+            {
+                return Ok(stream::iter(vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: halter_protocol::MessageId::new(),
+                    }),
+                    Ok(StreamEvent::TextStart { id: BlockId::new() }),
+                    Ok(StreamEvent::TextDelta {
+                        id: BlockId::new(),
+                        delta: "done".to_owned(),
+                    }),
+                    Ok(StreamEvent::TextEnd { id: BlockId::new() }),
+                    Ok(StreamEvent::MessageEnd {
+                        id: halter_protocol::MessageId::new(),
+                        stop_reason: StopReason::EndTurn,
+                        response_id: None,
+                    }),
+                ])
+                .boxed());
+            }
+            let first_block = BlockId::new();
+            let second_block = BlockId::new();
+            Ok(stream::iter(vec![
+                Ok(StreamEvent::MessageStart {
+                    id: halter_protocol::MessageId::new(),
+                }),
+                Ok(StreamEvent::ToolCallStart {
+                    id: first_block.clone(),
+                    tool_call_id: ToolCallId::new(),
+                    name: ToolName::from(self.tool_name),
+                }),
+                Ok(StreamEvent::ToolArgsDelta {
+                    id: first_block.clone(),
+                    delta: json!({}).to_string(),
+                }),
+                Ok(StreamEvent::ToolCallEnd { id: first_block }),
+                Ok(StreamEvent::ToolCallStart {
+                    id: second_block.clone(),
+                    tool_call_id: ToolCallId::new(),
+                    name: ToolName::from(self.tool_name),
+                }),
+                Ok(StreamEvent::ToolArgsDelta {
+                    id: second_block.clone(),
+                    delta: json!({}).to_string(),
+                }),
+                Ok(StreamEvent::ToolCallEnd { id: second_block }),
+                Ok(StreamEvent::MessageEnd {
+                    id: halter_protocol::MessageId::new(),
+                    stop_reason: StopReason::ToolUse,
+                    response_id: None,
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[derive(Debug)]
+    struct BarrierTool {
+        barrier: Arc<tokio::sync::Barrier>,
+        concurrency: ToolConcurrency,
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for BarrierTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: ToolName::from(self.name),
+                description: "barrier-synchronized tool".to_owned(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+                concurrency: self.concurrency,
+                capabilities: ToolCapabilities::default(),
+                provider_aliases: Default::default(),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _context: ToolContext,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<ToolResult> {
+            self.barrier.wait().await;
+            Ok(ToolResult::Empty)
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_safe_tools_execute_concurrently() {
+        // Two ParallelSafe tool calls in a single batch must run concurrently:
+        // each awaits a 2-party barrier that only resolves when both are in
+        // flight simultaneously. Serial execution would deadlock the barrier.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(
+            Arc::new(ParallelBatchProvider {
+                tool_name: "parallel_barrier",
+            }),
+            temp.path(),
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        services.tools.register(Arc::new(BarrierTool {
+            barrier: barrier.clone(),
+            concurrency: ToolConcurrency::ParallelSafe,
+            name: "parallel_barrier",
+        }));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            session
+                .submit_turn(Turn::user("run in parallel"))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("parallel-safe tools must not deadlock the barrier")
+        .expect("collect events");
+
+        let completed = result
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.payload,
+                    SessionEventPayload::ToolExecutionCompleted { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            completed, 2,
+            "both parallel-safe tool executions must complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusive_tools_run_serially_in_batch() {
+        // Two Exclusive tool calls in a single provider response must run in
+        // distinct batches. Giving them a 2-party barrier means concurrent
+        // execution would succeed and serial execution would hang — the
+        // timeout branch catches the happy path and asserts serialization.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(
+            Arc::new(ParallelBatchProvider {
+                tool_name: "exclusive_barrier",
+            }),
+            temp.path(),
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        services.tools.register(Arc::new(BarrierTool {
+            barrier: barrier.clone(),
+            concurrency: ToolConcurrency::Exclusive,
+            name: "exclusive_barrier",
+        }));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let timed = tokio::time::timeout(
+            Duration::from_millis(500),
+            session
+                .submit_turn(Turn::user("serialize exclusive"))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>(),
+        )
+        .await;
+        assert!(
+            timed.is_err(),
+            "exclusive tools must serialize; barrier should deadlock"
+        );
     }
 
     #[async_trait]

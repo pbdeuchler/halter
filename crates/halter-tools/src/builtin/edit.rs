@@ -64,9 +64,10 @@ impl Tool for EditTool {
             "editing file"
         );
 
-        context.policy.check_write(&path).await?;
+        let canonical = context.policy.check_write_path(&path).await?;
+        let canonical_path = canonical.into_path();
         let path_locks = context.path_locks.clone();
-        let path_for_edit = path.clone();
+        let path_for_edit = canonical_path.clone();
         let old = old_string.to_owned();
         let new = new_string.to_owned();
         let expected_sha256 = expected_sha256.clone();
@@ -109,10 +110,13 @@ impl Tool for EditTool {
         })
         .await??;
 
+        let occurrences_in_file = result.0;
+        let replacements_applied = if replace_all { occurrences_in_file } else { 1 };
         Ok(ToolResult::Json {
             value: json!({
-                "path": path,
-                "matches_replaced": if replace_all { result.0 } else { 1 },
+                "path": canonical_path,
+                "occurrences_in_file": occurrences_in_file,
+                "replacements_applied": replacements_applied,
                 "file_hash_before": result.1,
                 "file_hash_after": result.2,
             }),
@@ -137,7 +141,6 @@ mod tests {
             working_dir: root.to_path_buf(),
             path_locks: Arc::new(PathLockMap::default()),
             tool_sessions: Arc::new(crate::ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
@@ -145,7 +148,6 @@ mod tests {
                 allowed_write_roots: vec![root.to_path_buf()],
                 ..PolicySettings::default()
             })) as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: None,
         }
@@ -174,7 +176,8 @@ mod tests {
             panic!("expected json result");
         };
 
-        assert_eq!(value["matches_replaced"], 1);
+        assert_eq!(value["occurrences_in_file"], 1);
+        assert_eq!(value["replacements_applied"], 1);
         assert_eq!(std::fs::read_to_string(path).expect("read"), "hello there");
     }
 

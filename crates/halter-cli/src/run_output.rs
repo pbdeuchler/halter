@@ -201,6 +201,7 @@ mod tests {
             .observe(&SessionEventPayload::TurnFailed {
                 turn_id: halter_protocol::TurnId::from("turn-1"),
                 error: "provider exploded".to_owned(),
+                retryable: false,
             })
             .expect_err("turn failure should surface");
         assert_eq!(error, "provider exploded");
@@ -267,11 +268,11 @@ mod tests {
 
     #[test]
     fn strip_signatures_from_session_event_clears_assistant_message_signatures() {
-        let event = SessionEvent {
-            session_id: SessionId::from("session-1"),
-            sequence: 7,
-            delivery: halter_protocol::Delivery::Lossless,
-            payload: SessionEventPayload::MessageItem {
+        let event = SessionEvent::new_committed(
+            SessionId::from("session-1"),
+            7,
+            halter_protocol::Delivery::Lossless,
+            SessionEventPayload::MessageItem {
                 message: Message::Assistant(AssistantMessage {
                     id: MessageId::from("assistant-thinking"),
                     created_at: Utc::now(),
@@ -284,17 +285,17 @@ mod tests {
                     replay_meta: ReplayMeta::default(),
                 }),
             },
-        };
+        );
 
         let stripped = strip_signatures_from_session_event(&event);
 
         assert_eq!(
             stripped,
-            SessionEvent {
-                session_id: SessionId::from("session-1"),
-                sequence: 7,
-                delivery: halter_protocol::Delivery::Lossless,
-                payload: SessionEventPayload::MessageItem {
+            SessionEvent::new_committed(
+                SessionId::from("session-1"),
+                7,
+                halter_protocol::Delivery::Lossless,
+                SessionEventPayload::MessageItem {
                     message: Message::Assistant(AssistantMessage {
                         id: MessageId::from("assistant-thinking"),
                         created_at: event.clone().payload_message_created_at(),
@@ -307,7 +308,7 @@ mod tests {
                         replay_meta: ReplayMeta::default(),
                     }),
                 },
-            }
+            )
         );
     }
 

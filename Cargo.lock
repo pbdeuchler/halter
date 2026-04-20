@@ -1240,6 +1240,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "halter-protocol",
+ "indexmap",
  "schemars",
  "serde",
  "serde_json",
@@ -1257,11 +1258,15 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures",
+ "globset",
  "halter-protocol",
  "indexmap",
  "regex",
  "serde",
  "serde_json",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -1293,10 +1298,12 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "halter-protocol",
+ "hex",
  "indexmap",
  "reqwest",
  "serde_json",
  "sha2",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1317,10 +1324,12 @@ dependencies = [
  "halter-providers",
  "halter-session",
  "halter-tools",
+ "lru",
  "reqwest",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1373,6 +1382,7 @@ dependencies = [
  "sha2",
  "smallvec",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1934,6 +1944,15 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lru"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
+]
 
 [[package]]
 name = "lru-slab"

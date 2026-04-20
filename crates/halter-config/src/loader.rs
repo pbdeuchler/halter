@@ -138,7 +138,6 @@ roots = ["./.agent/plugins"]
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
 max_read_bytes = 1048576
-max_tool_output_bytes = 262144
 max_subagent_depth = 3
 max_concurrent_subagents = 8
 
@@ -364,19 +363,15 @@ enum ArrayMergePolicy {
 }
 
 fn array_merge_policy(path: &[String]) -> ArrayMergePolicy {
-    match path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    // Replace is the default for arrays; list only the exceptions that want
+    // append-dedupe semantics. The previous implementation named a handful of
+    // Replace paths explicitly alongside the `_ => Replace` fallback, which
+    // implied the listed paths were special when they were not. (finding L6)
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    match segments.as_slice() {
         ["resources", "skills", "roots"] | ["resources", "plugins", "roots"] => {
             ArrayMergePolicy::AppendDedupe
         }
-        ["policy", "shell", "allow"]
-        | ["policy", "allowed_write_roots"]
-        | ["policy", "network", "allowed_hosts"]
-        | ["tools", "enabled"] => ArrayMergePolicy::Replace,
         _ => ArrayMergePolicy::Replace,
     }
 }
@@ -390,6 +385,13 @@ pub fn config_fingerprint(config: &HarnessConfig) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Expands a path's leading `~/` against `$HOME`. No other substitutions are
+/// performed — `$VAR`, `${VAR}`, `~user/`, `%USERPROFILE%`, and shell escapes
+/// all pass through unchanged. This is deliberate: expanding env-var
+/// references on a user-supplied config path is a footgun (an attacker-
+/// controlled environment variable could redirect resource loads). Callers
+/// that *want* shell-like expansion must call a shell-expansion crate
+/// explicitly with an explicit threat model.
 #[must_use]
 pub fn expand_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
@@ -470,8 +472,8 @@ max_read_bytes = 99
         config.validate().expect("example config should validate");
         validate_runtime_requirements_with(&config, |name| {
             Some(OsString::from(match name {
-                "OPENAI_API_KEY" => "test-key",
-                _ => unreachable!("unexpected env var"),
+                "OPENAI_API_KEY" | "OPENROUTER_API_KEY" => "test-key",
+                _ => unreachable!("unexpected env var: {name}"),
             }))
         })
         .expect("example config runtime requirements should validate");

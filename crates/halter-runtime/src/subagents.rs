@@ -9,8 +9,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use halter_protocol::{
-    AgentId, AgentName, CloseSubagentRequest, CloseSubagentResponse, SendSubagentInputRequest,
-    SessionEvent, SessionEventPayload, SessionId, SpawnSubagentRequest, SubagentState,
+    AgentId, AgentName, CloseSubagentRequest, CloseSubagentResponse, PendingEvent,
+    SendSubagentInputRequest, SessionEventPayload, SessionId, SpawnSubagentRequest, SubagentState,
     SubagentStatus, Turn, TurnId, Usage, WaitSubagentRequest, WaitSubagentResponse,
 };
 use halter_session::SessionCommitConflict;
@@ -327,37 +327,26 @@ impl RuntimeSubagentControl {
             let expected_state = stored.state.clone();
             let mut next_state = expected_state.clone();
             let mut events = Vec::new();
-            events.extend(
-                dispatch
-                    .preview_runs
-                    .iter()
-                    .cloned()
-                    .map(|run| SessionEvent {
-                        session_id: parent_session_id.clone(),
-                        sequence: 0,
-                        delivery: halter_protocol::Delivery::Lossless,
-                        payload: SessionEventPayload::HookStarted { run },
-                    }),
-            );
-            events.extend(
-                dispatch
-                    .completed_runs
-                    .iter()
-                    .cloned()
-                    .map(|run| SessionEvent {
-                        session_id: parent_session_id.clone(),
-                        sequence: 0,
-                        delivery: halter_protocol::Delivery::Lossless,
-                        payload: SessionEventPayload::HookCompleted { run },
-                    }),
-            );
+            events.extend(dispatch.preview_runs.iter().cloned().map(|run| {
+                PendingEvent::new(
+                    parent_session_id.clone(),
+                    halter_protocol::Delivery::Lossless,
+                    SessionEventPayload::HookStarted { run },
+                )
+            }));
+            events.extend(dispatch.completed_runs.iter().cloned().map(|run| {
+                PendingEvent::new(
+                    parent_session_id.clone(),
+                    halter_protocol::Delivery::Lossless,
+                    SessionEventPayload::HookCompleted { run },
+                )
+            }));
             for message in apply_hook_side_effects(&mut next_state, &dispatch) {
-                events.push(SessionEvent {
-                    session_id: parent_session_id.clone(),
-                    sequence: 0,
-                    delivery: halter_protocol::Delivery::Lossless,
-                    payload: SessionEventPayload::MessageItem { message },
-                });
+                events.push(PendingEvent::new(
+                    parent_session_id.clone(),
+                    halter_protocol::Delivery::Lossless,
+                    SessionEventPayload::MessageItem { message },
+                ));
             }
 
             match self
@@ -403,7 +392,16 @@ impl RuntimeSubagentControl {
             }
         }
 
-        Ok(continuation)
+        // The loop body always either returns or `continue`s. Reaching this
+        // line would mean a future refactor accidentally let the loop fall
+        // through; surface that as an error rather than silently reporting
+        // success (H16: previous shape returned Ok(continuation) and erased
+        // the conflict).
+        let _ = continuation;
+        Err(anyhow::anyhow!(
+            "hook dispatch exhausted {} retries due to session commit conflict",
+            PARENT_HOOK_DISPATCH_MAX_RETRIES
+        ))
     }
 
     async fn run_subagent_start_hooks(
@@ -445,7 +443,6 @@ impl RuntimeSubagentControl {
                 .as_ref()
                 .map_or("default", |agent_type| agent_type.0.as_str()),
             &parent.blueprint.session_id,
-            None,
         )
         .await?;
         let _ = self
@@ -494,7 +491,6 @@ impl RuntimeSubagentControl {
             agent_id,
             agent_type.map_or("default", |agent_type| agent_type.0.as_str()),
             transcript_path.as_deref(),
-            None,
         )
         .await?;
         self.run_parent_hook_dispatch(parent_session_id, dispatch, false)
@@ -533,7 +529,7 @@ impl SubagentControl for RuntimeSubagentControl {
         self.inner
             .services
             .policy
-            .check_subagent_spawn(parent.blueprint.subagent_depth, active_subagents)
+            .check_subagent_spawn_typed(parent.blueprint.subagent_depth, active_subagents)
             .await?;
 
         let session_id = SessionId::new();
@@ -859,7 +855,11 @@ mod tests {
             .await
             .expect_err("depth should fail");
 
-        assert!(error.to_string().contains("max_subagent_depth"));
+        let message = error.to_string();
+        assert!(
+            message.contains("subagent limit reached: depth"),
+            "expected typed SubagentLimit error, got: {message}"
+        );
     }
 
     fn test_services(provider: Arc<dyn Provider>) -> Arc<RuntimeServices> {
@@ -907,7 +907,7 @@ mod tests {
             prompt_assembler: Arc::new(DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::default()),
             event_bus: Arc::new(EventBus::default()),
-            max_tool_output_bytes: 262_144,
+            turn_registry: Arc::new(crate::TurnRegistry::new()),
             shell_timeout_secs: 30,
         })
     }

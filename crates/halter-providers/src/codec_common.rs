@@ -7,7 +7,12 @@ use halter_protocol::{
 };
 use sha2::{Digest, Sha256};
 
-const DEFAULT_PROVIDER_ID_MAX_LEN: usize = 64;
+/// Max byte length shared by all provider-facing identifier aliases (tool
+/// call ids, Responses item ids, etc.). Previously split into
+/// `DEFAULT_PROVIDER_ID_MAX_LEN` here and `RESPONSES_ITEM_ID_MAX_LEN` in
+/// `openai_codec.rs`; both were `64` (finding L14), so consolidate.
+pub(crate) const PROVIDER_ID_MAX_LEN: usize = 64;
+const DEFAULT_PROVIDER_ID_MAX_LEN: usize = PROVIDER_ID_MAX_LEN;
 
 pub(crate) fn collect_system_text(request: &ProviderRequest) -> Option<String> {
     let mut sections = Vec::new();
@@ -136,6 +141,13 @@ pub(crate) fn bounded_provider_id_with_prefix(
     } else {
         sanitized
     };
+    // Invariant: `base` is ASCII — `sanitize_provider_id` maps every non
+    // alphanumeric/-/_ rune to `_`, and `short_hash` emits hex digits.
+    // The byte-slicing below (`&base[..head_len]`, `&suffix[..available]`)
+    // relies on this. Admitting multibyte runes into either path without
+    // switching to char-based truncation would panic on a char boundary
+    // (finding M21).
+    debug_assert!(base.is_ascii(), "provider id base must be ASCII");
     if prefix.len() + base.len() <= max_len {
         return format!("{prefix}{base}");
     }
@@ -146,6 +158,7 @@ pub(crate) fn bounded_provider_id_with_prefix(
     }
 
     let suffix = short_hash(value);
+    debug_assert!(suffix.is_ascii(), "provider id suffix must be ASCII");
     if suffix.len() >= available {
         return format!("{prefix}{}", &suffix[..available]);
     }
@@ -171,7 +184,9 @@ fn short_hash(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     let digest = hasher.finalize();
-    hex_prefix(&digest, 8)
+    let mut encoded = hex::encode(digest);
+    encoded.truncate(8);
+    encoded
 }
 
 fn sanitize_provider_id(value: &str) -> String {
@@ -185,15 +200,4 @@ fn sanitize_provider_id(value: &str) -> String {
             }
         })
         .collect()
-}
-
-fn hex_prefix(bytes: &[u8], hex_chars: usize) -> String {
-    let byte_count = hex_chars.div_ceil(2).min(bytes.len());
-    let mut out = String::with_capacity(byte_count * 2);
-    for byte in &bytes[..byte_count] {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out.truncate(hex_chars);
-    out
 }

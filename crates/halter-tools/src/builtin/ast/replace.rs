@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::PathLockMap;
+use crate::ToolPolicy;
 
 use super::FileCandidate;
 use super::language::{parse_strictness, resolve_language};
@@ -83,6 +84,7 @@ pub(super) fn run(
     candidates: Vec<FileCandidate>,
     path_locks: Arc<PathLockMap>,
     cancel: CancellationToken,
+    policy: Arc<dyn ToolPolicy>,
 ) -> anyhow::Result<Value> {
     let mut changes = Vec::new();
     let mut file_counts = BTreeMap::<String, u64>::new();
@@ -151,7 +153,7 @@ pub(super) fn run(
 
             for matched in ast.root().find_all(compiled.clone()) {
                 ensure_not_cancelled(&cancel)?;
-                if changes.len() as u64 + file_changes.len() as u64 == config.max_replacements {
+                if changes.len() as u64 + file_changes.len() as u64 >= config.max_replacements {
                     limit_reached = true;
                     break 'rules;
                 }
@@ -184,7 +186,15 @@ pub(super) fn run(
         if !config.dry_run {
             let output = apply_edits(&source, &file_edits)?;
             if output != source {
-                atomic_write_blocking(&candidate.absolute_path, output.as_bytes())?;
+                let canonical = policy
+                    .check_write_path_blocking(&candidate.absolute_path)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "failed to execute ast_grep tool: write denied for '{}': {error}",
+                            candidate.display_path,
+                        )
+                    })?;
+                atomic_write_blocking(canonical.path(), output.as_bytes())?;
             }
         }
         drop(guard);
@@ -265,15 +275,25 @@ fn apply_edits(content: &str, edits: &[Edit<String>]) -> anyhow::Result<String> 
     Ok(output)
 }
 
-#[allow(dead_code)]
+/// RAII holder for either a read or write path lock. Only used for its
+/// `Drop`, so variant payloads are intentionally never read.
 enum PathGuard {
-    Read(crate::builtin::fs_lock::PathReadGuard),
-    Write(crate::builtin::fs_lock::PathWriteGuard),
+    Read(#[allow(dead_code)] crate::builtin::fs_lock::PathReadGuard),
+    Write(#[allow(dead_code)] crate::builtin::fs_lock::PathWriteGuard),
 }
 
 #[cfg(all(test, feature = "ast-tools"))]
 mod tests {
     use super::*;
+    use crate::{DefaultToolPolicy, PolicySettings};
+
+    fn test_policy() -> Arc<dyn ToolPolicy> {
+        let settings = PolicySettings {
+            allowed_write_roots: vec![std::env::temp_dir()],
+            ..PolicySettings::default()
+        };
+        Arc::new(DefaultToolPolicy::new(settings))
+    }
 
     #[test]
     fn rejects_overlapping_edits() {
@@ -325,6 +345,7 @@ mod tests {
             }],
             Arc::new(PathLockMap::default()),
             CancellationToken::new(),
+            test_policy(),
         )
         .expect("replace should succeed");
 
@@ -363,6 +384,7 @@ mod tests {
             }],
             Arc::new(PathLockMap::default()),
             CancellationToken::new(),
+            test_policy(),
         )
         .expect("replace should succeed");
 

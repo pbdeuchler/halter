@@ -1,5 +1,10 @@
-// pattern: Imperative Shell
+// pattern: Functional Core
+//
+// This module holds pure helpers (input parsing, path resolution, ToolScope
+// RAII). The only side-effecting path — atomic_write_blocking — is scoped to
+// tmpfile + rename, not general I/O. (finding L30)
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -76,6 +81,26 @@ pub fn optional_u64(input: &Value, key: &str) -> anyhow::Result<Option<u64>> {
             .ok_or_else(|| anyhow::anyhow!("invalid tool input: field '{key}' must be a u64")),
         Some(_) => anyhow::bail!("invalid tool input: field '{key}' must be a u64"),
     }
+}
+
+pub fn parse_env_map(value: Option<&Value>) -> anyhow::Result<Option<HashMap<String, String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("invalid tool input: env must be an object"))?;
+    let mut env = HashMap::with_capacity(object.len());
+    for (key, value) in object {
+        let value = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid tool input: env values must be strings"))?;
+        env.insert(key.clone(), value.to_owned());
+    }
+    Ok(Some(env))
 }
 
 pub fn resolve_path(working_dir: &Path, path: &str) -> PathBuf {

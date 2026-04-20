@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use halter_protocol::{
-    Delivery, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload, SessionId,
-    SessionState,
+    Delivery, PendingEvent, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload,
+    SessionId, SessionState,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use tracing::{debug, info};
@@ -43,6 +43,21 @@ CREATE TABLE events (
 );
 "#,
 )];
+
+// Compile-time guarantee that MIGRATIONS is sorted by strictly increasing
+// version. run_migrations skips any entry whose version is <= the current
+// schema version, so an unsorted table would silently drop migrations.
+// (finding L15)
+const _: () = {
+    let mut i = 1;
+    while i < MIGRATIONS.len() {
+        assert!(
+            MIGRATIONS[i - 1].0 < MIGRATIONS[i].0,
+            "MIGRATIONS must be strictly monotonic in version"
+        );
+        i += 1;
+    }
+};
 
 pub struct SqliteSessionStore {
     connection: Arc<Mutex<Connection>>,
@@ -129,7 +144,7 @@ impl SessionStore for SqliteSessionStore {
         snapshot: Option<Arc<ResourceSnapshot>>,
         expected_state: Option<SessionState>,
         state: Option<SessionState>,
-        events: Vec<SessionEvent>,
+        events: Vec<PendingEvent>,
     ) -> Result<Vec<SessionEvent>> {
         let session_id = session_id.clone();
         self.with_conn(move |conn| {
@@ -265,7 +280,7 @@ fn commit_with_conn(
     snapshot: Option<Arc<ResourceSnapshot>>,
     expected_state: Option<SessionState>,
     state: Option<SessionState>,
-    events: Vec<SessionEvent>,
+    events: Vec<PendingEvent>,
 ) -> Result<Vec<SessionEvent>> {
     let started_at = Instant::now();
     let tx = conn
@@ -328,10 +343,10 @@ fn commit_with_conn(
         .with_context(|| format!("failed to update state for session '{}'", session_id.0))?;
     }
 
-    let mut next_sequence = next_event_sequence(&tx, session_id)?;
+    let starting_sequence = next_event_sequence(&tx, session_id)?;
     let mut committed = Vec::with_capacity(events.len());
-    for event in events {
-        let sequence = next_sequence;
+    for (offset, event) in events.into_iter().enumerate() {
+        let sequence = starting_sequence + offset as u64;
         let payload_json = serde_json::to_string(&event.payload)
             .context("failed to serialize session event payload")?;
         tx.execute(
@@ -351,13 +366,14 @@ fn commit_with_conn(
             )
         })?;
 
-        committed.push(SessionEvent {
-            session_id: session_id.clone(),
-            sequence,
-            delivery: event.delivery,
-            payload: event.payload,
-        });
-        next_sequence += 1;
+        committed.push(
+            PendingEvent {
+                session_id: session_id.clone(),
+                delivery: event.delivery,
+                payload: event.payload,
+            }
+            .into_committed(sequence),
+        );
     }
 
     tx.commit()
@@ -398,12 +414,12 @@ fn replay_with_conn(conn: &mut Connection, session_id: &SessionId) -> Result<Vec
         let (raw_session_id, raw_sequence, raw_delivery, raw_payload) = row?;
         let payload: SessionEventPayload = serde_json::from_str(&raw_payload)
             .context("failed to deserialize session event payload")?;
-        events.push(SessionEvent {
-            session_id: SessionId::from(raw_session_id),
-            sequence: sequence_from_sql(raw_sequence)?,
-            delivery: delivery_from_sql(&raw_delivery)?,
+        events.push(SessionEvent::new_committed(
+            SessionId::from(raw_session_id),
+            sequence_from_sql(raw_sequence)?,
+            delivery_from_sql(&raw_delivery)?,
             payload,
-        });
+        ));
     }
     Ok(events)
 }
@@ -582,6 +598,18 @@ fn unix_timestamp_seconds() -> Result<i64> {
     i64::try_from(duration.as_secs()).context("failed to convert unix timestamp to i64")
 }
 
+/// Resolves the default sqlite session-store path.
+///
+/// Precedence (all platforms):
+/// 1. `$XDG_DATA_HOME/halter/sessions.db` if `XDG_DATA_HOME` is set and
+///    non-empty. This is checked **before** platform-native fallbacks, so a
+///    developer who exports `XDG_DATA_HOME` globally on Windows will see the
+///    XDG path used instead of `%LOCALAPPDATA%`. This is intentional —
+///    cross-platform dotfile/portable-install workflows benefit from a
+///    single consistent override. (finding M27)
+/// 2. Platform fallback:
+///    - Windows: `%LOCALAPPDATA%/halter/sessions.db`
+///    - Unix:    `$HOME/.local/share/halter/sessions.db`
 fn default_db_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path).join("halter").join("sessions.db"));
@@ -716,8 +744,8 @@ mod tests {
             .expect("commit session");
 
         assert_eq!(committed.len(), 2);
-        assert_eq!(committed[0].sequence, 1);
-        assert_eq!(committed[1].sequence, 2);
+        assert_eq!(committed[0].sequence(), 1);
+        assert_eq!(committed[1].sequence(), 2);
         assert_eq!(committed[0].session_id, session.blueprint.session_id);
         assert_eq!(committed[1].session_id, session.blueprint.session_id);
 
@@ -937,13 +965,13 @@ mod tests {
             .expect("second commit");
 
         assert_eq!(
-            first.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            first.iter().map(SessionEvent::sequence).collect::<Vec<_>>(),
             vec![1, 2]
         );
         assert_eq!(
             second
                 .iter()
-                .map(|event| event.sequence)
+                .map(|event| event.sequence())
                 .collect::<Vec<_>>(),
             vec![3]
         );
@@ -954,7 +982,7 @@ mod tests {
         assert_eq!(
             replayed
                 .iter()
-                .map(|event| event.sequence)
+                .map(|event| event.sequence())
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
@@ -1112,14 +1140,13 @@ mod tests {
         snapshot
     }
 
-    fn test_event(summary: &str, delivery: Delivery) -> SessionEvent {
-        SessionEvent {
-            session_id: SessionId::from("ignored"),
-            sequence: 0,
+    fn test_event(summary: &str, delivery: Delivery) -> PendingEvent {
+        PendingEvent::new(
+            SessionId::from("ignored"),
             delivery,
-            payload: SessionEventPayload::ContextCompacted {
+            SessionEventPayload::ContextCompacted {
                 summary: summary.to_owned(),
             },
-        }
+        )
     }
 }

@@ -13,8 +13,8 @@ use crate::{Tool, ToolContext};
 
 use super::common::{ToolScope, ensure_not_cancelled, optional_u64, required_string, resolve_path};
 
-const DEFAULT_READ_LIMIT: u64 = 500;
 const MAX_READ_LIMIT: u64 = 500;
+const DEFAULT_READ_LIMIT: u64 = MAX_READ_LIMIT;
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug)]
@@ -32,7 +32,7 @@ impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("read"),
-            description: "Read up to 500 UTF-8 lines from disk".to_owned(),
+            description: format!("Read up to {MAX_READ_LIMIT} UTF-8 lines from disk"),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -77,8 +77,15 @@ impl Tool for ReadTool {
             "reading file"
         );
 
+        // Authorize the path before any I/O. We don't yet know how many bytes
+        // we'll read (it's bounded by line count, not bytes), so pass 0 here
+        // and re-check the actual byte size below — pre-authorization rejects
+        // sensitive paths before we open them.
+        let canonical = context.policy.check_read_path(&path, 0).await?;
+        let canonical_path = canonical.into_path();
+
         let path_locks = context.path_locks.clone();
-        let path_for_read = path.clone();
+        let path_for_read = canonical_path.clone();
         let read_window = tokio::task::spawn_blocking(move || {
             let _lock = path_locks.acquire_read(&path_for_read)?;
             let file = std::fs::File::open(&path_for_read)?;
@@ -88,12 +95,12 @@ impl Tool for ReadTool {
         .await??;
         context
             .policy
-            .check_read(&path, read_window.content.len())
+            .check_read_path(&canonical_path, read_window.content.len())
             .await?;
 
         Ok(ToolResult::Json {
             value: json!({
-                "path": path,
+                "path": canonical_path,
                 "content": read_window.content,
                 "sha256": read_window.sha256,
                 "total_lines": read_window.total_lines,
@@ -203,7 +210,6 @@ mod tests {
             working_dir: root.to_path_buf(),
             path_locks: Arc::new(PathLockMap::default()),
             tool_sessions: Arc::new(ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
@@ -212,7 +218,6 @@ mod tests {
                 max_read_bytes,
                 ..PolicySettings::default()
             })) as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: None,
         }

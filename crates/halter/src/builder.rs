@@ -1,6 +1,6 @@
 // pattern: Imperative Shell
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
@@ -22,8 +22,8 @@ use halter_runtime::{
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
-    DefaultToolPolicy, PathLockMap, PolicySettings, Tool, ToolRuntime, ToolSessionStore,
-    register_builtin_tools, register_subagent_tools,
+    DefaultToolPolicy, LoopbackAllow, PathLockMap, PolicySettings, Tool, ToolRuntime,
+    ToolSessionStore, register_builtin_tools, register_subagent_tools,
 };
 use tracing::{debug, info};
 
@@ -201,7 +201,7 @@ impl HalterBuilder {
                 config.context.prune_signal_threshold,
             )),
             event_bus: Arc::new(EventBus::default()),
-            max_tool_output_bytes: config.policy.max_tool_output_bytes,
+            turn_registry: Arc::new(halter_runtime::TurnRegistry::new()),
             shell_timeout_secs: config.policy.shell.timeout_secs,
         });
         let runtime = SessionRuntime::new(services.clone());
@@ -296,6 +296,17 @@ impl Halter {
     pub fn config(&self) -> &HarnessConfig {
         &self.config
     }
+
+    /// Drain all in-flight turns and refuse new submissions. Bounded by
+    /// `drain` — tasks still running when the deadline elapses are
+    /// aborted via `JoinHandle::abort`.
+    ///
+    /// Wire this into your process-level signal handler (e.g.
+    /// `tokio::signal::ctrl_c`) so that Ctrl-C does not orphan
+    /// half-committed turns.
+    pub async fn shutdown(&self, drain: std::time::Duration) -> halter_runtime::ShutdownReport {
+        self.runtime.shutdown(drain).await
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -389,16 +400,32 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         "building model registry"
     );
 
-    let mut registered_providers = HashSet::new();
-    for (provider_name, configured_provider) in [
-        (&default_model.provider, default_config.provider),
-        (&small_model.provider, small_config.provider),
-        (&subagent_model.provider, subagent_config.provider),
+    let mut registered_providers: HashMap<String, ResolvedProviderConfig> = HashMap::new();
+    for (role_label, provider_name, configured_provider) in [
+        ("default", &default_model.provider, default_config.provider),
+        ("small", &small_model.provider, small_config.provider),
+        (
+            "subagent",
+            &subagent_model.provider,
+            subagent_config.provider,
+        ),
     ] {
-        if !registered_providers.insert(provider_name.0.clone()) {
+        let resolved = resolve_selected_provider_config(config, configured_provider)?;
+        if let Some(existing) = registered_providers.get(&provider_name.0) {
+            anyhow::ensure!(
+                existing == &resolved,
+                "provider '{name}' is used by multiple roles with divergent per-role configuration; \
+                 the {role_label} role resolved to base_url '{new_base}' but an earlier role \
+                 resolved the same provider to base_url '{old_base}' (api key differences also \
+                 trigger this error). Consolidate the config or use distinct providers.",
+                name = provider_name,
+                role_label = role_label,
+                new_base = resolved.base_url,
+                old_base = existing.base_url,
+            );
             continue;
         }
-        let resolved = resolve_selected_provider_config(config, configured_provider)?;
+        registered_providers.insert(provider_name.0.clone(), resolved.clone());
         registry.register_provider(provider_name.clone(), build_provider(&resolved)?);
     }
     registry.set_default_model(default_model);
@@ -414,21 +441,25 @@ fn build_provider(
     debug!(
         provider = %provider.provider,
         base_url = %provider.base_url,
+        header_overrides = provider.headers.len(),
         "constructing provider client"
     );
     let provider: Arc<dyn halter_providers::Provider> = match provider.provider {
-        ConfiguredProvider::Anthropic => Arc::new(AnthropicProvider::new(
+        ConfiguredProvider::Anthropic => Arc::new(AnthropicProvider::new_with_headers(
             provider.api_key.clone(),
             provider.base_url.clone(),
-        )),
-        ConfiguredProvider::OpenAi => Arc::new(OpenAiProvider::new(
+            &provider.headers,
+        )?),
+        ConfiguredProvider::OpenAi => Arc::new(OpenAiProvider::new_with_headers(
             provider.api_key.clone(),
             provider.base_url.clone(),
-        )),
-        ConfiguredProvider::OpenRouter => Arc::new(OpenRouterProvider::new(
+            &provider.headers,
+        )?),
+        ConfiguredProvider::OpenRouter => Arc::new(OpenRouterProvider::new_with_headers(
             provider.api_key.clone(),
             provider.base_url.clone(),
-        )),
+            &provider.headers,
+        )?),
     };
     Ok(provider)
 }
@@ -460,17 +491,39 @@ where
 }
 
 fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
+    // `process_tree_root` is anchored to the live halter PID at builder
+    // time so process-signal checks (AC1.6 / AC1.7) can reject signals
+    // aimed at PIDs that aren't descendants of this process. Other newer
+    // fields (`allowed_read_roots`, `sensitive_path_patterns`,
+    // `shell_mode`) still inherit from `PolicySettings::default()` until
+    // the surface lands in user config.
+    let defaults = PolicySettings::default();
+    let allowed_hosts = if config.network.allowed_hosts.is_empty() {
+        defaults.allowed_hosts.clone()
+    } else {
+        config.network.allowed_hosts.clone()
+    };
     PolicySettings {
         allowed_write_roots: config.allowed_write_roots.clone(),
         max_read_bytes: config.max_read_bytes,
-        max_tool_output_bytes: config.max_tool_output_bytes,
         shell_enabled: config.shell.enabled,
         allowed_shell_commands: config.shell.allow.clone(),
         shell_timeout_secs: config.shell.timeout_secs,
         network_enabled: config.network.enabled,
-        allowed_hosts: config.network.allowed_hosts.clone(),
+        allowed_hosts,
+        allowed_loopback: config
+            .network
+            .allowed_loopback
+            .iter()
+            .map(|entry| LoopbackAllow {
+                host: entry.host.clone(),
+                port: entry.port,
+            })
+            .collect(),
         max_subagent_depth: config.max_subagent_depth,
         max_concurrent_subagents: config.max_concurrent_subagents,
+        process_tree_root: Some(std::process::id() as i32),
+        ..defaults
     }
 }
 
@@ -514,6 +567,21 @@ mod tests {
         assert!(error.to_string().contains("missing resource snapshot"));
     }
 
+    #[test]
+    fn policy_from_config_anchors_process_tree_root_to_live_pid() {
+        // AC1.6 / AC1.7 rely on `process_tree_root` being populated so the
+        // policy can reject signals aimed at PIDs outside the halter process
+        // tree. The capability surface defaults to `None`; the builder is the
+        // single place where the live PID gets stitched in.
+        let config = openai_config(Some("test-key")).policy.clone();
+        let settings = policy_from_config(&config);
+        assert_eq!(
+            settings.process_tree_root,
+            Some(std::process::id() as i32),
+            "process_tree_root should be anchored to std::process::id() at builder time"
+        );
+    }
+
     #[tokio::test]
     async fn builder_requires_provider_api_key_when_not_configured() {
         let error = resolve_selected_provider_config_with(
@@ -524,6 +592,37 @@ mod tests {
         .expect_err("provider resolution should fail");
 
         assert!(error.to_string().contains("OPENAI_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn h12_builder_accepts_shared_provider_across_roles() {
+        // All three roles share ConfiguredProvider::OpenAi, which resolves to
+        // the same ResolvedProviderConfig — the H12 collision check must
+        // accept identical registrations and not false-positive.
+        let mut config = openai_config(Some("test-key"));
+        config.models.small = Some(ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: "gpt-5-mini".to_owned(),
+            max_input_tokens: Some(64_000),
+            max_output_tokens: Some(4_096),
+            reasoning: None,
+            tokens_per_minute: None,
+        });
+        config.models.subagent = Some(ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: "gpt-5".to_owned(),
+            max_input_tokens: Some(200_000),
+            max_output_tokens: Some(8_192),
+            reasoning: None,
+            tokens_per_minute: None,
+        });
+
+        HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build should succeed when roles share a provider");
     }
 
     #[tokio::test]
@@ -645,6 +744,7 @@ mod tests {
         config.providers.openai = Some(ProviderConfig {
             base_url: None,
             api_key: api_key.map(ToOwned::to_owned),
+            headers: Default::default(),
         });
         config
     }
@@ -689,7 +789,7 @@ mod tests {
             snapshot: Option<Arc<halter_protocol::ResourceSnapshot>>,
             expected_state: Option<halter_protocol::SessionState>,
             state: Option<halter_protocol::SessionState>,
-            events: Vec<halter_protocol::SessionEvent>,
+            events: Vec<halter_protocol::PendingEvent>,
         ) -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
             self.commit_calls.fetch_add(1, Ordering::SeqCst);
             self.inner

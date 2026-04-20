@@ -107,11 +107,14 @@ impl SpawnAgentTool {
 
     fn normalize_request(
         &self,
-        mut request: SpawnSubagentRequest,
+        request: SpawnSubagentRequest,
     ) -> anyhow::Result<SpawnSubagentRequest> {
         if let Some(agent_type) = request.agent_type.as_ref() {
             if self.available_agent_types.is_empty() {
-                request.agent_type = None;
+                anyhow::bail!(
+                    "failed to execute spawn_agent tool: agent_type '{}' requested but no named agent roles are registered; omit agent_type to spawn the default child session",
+                    agent_type.0
+                );
             } else if !self
                 .available_agent_types
                 .iter()
@@ -143,21 +146,18 @@ impl SpawnAgentTool {
 #[async_trait]
 impl Tool for SpawnAgentTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from("spawn_agent"),
-            description:
-                "Spawn a child session to work on a delegated task. Omit agent_type to use the default child session. If you set model, use a registered model id such as default, small, or subagent, not a provider model name."
-                    .to_owned(),
-            input_schema: self.input_schema(),
-            concurrency: ToolConcurrency::Exclusive,
-            capabilities: ToolCapabilities {
-                mutating: false,
-                requires_approval: false,
-                cancellable: false,
-                long_running: false,
-            },
-            provider_aliases: Default::default(),
-        }
+        subagent_spec(
+            "spawn_agent",
+            "Spawn a child session to work on a delegated task. Omit agent_type to use the default child session. If you set model, use a registered model id such as default, small, or subagent, not a provider model name.",
+            self.input_schema(),
+            ToolConcurrency::Exclusive,
+            // long_running=true: spawning a child session can involve
+            // provider handshakes and blueprint resolution that take
+            // seconds, not milliseconds. Previously flagged false, which
+            // caused the runtime to apply short-tool-timeout semantics to
+            // spawn_agent. (finding L34)
+            subagent_capabilities(true),
+        )
     }
 
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
@@ -192,10 +192,10 @@ impl SendInputTool {
 #[async_trait]
 impl Tool for SendInputTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from("send_input"),
-            description: "Send a follow-up task to an existing child session".to_owned(),
-            input_schema: json!({
+        subagent_spec(
+            "send_input",
+            "Send a follow-up task to an existing child session",
+            json!({
                 "type": "object",
                 "properties": {
                     "target": { "type": "string" },
@@ -203,15 +203,9 @@ impl Tool for SendInputTool {
                 },
                 "required": ["target", "message"],
             }),
-            concurrency: ToolConcurrency::Exclusive,
-            capabilities: ToolCapabilities {
-                mutating: false,
-                requires_approval: false,
-                cancellable: false,
-                long_running: false,
-            },
-            provider_aliases: Default::default(),
-        }
+            ToolConcurrency::Exclusive,
+            subagent_capabilities(false),
+        )
     }
 
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
@@ -241,11 +235,10 @@ impl WaitAgentTool {
 #[async_trait]
 impl Tool for WaitAgentTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from("wait_agent"),
-            description: "Wait for one of the target child sessions to reach a terminal state"
-                .to_owned(),
-            input_schema: json!({
+        subagent_spec(
+            "wait_agent",
+            "Wait for one of the target child sessions to reach a terminal state",
+            json!({
                 "type": "object",
                 "properties": {
                     "targets": {
@@ -256,15 +249,9 @@ impl Tool for WaitAgentTool {
                 },
                 "required": ["targets"],
             }),
-            concurrency: ToolConcurrency::ReadOnly,
-            capabilities: ToolCapabilities {
-                mutating: false,
-                requires_approval: false,
-                cancellable: false,
-                long_running: true,
-            },
-            provider_aliases: Default::default(),
-        }
+            ToolConcurrency::ReadOnly,
+            subagent_capabilities(true),
+        )
     }
 
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
@@ -294,26 +281,19 @@ impl CloseAgentTool {
 #[async_trait]
 impl Tool for CloseAgentTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from("close_agent"),
-            description: "Close an existing child session and stop accepting follow-up input"
-                .to_owned(),
-            input_schema: json!({
+        subagent_spec(
+            "close_agent",
+            "Close an existing child session and stop accepting follow-up input",
+            json!({
                 "type": "object",
                 "properties": {
                     "target": { "type": "string" }
                 },
                 "required": ["target"],
             }),
-            concurrency: ToolConcurrency::Exclusive,
-            capabilities: ToolCapabilities {
-                mutating: false,
-                requires_approval: false,
-                cancellable: false,
-                long_running: false,
-            },
-            provider_aliases: Default::default(),
-        }
+            ToolConcurrency::Exclusive,
+            subagent_capabilities(false),
+        )
     }
 
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
@@ -326,6 +306,37 @@ impl Tool for CloseAgentTool {
             value: serde_json::to_value(response)
                 .context("failed to execute close_agent tool: invalid response payload")?,
         })
+    }
+}
+
+/// Shared ToolSpec builder for the subagent tools. The four tools differ
+/// only in name, description, input_schema, concurrency, and long_running,
+/// so centralizing the scaffolding here (finding M45) removes four
+/// near-identical ToolSpec blocks and keeps their shared flags
+/// (mutating=false, approval=false, cancellable=false) in one place.
+fn subagent_spec(
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
+    concurrency: ToolConcurrency,
+    capabilities: ToolCapabilities,
+) -> ToolSpec {
+    ToolSpec {
+        name: ToolName::from(name),
+        description: description.to_owned(),
+        input_schema,
+        concurrency,
+        capabilities,
+        provider_aliases: Default::default(),
+    }
+}
+
+fn subagent_capabilities(long_running: bool) -> ToolCapabilities {
+    ToolCapabilities {
+        mutating: false,
+        requires_approval: false,
+        cancellable: false,
+        long_running,
     }
 }
 
@@ -420,13 +431,11 @@ mod tests {
             working_dir: ".".into(),
             path_locks: Arc::new(crate::PathLockMap::default()),
             tool_sessions: Arc::new(crate::ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
                 as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: Some(Arc::new(SubagentParentContext {
                 blueprint: SessionBlueprint {
@@ -483,13 +492,11 @@ mod tests {
             working_dir: ".".into(),
             path_locks: Arc::new(crate::PathLockMap::default()),
             tool_sessions: Arc::new(crate::ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
                 as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: None,
         };
@@ -503,7 +510,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_ignores_agent_type_when_no_roles_are_loaded() {
+    async fn spawn_agent_rejects_agent_type_when_no_roles_are_loaded() {
         let control = Arc::new(RecordingSubagentControl::default());
         let tool = SpawnAgentTool::new(
             control.clone(),
@@ -515,13 +522,11 @@ mod tests {
             working_dir: ".".into(),
             path_locks: Arc::new(crate::PathLockMap::default()),
             tool_sessions: Arc::new(crate::ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
                 as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: Some(Arc::new(SubagentParentContext {
                 blueprint: SessionBlueprint {
@@ -541,19 +546,24 @@ mod tests {
             })),
         };
 
-        tool.execute(
-            context,
-            json!({
-                "message": "delegate this",
-                "agent_type": "general"
-            }),
-        )
-        .await
-        .expect("spawn succeeds");
+        let error = tool
+            .execute(
+                context,
+                json!({
+                    "message": "delegate this",
+                    "agent_type": "general"
+                }),
+            )
+            .await
+            .expect_err("agent_type without registered roles should fail");
 
+        assert!(
+            error
+                .to_string()
+                .contains("no named agent roles are registered")
+        );
         let requests = control.requests.lock().expect("requests");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].agent_type, None);
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]
@@ -568,13 +578,11 @@ mod tests {
             working_dir: ".".into(),
             path_locks: Arc::new(crate::PathLockMap::default()),
             tool_sessions: Arc::new(crate::ToolSessionStore::default()),
-            file_view: Arc::new(Default::default()),
             snapshot: Arc::new(ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default()))
                 as Arc<dyn ToolPolicy>,
-            max_tool_output_bytes: 16_384,
             shell_timeout_secs: 30,
             subagent_parent: Some(Arc::new(SubagentParentContext {
                 blueprint: SessionBlueprint {
