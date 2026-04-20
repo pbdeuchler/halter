@@ -172,10 +172,40 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
     }
 }
 
+/// Estimates the number of tokens consumed by `text` for budgeting purposes.
+///
+/// Uses a char-to-token ratio of 10/37 (≈3.7 chars per token), which averages
+/// English prose across current BPE tokenizers (cl100k_base, o200k_base, GPT
+/// tokenizers). This is intentionally *heuristic*: it runs in O(chars) and
+/// avoids loading tokenizer tables, at the cost of being wrong by ±20% for
+/// code-heavy or non-Latin text.
+///
+/// The compaction loop uses this solely for triggering thresholds, not for
+/// billing, so the approximation is acceptable. If a per-provider tokenizer
+/// becomes available, implement [`TokenEstimator`] and thread an alternative
+/// estimator through the context manager.
 #[must_use]
 pub fn estimate_text_tokens(text: &str) -> u64 {
-    let chars = text.chars().count() as u64;
-    (chars * 10) / 37
+    CharHeuristicEstimator.estimate(text)
+}
+
+/// A pluggable token-budget estimator. Implementors may swap in a
+/// model-specific tokenizer when one becomes available; today only
+/// [`CharHeuristicEstimator`] is provided.
+pub trait TokenEstimator {
+    fn estimate(&self, text: &str) -> u64;
+}
+
+/// Default estimator: `floor(chars * 10 / 37)` — see
+/// [`estimate_text_tokens`] for the rationale and caveats.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CharHeuristicEstimator;
+
+impl TokenEstimator for CharHeuristicEstimator {
+    fn estimate(&self, text: &str) -> u64 {
+        let chars = text.chars().count() as u64;
+        (chars * 10) / 37
+    }
 }
 
 #[must_use]
@@ -201,6 +231,17 @@ pub fn render_compaction_event_summary(
     )
 }
 
+/// Iteratively drop the lowest-signal, oldest units until the projected token
+/// count drops below `pre_compaction_target`. Replaces the prior bulk-tier
+/// eviction, which could overshoot the target by up to ~20× (finding H10):
+/// the previous strategy dropped *every* unit of the lowest admissible tier
+/// in one pass, even when removing two or three units would have sufficed.
+///
+/// Eviction order is `(signal ascending, order ascending)`: drop
+/// `VeryLow` before `Low`, `Low` before `Normal`, and oldest first within a
+/// tier. Units at signals above `prune_signal_threshold` are retained
+/// unconditionally — they represent the floor the operator told us not to
+/// breach.
 fn prune_units(
     settings: &ContextSettings,
     compacted_prefix_tokens: u64,
@@ -211,78 +252,35 @@ fn prune_units(
     }
 
     let mut retained = units.to_vec();
-    apply_bulk_eviction(
-        &mut retained,
-        compacted_prefix_tokens,
-        settings.pre_compaction_target,
-        settings.prune_signal_threshold,
-        MessageSignal::VeryLow,
-    );
-    apply_bulk_eviction(
-        &mut retained,
-        compacted_prefix_tokens,
-        settings.pre_compaction_target,
-        settings.prune_signal_threshold,
-        MessageSignal::Low,
-    );
-    apply_bulk_eviction(
-        &mut retained,
-        compacted_prefix_tokens,
-        settings.pre_compaction_target,
-        settings.prune_signal_threshold,
-        MessageSignal::Normal,
-    );
+    if remaining_tokens(&retained, compacted_prefix_tokens) <= settings.pre_compaction_target {
+        return retained;
+    }
 
-    if settings.prune_signal_threshold >= PruneSignalThreshold::High {
-        evict_high_units(
-            &mut retained,
-            compacted_prefix_tokens,
-            settings.pre_compaction_target,
-        );
+    // Build a per-retained candidate list, ordered from most-droppable to
+    // least. Within the allowed threshold, lower-signal (and then older)
+    // units go first.
+    let mut candidate_orders: Vec<usize> = retained
+        .iter()
+        .filter(|unit| threshold_allows_signal(settings.prune_signal_threshold, unit.signal))
+        .map(|unit| unit.order)
+        .collect();
+    candidate_orders.sort_by_key(|order| {
+        let unit = retained
+            .iter()
+            .find(|candidate| candidate.order == *order)
+            .expect("candidate order references a retained unit");
+        (unit.signal, unit.order)
+    });
+
+    for order in candidate_orders {
+        if remaining_tokens(&retained, compacted_prefix_tokens) <= settings.pre_compaction_target {
+            break;
+        }
+        retained.retain(|unit| unit.order != order);
     }
 
     retained.sort_by_key(|unit| unit.order);
     retained
-}
-
-fn apply_bulk_eviction(
-    retained: &mut Vec<CompactionUnit>,
-    compacted_prefix_tokens: u64,
-    pre_compaction_target: u64,
-    prune_signal_threshold: PruneSignalThreshold,
-    signal: MessageSignal,
-) {
-    if remaining_tokens(retained, compacted_prefix_tokens) <= pre_compaction_target
-        || !threshold_allows_signal(prune_signal_threshold, signal)
-    {
-        return;
-    }
-
-    retained.retain(|unit| unit.signal != signal);
-}
-
-fn evict_high_units(
-    retained: &mut Vec<CompactionUnit>,
-    compacted_prefix_tokens: u64,
-    pre_compaction_target: u64,
-) {
-    if remaining_tokens(retained, compacted_prefix_tokens) <= pre_compaction_target {
-        return;
-    }
-
-    let mut high_units = retained
-        .iter()
-        .filter(|unit| unit.signal == MessageSignal::High)
-        .cloned()
-        .collect::<Vec<_>>();
-    high_units.sort_by_key(|unit| (unit.estimated_tokens, unit.order));
-
-    for high_unit in high_units {
-        if remaining_tokens(retained, compacted_prefix_tokens) <= pre_compaction_target {
-            break;
-        }
-        retained.retain(|unit| unit.order != high_unit.order);
-    }
 }
 
 fn remaining_tokens(units: &[CompactionUnit], compacted_prefix_tokens: u64) -> u64 {
@@ -518,6 +516,117 @@ mod tests {
 
         assert!(preparation.compact_messages.is_empty());
         assert_eq!(preparation.reserved_suffix.len(), 1);
+    }
+
+    fn build_threshold_fixture() -> Vec<Message> {
+        use halter_protocol::SystemMessage;
+
+        let vlow_tool = Message::Tool(ToolResultMessage {
+            id: MessageId::new(),
+            call_id: ToolCallId::from("vlow"),
+            content: ToolResult::Empty,
+            error: None,
+            created_at: Utc::now(),
+        });
+        let low_tool = Message::Tool(ToolResultMessage {
+            id: MessageId::new(),
+            call_id: ToolCallId::from("low"),
+            content: ToolResult::Text {
+                text: "boom".repeat(32),
+            },
+            error: Some(ToolError {
+                message: "failed".to_owned(),
+            }),
+            created_at: Utc::now(),
+        });
+        let normal_tool = Message::Tool(ToolResultMessage {
+            id: MessageId::new(),
+            call_id: ToolCallId::from("normal"),
+            content: ToolResult::Text {
+                text: "hit".repeat(64),
+            },
+            error: None,
+            created_at: Utc::now(),
+        });
+        let high_system = Message::System(SystemMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            text: "sys".repeat(64),
+        });
+        let trailing_assistant = Message::Assistant(AssistantMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            parts: vec![AssistantPart::Text {
+                text: "keep me".repeat(64),
+            }],
+            stop_reason: None,
+            usage: None,
+            replay_meta: Default::default(),
+        });
+
+        vec![
+            vlow_tool,
+            low_tool,
+            normal_tool,
+            high_system,
+            trailing_assistant,
+        ]
+    }
+
+    #[test]
+    fn prune_threshold_preserves_signals_above_its_ceiling() {
+        struct Case {
+            threshold: PruneSignalThreshold,
+            retained: &'static [MessageSignal],
+        }
+
+        let cases = [
+            Case {
+                threshold: PruneSignalThreshold::VeryLow,
+                retained: &[
+                    MessageSignal::Low,
+                    MessageSignal::Normal,
+                    MessageSignal::High,
+                ],
+            },
+            Case {
+                threshold: PruneSignalThreshold::Low,
+                retained: &[MessageSignal::Normal, MessageSignal::High],
+            },
+            Case {
+                threshold: PruneSignalThreshold::Normal,
+                retained: &[MessageSignal::High],
+            },
+            Case {
+                threshold: PruneSignalThreshold::High,
+                retained: &[],
+            },
+        ];
+
+        for case in cases {
+            let messages = build_threshold_fixture();
+            let preparation = prepare_compaction(
+                &ContextSettings {
+                    compaction_threshold: 100,
+                    pre_compaction_target: 1,
+                    prune_signal_threshold: case.threshold,
+                },
+                &[],
+                &messages,
+            );
+
+            let surviving: Vec<MessageSignal> = preparation
+                .compact_messages
+                .iter()
+                .map(score_message)
+                .collect();
+
+            assert_eq!(
+                surviving, case.retained,
+                "threshold {:?}: expected {:?}, got {:?}",
+                case.threshold, case.retained, surviving
+            );
+        }
     }
 
     #[test]
