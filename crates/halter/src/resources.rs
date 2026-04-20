@@ -331,7 +331,12 @@ fn collect_skills(
     visited: &mut BTreeSet<PathBuf>,
     sink: &mut Vec<LoadedSkill>,
 ) -> anyhow::Result<()> {
-    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical_root = fs::canonicalize(root).with_context(|| {
+        format!(
+            "failed to canonicalize skill collection root '{}'",
+            root.display()
+        )
+    })?;
     if !visited.insert(canonical_root) {
         return Ok(());
     }
@@ -363,7 +368,7 @@ fn load_skill_root(root: &Path) -> anyhow::Result<LoadedSkill> {
     });
     let description = frontmatter.get("description").cloned().unwrap_or_default();
     Ok(LoadedSkill {
-        id: stable_skill_id(root),
+        id: stable_skill_id(root)?,
         name,
         description,
         root: root.to_path_buf(),
@@ -374,10 +379,18 @@ fn load_skill_root(root: &Path) -> anyhow::Result<LoadedSkill> {
     })
 }
 
-fn stable_skill_id(root: &Path) -> SkillId {
-    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+fn stable_skill_id(root: &Path) -> anyhow::Result<SkillId> {
+    let canonical_root = fs::canonicalize(root).with_context(|| {
+        format!(
+            "failed to canonicalize skill root '{}' while computing a stable id",
+            root.display()
+        )
+    })?;
     let fingerprint = canonical_root.display().to_string();
-    SkillId::from(format!("skill-{}", hash_bytes(fingerprint.as_bytes())))
+    Ok(SkillId::from(format!(
+        "skill-{}",
+        hash_bytes(fingerprint.as_bytes())
+    )))
 }
 
 fn load_scripts(root: &Path) -> anyhow::Result<Vec<LoadedExecutable>> {
@@ -420,12 +433,24 @@ fn load_plugin_root(root: &Path) -> anyhow::Result<Option<LoadedPlugin>> {
         name: manifest_value
             .get("name")
             .and_then(Value::as_str)
-            .unwrap_or("unnamed-plugin")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "plugin manifest at {} is missing required string field 'name'",
+                    manifest_path.display()
+                )
+            })?
             .to_owned(),
         version: manifest_value
             .get("version")
             .and_then(Value::as_str)
-            .unwrap_or("0.0.0")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "plugin manifest at {} is missing required string field 'version'",
+                    manifest_path.display()
+                )
+            })?
             .to_owned(),
         skills: read_string_array(&manifest_value, "skills"),
         agents: read_string_array(&manifest_value, "agents"),
@@ -444,7 +469,7 @@ fn load_plugin_root(root: &Path) -> anyhow::Result<Option<LoadedPlugin>> {
         allowed_http_hosts: read_string_array(&manifest_value, "allowedHttpHosts"),
         allowed_env_vars: read_string_array(&manifest_value, "allowedEnvVars"),
     };
-    let plugin_id = stable_plugin_id(root, &manifest);
+    let plugin_id = stable_plugin_id(root, &manifest)?;
 
     let mut skills = Vec::new();
     let mut visited_skill_dirs = BTreeSet::new();
@@ -562,15 +587,23 @@ fn hash_bytes(bytes: &[u8]) -> ContentHash {
     format!("{:x}", hasher.finalize())
 }
 
-fn stable_plugin_id(root: &Path, manifest: &PluginManifest) -> PluginId {
-    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+fn stable_plugin_id(root: &Path, manifest: &PluginManifest) -> anyhow::Result<PluginId> {
+    let canonical_root = fs::canonicalize(root).with_context(|| {
+        format!(
+            "failed to canonicalize plugin root '{}' while computing a stable id",
+            root.display()
+        )
+    })?;
     let fingerprint = format!(
         "{}\0{}\0{}",
         manifest.name,
         manifest.version,
         canonical_root.display()
     );
-    PluginId::from(format!("plugin-{}", hash_bytes(fingerprint.as_bytes())))
+    Ok(PluginId::from(format!(
+        "plugin-{}",
+        hash_bytes(fingerprint.as_bytes())
+    )))
 }
 
 fn normalized_roots(roots: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
@@ -586,6 +619,12 @@ fn normalized_roots(roots: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     Ok(normalized)
 }
 
+/// Expands a resource-root path's leading `~/` against `$HOME`. No other
+/// substitutions (`$VAR`, `${VAR}`, `~user/`) are performed — see
+/// [`halter_config::expand_path`] for the rationale. Plugin component paths
+/// have a *separate*, explicitly scoped alias mechanism (the
+/// `${CLAUDE_PLUGIN_ROOT}` family) handled by
+/// [`expand_plugin_component_path`].
 fn expand_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if let Some(stripped) = raw.strip_prefix("~/")
@@ -897,6 +936,127 @@ description: says hello
             first_id.0.starts_with("skill-"),
             "skill id should be content-addressed: {}",
             first_id.0
+        );
+    }
+
+    #[tokio::test]
+    async fn m8_plugin_manifest_missing_name_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let manifest_dir = plugin_root.join(".halter-plugin");
+
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(manifest_dir.join("plugin.json"), r#"{"version": "0.1.0"}"#)
+            .expect("write manifest");
+
+        let mut config = HarnessConfig::default();
+        config.resources.plugins.roots = vec![temp.path().to_path_buf()];
+        let error = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect_err("compile should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing required string field 'name'")
+                || error.chain().any(|e| e
+                    .to_string()
+                    .contains("missing required string field 'name'")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn m8_plugin_manifest_missing_version_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let manifest_dir = plugin_root.join(".halter-plugin");
+
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(manifest_dir.join("plugin.json"), r#"{"name": "example"}"#)
+            .expect("write manifest");
+
+        let mut config = HarnessConfig::default();
+        config.resources.plugins.roots = vec![temp.path().to_path_buf()];
+        let error = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect_err("compile should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing required string field 'version'")
+                || error.chain().any(|e| e
+                    .to_string()
+                    .contains("missing required string field 'version'")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn m8_plugin_manifest_blank_name_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let manifest_dir = plugin_root.join(".halter-plugin");
+
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            r#"{"name": "  ", "version": "0.1.0"}"#,
+        )
+        .expect("write manifest");
+
+        let mut config = HarnessConfig::default();
+        config.resources.plugins.roots = vec![temp.path().to_path_buf()];
+        let error = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect_err("compile should fail");
+
+        assert!(
+            error.chain().any(|e| e
+                .to_string()
+                .contains("missing required string field 'name'")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn m9_stable_skill_id_errors_on_nonexistent_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("does_not_exist");
+        let error = stable_skill_id(&missing).expect_err("canonicalize should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to canonicalize skill root"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn m9_stable_plugin_id_errors_on_nonexistent_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("does_not_exist");
+        let manifest = PluginManifest {
+            name: "x".to_owned(),
+            version: "0.0.1".to_owned(),
+            skills: Vec::new(),
+            agents: Vec::new(),
+            hooks: None,
+            mcp_servers: None,
+            lsp_servers: None,
+            allowed_http_hosts: Vec::new(),
+            allowed_env_vars: Vec::new(),
+        };
+        let error = stable_plugin_id(&missing, &manifest).expect_err("canonicalize should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to canonicalize plugin root"),
+            "unexpected error: {error}"
         );
     }
 }

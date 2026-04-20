@@ -390,6 +390,13 @@ pub fn config_fingerprint(config: &HarnessConfig) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Expands a path's leading `~/` against `$HOME`. No other substitutions are
+/// performed — `$VAR`, `${VAR}`, `~user/`, `%USERPROFILE%`, and shell escapes
+/// all pass through unchanged. This is deliberate: expanding env-var
+/// references on a user-supplied config path is a footgun (an attacker-
+/// controlled environment variable could redirect resource loads). Callers
+/// that *want* shell-like expansion must call a shell-expansion crate
+/// explicitly with an explicit threat model.
 #[must_use]
 pub fn expand_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();

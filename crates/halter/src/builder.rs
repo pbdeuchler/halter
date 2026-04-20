@@ -1,6 +1,6 @@
 // pattern: Imperative Shell
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
@@ -401,16 +401,32 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         "building model registry"
     );
 
-    let mut registered_providers = HashSet::new();
-    for (provider_name, configured_provider) in [
-        (&default_model.provider, default_config.provider),
-        (&small_model.provider, small_config.provider),
-        (&subagent_model.provider, subagent_config.provider),
+    let mut registered_providers: HashMap<String, ResolvedProviderConfig> = HashMap::new();
+    for (role_label, provider_name, configured_provider) in [
+        ("default", &default_model.provider, default_config.provider),
+        ("small", &small_model.provider, small_config.provider),
+        (
+            "subagent",
+            &subagent_model.provider,
+            subagent_config.provider,
+        ),
     ] {
-        if !registered_providers.insert(provider_name.0.clone()) {
+        let resolved = resolve_selected_provider_config(config, configured_provider)?;
+        if let Some(existing) = registered_providers.get(&provider_name.0) {
+            anyhow::ensure!(
+                existing == &resolved,
+                "provider '{name}' is used by multiple roles with divergent per-role configuration; \
+                 the {role_label} role resolved to base_url '{new_base}' but an earlier role \
+                 resolved the same provider to base_url '{old_base}' (api key differences also \
+                 trigger this error). Consolidate the config or use distinct providers.",
+                name = provider_name,
+                role_label = role_label,
+                new_base = resolved.base_url,
+                old_base = existing.base_url,
+            );
             continue;
         }
-        let resolved = resolve_selected_provider_config(config, configured_provider)?;
+        registered_providers.insert(provider_name.0.clone(), resolved.clone());
         registry.register_provider(provider_name.clone(), build_provider(&resolved)?);
     }
     registry.set_default_model(default_model);
@@ -574,6 +590,37 @@ mod tests {
         .expect_err("provider resolution should fail");
 
         assert!(error.to_string().contains("OPENAI_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn h12_builder_accepts_shared_provider_across_roles() {
+        // All three roles share ConfiguredProvider::OpenAi, which resolves to
+        // the same ResolvedProviderConfig — the H12 collision check must
+        // accept identical registrations and not false-positive.
+        let mut config = openai_config(Some("test-key"));
+        config.models.small = Some(ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: "gpt-5-mini".to_owned(),
+            max_input_tokens: Some(64_000),
+            max_output_tokens: Some(4_096),
+            reasoning: None,
+            tokens_per_minute: None,
+        });
+        config.models.subagent = Some(ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: "gpt-5".to_owned(),
+            max_input_tokens: Some(200_000),
+            max_output_tokens: Some(8_192),
+            reasoning: None,
+            tokens_per_minute: None,
+        });
+
+        HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build should succeed when roles share a provider");
     }
 
     #[tokio::test]
