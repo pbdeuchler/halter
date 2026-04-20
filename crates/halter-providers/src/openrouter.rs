@@ -25,8 +25,19 @@ impl OpenRouterProvider {
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_headers(api_key, base_url, &[])
+    }
+
+    /// Construct an OpenRouter provider with user-configured HTTP header
+    /// overrides. Overrides replace any default or hardcoded header
+    /// (`Authorization`, `Content-Type`) case-insensitively.
+    pub fn new_with_headers(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: ResponsesProvider::try_new(config(), api_key, base_url)?,
+            inner: ResponsesProvider::try_new(config(), api_key, base_url, header_overrides)?,
         })
     }
 }

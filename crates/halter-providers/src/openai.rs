@@ -26,8 +26,19 @@ impl OpenAiProvider {
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_headers(api_key, base_url, &[])
+    }
+
+    /// Construct an OpenAI provider with user-configured HTTP header
+    /// overrides. Overrides replace any default or hardcoded header
+    /// (`Authorization`, `Content-Type`) case-insensitively.
+    pub fn new_with_headers(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: ResponsesProvider::try_new(config(), api_key, base_url)?,
+            inner: ResponsesProvider::try_new(config(), api_key, base_url, header_overrides)?,
         })
     }
 }
@@ -165,6 +176,136 @@ mod tests {
             gap >= Duration::from_millis(15),
             "expected retry to honor cooldown, saw gap {gap:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn openai_provider_applies_header_overrides() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let base_url = spawn_header_capture_server(captured.clone()).await;
+        let overrides = vec![
+            ("authorization".to_owned(), "Bearer override-token".to_owned()),
+            ("X-Trace-Id".to_owned(), "trace-1".to_owned()),
+        ];
+        let provider = OpenAiProvider::new_with_headers("default-key", base_url, &overrides)
+            .expect("openai provider");
+
+        let mut stream = provider
+            .stream(
+                sample_request(ApiKind::OpenAiResponses),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("provider stream");
+        while stream.next().await.is_some() {}
+
+        let captured = captured.lock().await.clone();
+        let headers_end = find_headers_end(&captured).expect("headers end");
+        let request_text = String::from_utf8_lossy(&captured[..headers_end]);
+
+        let bearer_lines = request_text
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .count();
+        assert_eq!(bearer_lines, 1, "authorization should appear once");
+        assert!(
+            request_text
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer override-token")),
+            "override bearer must replace default, got:\n{request_text}"
+        );
+        assert!(
+            request_text
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-trace-id: trace-1")),
+            "custom header must be forwarded, got:\n{request_text}"
+        );
+        let content_type_lines = request_text
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+            .count();
+        assert_eq!(content_type_lines, 1, "content-type should not duplicate");
+    }
+
+    async fn spawn_header_capture_server(captured: Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept socket");
+            let buffer = read_http_request_buffer(&mut socket)
+                .await
+                .expect("read request");
+            *captured.lock().await = buffer;
+
+            let completed = json!({
+                "type": "response.completed",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_hdr",
+                    "created_at": 0,
+                    "model": "gpt-5.4",
+                    "object": "response",
+                    "output": [],
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 0,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": 0,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 0
+                    }
+                }
+            });
+            let body = format!("data: {completed}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        format!("http://{address}")
+    }
+
+    async fn read_http_request_buffer(
+        socket: &mut tokio::net::TcpStream,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+
+        loop {
+            let read = socket.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(headers_end) = find_headers_end(&buffer) {
+                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(0);
+                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
+                if body_bytes >= content_length {
+                    return Ok(buffer);
+                }
+            }
+        }
+
+        anyhow::bail!("incomplete http request")
     }
 
     fn sample_request(api_kind: ApiKind) -> ProviderRequest {

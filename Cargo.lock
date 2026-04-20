@@ -1240,6 +1240,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "halter-protocol",
+ "indexmap",
  "schemars",
  "serde",
  "serde_json",

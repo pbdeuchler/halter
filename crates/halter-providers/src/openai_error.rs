@@ -121,8 +121,31 @@ fn parse_api_error_object(value: &Value) -> Option<ApiError> {
         return None;
     }
 
+    // OpenRouter wraps upstream-provider failures as
+    // `{"error": {"message": "Provider returned error", "metadata": {"provider_name": "...", "raw": "..."}}}`.
+    // Without lifting `metadata.raw` into the user-facing message, every
+    // upstream failure surfaces as the generic top-level string and the
+    // real cause is lost.
+    let message = match (
+        value
+            .pointer("/metadata/provider_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        value
+            .pointer("/metadata/raw")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    ) {
+        (Some(provider), Some(raw)) => format!("{message} ({provider}: {raw})"),
+        (None, Some(raw)) => format!("{message}: {raw}"),
+        (Some(provider), None) => format!("{message} ({provider})"),
+        (None, None) => message.to_owned(),
+    };
+
     Some(ApiError {
-        message: message.to_owned(),
+        message,
         r#type: value
             .get("type")
             .and_then(Value::as_str)
@@ -315,5 +338,53 @@ mod tests {
             openai_api_error_retry_after(&error),
             Some(Duration::from_millis(75))
         );
+    }
+
+    #[test]
+    fn lifts_openrouter_metadata_raw_into_message() {
+        let body = json!({
+            "error": {
+                "code": 400,
+                "message": "Provider returned error",
+                "metadata": {
+                    "provider_name": "Z.AI",
+                    "raw": "The requested model 'z-ai/glm-5.1' does not exist."
+                }
+            }
+        });
+
+        let error = parse_openai_http_error(body.to_string().as_bytes()).expect("api error");
+
+        assert_eq!(
+            error.message,
+            "Provider returned error (Z.AI: The requested model 'z-ai/glm-5.1' does not exist.)"
+        );
+    }
+
+    #[test]
+    fn lifts_openrouter_metadata_raw_without_provider_name() {
+        let body = json!({
+            "error": {
+                "message": "Provider returned error",
+                "metadata": { "raw": "upstream detail" }
+            }
+        });
+
+        let error = parse_openai_http_error(body.to_string().as_bytes()).expect("api error");
+
+        assert_eq!(error.message, "Provider returned error: upstream detail");
+    }
+
+    #[test]
+    fn leaves_message_untouched_when_metadata_raw_absent() {
+        let body = json!({
+            "error": {
+                "message": "invalid api key"
+            }
+        });
+
+        let error = parse_openai_http_error(body.to_string().as_bytes()).expect("api error");
+
+        assert_eq!(error.message, "invalid api key");
     }
 }
