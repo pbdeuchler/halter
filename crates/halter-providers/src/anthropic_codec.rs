@@ -283,7 +283,13 @@ fn encode_thinking(
     max_output_tokens: Option<u32>,
 ) -> Option<Value> {
     let reasoning = reasoning?;
-    let max_output_tokens = max_output_tokens?;
+    let Some(max_output_tokens) = max_output_tokens else {
+        tracing::warn!(
+            ?reasoning,
+            "reasoning requested but max_output_tokens is unset; anthropic thinking block dropped silently. Set max_output_tokens or remove reasoning effort."
+        );
+        return None;
+    };
     if max_output_tokens <= 1_024 {
         return None;
     }

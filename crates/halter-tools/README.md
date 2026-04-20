@@ -387,6 +387,9 @@ Notes:
 - `kill_tree` requires process control to be allowed
 - internally this is checked through shell-style policy gating
 - useful for cleaning up runaway tasks or inspecting spawned subprocess trees
+- `kill_tree` response includes `per_pid: [{pid, killed}]` alongside the
+  aggregate `killed` count, so callers can see which descendant refused the
+  signal rather than just "3 of 5 killed"
 
 ---
 
