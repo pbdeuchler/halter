@@ -110,9 +110,13 @@ impl Provider for FakeProvider {
             .filter(|item| !item.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
+        // Mirror the OpenAI Responses `reasoning`-shaped envelope used for
+        // compacted context restoration. The earlier `type: "compaction"`
+        // item matched no real provider and would have caused cross-provider
+        // assertions to diverge unnecessarily. (finding L18)
         Ok(ProviderCompactionResponse {
             output: vec![json!({
-                "type": "compaction",
+                "type": "reasoning",
                 "id": format!("cmp_{}", request.session_id.0),
                 "encrypted_content": summary,
             })],

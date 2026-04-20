@@ -44,6 +44,21 @@ CREATE TABLE events (
 "#,
 )];
 
+// Compile-time guarantee that MIGRATIONS is sorted by strictly increasing
+// version. run_migrations skips any entry whose version is <= the current
+// schema version, so an unsorted table would silently drop migrations.
+// (finding L15)
+const _: () = {
+    let mut i = 1;
+    while i < MIGRATIONS.len() {
+        assert!(
+            MIGRATIONS[i - 1].0 < MIGRATIONS[i].0,
+            "MIGRATIONS must be strictly monotonic in version"
+        );
+        i += 1;
+    }
+};
+
 pub struct SqliteSessionStore {
     connection: Arc<Mutex<Connection>>,
 }

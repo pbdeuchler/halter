@@ -363,19 +363,15 @@ enum ArrayMergePolicy {
 }
 
 fn array_merge_policy(path: &[String]) -> ArrayMergePolicy {
-    match path
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    // Replace is the default for arrays; list only the exceptions that want
+    // append-dedupe semantics. The previous implementation named a handful of
+    // Replace paths explicitly alongside the `_ => Replace` fallback, which
+    // implied the listed paths were special when they were not. (finding L6)
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    match segments.as_slice() {
         ["resources", "skills", "roots"] | ["resources", "plugins", "roots"] => {
             ArrayMergePolicy::AppendDedupe
         }
-        ["policy", "shell", "allow"]
-        | ["policy", "allowed_write_roots"]
-        | ["policy", "network", "allowed_hosts"]
-        | ["tools", "enabled"] => ArrayMergePolicy::Replace,
         _ => ArrayMergePolicy::Replace,
     }
 }
