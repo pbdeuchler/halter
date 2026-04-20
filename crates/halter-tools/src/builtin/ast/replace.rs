@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::PathLockMap;
+use crate::ToolPolicy;
 
 use super::FileCandidate;
 use super::language::{parse_strictness, resolve_language};
@@ -83,6 +84,7 @@ pub(super) fn run(
     candidates: Vec<FileCandidate>,
     path_locks: Arc<PathLockMap>,
     cancel: CancellationToken,
+    policy: Arc<dyn ToolPolicy>,
 ) -> anyhow::Result<Value> {
     let mut changes = Vec::new();
     let mut file_counts = BTreeMap::<String, u64>::new();
@@ -184,7 +186,15 @@ pub(super) fn run(
         if !config.dry_run {
             let output = apply_edits(&source, &file_edits)?;
             if output != source {
-                atomic_write_blocking(&candidate.absolute_path, output.as_bytes())?;
+                let canonical = policy
+                    .check_write_path_blocking(&candidate.absolute_path)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "failed to execute ast_grep tool: write denied for '{}': {error}",
+                            candidate.display_path,
+                        )
+                    })?;
+                atomic_write_blocking(canonical.path(), output.as_bytes())?;
             }
         }
         drop(guard);
@@ -274,6 +284,15 @@ enum PathGuard {
 #[cfg(all(test, feature = "ast-tools"))]
 mod tests {
     use super::*;
+    use crate::{DefaultToolPolicy, PolicySettings};
+
+    fn test_policy() -> Arc<dyn ToolPolicy> {
+        let settings = PolicySettings {
+            allowed_write_roots: vec![std::env::temp_dir()],
+            ..PolicySettings::default()
+        };
+        Arc::new(DefaultToolPolicy::new(settings))
+    }
 
     #[test]
     fn rejects_overlapping_edits() {
@@ -325,6 +344,7 @@ mod tests {
             }],
             Arc::new(PathLockMap::default()),
             CancellationToken::new(),
+            test_policy(),
         )
         .expect("replace should succeed");
 
@@ -363,6 +383,7 @@ mod tests {
             }],
             Arc::new(PathLockMap::default()),
             CancellationToken::new(),
+            test_policy(),
         )
         .expect("replace should succeed");
 

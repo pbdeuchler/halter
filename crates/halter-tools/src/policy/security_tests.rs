@@ -468,6 +468,69 @@ async fn review_hook_runtime_ac2_7_kill_switch_denies_everything() {
     }
 }
 
+// ------------- H33: blocking-variant write check mirrors the async one
+//
+// The ast/replace tool runs on a blocking worker and now invokes the policy
+// immediately before the write. The sync `check_write_path_blocking` helper
+// must produce the same accept/reject decisions and identical `CanonicalPath`
+// output as the async `check_write_path` — otherwise the TOCTOU move could
+// accidentally widen or narrow the enforced surface.
+
+#[tokio::test]
+async fn h33_check_write_path_blocking_accepts_what_async_accepts() {
+    let dir = TempDir::new().expect("tempdir");
+    let policy = tmp_policy(dir.path());
+    let target = dir.path().join("sub").join("out.txt");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+    let async_ok = policy
+        .check_write_path(&target)
+        .await
+        .expect("async accepts write under allowed root");
+    let sync_ok = policy
+        .check_write_path_blocking(&target)
+        .expect("sync mirror accepts the same path");
+    assert_eq!(async_ok.path(), sync_ok.path());
+}
+
+#[test]
+fn h33_check_write_path_blocking_rejects_sensitive_path() {
+    let dir = TempDir::new().expect("tempdir");
+    let policy = tmp_policy(dir.path());
+
+    // `/etc/shadow` is rejected by the sensitive-path glob before any I/O —
+    // the sync mirror must reject it for the same reason.
+    let err = policy
+        .check_write_path_blocking(std::path::Path::new("/etc/shadow"))
+        .expect_err("sensitive path must be denied by sync mirror");
+    assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
+}
+
+#[test]
+#[cfg(unix)]
+fn h33_check_write_path_blocking_rejects_symlink_escape() {
+    let base = TempDir::new().expect("base tempdir");
+    let outside = TempDir::new().expect("outside tempdir");
+    let inside = base.path().join("allowed");
+    std::fs::create_dir(&inside).unwrap();
+    let link = inside.join("escape");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        allowed_write_roots: vec![base.path().to_path_buf()],
+        allowed_read_roots: vec![base.path().to_path_buf()],
+        ..PolicySettings::default()
+    });
+
+    let err = policy
+        .check_write_path_blocking(&link.join("pwned.txt"))
+        .expect_err("symlink traversal must be denied by sync mirror");
+    assert!(matches!(
+        err,
+        PolicyError::NotInRoot { .. } | PolicyError::SymlinkEscape { .. }
+    ));
+}
+
 // ------------- AC1.14: nonexistent root produces typed error
 
 #[tokio::test]

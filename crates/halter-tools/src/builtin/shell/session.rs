@@ -143,7 +143,7 @@ async fn cancel_shell_task(
 async fn reset_shell_session(session: &std::sync::Arc<TokioMutex<Option<ShellSessionCore>>>) {
     let mut guard = session.lock().await;
     if let Some(shell) = guard.as_ref() {
-        terminate_background_jobs(&shell.shell);
+        terminate_background_jobs(&shell.shell).await;
     }
     *guard = None;
 }
@@ -255,7 +255,7 @@ async fn run_shell_command(
         .await;
 
     if cancel.is_cancelled() {
-        terminate_background_jobs(&session.shell);
+        terminate_background_jobs(&session.shell).await;
     }
 
     if env_scope_pushed {
@@ -478,8 +478,14 @@ fn session_keepalive(result: &ExecutionResult) -> bool {
     matches!(result.next_control_flow, ExecutionControlFlow::Normal)
 }
 
+/// Delay between TERM and the follow-up KILL sweep. Matches the pre-review
+/// behavior; kept inline (not a detached `tokio::spawn`) so callers observe a
+/// fully drained process group before returning (finding M36).
 #[cfg(unix)]
-fn terminate_background_jobs(shell: &BrushShell) {
+const POST_EXIT_KILL_DELAY: Duration = Duration::from_millis(500);
+
+#[cfg(unix)]
+async fn terminate_background_jobs(shell: &BrushShell) {
     if shell.jobs.jobs.is_empty() {
         return;
     }
@@ -506,19 +512,17 @@ fn terminate_background_jobs(shell: &BrushShell) {
         let _ = kill_tree(pid, TERM_SIGNAL);
     }
 
-    tokio::spawn(async move {
-        time::sleep(Duration::from_millis(500)).await;
-        for pgid in pgids {
-            let _ = kill_process_group(pgid, KILL_SIGNAL);
-        }
-        for pid in pids {
-            let _ = kill_tree(pid, KILL_SIGNAL);
-        }
-    });
+    time::sleep(POST_EXIT_KILL_DELAY).await;
+    for pgid in pgids {
+        let _ = kill_process_group(pgid, KILL_SIGNAL);
+    }
+    for pid in pids {
+        let _ = kill_tree(pid, KILL_SIGNAL);
+    }
 }
 
 #[cfg(not(unix))]
-fn terminate_background_jobs(_shell: &BrushShell) {}
+async fn terminate_background_jobs(_shell: &BrushShell) {}
 
 #[cfg(test)]
 mod tests {

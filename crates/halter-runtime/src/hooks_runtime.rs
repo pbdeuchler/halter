@@ -1614,6 +1614,12 @@ mod tests {
             async fn check_write_path(&self, _path: &Path) -> Result<CanonicalPath, PolicyError> {
                 unimplemented!()
             }
+            fn check_write_path_blocking(
+                &self,
+                _path: &Path,
+            ) -> Result<CanonicalPath, PolicyError> {
+                unimplemented!()
+            }
             async fn check_process_signal(&self, _pid: Pid) -> Result<(), PolicyError> {
                 Ok(())
             }

@@ -146,6 +146,14 @@ pub trait ToolPolicy: Send + Sync {
     /// holds the parent fd.
     async fn check_write_path(&self, path: &Path) -> Result<CanonicalPath, PolicyError>;
 
+    /// Synchronous mirror of [`check_write_path`]. Callers running on a
+    /// blocking worker (e.g. `spawn_blocking`) use this to move the
+    /// authorization check next to the actual filesystem write, closing the
+    /// TOCTOU window between check and open (finding H33). Default
+    /// implementations must perform identical policy enforcement to the
+    /// async variant.
+    fn check_write_path_blocking(&self, path: &Path) -> Result<CanonicalPath, PolicyError>;
+
     /// Authorize sending a process signal to `pid`. Enforces the session's
     /// process-tree boundary when configured.
     async fn check_process_signal(&self, pid: Pid) -> Result<(), PolicyError>;
@@ -252,6 +260,17 @@ impl DefaultToolPolicy {
         }
         Ok(())
     }
+
+    fn check_write_path_sync(&self, path: &Path) -> Result<CanonicalPath, PolicyError> {
+        let absolute = absolute_path_typed(path)?;
+        reject_parent_traversal_typed(&absolute)?;
+        self.verify_not_sensitive(&absolute)?;
+        let canonical = resolve_write_target_typed(&absolute)?;
+        self.verify_not_sensitive(canonical.path())?;
+        let roots = self.canonical_write_roots()?;
+        Self::verify_under_any_root(canonical.path(), &roots)?;
+        Ok(canonical)
+    }
 }
 
 #[async_trait]
@@ -278,14 +297,11 @@ impl ToolPolicy for DefaultToolPolicy {
     }
 
     async fn check_write_path(&self, path: &Path) -> Result<CanonicalPath, PolicyError> {
-        let absolute = absolute_path_typed(path)?;
-        reject_parent_traversal_typed(&absolute)?;
-        self.verify_not_sensitive(&absolute)?;
-        let canonical = resolve_write_target_typed(&absolute)?;
-        self.verify_not_sensitive(canonical.path())?;
-        let roots = self.canonical_write_roots()?;
-        Self::verify_under_any_root(canonical.path(), &roots)?;
-        Ok(canonical)
+        self.check_write_path_sync(path)
+    }
+
+    fn check_write_path_blocking(&self, path: &Path) -> Result<CanonicalPath, PolicyError> {
+        self.check_write_path_sync(path)
     }
 
     async fn check_process_signal(&self, pid: Pid) -> Result<(), PolicyError> {
