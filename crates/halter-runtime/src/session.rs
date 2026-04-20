@@ -899,33 +899,6 @@ impl SessionHandle {
                 },
             );
 
-            let post_response_observed = observe_state(stored.blueprint.working_dir.clone());
-            let post_response_plan = self
-                .services
-                .context_manager
-                .plan(
-                    &stored.blueprint,
-                    &state,
-                    &post_response_observed,
-                    snapshot.as_ref(),
-                    &self.services.tools.specs(),
-                    &compaction_model,
-                    compaction_provider.as_ref(),
-                )
-                .await?;
-            if let Some(ref compaction) = post_response_plan.compaction {
-                state.compacted_prefix = post_response_plan.compacted_prefix.clone();
-                state.messages = post_response_plan.messages.clone();
-                state.last_response_id = None;
-                state.messages_seen_by_provider = 0;
-                self.push_event(
-                    &mut events,
-                    SessionEventPayload::ContextCompacted {
-                        summary: compaction.summary.clone(),
-                    },
-                );
-            }
-
             let tool_calls = assistant_tool_calls(&materialized.message);
             if tool_calls.is_empty() {
                 let stop_dispatch = run_stop(

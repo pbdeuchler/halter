@@ -12,7 +12,9 @@ mod subagents;
 mod turn_registry;
 
 pub use compaction::{ContextSettings, score_message};
-pub use context::{CompactionOutcome, ContextManager, DefaultContextManager};
+pub use context::{
+    CompactionOutcome, ContextManager, DefaultContextManager, resolve_response_chain,
+};
 pub use event_bus::EventBus;
 pub use hooks_runtime::{
     ExecutedHookDispatch, HookInvocationContext, run_notification, run_post_compact,

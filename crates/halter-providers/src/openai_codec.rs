@@ -13,6 +13,7 @@ use halter_protocol::{
     UserPart,
 };
 use serde_json::{Map, Value, json};
+use tracing::warn;
 
 use crate::codec_common::{
     assistant_text, bounded_provider_id, bounded_provider_id_with_prefix, canonical_tool_name,
@@ -644,6 +645,13 @@ impl ResponsesStreamDecoder {
             .expect("reasoning block initialized");
         if let Some(existing_mode) = block.mode {
             if existing_mode != mode {
+                warn!(
+                    reasoning_id = %block.id,
+                    existing_mode = ?existing_mode,
+                    dropped_mode = ?mode,
+                    dropped_chars = delta.chars().count(),
+                    "dropping reasoning delta: mode mismatch within a single reasoning block"
+                );
                 return;
             }
         } else {
