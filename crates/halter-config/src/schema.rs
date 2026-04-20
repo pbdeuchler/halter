@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use halter_protocol::{ApiKind, ProviderKind, PruneSignalThreshold, ReasoningEffort};
+use indexmap::IndexMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -225,6 +226,11 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Optional HTTP headers applied to every request the provider emits.
+    /// Names collide case-insensitively; configured entries override any
+    /// default or hardcoded provider header (Authorization, x-api-key, etc.).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub headers: IndexMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -247,6 +253,9 @@ pub struct ResolvedProviderConfig {
     pub provider: ConfiguredProvider,
     pub base_url: String,
     pub api_key: String,
+    /// Ordered list of user-configured headers. The runtime applies these
+    /// over provider defaults using case-insensitive name matching.
+    pub headers: Vec<(String, String)>,
 }
 
 pub fn resolve_provider_runtime_config<F>(
@@ -286,10 +295,21 @@ where
         )
     })?;
 
+    let headers = configured
+        .map(|config| {
+            config
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(ResolvedProviderConfig {
         provider,
         base_url,
         api_key,
+        headers,
     })
 }
 
@@ -302,6 +322,24 @@ fn validate_provider_config(name: &str, provider: &ProviderConfig) -> anyhow::Re
         &format!("providers.{name}.api_key"),
         provider.api_key.as_deref(),
     )?;
+    for (header_name, header_value) in &provider.headers {
+        validate_required_string(
+            &format!("providers.{name}.headers.<key>"),
+            header_name,
+        )?;
+        if !header_name
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b':')
+        {
+            anyhow::bail!(
+                "invalid configuration: providers.{name}.headers name '{header_name}' is not a valid HTTP header name"
+            );
+        }
+        validate_optional_string(
+            &format!("providers.{name}.headers.{header_name}"),
+            Some(header_value),
+        )?;
+    }
     Ok(())
 }
 
@@ -609,6 +647,7 @@ mod tests {
             Some(&ProviderConfig {
                 base_url: Some("https://proxy.example.com".to_owned()),
                 api_key: Some("configured-key".to_owned()),
+                headers: IndexMap::new(),
             }),
             |_| Ok(Some("env-key".to_owned())),
         )
@@ -669,6 +708,7 @@ mod tests {
         config.providers.openai = Some(ProviderConfig {
             base_url: None,
             api_key: Some("test-key".to_owned()),
+            headers: IndexMap::new(),
         });
         config.sessions.sqlite_path = Some(PathBuf::from("/tmp/halter.db"));
 

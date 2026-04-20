@@ -11,6 +11,7 @@ mod anthropic;
 mod anthropic_codec;
 mod codec_common;
 mod fake;
+mod header_overrides;
 mod http_client;
 mod openai;
 mod openai_codec;

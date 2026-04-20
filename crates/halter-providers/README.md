@@ -248,6 +248,31 @@ If you switch a session to Anthropic, parts of your assumptions may need to chan
 
 ---
 
+## HTTP header overrides
+
+All three built-in providers expose a `new_with_headers(api_key, base_url, &[(name, value)])`
+constructor. The supplied overrides are applied per request with insert
+semantics: entries replace any default or hardcoded header (`Authorization`,
+`x-api-key`, `anthropic-version`, `Content-Type`) case-insensitively, and any
+unrelated header names are forwarded as-is.
+
+```rust
+use halter_providers::OpenAiProvider;
+
+let provider = OpenAiProvider::new_with_headers(
+    std::env::var("OPENAI_API_KEY")?,
+    "https://api.openai.com",
+    &[
+        ("Authorization".into(), "Bearer org-specific-token".into()),
+        ("X-Trace-Id".into(), "halter-dev".into()),
+    ],
+)?;
+```
+
+Config-driven use goes through `[providers.<name>.headers]` in `halter-config`.
+
+---
+
 ## Fake provider
 
 `FakeProvider` is for tests and local verification.

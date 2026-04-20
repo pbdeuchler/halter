@@ -441,20 +441,24 @@ fn build_provider(
     debug!(
         provider = %provider.provider,
         base_url = %provider.base_url,
+        header_overrides = provider.headers.len(),
         "constructing provider client"
     );
     let provider: Arc<dyn halter_providers::Provider> = match provider.provider {
-        ConfiguredProvider::Anthropic => Arc::new(AnthropicProvider::new(
+        ConfiguredProvider::Anthropic => Arc::new(AnthropicProvider::new_with_headers(
             provider.api_key.clone(),
             provider.base_url.clone(),
+            &provider.headers,
         )?),
-        ConfiguredProvider::OpenAi => Arc::new(OpenAiProvider::new(
+        ConfiguredProvider::OpenAi => Arc::new(OpenAiProvider::new_with_headers(
             provider.api_key.clone(),
             provider.base_url.clone(),
+            &provider.headers,
         )?),
-        ConfiguredProvider::OpenRouter => Arc::new(OpenRouterProvider::new(
+        ConfiguredProvider::OpenRouter => Arc::new(OpenRouterProvider::new_with_headers(
             provider.api_key.clone(),
             provider.base_url.clone(),
+            &provider.headers,
         )?),
     };
     Ok(provider)
@@ -740,6 +744,7 @@ mod tests {
         config.providers.openai = Some(ProviderConfig {
             base_url: None,
             api_key: api_key.map(ToOwned::to_owned),
+            headers: Default::default(),
         });
         config
     }

@@ -60,10 +60,11 @@ impl ResponsesProvider {
         config: ResponsesProviderConfig,
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
     ) -> anyhow::Result<Self> {
         Ok(Self {
             config,
-            transport: ResponsesTransport::try_new(api_key, base_url)?,
+            transport: ResponsesTransport::try_new(api_key, base_url, header_overrides)?,
         })
     }
 
@@ -534,6 +535,7 @@ mod tests {
             },
             "test-key",
             "http://127.0.0.1:1",
+            &[],
         )
         .expect("responses provider");
 
@@ -747,6 +749,7 @@ mod tests {
             },
             "test-key",
             base_url,
+            &[],
         )
         .expect("responses provider");
 

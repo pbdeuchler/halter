@@ -2,6 +2,7 @@
 
 use anyhow::Context;
 use reqwest::Client;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -11,6 +12,11 @@ use tracing::{debug, warn};
 pub(crate) struct JsonRequest {
     pub provider_label: &'static str,
     pub url: String,
+    /// Headers applied with insert semantics — later entries override
+    /// earlier entries with the same (case-insensitive) name. A
+    /// `Content-Type: application/json` default is set by `post_json` before
+    /// these are applied, so a caller-supplied `Content-Type` header will
+    /// replace it cleanly (no duplicate values).
     pub headers: Vec<(String, String)>,
     pub body: Value,
 }
@@ -51,17 +57,37 @@ impl JsonHttpClient {
             headers,
             body,
         } = request;
-        let body_bytes = body.to_string().len();
+        let body_bytes_vec = serde_json::to_vec(&body)
+            .with_context(|| format!("failed to encode {} request body", provider_label))?;
+        let body_bytes = body_bytes_vec.len();
         debug!(
             provider = provider_label,
             url = %url,
             body_bytes,
             "sending json request"
         );
-        let mut builder = self.client.post(&url).json(&body);
+        let mut header_map = HeaderMap::new();
+        header_map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         for (name, value) in headers {
-            builder = builder.header(name, value);
+            let header_name = HeaderName::from_bytes(name.as_bytes()).with_context(|| {
+                format!(
+                    "failed to encode http header '{}' for {} request",
+                    name, provider_label
+                )
+            })?;
+            let header_value = HeaderValue::from_str(&value).with_context(|| {
+                format!(
+                    "failed to encode http header value for '{}' in {} request",
+                    name, provider_label
+                )
+            })?;
+            header_map.insert(header_name, header_value);
         }
+        let builder = self
+            .client
+            .post(&url)
+            .headers(header_map)
+            .body(body_bytes_vec);
 
         let response = select! {
             _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),

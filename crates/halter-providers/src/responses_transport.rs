@@ -9,6 +9,7 @@ use async_openai::{
 };
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Client as ReqwestClient, Response, StatusCode};
 use serde_json::Value;
 use thiserror::Error;
@@ -18,6 +19,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::header_overrides::HeaderOverrides;
 use crate::openai_error::{
     Retryability, SYNTHETIC_SERVER_ERROR_CODE, classify, openai_api_error_retry_after,
     parse_openai_http_error, parse_openai_stream_error,
@@ -121,12 +123,14 @@ pub(crate) struct ResponsesTransport {
     api_key: SecretString,
     base_url: String,
     openai_rate_limiter: OpenAiRateLimiter,
+    header_overrides: HeaderOverrides,
 }
 
 impl ResponsesTransport {
     pub(crate) fn try_new(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
     ) -> anyhow::Result<Self> {
         let api_key = api_key.into();
         let base_url = base_url.into();
@@ -140,6 +144,7 @@ impl ResponsesTransport {
             client,
             api_key,
             base_url,
+            header_overrides: HeaderOverrides::new(header_overrides)?,
         })
     }
 
@@ -230,11 +235,35 @@ impl ResponsesTransport {
                     code: None,
                 }),
             })?;
+        let body_bytes = serde_json::to_vec(&request).map_err(|error| TransportError::Fatal {
+            source: OpenAIError::ApiError(ApiError {
+                message: format!(
+                    "failed to encode {} request body: {error}",
+                    request_meta.provider_label
+                ),
+                r#type: None,
+                param: None,
+                code: None,
+            }),
+        })?;
+        let headers = self
+            .request_headers()
+            .map_err(|error| TransportError::Fatal {
+                source: OpenAIError::ApiError(ApiError {
+                    message: format!(
+                        "failed to build {} request headers: {error}",
+                        request_meta.provider_label
+                    ),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                }),
+            })?;
         let request_builder = self
             .client
             .post(provider_url(&self.base_url, path))
-            .bearer_auth(self.api_key.expose_secret())
-            .json(&request);
+            .headers(headers)
+            .body(body_bytes);
 
         let response = select! {
             _ = cancel.cancelled() => return Err(TransportError::Cancelled),
@@ -270,6 +299,22 @@ impl ResponsesTransport {
         }
 
         Ok(response)
+    }
+
+    fn request_headers(&self) -> anyhow::Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if !self.header_overrides.contains("authorization") {
+            let mut auth_value = HeaderValue::from_str(&format!(
+                "Bearer {}",
+                self.api_key.expose_secret()
+            ))
+            .context("failed to encode Authorization header")?;
+            auth_value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, auth_value);
+        }
+        self.header_overrides.apply_to_map(&mut headers);
+        Ok(headers)
     }
 
     async fn rate_limit_permit(
@@ -446,7 +491,7 @@ mod tests {
         let request_times = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let base_url = spawn_sse_server(request_times.clone(), 2).await;
         let transport =
-            ResponsesTransport::try_new("test-key", base_url).expect("responses transport");
+            ResponsesTransport::try_new("test-key", base_url, &[]).expect("responses transport");
         let request = json!({
             "model": "gpt-5",
             "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "hello" }] }],
@@ -574,7 +619,7 @@ mod tests {
             stall_signal.notified().await;
         });
 
-        let transport = ResponsesTransport::try_new("test-key", format!("http://{address}"))
+        let transport = ResponsesTransport::try_new("test-key", format!("http://{address}"), &[])
             .expect("responses transport");
         let request = json!({
             "model": "gpt-5",
@@ -688,7 +733,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.expect("write");
         });
 
-        let transport = ResponsesTransport::try_new("test-key", format!("http://{address}"))
+        let transport = ResponsesTransport::try_new("test-key", format!("http://{address}"), &[])
             .expect("responses transport");
 
         // Build the request_meta explicitly (struct does not implement
