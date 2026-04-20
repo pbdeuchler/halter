@@ -137,34 +137,40 @@ pub(crate) fn parse_openai_reset_duration(value: &str) -> Option<Duration> {
 
     let bytes = value.as_bytes();
     let mut index = 0usize;
-    let mut total_millis = 0u64;
+    let mut total_millis = 0f64;
 
     while index < bytes.len() {
         let number_start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
+        while index < bytes.len() && (bytes[index].is_ascii_digit() || bytes[index] == b'.') {
             index += 1;
         }
         if number_start == index {
             return None;
         }
 
-        let amount = value[number_start..index].parse::<u64>().ok()?;
+        let amount = value[number_start..index].parse::<f64>().ok()?;
+        if !amount.is_finite() || amount < 0.0 {
+            return None;
+        }
         let (unit_millis, consumed) = if value[index..].starts_with("ms") {
-            (1u64, 2usize)
+            (1.0_f64, 2usize)
         } else if value[index..].starts_with('s') {
-            (1_000u64, 1usize)
+            (1_000.0_f64, 1usize)
         } else if value[index..].starts_with('m') {
-            (60_000u64, 1usize)
+            (60_000.0_f64, 1usize)
         } else if value[index..].starts_with('h') {
-            (3_600_000u64, 1usize)
+            (3_600_000.0_f64, 1usize)
         } else {
             return None;
         };
         index += consumed;
-        total_millis = total_millis.checked_add(amount.checked_mul(unit_millis)?)?;
+        total_millis += amount * unit_millis;
+        if !total_millis.is_finite() {
+            return None;
+        }
     }
 
-    Some(Duration::from_millis(total_millis))
+    millis_to_duration(total_millis)
 }
 
 pub(crate) fn parse_retry_after_duration(value: &str, now_wall: SystemTime) -> Option<Duration> {
@@ -173,8 +179,8 @@ pub(crate) fn parse_retry_after_duration(value: &str, now_wall: SystemTime) -> O
         return None;
     }
 
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+    if let Ok(seconds) = value.parse::<f64>() {
+        return millis_to_duration(seconds * 1_000.0);
     }
 
     let retry_at = DateTime::parse_from_rfc2822(value)
@@ -186,6 +192,21 @@ pub(crate) fn parse_retry_after_duration(value: &str, now_wall: SystemTime) -> O
         .num_milliseconds()
         .max(0);
     Some(Duration::from_millis(u64::try_from(millis).ok()?))
+}
+
+// OpenAI occasionally returns fractional reset durations ("1.2s",
+// "0.5", "2m3.5s"); rounding to the nearest millisecond is sufficient
+// for cooldown accounting and avoids losing signal on sub-second
+// fractions. (finding M31)
+fn millis_to_duration(millis: f64) -> Option<Duration> {
+    if !millis.is_finite() || millis < 0.0 {
+        return None;
+    }
+    let rounded = millis.round();
+    if rounded > (u64::MAX as f64) {
+        return None;
+    }
+    Some(Duration::from_millis(rounded as u64))
 }
 
 fn refresh_state(state: &mut OpenAiRateLimitState, now: Instant) {
@@ -305,8 +326,28 @@ mod tests {
                 want: Some(Duration::from_millis(123_150)),
             },
             TestCase {
+                name: "fractional_seconds",
+                input: "1.2s",
+                want: Some(Duration::from_millis(1_200)),
+            },
+            TestCase {
+                name: "fractional_minutes",
+                input: "0.5m",
+                want: Some(Duration::from_millis(30_000)),
+            },
+            TestCase {
+                name: "fractional_mixed",
+                input: "2m3.5s",
+                want: Some(Duration::from_millis(123_500)),
+            },
+            TestCase {
                 name: "invalid",
                 input: "soon",
+                want: None,
+            },
+            TestCase {
+                name: "malformed_fraction",
+                input: "1..5s",
                 want: None,
             },
         ];
@@ -331,9 +372,19 @@ mod tests {
             Some(Duration::from_secs(2))
         );
         assert_eq!(
+            parse_retry_after_duration("1.2", now_wall),
+            Some(Duration::from_millis(1_200))
+        );
+        assert_eq!(
+            parse_retry_after_duration("0.001", now_wall),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
             parse_retry_after_duration(http_date, now_wall),
             Some(Duration::from_secs(5))
         );
+        assert_eq!(parse_retry_after_duration("-1", now_wall), None);
+        assert_eq!(parse_retry_after_duration("nope", now_wall), None);
     }
 
     #[test]
