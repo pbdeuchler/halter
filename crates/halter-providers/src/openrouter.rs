@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
-    ProviderRequest, StreamEvent, ToolCallIdPolicy,
+    DEFAULT_TEMPERATURE, ProviderCapabilities, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -25,19 +25,28 @@ impl OpenRouterProvider {
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_headers(api_key, base_url, &[])
+        Self::new_with_headers(api_key, base_url, &[], DEFAULT_TEMPERATURE)
     }
 
     /// Construct an OpenRouter provider with user-configured HTTP header
     /// overrides. Overrides replace any default or hardcoded header
-    /// (`Authorization`, `Content-Type`) case-insensitively.
+    /// (`Authorization`, `Content-Type`) case-insensitively. `temperature`
+    /// is forwarded verbatim to every request body; callers typically pull
+    /// it from the resolved provider config.
     pub fn new_with_headers(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
+        temperature: f32,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: ResponsesProvider::try_new(config(), api_key, base_url, header_overrides)?,
+            inner: ResponsesProvider::try_new(
+                config(),
+                api_key,
+                base_url,
+                header_overrides,
+                temperature,
+            )?,
         })
     }
 }

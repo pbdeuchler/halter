@@ -430,9 +430,10 @@ fn decode_stream_event(
         return Err(OpenAIError::ApiError(api_error));
     }
 
-    if let Ok(raw) = serde_json::from_str::<Value>(data)
-        && let Some(event) = NonStandardStreamEvent::parse(&raw)
-    {
+    let mut raw = serde_json::from_str::<Value>(data)
+        .map_err(|error| OpenAIError::JSONDeserialize(error, data.to_owned()))?;
+
+    if let Some(event) = NonStandardStreamEvent::parse(&raw) {
         match event {
             NonStandardStreamEvent::Keepalive { sequence_number } => {
                 info!(sequence_number, "received keepalive from responses stream");
@@ -441,9 +442,31 @@ fn decode_stream_event(
         return Ok(None);
     }
 
-    serde_json::from_str::<ResponseStreamEvent>(data)
+    patch_missing_output_tokens_details(&mut raw);
+
+    serde_json::from_value::<ResponseStreamEvent>(raw)
         .map(Some)
         .map_err(|error| OpenAIError::JSONDeserialize(error, data.to_owned()))
+}
+
+// Some upstreams (e.g. OpenRouter proxying Fireworks) omit
+// `output_tokens_details` from the responses-API `usage` block even though
+// `async-openai` models it as required. Defaulting `reasoning_tokens` to 0 is
+// accurate for providers that don't track reasoning and preserves the field
+// verbatim when it is present.
+fn patch_missing_output_tokens_details(value: &mut Value) {
+    let Some(usage) = value
+        .pointer_mut("/response/usage")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if !usage.contains_key("output_tokens_details") {
+        usage.insert(
+            "output_tokens_details".to_owned(),
+            serde_json::json!({ "reasoning_tokens": 0 }),
+        );
+    }
 }
 
 fn decode_openai_error(status: StatusCode, body: &[u8]) -> OpenAIError {
@@ -817,5 +840,87 @@ mod tests {
             Some(500_000),
             "observer must thread Some(500_000) TPM, not None",
         );
+    }
+
+    fn observer() -> OpenAiStreamRateLimitObserver {
+        OpenAiStreamRateLimitObserver {
+            limiter: OpenAiRateLimiter::new(
+                &SecretString::from("test-key"),
+                "https://api.openai.com",
+            ),
+            model: "gpt-5".to_owned(),
+            tokens_per_minute: None,
+        }
+    }
+
+    #[test]
+    fn decode_stream_event_fills_missing_output_tokens_details() {
+        // OpenRouter/Fireworks-style event: `output_tokens_details` absent.
+        let data = json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "created_at": 0,
+                "model": "qwen3p6-plus",
+                "object": "response",
+                "output": [],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15,
+                    "input_tokens_details": { "cached_tokens": 0 }
+                }
+            }
+        })
+        .to_string();
+
+        let decoded = decode_stream_event(&data, &observer())
+            .expect("decode succeeds")
+            .expect("event present");
+        match decoded {
+            ResponseStreamEvent::ResponseCompleted(event) => {
+                let usage = event.response.usage.expect("usage parsed");
+                assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
+            }
+            other => panic!("expected ResponseCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_stream_event_preserves_present_output_tokens_details() {
+        // Standard OpenAI event: field present and non-zero.
+        let data = json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "created_at": 0,
+                "model": "gpt-5",
+                "object": "response",
+                "output": [],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15,
+                    "input_tokens_details": { "cached_tokens": 0 },
+                    "output_tokens_details": { "reasoning_tokens": 3 }
+                }
+            }
+        })
+        .to_string();
+
+        let decoded = decode_stream_event(&data, &observer())
+            .expect("decode succeeds")
+            .expect("event present");
+        match decoded {
+            ResponseStreamEvent::ResponseCompleted(event) => {
+                let usage = event.response.usage.expect("usage parsed");
+                assert_eq!(usage.output_tokens_details.reasoning_tokens, 3);
+            }
+            other => panic!("expected ResponseCompleted, got {other:?}"),
+        }
     }
 }

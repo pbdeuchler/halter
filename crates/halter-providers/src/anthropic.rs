@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use halter_protocol::{
-    ApiKind, ProviderCapabilities, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
+    ApiKind, DEFAULT_TEMPERATURE, ProviderCapabilities, ProviderError, ProviderRequest,
+    StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -22,6 +23,7 @@ pub struct AnthropicProvider {
     base_url: String,
     client: JsonHttpClient,
     header_overrides: HeaderOverrides,
+    temperature: f32,
 }
 
 impl AnthropicProvider {
@@ -29,22 +31,25 @@ impl AnthropicProvider {
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_headers(api_key, base_url, &[])
+        Self::new_with_headers(api_key, base_url, &[], DEFAULT_TEMPERATURE)
     }
 
     /// Same as [`AnthropicProvider::new`] but also accepts user-configured
     /// header overrides that replace any default or hardcoded header
     /// (`x-api-key`, `anthropic-version`, `Content-Type`) case-insensitively.
+    /// `temperature` is forwarded verbatim into every request body.
     pub fn new_with_headers(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
+        temperature: f32,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
             client: JsonHttpClient::try_new()?,
             header_overrides: HeaderOverrides::new(header_overrides)?,
+            temperature,
         })
     }
 }
@@ -89,7 +94,7 @@ impl Provider for AnthropicProvider {
             "starting anthropic request"
         );
 
-        let body = anthropic_codec::encode_request(&request)?;
+        let body = anthropic_codec::encode_request(&request, self.temperature)?;
         let default_headers = vec![
             (
                 "x-api-key".to_owned(),

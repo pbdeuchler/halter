@@ -23,6 +23,7 @@ path = "src/main.rs"
 [features]
 advanced-tools = ["halter/advanced-tools"]
 ast-tools = ["halter/ast-tools"]
+browser-tools = ["halter/browser-tools"]
 image-tools = ["halter/image-tools"]
 pty = ["halter/pty"]
 profiling = ["halter/profiling"]

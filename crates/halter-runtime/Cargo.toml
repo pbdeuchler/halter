@@ -13,10 +13,11 @@ rust-version.workspace = true
 [features]
 advanced-tools = ["halter-tools/advanced-tools"]
 ast-tools = ["halter-tools/ast-tools"]
+browser-tools = ["halter-tools/browser-tools"]
 image-tools = ["halter-tools/image-tools"]
 pty = ["halter-tools/pty"]
 profiling = ["halter-tools/profiling"]
-full = ["advanced-tools", "ast-tools", "image-tools", "pty", "profiling"]
+full = ["advanced-tools", "ast-tools", "browser-tools", "image-tools", "pty", "profiling"]
 
 [dependencies]
 anyhow.workspace = true

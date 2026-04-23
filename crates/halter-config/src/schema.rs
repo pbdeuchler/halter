@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use halter_protocol::{ApiKind, ProviderKind, PruneSignalThreshold, ReasoningEffort};
+use halter_protocol::{ApiKind, DEFAULT_TEMPERATURE, ProviderKind, PruneSignalThreshold, ReasoningEffort};
 use indexmap::IndexMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ pub const DEFAULT_MODEL_ID: &str = "default";
 pub const SMALL_MODEL_ID: &str = "small";
 pub const SUBAGENT_MODEL_ID: &str = "subagent";
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessConfig {
     pub version: u32,
@@ -107,7 +107,7 @@ impl HarnessConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
     #[serde(default)]
@@ -219,7 +219,7 @@ impl fmt::Display for ConfiguredProvider {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     #[serde(default)]
@@ -231,6 +231,10 @@ pub struct ProviderConfig {
     /// default or hardcoded provider header (Authorization, x-api-key, etc.).
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub headers: IndexMap<String, String>,
+    /// Optional override for the sampling temperature. Falls back to the
+    /// global `DEFAULT_TEMPERATURE` (0.7) when unset. Must be in `0.0..=2.0`.
+    #[serde(default)]
+    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -248,7 +252,7 @@ pub struct ModelConfig {
     pub tokens_per_minute: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProviderConfig {
     pub provider: ConfiguredProvider,
     pub base_url: String,
@@ -256,6 +260,10 @@ pub struct ResolvedProviderConfig {
     /// Ordered list of user-configured headers. The runtime applies these
     /// over provider defaults using case-insensitive name matching.
     pub headers: Vec<(String, String)>,
+    /// Sampling temperature forwarded to every request this provider emits.
+    /// Defaults to `DEFAULT_TEMPERATURE` (0.7) when the user does not override
+    /// `[providers.<name>].temperature`.
+    pub temperature: f32,
 }
 
 pub fn resolve_provider_runtime_config<F>(
@@ -305,11 +313,16 @@ where
         })
         .unwrap_or_default();
 
+    let temperature = configured
+        .and_then(|config| config.temperature)
+        .unwrap_or(DEFAULT_TEMPERATURE);
+
     Ok(ResolvedProviderConfig {
         provider,
         base_url,
         api_key,
         headers,
+        temperature,
     })
 }
 
@@ -336,6 +349,20 @@ fn validate_provider_config(name: &str, provider: &ProviderConfig) -> anyhow::Re
             &format!("providers.{name}.headers.{header_name}"),
             Some(header_value),
         )?;
+    }
+    validate_optional_temperature(
+        &format!("providers.{name}.temperature"),
+        provider.temperature,
+    )?;
+    Ok(())
+}
+
+fn validate_optional_temperature(path: &str, value: Option<f32>) -> anyhow::Result<()> {
+    let Some(temperature) = value else {
+        return Ok(());
+    };
+    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+        anyhow::bail!("invalid configuration: {path} must be a finite value in 0.0..=2.0");
     }
     Ok(())
 }
@@ -645,6 +672,7 @@ mod tests {
                 base_url: Some("https://proxy.example.com".to_owned()),
                 api_key: Some("configured-key".to_owned()),
                 headers: IndexMap::new(),
+                temperature: None,
             }),
             |_| Ok(Some("env-key".to_owned())),
         )
@@ -652,6 +680,72 @@ mod tests {
 
         assert_eq!(resolved.base_url, "https://proxy.example.com");
         assert_eq!(resolved.api_key, "configured-key");
+        assert_eq!(resolved.temperature, DEFAULT_TEMPERATURE);
+    }
+
+    #[test]
+    fn provider_resolution_applies_configured_temperature_override() {
+        let resolved = resolve_provider_runtime_config(
+            ConfiguredProvider::OpenRouter,
+            Some(&ProviderConfig {
+                base_url: None,
+                api_key: Some("configured-key".to_owned()),
+                headers: IndexMap::new(),
+                temperature: Some(0.2),
+            }),
+            |_| Ok(None),
+        )
+        .expect("resolve provider");
+
+        assert!((resolved.temperature - 0.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn provider_resolution_defaults_temperature_when_unset() {
+        let resolved = resolve_provider_runtime_config(
+            ConfiguredProvider::Anthropic,
+            None,
+            |_| Ok(Some("env-key".to_owned())),
+        )
+        .expect("resolve provider");
+
+        assert_eq!(resolved.temperature, DEFAULT_TEMPERATURE);
+    }
+
+    #[test]
+    fn provider_config_rejects_out_of_range_temperature() {
+        let error = validate_provider_config(
+            "openrouter",
+            &ProviderConfig {
+                base_url: None,
+                api_key: Some("configured-key".to_owned()),
+                headers: IndexMap::new(),
+                temperature: Some(2.5),
+            },
+        )
+        .expect_err("validation should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("providers.openrouter.temperature must be a finite value in 0.0..=2.0")
+        );
+    }
+
+    #[test]
+    fn provider_config_rejects_nan_temperature() {
+        let error = validate_provider_config(
+            "openai",
+            &ProviderConfig {
+                base_url: None,
+                api_key: Some("configured-key".to_owned()),
+                headers: IndexMap::new(),
+                temperature: Some(f32::NAN),
+            },
+        )
+        .expect_err("validation should fail");
+
+        assert!(error.to_string().contains("temperature"));
     }
 
     #[test]
@@ -706,6 +800,7 @@ mod tests {
             base_url: None,
             api_key: Some("test-key".to_owned()),
             headers: IndexMap::new(),
+            temperature: None,
         });
         config.sessions.sqlite_path = Some(PathBuf::from("/tmp/halter.db"));
 
