@@ -99,6 +99,7 @@ The runtime asks for a tool by name. This crate decides:
 
 - `PtyTool` (`pty`)
 - `AstGrepTool` (`ast-tools`)
+- `BrowserTool` (`browser-tools`)
 - `ImageTool` (`image-tools`)
 - `ProfilingTool` (`profiling`)
 
@@ -117,6 +118,7 @@ This crate supports capability slicing via features:
 
 - `advanced-tools`
 - `ast-tools`
+- `browser-tools`
 - `image-tools`
 - `pty`
 - `profiling`
@@ -442,6 +444,66 @@ Actions:
 - `convert`
 
 Use this when the agent needs to inspect or transform local image files.
+
+---
+
+## `browser`
+
+Feature: `browser-tools`
+
+Drives a remote web browser via [playwright-rs](https://docs.rs/playwright-rs)
+connected over CDP to a cloud provider. One persistent browser session per
+halter `SessionId`, dispatched by `action`.
+
+Actions:
+
+- `navigate` — load a URL; returns title + ARIA snapshot with ref ids
+- `snapshot` — re-fetch the ARIA snapshot
+- `click` / `type` / `press` — act on a `ref` from the snapshot, or a raw `selector`
+- `scroll` — `direction: "up" | "down"`
+- `back` — history navigation
+- `screenshot` — PNG; saved to `output_path` or returned base64
+- `eval` — JavaScript expression, returns the value
+- `console` — accumulated console messages + uncaught errors
+- `close` — release the cloud session
+
+Element addressing prefers ARIA refs that Playwright assigns natively in the
+snapshot YAML (e.g. `ref="s1e3"`). Bare selectors work as fallback for cases
+where ref-based addressing isn't enough (CSS, `role=…`, `text=…`).
+
+URL navigation goes through `ToolPolicy::check_network`, including the
+post-redirect URL — a 302 to a private address is rejected before snapshot
+returns.
+
+### Provider configuration
+
+Currently one provider is shipped: `BrowserbaseProvider`. It activates when
+both env vars are present:
+
+- `BROWSERBASE_API_KEY`
+- `BROWSERBASE_PROJECT_ID`
+
+Optional knobs:
+
+- `BROWSERBASE_BASE_URL` (default `https://api.browserbase.com`)
+- `BROWSERBASE_PROXIES` (default `true` — falls back gracefully on plans without proxy support)
+- `BROWSERBASE_KEEP_ALIVE` (default `true` — falls back on free plans)
+- `BROWSERBASE_SESSION_TIMEOUT` (in milliseconds)
+
+The trait `BrowserProvider` lets new adapters drop in without touching the
+tool itself.
+
+### Runtime requirements
+
+playwright-rs spawns the Playwright Node driver. First-time setup needs:
+
+```sh
+npm install -g playwright
+npx playwright install
+```
+
+The driver is launched once per process and shared across all halter
+sessions.
 
 ---
 

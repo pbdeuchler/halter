@@ -11,7 +11,7 @@ use crate::codec_common::{
     collect_system_text, normalized_tool_call_id, tool_name_for_provider, tool_result_text,
 };
 
-pub(crate) fn encode_request(request: &ProviderRequest) -> anyhow::Result<Value> {
+pub(crate) fn encode_request(request: &ProviderRequest, temperature: f32) -> anyhow::Result<Value> {
     if request.model.api_kind != ApiKind::AnthropicMessages {
         anyhow::bail!(
             "failed to encode anthropic request: unsupported api kind '{}'",
@@ -28,6 +28,7 @@ pub(crate) fn encode_request(request: &ProviderRequest) -> anyhow::Result<Value>
         "max_tokens".to_owned(),
         json!(request.model.max_output_tokens.unwrap_or(4096)),
     );
+    body.insert("temperature".to_owned(), json!(temperature));
     body.insert(
         "messages".to_owned(),
         Value::Array(encode_messages(request)?),
@@ -400,7 +401,8 @@ mod tests {
             }),
         ]);
 
-        let body = encode_request(&request).expect("encode request");
+        let body = encode_request(&request, halter_protocol::DEFAULT_TEMPERATURE)
+            .expect("encode request");
 
         assert_eq!(
             body.get("system").and_then(Value::as_str),
@@ -412,6 +414,18 @@ mod tests {
             body["messages"][2]["content"][0]["tool_use_id"],
             "call_with_spaces"
         );
+        assert_eq!(
+            body["temperature"],
+            json!(halter_protocol::DEFAULT_TEMPERATURE)
+        );
+    }
+
+    #[test]
+    fn anthropic_request_forwards_configured_temperature_override() {
+        let request = sample_request(Vec::new());
+        let body = encode_request(&request, 0.25).expect("encode request");
+
+        assert_eq!(body["temperature"], json!(0.25_f32));
     }
 
     #[test]

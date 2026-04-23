@@ -53,6 +53,7 @@ pub(crate) struct ResponsesProviderConfig {
 pub(crate) struct ResponsesProvider {
     config: ResponsesProviderConfig,
     transport: ResponsesTransport,
+    temperature: f32,
 }
 
 impl ResponsesProvider {
@@ -61,10 +62,12 @@ impl ResponsesProvider {
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
+        temperature: f32,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             config,
             transport: ResponsesTransport::try_new(api_key, base_url, header_overrides)?,
+            temperature,
         })
     }
 
@@ -103,6 +106,7 @@ impl ResponsesProvider {
                     .then_some(request.prompt.prefix_cache_key.as_str()),
                 include_encrypted_reasoning: self.config.request.include_encrypted_reasoning,
                 reasoning_summary: self.config.request.reasoning_summary,
+                temperature: self.temperature,
             },
         )?;
         let request_bytes = request_body.to_string().len();
@@ -536,6 +540,7 @@ mod tests {
             "test-key",
             "http://127.0.0.1:1",
             &[],
+            halter_protocol::DEFAULT_TEMPERATURE,
         )
         .expect("responses provider");
 
@@ -750,6 +755,7 @@ mod tests {
             "test-key",
             base_url,
             &[],
+            halter_protocol::DEFAULT_TEMPERATURE,
         )
         .expect("responses provider");
 

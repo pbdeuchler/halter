@@ -2,6 +2,8 @@
 
 #[cfg(feature = "ast-tools")]
 pub mod ast;
+#[cfg(feature = "browser-tools")]
+pub mod browser;
 pub mod common;
 pub mod edit;
 pub mod fs_lock;
@@ -24,6 +26,8 @@ use crate::{Tool, ToolRuntime};
 
 #[cfg(feature = "ast-tools")]
 pub use ast::AstGrepTool;
+#[cfg(feature = "browser-tools")]
+pub use browser::BrowserTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -77,6 +81,15 @@ pub fn register_builtin_tools(runtime: &ToolRuntime, enabled: &[String]) {
     #[cfg(feature = "image-tools")]
     {
         let tool = Arc::new(ImageTool) as Arc<dyn Tool>;
+        let tool_name = tool.spec().name.0;
+        if register_all || enabled.iter().any(|name| name == &tool_name) {
+            runtime.register(tool);
+        }
+    }
+
+    #[cfg(feature = "browser-tools")]
+    {
+        let tool = Arc::new(BrowserTool) as Arc<dyn Tool>;
         let tool_name = tool.spec().name.0;
         if register_all || enabled.iter().any(|name| name == &tool_name) {
             runtime.register(tool);

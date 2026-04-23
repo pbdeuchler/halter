@@ -34,6 +34,8 @@ pub(crate) struct ResponsesRequestOptions<'a> {
     pub prompt_cache_key: Option<&'a str>,
     pub include_encrypted_reasoning: bool,
     pub reasoning_summary: Option<&'a str>,
+    /// Sampling temperature forwarded to the Responses API.
+    pub temperature: f32,
 }
 
 pub(crate) fn encode_responses_request(
@@ -68,6 +70,7 @@ pub(crate) fn encode_responses_request(
     }
 
     body.insert("stream".to_owned(), Value::Bool(options.stream));
+    body.insert("temperature".to_owned(), json!(options.temperature));
 
     if let Some(max_output_tokens) = request.model.max_output_tokens {
         body.insert("max_output_tokens".to_owned(), json!(max_output_tokens));
@@ -1613,10 +1616,10 @@ fn chat_content_text(content: Option<&Value>) -> Option<String> {
 mod tests {
     use chrono::Utc;
     use halter_protocol::{
-        ApiKind, AssembledPrompt, AssistantMessage, AssistantPart, CacheScope, Message, MessageId,
-        ModelId, ModelRole, PromptSegment, PromptSegmentId, ProviderKind, ProviderName,
-        ResolvedModel, ToolAlias, ToolCall, ToolCallId, ToolCapabilities, ToolConcurrency,
-        ToolResult, ToolResultMessage, ToolSpec, TurnId, UserMessage, Volatility,
+        ApiKind, AssembledPrompt, AssistantMessage, AssistantPart, CacheScope, DEFAULT_TEMPERATURE,
+        Message, MessageId, ModelId, ModelRole, PromptSegment, PromptSegmentId, ProviderKind,
+        ProviderName, ResolvedModel, ToolAlias, ToolCall, ToolCallId, ToolCapabilities,
+        ToolConcurrency, ToolResult, ToolResultMessage, ToolSpec, TurnId, UserMessage, Volatility,
     };
     use indexmap::IndexMap;
     use serde_json::json;
@@ -1653,6 +1656,7 @@ mod tests {
                 prompt_cache_key: Some(request.prompt.prefix_cache_key.as_str()),
                 include_encrypted_reasoning: true,
                 reasoning_summary: Some("auto"),
+                temperature: 0.5,
             },
         )
         .expect("encode request");
@@ -1660,6 +1664,7 @@ mod tests {
         assert_eq!(body["prompt_cache_key"], "cache-key");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], false);
+        assert_eq!(body["temperature"], json!(0.5_f32));
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["reasoning"]["summary"], "auto");
@@ -1701,6 +1706,7 @@ mod tests {
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
                 reasoning_summary: None,
+                temperature: DEFAULT_TEMPERATURE,
             },
         )
         .expect("encode request");
@@ -1725,6 +1731,7 @@ mod tests {
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
                 reasoning_summary: None,
+                temperature: DEFAULT_TEMPERATURE,
             },
         )
         .expect("encode request");
@@ -1882,6 +1889,7 @@ mod tests {
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
                 reasoning_summary: None,
+                temperature: DEFAULT_TEMPERATURE,
             },
         )
         .expect("encode request");

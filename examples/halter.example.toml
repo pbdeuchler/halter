@@ -15,20 +15,36 @@ version = 1
 # model = "gpt-5.4-mini"
 # reasoning = "medium"
 
+# [models.default]
+# provider = "openrouter"
+# model = "z-ai/glm-5.1"
+# reasoning = "xhigh"
+# # tokens_per_minute = 500_000  # Default: 500,000. Proactive token budget for rate limiting.
+#
+# [models.subagent]
+# provider = "openrouter"
+# model = "moonshotai/kimi-k2.6"
+# reasoning = "medium"
+
 [models.default]
 provider = "openrouter"
-model = "z-ai/glm-5.1"
-reasoning = "xhigh"
+model = "accounts/fireworks/models/qwen3p6-plus"
+reasoning = "high"
 # tokens_per_minute = 500_000  # Default: 500,000. Proactive token budget for rate limiting.
 
 [models.subagent]
-provider = "openai"
-model = "moonshotai/kimi-k2.5"
+provider = "openrouter"
+model = "accounts/fireworks/models/kimi-k2p6"
 reasoning = "medium"
+
+[providers.openrouter]
+base_url = "https://api.fireworks.ai/inference"
+# temperature = 0.7  # Default: 0.7. Sampling temperature in 0.0..=2.0.
 
 # [providers.openai]
 # base_url = "https://myproxy.example.com"
 # api_key = "sk-..."
+# temperature = 0.7  # Default: 0.7. Sampling temperature in 0.0..=2.0.
 
 [resources.skills]
 roots = ["./.agent/skills"]
@@ -60,6 +76,9 @@ enabled = [
   "spawn_agent",
   "send_input",
   "close_agent",
+
+  # Convienence tools
+  "browser",
 ]
 
 [context]
@@ -74,6 +93,9 @@ allowed_write_roots = ["./", "/tmp/halter"]
 max_read_bytes = 1048576
 max_subagent_depth = 3
 max_concurrent_subagents = 8
+
+[policy.network]
+enabled = true
 
 [policy.shell]
 enabled = true

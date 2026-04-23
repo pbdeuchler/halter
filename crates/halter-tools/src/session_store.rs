@@ -8,6 +8,8 @@ use halter_protocol::SessionId;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as TokioMutex;
 
+#[cfg(feature = "browser-tools")]
+use crate::builtin::browser::session::BrowserSession;
 #[cfg(feature = "pty")]
 use crate::builtin::pty::PtySessionHandle;
 use crate::builtin::shell::session::ShellSessionCore;
@@ -17,6 +19,8 @@ pub struct ToolSessionStore {
     shell_sessions: DashMap<String, Arc<TokioMutex<Option<ShellSessionCore>>>>,
     #[cfg(feature = "pty")]
     pty_sessions: DashMap<String, Arc<Mutex<Option<PtySessionHandle>>>>,
+    #[cfg(feature = "browser-tools")]
+    browser_sessions: DashMap<String, Arc<TokioMutex<Option<BrowserSession>>>>,
 }
 
 impl ToolSessionStore {
@@ -37,6 +41,18 @@ impl ToolSessionStore {
         self.pty_sessions
             .entry(session_id.0.clone())
             .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    }
+
+    #[cfg(feature = "browser-tools")]
+    #[must_use]
+    pub fn browser_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Arc<TokioMutex<Option<BrowserSession>>> {
+        self.browser_sessions
+            .entry(session_id.0.clone())
+            .or_insert_with(|| Arc::new(TokioMutex::new(None)))
             .clone()
     }
 }

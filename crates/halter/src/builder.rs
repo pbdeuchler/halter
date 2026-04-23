@@ -449,16 +449,19 @@ fn build_provider(
             provider.api_key.clone(),
             provider.base_url.clone(),
             &provider.headers,
+            provider.temperature,
         )?),
         ConfiguredProvider::OpenAi => Arc::new(OpenAiProvider::new_with_headers(
             provider.api_key.clone(),
             provider.base_url.clone(),
             &provider.headers,
+            provider.temperature,
         )?),
         ConfiguredProvider::OpenRouter => Arc::new(OpenRouterProvider::new_with_headers(
             provider.api_key.clone(),
             provider.base_url.clone(),
             &provider.headers,
+            provider.temperature,
         )?),
     };
     Ok(provider)
@@ -745,6 +748,7 @@ mod tests {
             base_url: None,
             api_key: api_key.map(ToOwned::to_owned),
             headers: Default::default(),
+            temperature: None,
         });
         config
     }

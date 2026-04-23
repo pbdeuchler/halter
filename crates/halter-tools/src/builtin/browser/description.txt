@@ -1,0 +1,7 @@
+Drive a remote web browser. One persistent browser session per halter session, dispatched by `action`.
+
+Typical workflow: `navigate` to load a URL (returns a snapshot you can act on), then use `click`/`type`/`scroll` against ref ids from the snapshot, take `screenshot` or query `console` for diagnostics, and finally `close` to release the cloud session.
+
+Element addressing prefers aria refs from the snapshot (e.g. ref="s1e3"). A raw `selector` (CSS or playwright role= / text=) also works as a fallback. Snapshots over 8000 chars are truncated — use targeted refs instead of asking for repeated snapshots.
+
+For simple page reads, prefer a plain HTTP fetch — this tool is for interactive pages or content that requires JavaScript / a logged-in session.

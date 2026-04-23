@@ -8,6 +8,8 @@ mod subagent;
 
 #[cfg(feature = "ast-tools")]
 pub use builtin::AstGrepTool;
+#[cfg(feature = "browser-tools")]
+pub use builtin::BrowserTool;
 #[cfg(feature = "image-tools")]
 pub use builtin::ImageTool;
 #[cfg(feature = "profiling")]
