@@ -12,10 +12,11 @@ use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
     AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash, Delivery,
     HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState, PendingEvent,
-    PendingToolCall, PromptSegment, PromptSegmentId, ProviderError, ProviderRequest, ReplayMeta,
-    ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState,
-    StopReason, StreamEvent, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult,
-    ToolResultMessage, Turn, TurnId, Usage, Volatility,
+    PendingToolCall, PromptSegment, PromptSegmentId, PromptSegmentKind, ProviderError,
+    ProviderRequest, ReplayMeta, ResourceSnapshot, SessionBlueprint, SessionEvent,
+    SessionEventPayload, SessionId, SessionState, StopReason, StreamEvent, SystemMessage, ToolCall,
+    ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn, TurnId, Usage,
+    Volatility,
 };
 use halter_providers::ModelRegistry;
 use halter_session::{SessionStore, StoredSession};
@@ -647,7 +648,7 @@ impl SessionHandle {
             .models
             .model(&stored.blueprint.default_model)?;
         let compaction_provider = self.services.models.provider(&compaction_model.provider)?;
-        let compaction = self
+        let outcome = self
             .services
             .context_manager
             .compact_now(
@@ -661,14 +662,9 @@ impl SessionHandle {
                 custom_instructions,
             )
             .await?;
-        let summary = if let Some(result) = compaction.compaction {
-            state.compacted_prefix = compaction.compacted_prefix;
-            state.messages = compaction.messages;
-            state.last_response_id = None;
-            state.messages_seen_by_provider = 0;
-            result.summary
-        } else {
-            "No compaction needed.".to_owned()
+        let summary = match outcome.apply(&mut state) {
+            Some(result) => result.summary,
+            None => "No compaction needed.".to_owned(),
         };
         state.pending_session_start_source = Some(HookSessionStartSource::Compact);
         self.push_event(
@@ -810,15 +806,16 @@ impl SessionHandle {
                 )
                 .await?;
 
-            if let Some(ref compaction) = plan.compaction {
-                state.compacted_prefix = plan.compacted_prefix.clone();
-                state.messages = plan.messages.clone();
-                state.last_response_id = None;
-                state.messages_seen_by_provider = 0;
+            let plan_outcome = crate::CompactionOutcome {
+                messages: plan.messages.clone(),
+                compacted_prefix: plan.compacted_prefix.clone(),
+                compaction: plan.compaction.clone(),
+            };
+            if let Some(result) = plan_outcome.apply(&mut state) {
                 self.push_event(
                     &mut events,
                     SessionEventPayload::ContextCompacted {
-                        summary: compaction.summary.clone(),
+                        summary: result.summary,
                     },
                 );
             }
@@ -1556,6 +1553,7 @@ fn build_hook_prompt_segment(text: &str) -> PromptSegment {
         volatility: Volatility::TurnDynamic,
         cache_scope: CacheScope::Dynamic,
         content_hash: hash_text(text),
+        kind: PromptSegmentKind::Append,
     }
 }
 

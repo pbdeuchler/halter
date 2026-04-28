@@ -16,10 +16,10 @@ use halter_hooks::{
     summary_entries,
 };
 use halter_protocol::{
-    AssembledPrompt, AssistantMessage, AssistantPart, CacheScope, HookOutputEntry, HookOutputKind,
-    HookRunStatus, HookRunSummary, HookSessionStartSource, Message, ModelId, PromptSegment,
-    PromptSegmentId, SessionId, SessionState, ToolCall, ToolError, ToolResult, Turn, TurnId,
-    UserMessage, Volatility,
+    AssembledPrompt, AssistantMessage, AssistantPart, CacheBreakpoints, CacheScope,
+    HookOutputEntry, HookOutputKind, HookRunStatus, HookRunSummary, HookSessionStartSource,
+    Message, ModelId, PromptSegment, PromptSegmentId, PromptSegmentKind, SessionId, SessionState,
+    ToolCall, ToolError, ToolResult, Turn, TurnId, UserMessage, Volatility,
 };
 use halter_tools::{PolicyError, ToolPolicy};
 use lru::LruCache;
@@ -821,6 +821,9 @@ async fn run_prompt(
             rendered_prefix: String::new(),
             rendered_transcript: prompt_text.clone(),
             rendered: prompt_text,
+            cache_breakpoints: CacheBreakpoints::default(),
+            system_segment_count: 0,
+            skill_segment_count: 0,
         },
         compacted_prefix: Vec::new(),
         messages: vec![Message::User(user_message)],
@@ -1371,6 +1374,7 @@ fn hook_prompt_segment(text: &str) -> PromptSegment {
         volatility: Volatility::SessionStable,
         cache_scope: CacheScope::PrefixCacheable,
         content_hash: hash_text(text),
+        kind: PromptSegmentKind::System,
     }
 }
 

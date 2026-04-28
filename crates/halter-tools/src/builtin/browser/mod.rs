@@ -22,8 +22,7 @@ use tracing::debug;
 use crate::{Tool, ToolContext};
 
 use super::common::{
-    ToolScope, ensure_not_cancelled, optional_bool, optional_string, required_string,
-    resolve_path,
+    ToolScope, ensure_not_cancelled, optional_bool, optional_string, required_string, resolve_path,
 };
 
 pub mod browserbase;
@@ -77,9 +76,7 @@ impl Tool for BrowserTool {
             "eval" => action_eval(&context, &input).await?,
             "console" => action_console(&context).await?,
             "close" => action_close(&context).await?,
-            other => anyhow::bail!(
-                "failed to execute browser tool: unknown action '{other}'"
-            ),
+            other => anyhow::bail!("failed to execute browser tool: unknown action '{other}'"),
         };
         Ok(ToolResult::Json { value })
     }
@@ -272,8 +269,8 @@ async fn action_press(context: &ToolContext, input: &Value) -> anyhow::Result<Va
 }
 
 async fn action_screenshot(context: &ToolContext, input: &Value) -> anyhow::Result<Value> {
-    let output_path = optional_string(input, "output_path")
-        .map(|path| resolve_path(&context.working_dir, path));
+    let output_path =
+        optional_string(input, "output_path").map(|path| resolve_path(&context.working_dir, path));
     let mut options = default_screenshot_options();
     if let Some(full_page) = optional_bool(input, "full_page")? {
         options.full_page = Some(full_page);
@@ -373,9 +370,7 @@ async fn action_close(context: &ToolContext) -> anyhow::Result<Value> {
 // Helpers
 // ----------------------------------------------------------------------------
 
-async fn ensure_session(
-    slot: &mut Option<BrowserSession>,
-) -> anyhow::Result<&mut BrowserSession> {
+async fn ensure_session(slot: &mut Option<BrowserSession>) -> anyhow::Result<&mut BrowserSession> {
     if slot.is_none() {
         let provider = resolve_default_provider()?;
         let session = BrowserSession::open(provider).await?;
@@ -384,9 +379,7 @@ async fn ensure_session(
     Ok(slot.as_mut().expect("session was just inserted"))
 }
 
-fn require_open_session(
-    slot: &mut Option<BrowserSession>,
-) -> anyhow::Result<&mut BrowserSession> {
+fn require_open_session(slot: &mut Option<BrowserSession>) -> anyhow::Result<&mut BrowserSession> {
     slot.as_mut().ok_or_else(|| {
         anyhow::anyhow!(
             "failed to execute browser tool: no open browser session — call action='navigate' first"

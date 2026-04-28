@@ -2,14 +2,14 @@
 
 use base64::Engine;
 use halter_protocol::{
-    ApiKind, AssistantPart, BlockId, Message, MessageId, ProviderRequest, ReasoningEffort,
-    StopReason, StreamEvent, ToolResultMessage, Usage, UserPart,
+    ApiKind, AssistantPart, BlockId, Message, MessageId, PromptSegment, ProviderRequest,
+    ReasoningEffort, StopReason, StreamEvent, ToolResultMessage, Usage, UserPart,
 };
 use serde_json::{Map, Value, json};
 
-use crate::codec_common::{
-    collect_system_text, normalized_tool_call_id, tool_name_for_provider, tool_result_text,
-};
+use crate::codec_common::{normalized_tool_call_id, tool_name_for_provider, tool_result_text};
+
+const CACHE_CONTROL_EPHEMERAL: &str = "ephemeral";
 
 pub(crate) fn encode_request(request: &ProviderRequest, temperature: f32) -> anyhow::Result<Value> {
     if request.model.api_kind != ApiKind::AnthropicMessages {
@@ -34,8 +34,8 @@ pub(crate) fn encode_request(request: &ProviderRequest, temperature: f32) -> any
         Value::Array(encode_messages(request)?),
     );
 
-    if let Some(system) = collect_system_text(request) {
-        body.insert("system".to_owned(), Value::String(system));
+    if let Some(system) = encode_system_blocks(request) {
+        body.insert("system".to_owned(), system);
     }
     if !request.tools.is_empty() {
         body.insert("tools".to_owned(), Value::Array(encode_tools(request)));
@@ -47,6 +47,116 @@ pub(crate) fn encode_request(request: &ProviderRequest, temperature: f32) -> any
     }
 
     Ok(Value::Object(body))
+}
+
+/// Encode the system field as either a flat string (when no breakpoints
+/// land in this section) or an array of text blocks with `cache_control`
+/// attached to the last block of each section the runtime asked us to
+/// pin. Anthropic supports a maximum of four cache breakpoints per
+/// request, which is exactly the shape the assembler emits.
+fn encode_system_blocks(request: &ProviderRequest) -> Option<Value> {
+    let breakpoints = request.prompt.cache_breakpoints;
+    let want_blocks = breakpoints.after_system || breakpoints.after_skills;
+    if !want_blocks {
+        // Fast path: hand the provider one flat system string, identical
+        // to the legacy behavior so callers that bypass the assembler
+        // (and thus omit section metadata) keep working.
+        return collect_system_text_legacy(request).map(Value::String);
+    }
+
+    let system_blob = render_segments(request.prompt.system_segments());
+    let skill_blob = render_segments(request.prompt.skill_segments());
+    let tail_blob = render_system_tail(request);
+
+    let mut blocks: Vec<Value> = Vec::new();
+    if let Some(text) = system_blob {
+        blocks.push(text_block(text, breakpoints.after_system));
+    }
+    if let Some(text) = skill_blob {
+        blocks.push(text_block(text, breakpoints.after_skills));
+    }
+    if let Some(text) = tail_blob {
+        blocks.push(text_block(text, false));
+    }
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(Value::Array(blocks))
+    }
+}
+
+/// Legacy single-string system field. Keeps backward compatibility for
+/// requests assembled outside the runtime path (test fixtures, hand-built
+/// `ProviderRequest`s).
+fn collect_system_text_legacy(request: &ProviderRequest) -> Option<String> {
+    let mut sections = Vec::new();
+    let rendered_prefix = request.prompt.rendered_prefix.trim();
+    if !rendered_prefix.is_empty() {
+        sections.push(rendered_prefix.to_owned());
+    }
+    for message in &request.messages {
+        if let Message::System(system) = message {
+            let text = system.text.trim();
+            if !text.is_empty() {
+                sections.push(text.to_owned());
+            }
+        }
+    }
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
+}
+
+fn render_segments(segments: &[PromptSegment]) -> Option<String> {
+    let combined = segments
+        .iter()
+        .map(|seg| seg.text.as_str().trim_end())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+/// Everything the assembler placed in `rendered_prefix` that does NOT
+/// belong to the system or skills sections — append segments, summaries,
+/// in-band compacted prefix items, and any `Message::System` payloads.
+fn render_system_tail(request: &ProviderRequest) -> Option<String> {
+    let mut sections = Vec::new();
+    if let Some(text) = render_segments(request.prompt.append_segments()) {
+        sections.push(text);
+    }
+    for message in &request.messages {
+        if let Message::System(system) = message {
+            let text = system.text.trim();
+            if !text.is_empty() {
+                sections.push(text.to_owned());
+            }
+        }
+    }
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
+}
+
+fn text_block(text: String, cache_breakpoint: bool) -> Value {
+    let mut block = Map::new();
+    block.insert("type".to_owned(), Value::String("text".to_owned()));
+    block.insert("text".to_owned(), Value::String(text));
+    if cache_breakpoint {
+        block.insert(
+            "cache_control".to_owned(),
+            json!({ "type": CACHE_CONTROL_EPHEMERAL }),
+        );
+    }
+    Value::Object(block)
 }
 
 pub(crate) fn decode_response(
@@ -183,7 +293,38 @@ fn encode_messages(request: &ProviderRequest) -> anyhow::Result<Vec<Value>> {
     }
 
     flush_tool_results(&mut encoded, &mut pending_tool_results);
+
+    if request.prompt.cache_breakpoints.after_user_prompt {
+        attach_cache_breakpoint_to_last_user_message(&mut encoded);
+    }
     Ok(encoded)
+}
+
+/// Find the most recent user-role message in the encoded payload and put
+/// `cache_control: ephemeral` on its last content block. The Anthropic
+/// docs are explicit: cache_control belongs on the last block of the
+/// section you want pinned, not on the message envelope.
+fn attach_cache_breakpoint_to_last_user_message(messages: &mut [Value]) {
+    let Some(message) = messages.iter_mut().rev().find(|message| {
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "user")
+    }) else {
+        return;
+    };
+    let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(last_block) = content.last_mut() else {
+        return;
+    };
+    if let Value::Object(map) = last_block {
+        map.insert(
+            "cache_control".to_owned(),
+            json!({ "type": CACHE_CONTROL_EPHEMERAL }),
+        );
+    }
 }
 
 fn encode_user_parts(parts: &[UserPart]) -> Vec<Value> {
@@ -266,15 +407,25 @@ fn flush_tool_results(encoded: &mut Vec<Value>, pending_tool_results: &mut Vec<V
 }
 
 fn encode_tools(request: &ProviderRequest) -> Vec<Value> {
+    let last_index = request.tools.len().saturating_sub(1);
+    let pin_last = request.prompt.cache_breakpoints.after_tools;
     request
         .tools
         .iter()
-        .map(|tool| {
-            json!({
+        .enumerate()
+        .map(|(index, tool)| {
+            let mut spec = json!({
                 "name": tool_name_for_provider(&tool.name, &request.tools, request.model.provider_kind),
                 "description": tool.description,
                 "input_schema": tool.input_schema,
-            })
+            });
+            if pin_last && index == last_index && let Value::Object(map) = &mut spec {
+                map.insert(
+                    "cache_control".to_owned(),
+                    json!({ "type": CACHE_CONTROL_EPHEMERAL }),
+                );
+            }
+            spec
         })
         .collect()
 }
@@ -352,10 +503,10 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use halter_protocol::{
-        ApiKind, AssembledPrompt, AssistantMessage, AssistantPart, CacheScope, Message, MessageId,
-        ModelId, ModelRole, PromptSegment, PromptSegmentId, ProviderKind, ProviderName,
-        ProviderRequest, ResolvedModel, ToolAlias, ToolCall, ToolCallId, ToolCapabilities,
-        ToolConcurrency, ToolSpec, TurnId, UserMessage, Volatility,
+        ApiKind, AssembledPrompt, AssistantMessage, AssistantPart, CacheBreakpoints, CacheScope,
+        Message, MessageId, ModelId, ModelRole, PromptSegment, PromptSegmentId, PromptSegmentKind,
+        ProviderKind, ProviderName, ProviderRequest, ResolvedModel, ToolAlias, ToolCall,
+        ToolCallId, ToolCapabilities, ToolConcurrency, ToolSpec, TurnId, UserMessage, Volatility,
     };
     use indexmap::IndexMap;
     use serde_json::json;
@@ -401,8 +552,8 @@ mod tests {
             }),
         ]);
 
-        let body = encode_request(&request, halter_protocol::DEFAULT_TEMPERATURE)
-            .expect("encode request");
+        let body =
+            encode_request(&request, halter_protocol::DEFAULT_TEMPERATURE).expect("encode request");
 
         assert_eq!(
             body.get("system").and_then(Value::as_str),
@@ -488,6 +639,7 @@ mod tests {
                     volatility: Volatility::Static,
                     cache_scope: CacheScope::PrefixCacheable,
                     content_hash: "hash".to_owned(),
+                    kind: PromptSegmentKind::System,
                 }],
                 transcript: messages.clone(),
                 ordered_segments: Vec::new(),
@@ -495,6 +647,9 @@ mod tests {
                 rendered_prefix: "follow plan".to_owned(),
                 rendered_transcript: String::new(),
                 rendered: String::new(),
+                cache_breakpoints: CacheBreakpoints::default(),
+                system_segment_count: 0,
+                skill_segment_count: 0,
             },
             compacted_prefix: Vec::new(),
             messages,

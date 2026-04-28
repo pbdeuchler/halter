@@ -86,6 +86,7 @@ fn config() -> ResponsesProviderConfig {
             supports_documents: false,
             supports_prompt_cache: true,
             supports_compaction: true,
+            compaction_strategy: None,
             supports_tool_result_media: false,
             requires_non_empty_assistant_content: false,
             tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
@@ -247,7 +248,7 @@ mod tests {
                 "content": [
                     {
                         "type": "input_text",
-                        "text": "[Compacted context]\n\n## User Intent\nShip compaction support"
+                        "text": "<compaction>\n## User Intent\nShip compaction support\n</compaction>"
                     }
                 ],
             })]
@@ -280,6 +281,9 @@ mod tests {
                 rendered_prefix: String::new(),
                 rendered_transcript: String::new(),
                 rendered: String::new(),
+                cache_breakpoints: halter_protocol::CacheBreakpoints::default(),
+                system_segment_count: 0,
+                skill_segment_count: 0,
             },
             compacted_prefix: Vec::new(),
             messages: Vec::new(),

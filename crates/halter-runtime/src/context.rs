@@ -15,6 +15,24 @@ use crate::compaction::{
     ContextSettings, estimate_context_tokens, prepare_compaction, render_compaction_event_summary,
     should_trigger_compaction,
 };
+use crate::prompt::skill_prompt_segment;
+
+/// Build one prompt segment per skill loaded into the resource snapshot,
+/// in skill-name order so the resulting prefix is stable across rebuilds.
+/// Snapshot order is already deterministic (`IndexMap`), but we still sort
+/// by name to be defensive against future loader changes.
+fn skill_prompt_segments(snapshot: &ResourceSnapshot) -> Vec<PromptSegment> {
+    let mut entries: Vec<(&str, &str)> = snapshot
+        .skills
+        .values()
+        .map(|skill| (skill.name.as_str(), skill.body.as_str()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+        .into_iter()
+        .map(|(name, body)| skill_prompt_segment(name, body))
+        .collect()
+}
 
 const DEFAULT_COMPACTION_PROMPT_MARKDOWN: &str = include_str!("../prompts/default-compaction.md");
 
@@ -23,6 +41,33 @@ pub struct CompactionOutcome {
     pub messages: Vec<Message>,
     pub compacted_prefix: Vec<Value>,
     pub compaction: Option<CompactionResult>,
+}
+
+impl CompactionOutcome {
+    /// Apply the outcome to a `SessionState` in place. Used by both the
+    /// turn loop and the manual `compact()` entry point so the rules for
+    /// "what changes when compaction lands" live in one place rather than
+    /// being copy-pasted into every caller.
+    ///
+    /// Returns the inner `CompactionResult` when compaction actually fired
+    /// (so callers can publish the event), or `None` when there was
+    /// nothing to compact and the state was left untouched.
+    pub fn apply(self, state: &mut SessionState) -> Option<CompactionResult> {
+        let CompactionOutcome {
+            messages,
+            compacted_prefix,
+            compaction,
+        } = self;
+        let result = compaction?;
+        state.compacted_prefix = compacted_prefix;
+        state.messages = messages;
+        // Compaction breaks the previous_response_id chain: the provider
+        // has no record of the synthetic `compacted_prefix` we just
+        // injected, so the next request must replay everything.
+        state.last_response_id = None;
+        state.messages_seen_by_provider = 0;
+        Some(result)
+    }
 }
 
 #[async_trait]
@@ -109,15 +154,20 @@ impl DefaultContextManager {
             });
         }
 
-        if !compaction_provider.capabilities().supports_compaction {
+        let capabilities = compaction_provider.capabilities();
+        if !capabilities.supports_compaction {
             anyhow::bail!(
                 "failed to compact session: provider '{}' does not support compaction",
                 compaction_model.provider
             );
         }
 
-        let preparation =
-            prepare_compaction(&self.settings, &state.compacted_prefix, &state.messages);
+        let preparation = prepare_compaction(
+            &self.settings,
+            &state.compacted_prefix,
+            &state.messages,
+            capabilities.compaction_strategy,
+        );
         if state.compacted_prefix.is_empty() && preparation.compact_messages.is_empty() {
             return Ok(CompactionOutcome {
                 messages: state.messages.clone(),
@@ -164,12 +214,13 @@ impl ContextManager for DefaultContextManager {
         blueprint: &SessionBlueprint,
         state: &SessionState,
         observed: &ObservedState,
-        _snapshot: &ResourceSnapshot,
+        snapshot: &ResourceSnapshot,
         tool_specs: &[ToolSpec],
         compaction_model: &ResolvedModel,
         compaction_provider: &(dyn Provider + Send + Sync),
     ) -> anyhow::Result<ContextPlan> {
         let mut prompt_segments = blueprint.system_prompt_seed.clone();
+        prompt_segments.extend(skill_prompt_segments(snapshot));
         prompt_segments.extend(state.appended_prompt_segments.clone());
 
         let file_views = state
@@ -253,13 +304,14 @@ impl ContextManager for DefaultContextManager {
         blueprint: &SessionBlueprint,
         state: &SessionState,
         _observed: &ObservedState,
-        _snapshot: &ResourceSnapshot,
+        snapshot: &ResourceSnapshot,
         tool_specs: &[ToolSpec],
         compaction_model: &ResolvedModel,
         compaction_provider: &(dyn Provider + Send + Sync),
         custom_instructions: Option<&str>,
     ) -> anyhow::Result<CompactionOutcome> {
         let mut prompt_segments = blueprint.system_prompt_seed.clone();
+        prompt_segments.extend(skill_prompt_segments(snapshot));
         prompt_segments.extend(state.appended_prompt_segments.clone());
         self.execute_compaction(
             blueprint,

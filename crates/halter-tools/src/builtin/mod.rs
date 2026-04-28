@@ -178,6 +178,30 @@ mod tests {
         assert!(!specs.iter().any(|spec| spec.name.0 == "shell"));
     }
 
+    #[test]
+    fn specs_are_returned_in_alphabetical_order() {
+        let runtime = ToolRuntime::new();
+        register_builtin_tools(
+            &runtime,
+            &[
+                "write".to_owned(),
+                "edit".to_owned(),
+                "read".to_owned(),
+                "glob".to_owned(),
+                "grep".to_owned(),
+            ],
+        );
+
+        let names: Vec<String> = runtime
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name.0)
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
     #[tokio::test]
     async fn write_tool_respects_policy_denials() {
         let temp = tempfile::tempdir().expect("tempdir");

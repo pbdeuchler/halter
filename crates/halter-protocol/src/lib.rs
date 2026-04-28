@@ -862,6 +862,21 @@ pub struct PromptSegment {
     pub volatility: Volatility,
     pub cache_scope: CacheScope,
     pub content_hash: ContentHash,
+    /// Logical section the segment belongs to. The prompt assembler groups
+    /// segments by kind so the wire layout (system, then skills, then the
+    /// turn) is independent of insertion order, and so codecs can emit
+    /// cache breakpoints on stable boundaries.
+    #[serde(default)]
+    pub kind: PromptSegmentKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSegmentKind {
+    #[default]
+    System,
+    Skill,
+    Append,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -876,6 +891,44 @@ pub enum Volatility {
 pub enum CacheScope {
     PrefixCacheable,
     Dynamic,
+}
+
+/// Marks the four section boundaries the runtime asks codecs to expose as
+/// cache breakpoints when the underlying provider supports them.
+///
+/// The order is fixed: system prompt, tool descriptions, skills, then the
+/// most recent user prompt. The "rest of the session" follows the last
+/// breakpoint and is therefore the only window eligible for in-band
+/// compaction by non-dedicated providers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct CacheBreakpoints {
+    pub after_system: bool,
+    pub after_tools: bool,
+    pub after_skills: bool,
+    pub after_user_prompt: bool,
+}
+
+impl CacheBreakpoints {
+    /// All four breakpoints active. The prompt assembler emits this layout
+    /// for any session that has a non-empty system prompt and at least one
+    /// user message; codecs may downgrade as needed.
+    #[must_use]
+    pub fn all() -> Self {
+        Self {
+            after_system: true,
+            after_tools: true,
+            after_skills: true,
+            after_user_prompt: true,
+        }
+    }
+
+    #[must_use]
+    pub fn count_active(&self) -> usize {
+        usize::from(self.after_system)
+            + usize::from(self.after_tools)
+            + usize::from(self.after_skills)
+            + usize::from(self.after_user_prompt)
+    }
 }
 
 pub type FileViewCache = IndexMap<PathBuf, FileViewEntry>;
@@ -1068,11 +1121,33 @@ pub struct ProviderCapabilities {
     pub supports_documents: bool,
     pub supports_prompt_cache: bool,
     pub supports_compaction: bool,
+    /// How the provider implements compaction. The runtime narrows the
+    /// compaction window for `Inline` providers (only the segment after the
+    /// last cache breakpoint is eligible) because in-band summarization is
+    /// lossy and ratchets context fast when the surface is too wide.
+    #[serde(default)]
+    pub compaction_strategy: Option<ProviderCompactionStrategy>,
     pub supports_tool_result_media: bool,
     pub requires_non_empty_assistant_content: bool,
     pub tool_call_id_policy: ToolCallIdPolicy,
     pub max_input_tokens: u64,
     pub max_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCompactionStrategy {
+    /// A first-class compaction endpoint (e.g. OpenAI Responses
+    /// `/v1/responses/compact`) that returns encrypted content for safe
+    /// reinjection. The runtime can compact aggressively because the
+    /// provider preserves anchor invariants.
+    Dedicated,
+    /// In-band compaction via the regular completions endpoint
+    /// (e.g. OpenRouter's responses passthrough). Lossy: the runtime
+    /// only compacts the trailing window after the last cache breakpoint
+    /// and wraps the result in explicit compaction tags so the model can
+    /// distinguish it from authoritative system content.
+    Inline,
 }
 
 impl Default for ProviderCapabilities {
@@ -1086,6 +1161,7 @@ impl Default for ProviderCapabilities {
             supports_documents: false,
             supports_prompt_cache: false,
             supports_compaction: false,
+            compaction_strategy: None,
             supports_tool_result_media: false,
             requires_non_empty_assistant_content: false,
             tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
@@ -1193,6 +1269,48 @@ pub struct AssembledPrompt {
     pub rendered_prefix: String,
     pub rendered_transcript: String,
     pub rendered: String,
+    /// Section boundaries that the assembler asks the codec to expose as
+    /// cache breakpoints. Codecs that do not support explicit breakpoints
+    /// (e.g. OpenAI Responses, which uses prefix-prefix caching) ignore
+    /// this; codecs that do (Anthropic) emit `cache_control` on the last
+    /// content block of each marked section.
+    #[serde(default)]
+    pub cache_breakpoints: CacheBreakpoints,
+    /// Index into `ordered_segments` after which the system-prompt
+    /// breakpoint applies. `None` when there are no system segments.
+    #[serde(default)]
+    pub system_segment_count: usize,
+    /// Number of segments at the head of `ordered_segments` that belong
+    /// to the skills section. Always immediately follows the system block.
+    #[serde(default)]
+    pub skill_segment_count: usize,
+}
+
+impl AssembledPrompt {
+    /// Slice of segments that constitute the system-prompt section.
+    #[must_use]
+    pub fn system_segments(&self) -> &[PromptSegment] {
+        let end = self.system_segment_count.min(self.ordered_segments.len());
+        &self.ordered_segments[..end]
+    }
+
+    /// Slice of segments that constitute the skills section.
+    #[must_use]
+    pub fn skill_segments(&self) -> &[PromptSegment] {
+        let start = self.system_segment_count.min(self.ordered_segments.len());
+        let end = (start + self.skill_segment_count).min(self.ordered_segments.len());
+        &self.ordered_segments[start..end]
+    }
+
+    /// Slice of segments that follow both the system and skills sections —
+    /// hook-appended context, etc. These never receive a cache breakpoint
+    /// because they may change turn-to-turn.
+    #[must_use]
+    pub fn append_segments(&self) -> &[PromptSegment] {
+        let start =
+            (self.system_segment_count + self.skill_segment_count).min(self.ordered_segments.len());
+        &self.ordered_segments[start..]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

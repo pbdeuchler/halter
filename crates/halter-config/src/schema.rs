@@ -4,7 +4,9 @@ use std::fmt;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use halter_protocol::{ApiKind, DEFAULT_TEMPERATURE, ProviderKind, PruneSignalThreshold, ReasoningEffort};
+use halter_protocol::{
+    ApiKind, DEFAULT_TEMPERATURE, ProviderKind, PruneSignalThreshold, ReasoningEffort,
+};
 use indexmap::IndexMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -702,11 +704,9 @@ mod tests {
 
     #[test]
     fn provider_resolution_defaults_temperature_when_unset() {
-        let resolved = resolve_provider_runtime_config(
-            ConfiguredProvider::Anthropic,
-            None,
-            |_| Ok(Some("env-key".to_owned())),
-        )
+        let resolved = resolve_provider_runtime_config(ConfiguredProvider::Anthropic, None, |_| {
+            Ok(Some("env-key".to_owned()))
+        })
         .expect("resolve provider");
 
         assert_eq!(resolved.temperature, DEFAULT_TEMPERATURE);

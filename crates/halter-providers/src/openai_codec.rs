@@ -25,7 +25,13 @@ use crate::codec_common::{
 // Kept as a named alias because the local sites read more clearly with the
 // responses-item-specific identifier at the callsite.
 const RESPONSES_ITEM_ID_MAX_LEN: usize = crate::codec_common::PROVIDER_ID_MAX_LEN;
-const COMPACTED_CONTEXT_PREFIX: &str = "[Compacted context]\n\n";
+/// Tag pair that wraps an in-band (non-dedicated) compaction summary so
+/// the model can clearly distinguish lossy summarized history from
+/// authoritative system content. The runtime relies on these literal
+/// markers when computing eligibility windows, so changing them requires
+/// a coordinated update.
+pub(crate) const COMPACTION_OPEN_TAG: &str = "<compaction>\n";
+pub(crate) const COMPACTION_CLOSE_TAG: &str = "\n</compaction>";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponsesRequestOptions<'a> {
@@ -167,7 +173,7 @@ pub(crate) fn decode_openrouter_compact_response(
         Vec::new()
     } else {
         vec![encode_responses_developer_message(&format!(
-            "{COMPACTED_CONTEXT_PREFIX}{compacted_text}"
+            "{COMPACTION_OPEN_TAG}{compacted_text}{COMPACTION_CLOSE_TAG}"
         ))]
     };
 
@@ -1616,10 +1622,11 @@ fn chat_content_text(content: Option<&Value>) -> Option<String> {
 mod tests {
     use chrono::Utc;
     use halter_protocol::{
-        ApiKind, AssembledPrompt, AssistantMessage, AssistantPart, CacheScope, DEFAULT_TEMPERATURE,
-        Message, MessageId, ModelId, ModelRole, PromptSegment, PromptSegmentId, ProviderKind,
-        ProviderName, ResolvedModel, ToolAlias, ToolCall, ToolCallId, ToolCapabilities,
-        ToolConcurrency, ToolResult, ToolResultMessage, ToolSpec, TurnId, UserMessage, Volatility,
+        ApiKind, AssembledPrompt, AssistantMessage, AssistantPart, CacheBreakpoints, CacheScope,
+        DEFAULT_TEMPERATURE, Message, MessageId, ModelId, ModelRole, PromptSegment,
+        PromptSegmentId, PromptSegmentKind, ProviderKind, ProviderName, ResolvedModel, ToolAlias,
+        ToolCall, ToolCallId, ToolCapabilities, ToolConcurrency, ToolResult, ToolResultMessage,
+        ToolSpec, TurnId, UserMessage, Volatility,
     };
     use indexmap::IndexMap;
     use serde_json::json;
@@ -1828,7 +1835,7 @@ mod tests {
                 "content": [
                     {
                         "type": "input_text",
-                        "text": "[Compacted context]\n\n## User Intent\n- finish the fix\n\n## Completed Work"
+                        "text": "<compaction>\n## User Intent\n- finish the fix\n\n## Completed Work\n</compaction>"
                     }
                 ],
             })]
@@ -2534,6 +2541,7 @@ mod tests {
                     volatility: Volatility::Static,
                     cache_scope: CacheScope::PrefixCacheable,
                     content_hash: "hash".to_owned(),
+                    kind: PromptSegmentKind::System,
                 }],
                 transcript: Vec::new(),
                 ordered_segments: Vec::new(),
@@ -2541,6 +2549,9 @@ mod tests {
                 rendered_prefix: "follow plan".to_owned(),
                 rendered_transcript: String::new(),
                 rendered: String::new(),
+                cache_breakpoints: CacheBreakpoints::default(),
+                system_segment_count: 0,
+                skill_segment_count: 0,
             },
             compacted_prefix: Vec::new(),
             messages: vec![

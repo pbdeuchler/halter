@@ -2,7 +2,7 @@
 
 use halter_protocol::{
     AgentName, AssistantMessage, AssistantPart, CacheScope, ContentHash, Message, PromptSegment,
-    PromptSegmentId, SessionEvent, SessionEventPayload, SessionId, SessionState,
+    PromptSegmentId, PromptSegmentKind, SessionEvent, SessionEventPayload, SessionId, SessionState,
     SpawnSubagentRequest, SubagentRef, Usage, Volatility,
 };
 use halter_tools::SubagentParentContext;
@@ -116,6 +116,7 @@ fn build_agent_prompt_segment(
         volatility: Volatility::SessionStable,
         cache_scope: CacheScope::PrefixCacheable,
         content_hash: hash_text(&agent.prompt),
+        kind: PromptSegmentKind::System,
     })
 }
 
@@ -221,6 +222,7 @@ mod tests {
                     volatility: Volatility::Static,
                     cache_scope: CacheScope::PrefixCacheable,
                     content_hash: "base".into(),
+                    kind: PromptSegmentKind::System,
                 }],
                 max_turns: Some(4),
                 subagent_depth: 1,

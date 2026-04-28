@@ -86,9 +86,10 @@ impl BrowserSession {
                 }
             }
             None => {
-                let context = browser.new_context().await.map_err(|err| {
-                    anyhow::anyhow!("failed to create browser context: {err}")
-                })?;
+                let context = browser
+                    .new_context()
+                    .await
+                    .map_err(|err| anyhow::anyhow!("failed to create browser context: {err}"))?;
                 context
                     .new_page()
                     .await

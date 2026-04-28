@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use halter_protocol::{
-    AssistantPart, Message, MessageSignal, PromptSegment, PruneSignalThreshold, SummarySlice,
-    ToolCall, ToolCallId, ToolName, ToolResult, ToolResultMessage,
+    AssistantPart, Message, MessageSignal, PromptSegment, ProviderCompactionStrategy,
+    PruneSignalThreshold, SummarySlice, ToolCall, ToolCallId, ToolName, ToolResult,
+    ToolResultMessage,
 };
 use serde_json::Value;
 
@@ -76,13 +77,52 @@ pub fn split_reserved_suffix(messages: &[Message]) -> ReservedSuffix {
     }
 }
 
+/// Inline-strategy split: for non-dedicated providers, only the segment
+/// strictly after the last cache breakpoint (i.e. after the most recent
+/// user message) is eligible for compaction. Everything up to and
+/// including that user message is preserved verbatim. With no user
+/// messages, nothing is eligible.
+///
+/// Field semantics match `split_reserved_suffix`: `eligible_prefix` is
+/// the slice handed to the provider for compaction, `reserved_suffix` is
+/// the slice kept verbatim in the live transcript.
+#[must_use]
+pub fn split_reserved_suffix_after_last_user(messages: &[Message]) -> ReservedSuffix {
+    let Some(last_user_index) = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User(_)))
+    else {
+        return ReservedSuffix {
+            eligible_prefix: Vec::new(),
+            reserved_suffix: messages.to_vec(),
+            reserved_response_block: false,
+        };
+    };
+    let pivot = last_user_index + 1;
+    ReservedSuffix {
+        // Post-user tail = candidates for compaction.
+        eligible_prefix: messages[pivot..].to_vec(),
+        // System/skills/prior turns + the latest user message survive verbatim.
+        reserved_suffix: messages[..pivot].to_vec(),
+        reserved_response_block: false,
+    }
+}
+
 #[must_use]
 pub fn prepare_compaction(
     settings: &ContextSettings,
     compacted_prefix: &[Value],
     messages: &[Message],
+    strategy: Option<ProviderCompactionStrategy>,
 ) -> CompactionPreparation {
-    let reserved = split_reserved_suffix(messages);
+    let reserved = match strategy {
+        // In-band compaction must not touch the system prompt, tools,
+        // skills, or the most recent user message — those are the four
+        // cache breakpoints. Only the trailing assistant + tool window
+        // is eligible.
+        Some(ProviderCompactionStrategy::Inline) => split_reserved_suffix_after_last_user(messages),
+        _ => split_reserved_suffix(messages),
+    };
     let units = build_compaction_units(&reserved.eligible_prefix);
     let compacted_prefix_tokens = estimate_compacted_prefix_tokens(compacted_prefix);
     let retained_units = prune_units(settings, compacted_prefix_tokens, &units);
@@ -512,6 +552,7 @@ mod tests {
             },
             &[],
             &messages,
+            None,
         );
 
         assert!(preparation.compact_messages.is_empty());
@@ -613,6 +654,7 @@ mod tests {
                 },
                 &[],
                 &messages,
+                None,
             );
 
             let surviving: Vec<MessageSignal> = preparation
@@ -644,5 +686,101 @@ mod tests {
         });
 
         assert_eq!(score_message(&message), MessageSignal::Low);
+    }
+
+    #[test]
+    fn split_after_last_user_reserves_through_user_prompt() {
+        let tool_call_id = ToolCallId::from("call_1");
+        let messages = vec![
+            Message::User(UserMessage::text("first user")),
+            Message::Assistant(AssistantMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: vec![AssistantPart::Text {
+                    text: "first reply".to_owned(),
+                }],
+                stop_reason: None,
+                usage: None,
+                replay_meta: Default::default(),
+            }),
+            Message::User(UserMessage::text("latest user prompt")),
+            Message::Assistant(AssistantMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: vec![AssistantPart::ToolCall(ToolCall {
+                    id: tool_call_id.clone(),
+                    name: "read".into(),
+                    arguments: json!({}),
+                })],
+                stop_reason: None,
+                usage: None,
+                replay_meta: Default::default(),
+            }),
+            Message::Tool(ToolResultMessage {
+                id: MessageId::new(),
+                call_id: tool_call_id,
+                content: ToolResult::Text {
+                    text: "tool out".to_owned(),
+                },
+                error: None,
+                created_at: Utc::now(),
+            }),
+        ];
+
+        let split = split_reserved_suffix_after_last_user(&messages);
+        // Reserved up to and including the most recent user message...
+        assert_eq!(split.reserved_suffix.len(), 3);
+        assert!(matches!(
+            split.reserved_suffix.last(),
+            Some(Message::User(_))
+        ));
+        // ...and the post-user tail (assistant + tool) is eligible for compaction.
+        assert_eq!(split.eligible_prefix.len(), 2);
+    }
+
+    #[test]
+    fn inline_strategy_only_compacts_post_user_tail() {
+        let tool_call_id = ToolCallId::from("inline_call");
+        let messages = vec![
+            Message::User(UserMessage::text("anchor user prompt that survives")),
+            Message::Assistant(AssistantMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: vec![AssistantPart::ToolCall(ToolCall {
+                    id: tool_call_id.clone(),
+                    name: "shell".into(),
+                    arguments: json!({"cmd": "ls"}),
+                })],
+                stop_reason: None,
+                usage: None,
+                replay_meta: Default::default(),
+            }),
+            Message::Tool(ToolResultMessage {
+                id: MessageId::new(),
+                call_id: tool_call_id,
+                content: ToolResult::Text {
+                    text: "noise that should be summarized".repeat(32),
+                },
+                error: None,
+                created_at: Utc::now(),
+            }),
+        ];
+
+        let prepared = prepare_compaction(
+            &ContextSettings {
+                compaction_threshold: 50,
+                pre_compaction_target: 1,
+                prune_signal_threshold: PruneSignalThreshold::Normal,
+            },
+            &[],
+            &messages,
+            Some(ProviderCompactionStrategy::Inline),
+        );
+
+        // Reserved suffix = messages we keep verbatim (the user anchor).
+        // Compact messages = post-user tail eligible for in-band summarization.
+        assert_eq!(prepared.reserved_suffix.len(), 1);
+        assert!(matches!(prepared.reserved_suffix[0], Message::User(_)));
+        assert!(!prepared.reserved_response_block);
     }
 }

@@ -1104,6 +1104,7 @@ mod tests {
                 volatility: halter_protocol::Volatility::SessionStable,
                 cache_scope: halter_protocol::CacheScope::PrefixCacheable,
                 content_hash: format!("hash-{name}"),
+                kind: halter_protocol::PromptSegmentKind::System,
             }],
             max_turns: Some(16),
             subagent_depth: 1,

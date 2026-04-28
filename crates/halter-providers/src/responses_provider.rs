@@ -8,7 +8,8 @@ use async_openai::error::OpenAIError;
 use futures::{Stream, StreamExt, channel::mpsc, stream::BoxStream};
 use halter_protocol::{
     ApiKind, MessageId, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent,
+    ProviderCompactionResponse, ProviderCompactionStrategy, ProviderError, ProviderRequest,
+    StreamEvent,
 };
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -75,6 +76,11 @@ impl ResponsesProvider {
     pub(crate) fn capabilities(&self) -> ProviderCapabilities {
         let mut capabilities = self.config.capabilities.clone();
         capabilities.supports_compaction = self.config.compact_strategy.is_some();
+        capabilities.compaction_strategy =
+            self.config.compact_strategy.map(|strategy| match strategy {
+                CompactStrategy::DedicatedEndpoint => ProviderCompactionStrategy::Dedicated,
+                CompactStrategy::InlineResponses => ProviderCompactionStrategy::Inline,
+            });
         capabilities
     }
 
@@ -817,6 +823,9 @@ mod tests {
                 rendered_prefix: String::new(),
                 rendered_transcript: String::new(),
                 rendered: String::new(),
+                cache_breakpoints: halter_protocol::CacheBreakpoints::default(),
+                system_segment_count: 0,
+                skill_segment_count: 0,
             },
             compacted_prefix: Vec::new(),
             messages: Vec::new(),

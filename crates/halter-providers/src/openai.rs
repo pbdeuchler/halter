@@ -87,6 +87,7 @@ fn config() -> ResponsesProviderConfig {
             supports_documents: true,
             supports_prompt_cache: true,
             supports_compaction: true,
+            compaction_strategy: None,
             supports_tool_result_media: false,
             requires_non_empty_assistant_content: false,
             tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
@@ -198,9 +199,13 @@ mod tests {
             ),
             ("X-Trace-Id".to_owned(), "trace-1".to_owned()),
         ];
-        let provider =
-            OpenAiProvider::new_with_headers("default-key", base_url, &overrides, DEFAULT_TEMPERATURE)
-                .expect("openai provider");
+        let provider = OpenAiProvider::new_with_headers(
+            "default-key",
+            base_url,
+            &overrides,
+            DEFAULT_TEMPERATURE,
+        )
+        .expect("openai provider");
 
         let mut stream = provider
             .stream(
@@ -345,6 +350,9 @@ mod tests {
                 rendered_prefix: String::new(),
                 rendered_transcript: String::new(),
                 rendered: String::new(),
+                cache_breakpoints: halter_protocol::CacheBreakpoints::default(),
+                system_segment_count: 0,
+                skill_segment_count: 0,
             },
             compacted_prefix: Vec::new(),
             messages: Vec::new(),

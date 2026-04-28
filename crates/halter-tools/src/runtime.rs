@@ -124,13 +124,19 @@ impl ToolRuntime {
             .insert(spec.name.0, tool);
     }
 
+    /// Returns tool specs sorted alphabetically by canonical name.
+    /// A stable order keeps the tools section of the prompt byte-identical
+    /// across requests, which is the boundary that prefix caches key on.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools
+        let mut specs: Vec<ToolSpec> = self
+            .tools
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
             .map(|tool| tool.spec())
-            .collect()
+            .collect();
+        specs.sort_by(|a, b| a.name.0.cmp(&b.name.0));
+        specs
     }
 
     /// Look up the declared [`ToolConcurrency`] for a registered tool by name.

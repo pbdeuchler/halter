@@ -90,9 +90,7 @@ impl BrowserbaseProvider {
         let client = Client::builder()
             .user_agent(concat!("halter-tools/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|err| {
-                anyhow::anyhow!("failed to build browserbase http client: {err}")
-            })?;
+            .map_err(|err| anyhow::anyhow!("failed to build browserbase http client: {err}"))?;
         Ok(Self { config, client })
     }
 }
@@ -130,15 +128,15 @@ impl BrowserProvider for BrowserbaseProvider {
             features.push("custom_timeout");
         }
 
-        let session = self.create_session_with_fallback(&mut body, &mut features).await?;
+        let session = self
+            .create_session_with_fallback(&mut body, &mut features)
+            .await?;
 
         let id = session
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "failed to create browserbase session: response missing 'id' field"
-                )
+                anyhow::anyhow!("failed to create browserbase session: response missing 'id' field")
             })?
             .to_owned();
         let cdp_url = session
@@ -184,9 +182,7 @@ impl BrowserProvider for BrowserbaseProvider {
             return Ok(());
         }
         let detail = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "failed to close browserbase session {session_id}: HTTP {status} {detail}"
-        )
+        anyhow::bail!("failed to close browserbase session {session_id}: HTTP {status} {detail}")
     }
 }
 
