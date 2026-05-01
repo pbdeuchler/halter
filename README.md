@@ -358,6 +358,7 @@ Built-in tools include:
 - `edit`
 - `shell`
 - `process`
+- `task` (in-memory todo list scoped to the session)
 
 Optional feature-gated tools include:
 

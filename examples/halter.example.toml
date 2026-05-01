@@ -65,6 +65,7 @@ enabled = [
   "edit",
   "shell",
   "process",
+  "task",     # in-memory todo list scoped to the session
   "pty",      # requires the `pty` feature
   "ast_grep", # requires the `ast-tools` feature; `find` reads, `replace` writes
   "image",    # requires the `image-tools` feature; `info` reads, `resize`/`convert` can write

@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use halter_protocol::SessionId;
-#[cfg(feature = "pty")]
 use parking_lot::Mutex;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -13,10 +12,12 @@ use crate::builtin::browser::session::BrowserSession;
 #[cfg(feature = "pty")]
 use crate::builtin::pty::PtySessionHandle;
 use crate::builtin::shell::session::ShellSessionCore;
+use crate::builtin::task::TaskList;
 
 #[derive(Default)]
 pub struct ToolSessionStore {
     shell_sessions: DashMap<String, Arc<TokioMutex<Option<ShellSessionCore>>>>,
+    task_sessions: DashMap<String, Arc<Mutex<TaskList>>>,
     #[cfg(feature = "pty")]
     pty_sessions: DashMap<String, Arc<Mutex<Option<PtySessionHandle>>>>,
     #[cfg(feature = "browser-tools")]
@@ -32,6 +33,18 @@ impl ToolSessionStore {
         self.shell_sessions
             .entry(session_id.0.clone())
             .or_insert_with(|| Arc::new(TokioMutex::new(None)))
+            .clone()
+    }
+
+    /// Returns the in-memory task list bound to this session, creating it on
+    /// first access. Storage is process-local; persistence (file, sqlite, …)
+    /// can be introduced by replacing this accessor with a swappable backend
+    /// behind a `TaskStore` trait without touching `TaskTool`.
+    #[must_use]
+    pub fn task_session(&self, session_id: &SessionId) -> Arc<Mutex<TaskList>> {
+        self.task_sessions
+            .entry(session_id.0.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(TaskList::default())))
             .clone()
     }
 

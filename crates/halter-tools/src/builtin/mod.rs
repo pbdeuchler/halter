@@ -17,6 +17,7 @@ pub mod profiling;
 pub mod pty;
 pub mod read;
 pub mod shell;
+pub mod task;
 pub mod text;
 pub mod write;
 
@@ -40,6 +41,7 @@ pub use profiling::ProfilingTool;
 pub use pty::PtyTool;
 pub use read::ReadTool;
 pub use shell::ShellTool;
+pub use task::{InMemoryTaskStore, Task, TaskList, TaskStatus, TaskStore, TaskSummary, TaskTool};
 pub use write::WriteTool;
 
 /// Registers the built-in tool set against a runtime that is already being assembled.
@@ -53,6 +55,7 @@ pub fn register_builtin_tools(runtime: &ToolRuntime, enabled: &[String]) {
         Arc::new(GrepTool),
         Arc::new(ShellTool),
         Arc::new(ProcessTool),
+        Arc::new(TaskTool),
     ] {
         let tool_name = tool.spec().name.0;
         if register_all || enabled.iter().any(|name| name == &tool_name) {

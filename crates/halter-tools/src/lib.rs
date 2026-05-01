@@ -18,8 +18,8 @@ pub use builtin::ProfilingTool;
 pub use builtin::PtyTool;
 pub use builtin::fs_lock::PathLockMap;
 pub use builtin::{
-    EditTool, GlobTool, GrepTool, ProcessTool, ReadTool, ShellTool, WriteTool,
-    register_builtin_tools,
+    EditTool, GlobTool, GrepTool, InMemoryTaskStore, ProcessTool, ReadTool, ShellTool, Task,
+    TaskList, TaskStatus, TaskStore, TaskSummary, TaskTool, WriteTool, register_builtin_tools,
 };
 pub use policy::{
     CanonicalPath, DefaultToolPolicy, LoopbackAllow, Pid, PolicyError, PolicySettings, ShellMode,
