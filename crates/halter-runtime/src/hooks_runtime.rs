@@ -876,6 +876,7 @@ async fn run_agent(
         // governs when its turns drain.
         turn_registry: Arc::new(crate::TurnRegistry::new()),
         shell_timeout_secs: sess.services().shell_timeout_secs,
+        trace_recorder: sess.services().trace_recorder.clone(),
     });
     let model = resolve_agent_model(sess, config.model.as_deref())?;
     let working_dir = request

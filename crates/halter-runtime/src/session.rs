@@ -58,6 +58,10 @@ pub struct RuntimeServices {
     pub event_bus: Arc<EventBus>,
     pub turn_registry: Arc<TurnRegistry>,
     pub shell_timeout_secs: u64,
+    /// Optional sink that mirrors every committed `SessionEvent` into a
+    /// per-session JSONL trace file. Disabled (`None`) when
+    /// `runtime.traces_dir` is not configured.
+    pub trace_recorder: Option<Arc<crate::TraceRecorder>>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +175,9 @@ struct EvictionGuard {
 
 impl Drop for EvictionGuard {
     fn drop(&mut self) {
+        if let Some(recorder) = &self.services.trace_recorder {
+            recorder.close_session(&self.session_id);
+        }
         evict_session_hooks(&self.services, &self.session_id);
     }
 }
@@ -1226,6 +1233,9 @@ impl SessionHandle {
                 live.emit_committed(event.clone());
             }
             self.services.event_bus.publish(event.clone());
+            if let Some(recorder) = &self.services.trace_recorder {
+                recorder.record(event);
+            }
         }
         Ok(committed)
     }
@@ -1264,7 +1274,15 @@ impl SessionHandle {
     }
 
     fn make_event(&self, payload: SessionEventPayload) -> PendingEvent {
-        PendingEvent::new(self.session_id.clone(), Delivery::Lossless, payload)
+        let pending = PendingEvent::new(self.session_id.clone(), Delivery::Lossless, payload);
+        // Mirror every event into the trace as soon as it's generated so that
+        // long-running turns (many tool-call iterations under a single
+        // `commit_and_publish`) still produce live trace output. The
+        // committed counterpart arrives later via `record`.
+        if let Some(recorder) = &self.services.trace_recorder {
+            recorder.record_pending(&pending);
+        }
+        pending
     }
 }
 
@@ -1625,6 +1643,14 @@ pub(crate) async fn create_session_seeded(
         })
         .await?;
 
+    if let Some(recorder) = &services.trace_recorder {
+        recorder.open_session(
+            &session_id,
+            blueprint.parent_session_id.as_ref(),
+            &blueprint,
+        )?;
+    }
+
     let started = PendingEvent::new(
         session_id.clone(),
         Delivery::Lossless,
@@ -1635,6 +1661,9 @@ pub(crate) async fn create_session_seeded(
         .commit(&session_id, None, None, None, vec![started])
         .await?;
     for event in committed {
+        if let Some(recorder) = &services.trace_recorder {
+            recorder.record(&event);
+        }
         services.event_bus.publish(event);
     }
 
@@ -1821,6 +1850,7 @@ impl Default for RuntimeServices {
             event_bus: Arc::new(EventBus::default()),
             turn_registry: Arc::new(TurnRegistry::new()),
             shell_timeout_secs: 30,
+            trace_recorder: None,
         }
     }
 }

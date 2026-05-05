@@ -483,16 +483,40 @@ fn decode_openai_error(status: StatusCode, body: &[u8]) -> OpenAIError {
         });
     }
 
-    parse_openai_http_error(body)
-        .map(OpenAIError::ApiError)
-        .unwrap_or_else(|| {
-            OpenAIError::ApiError(ApiError {
-                message: String::from_utf8_lossy(body).trim().to_owned(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })
+    let mut api_error = parse_openai_http_error(body).unwrap_or_else(|| ApiError {
+        message: String::from_utf8_lossy(body).trim().to_owned(),
+        r#type: None,
+        param: None,
+        code: None,
+    });
+    augment_unauthorized_message(status, &mut api_error);
+    OpenAIError::ApiError(api_error)
+}
+
+/// OpenRouter rejects bearer tokens whose format it does not recognize
+/// (e.g. a Fireworks key sent to the default `https://openrouter.ai/api`
+/// base URL) with the misleading body `"Missing Authentication header"` —
+/// even though the request did carry an `Authorization` header. The
+/// transport always populates that header from the configured/env api key,
+/// so a 401 with this exact phrase is unambiguous: the supplied key has the
+/// wrong format for the endpoint we just talked to. Rewrite the message to
+/// say so instead of letting users chase a phantom missing-header bug.
+fn augment_unauthorized_message(status: StatusCode, error: &mut ApiError) {
+    if status != StatusCode::UNAUTHORIZED {
+        return;
+    }
+    if !error
+        .message
+        .eq_ignore_ascii_case("Missing Authentication header")
+    {
+        return;
+    }
+    error.message = "Missing Authentication header — the upstream rejected the supplied \
+         API key format despite the Authorization header being sent. Verify the key \
+         matches the configured provider (OpenRouter keys begin with `sk-or-v1-`); \
+         a key from a different provider routed to OpenRouter will surface this exact \
+         message."
+        .to_owned();
 }
 
 #[cfg(test)]
@@ -921,6 +945,81 @@ mod tests {
                 assert_eq!(usage.output_tokens_details.reasoning_tokens, 3);
             }
             other => panic!("expected ResponseCompleted, got {other:?}"),
+        }
+    }
+
+    /// OpenRouter returns `{"error":{"message":"Missing Authentication header","code":401}}`
+    /// for HTTP 401 when the supplied bearer token has a format it does not
+    /// recognize (e.g. a Fireworks key sent to the default OpenRouter base
+    /// URL). The transport always populates the Authorization header from the
+    /// resolved api key, so the upstream's phrasing is misleading. Verify the
+    /// decoded ApiError carries the augmented hint instead of the literal
+    /// upstream message.
+    #[test]
+    fn decode_openai_error_rewrites_openrouter_missing_auth_header() {
+        let body = json!({
+            "error": {
+                "message": "Missing Authentication header",
+                "code": 401
+            }
+        })
+        .to_string();
+        let error = decode_openai_error(StatusCode::UNAUTHORIZED, body.as_bytes());
+        match error {
+            OpenAIError::ApiError(api_error) => {
+                assert!(
+                    api_error
+                        .message
+                        .starts_with("Missing Authentication header — the upstream rejected"),
+                    "expected augmented hint, saw: {}",
+                    api_error.message
+                );
+                assert!(
+                    api_error.message.contains("sk-or-v1-"),
+                    "expected key-format hint, saw: {}",
+                    api_error.message
+                );
+            }
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    /// 401s with messages we don't have a hint for must pass through
+    /// untouched — the augmentation only fires for the OpenRouter-specific
+    /// "Missing Authentication header" phrase.
+    #[test]
+    fn decode_openai_error_leaves_other_unauthorized_messages_untouched() {
+        let body = json!({
+            "error": {
+                "message": "Invalid API key",
+                "code": 401
+            }
+        })
+        .to_string();
+        let error = decode_openai_error(StatusCode::UNAUTHORIZED, body.as_bytes());
+        match error {
+            OpenAIError::ApiError(api_error) => assert_eq!(api_error.message, "Invalid API key"),
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    /// The augmentation must not fire for non-401 statuses — only the exact
+    /// upstream signature warrants the hint.
+    #[test]
+    fn decode_openai_error_leaves_non_401_missing_auth_untouched() {
+        let body = json!({
+            "error": {
+                "message": "Missing Authentication header",
+                "code": 400
+            }
+        })
+        .to_string();
+        let error = decode_openai_error(StatusCode::BAD_REQUEST, body.as_bytes());
+        match error {
+            OpenAIError::ApiError(api_error) => {
+                assert_eq!(api_error.message, "Missing Authentication header")
+            }
+            other => panic!("expected ApiError, got {other:?}"),
         }
     }
 }

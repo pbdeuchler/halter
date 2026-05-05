@@ -373,6 +373,9 @@ impl RuntimeSubagentControl {
                         );
                     }
                     for event in committed {
+                        if let Some(recorder) = &self.inner.services.trace_recorder {
+                            recorder.record(&event);
+                        }
                         self.inner.services.event_bus.publish(event);
                     }
                     return Ok(continuation);
@@ -909,6 +912,7 @@ mod tests {
             event_bus: Arc::new(EventBus::default()),
             turn_registry: Arc::new(crate::TurnRegistry::new()),
             shell_timeout_secs: 30,
+            trace_recorder: None,
         })
     }
 

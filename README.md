@@ -136,6 +136,12 @@ timeout_secs = 30
 
 [sessions]
 backend = "memory"
+
+[runtime]
+# Optional. When set, halter writes a `<session_id>.txt` JSONL trace per session
+# into this directory: one header line followed by every committed SessionEvent.
+# Useful for offline debugging and for restoring session state from disk.
+# traces_dir = "/tmp/halter/traces"
 ```
 
 You can derive this from `examples/halter.example.toml` and tailor it to your environment.

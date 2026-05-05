@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use halter_config::{
     ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, PolicyConfig, ResolvedProviderConfig,
-    SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, load_path,
+    SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, expand_path, load_path,
     resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
@@ -18,7 +18,7 @@ use halter_protocol::{
 use halter_providers::{AnthropicProvider, ModelRegistry, OpenAiProvider, OpenRouterProvider};
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
-    RuntimeServices, SessionInit, SessionRuntime,
+    RuntimeServices, SessionInit, SessionRuntime, TraceRecorder,
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
@@ -184,6 +184,12 @@ impl HalterBuilder {
             Some(store) => store,
             None => build_session_store(&config.sessions)?,
         };
+        let trace_recorder = config
+            .runtime
+            .traces_dir
+            .as_ref()
+            .map(|dir| TraceRecorder::open(expand_path(dir)).map(Arc::new))
+            .transpose()?;
         let services = Arc::new(RuntimeServices {
             resources: Arc::new(ResourceHandle::new(snapshot, hooks, hook_warnings)),
             registered_hooks: Arc::new(registered_hooks),
@@ -203,6 +209,7 @@ impl HalterBuilder {
             event_bus: Arc::new(EventBus::default()),
             turn_registry: Arc::new(halter_runtime::TurnRegistry::new()),
             shell_timeout_secs: config.policy.shell.timeout_secs,
+            trace_recorder,
         });
         let runtime = SessionRuntime::new(services.clone());
         register_subagent_tools(
@@ -700,6 +707,99 @@ mod tests {
             .build()
             .await
             .expect("build halter");
+    }
+
+    #[tokio::test]
+    async fn builder_writes_per_session_trace_file_when_traces_dir_configured() {
+        let temp = tempdir().expect("tempdir");
+        let traces_dir = temp.path().join("traces");
+        let mut config = openai_config(Some("test-key"));
+        config.runtime.traces_dir = Some(traces_dir.clone());
+
+        let halter = HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build halter");
+
+        let session = halter
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("create session");
+
+        let session_id = session.session_id().0.clone();
+        drop(session);
+
+        let trace_path = traces_dir.join(format!("{session_id}.txt"));
+        let contents = std::fs::read_to_string(&trace_path).expect("read trace file");
+        let mut lines = contents.lines();
+        let header: serde_json::Value =
+            serde_json::from_str(lines.next().expect("header")).expect("header json");
+        assert_eq!(header["kind"], "trace_header");
+        assert_eq!(header["session_id"], session_id);
+        let started: halter_protocol::SessionEvent =
+            serde_json::from_str(lines.next().expect("session-started event"))
+                .expect("event json");
+        assert!(matches!(
+            started.payload,
+            halter_protocol::SessionEventPayload::SessionStarted
+        ));
+    }
+
+    #[tokio::test]
+    async fn builder_skips_trace_file_when_traces_dir_unset() {
+        let temp = tempdir().expect("tempdir");
+        let halter = HalterBuilder::default()
+            .with_config(openai_config(Some("test-key")))
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build halter");
+
+        halter
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("create session");
+
+        let entries: Vec<_> = std::fs::read_dir(temp.path())
+            .expect("read tempdir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "no trace files should exist outside traces_dir: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_fails_when_traces_dir_points_at_a_file() {
+        let temp = tempdir().expect("tempdir");
+        let bogus = temp.path().join("not-a-dir.txt");
+        std::fs::write(&bogus, b"hi").expect("seed file");
+        let mut config = openai_config(Some("test-key"));
+        config.runtime.traces_dir = Some(bogus.clone());
+
+        let error = match HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+        {
+            Ok(_) => panic!("build should fail when traces_dir points at a file"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("not a directory"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(feature = "sqlite")]

@@ -9,6 +9,7 @@ mod prompt;
 mod session;
 mod subagent_session;
 mod subagents;
+mod trace_recorder;
 mod turn_registry;
 
 pub use compaction::{ContextSettings, score_message};
@@ -24,4 +25,5 @@ pub use hooks_runtime::{
 };
 pub use prompt::{DefaultPromptAssembler, PromptAssembler, skill_prompt_segment};
 pub use session::{HalterSession, ResourceHandle, RuntimeServices, SessionInit, SessionRuntime};
+pub use trace_recorder::TraceRecorder;
 pub use turn_registry::{ShutdownReport, TurnRegistry, TurnRegistryError};

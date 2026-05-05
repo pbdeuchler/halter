@@ -82,6 +82,7 @@ impl HarnessConfig {
         }
 
         self.context.validate()?;
+        self.runtime.validate()?;
 
         Ok(())
     }
@@ -647,6 +648,23 @@ impl SessionsConfig {
 pub struct RuntimeConfig {
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
+    /// Directory where full per-session traces are written as `<session_id>.txt`
+    /// JSONL files. Each file begins with a header line describing the session
+    /// blueprint and is followed by one JSON-encoded `SessionEvent` per line —
+    /// enough to debug a run and to rebuild session state offline.
+    #[serde(default)]
+    pub traces_dir: Option<PathBuf>,
+}
+
+impl RuntimeConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(path) = &self.traces_dir
+            && path.as_os_str().is_empty()
+        {
+            anyhow::bail!("invalid configuration: runtime.traces_dir must not be empty");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -818,6 +836,60 @@ mod tests {
             error
                 .to_string()
                 .contains("sessions.sqlite_path requires the 'sqlite' cargo feature")
+        );
+    }
+
+    #[test]
+    fn runtime_traces_dir_round_trips_through_toml() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[runtime]
+traces_dir = "/tmp/halter/traces"
+"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            parsed.runtime.traces_dir,
+            Some(PathBuf::from("/tmp/halter/traces"))
+        );
+        parsed.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn runtime_traces_dir_rejects_empty_path() {
+        let mut config = HarnessConfig::default();
+        config.models.default = Some(ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: "gpt-5".to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tokens_per_minute: None,
+        });
+        config.providers.openai = Some(ProviderConfig {
+            base_url: None,
+            api_key: Some("test-key".to_owned()),
+            headers: IndexMap::new(),
+            temperature: None,
+        });
+        config.runtime.traces_dir = Some(PathBuf::from(""));
+
+        let error = config.validate().expect_err("empty traces_dir should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime.traces_dir must not be empty"),
+            "unexpected error: {error}"
         );
     }
 
