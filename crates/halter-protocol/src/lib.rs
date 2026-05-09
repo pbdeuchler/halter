@@ -479,7 +479,7 @@ pub struct SpawnSubagentRequest {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<AgentName>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub fork_context: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelId>,
@@ -536,10 +536,6 @@ pub struct WaitSubagentResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CloseSubagentResponse {
     pub previous_status: SubagentStatus,
-}
-
-const fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

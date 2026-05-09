@@ -168,6 +168,14 @@ impl SessionInit {
 /// dropped. Pre-Phase-3 code put `Drop` on `HalterSession` itself, which
 /// meant any short-lived clone (e.g. a clone moved into a `tokio::spawn`
 /// turn loop) would evict the hooks for the still-live original handle.
+///
+/// The trace recorder is intentionally *not* closed here. Calls to
+/// `HalterSession::new` for an already-live session (e.g. the parent's
+/// short-lived handle constructed inside subagent hook dispatch) yield
+/// independent `EvictionGuard`s; closing the trace on a temporary handle's
+/// drop would silently remove the parent's writer entry while real work was
+/// still streaming events under that session id. The recorder flushes per
+/// line and is cleaned up when the runtime drops it.
 struct EvictionGuard {
     services: Arc<RuntimeServices>,
     session_id: SessionId,
@@ -175,9 +183,6 @@ struct EvictionGuard {
 
 impl Drop for EvictionGuard {
     fn drop(&mut self) {
-        if let Some(recorder) = &self.services.trace_recorder {
-            recorder.close_session(&self.session_id);
-        }
         evict_session_hooks(&self.services, &self.session_id);
     }
 }
@@ -1434,8 +1439,46 @@ pub(crate) async fn materialize_assistant_message(
     }
 
     flush_text_buffer(&mut parts, &mut text_buffer);
-    if !tool_call_blocks.is_empty() {
-        anyhow::bail!("failed to materialize tool call: unterminated tool call block");
+    // Unterminated tool call blocks are recoverable: the upstream stream
+    // ended without a `ToolCallEnd` (a misbehaving provider, a truncated
+    // response, or an [DONE] frame that arrived before the codec closed
+    // every output item). Treat each pending block as if a `ToolCallEnd`
+    // had been received and push it as a synthetic `ToolCall` part using
+    // the arguments we did accumulate. If those arguments fail to parse
+    // (e.g. truncated mid-JSON), substitute `{}` so the tool runtime can
+    // surface a tool-side error to the model rather than dropping the
+    // entire turn. Previously this branch bailed with
+    // "unterminated tool call block", which terminated the whole session
+    // even though a single bad streaming event need not be fatal.
+    for (block_id, pending) in std::mem::take(&mut tool_call_blocks) {
+        let arguments = match parse_tool_call_arguments(&pending.arguments) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    provider = %model.provider,
+                    model = %model.model,
+                    tool_call_id = %pending.tool_call_id,
+                    block_id = %block_id,
+                    raw_arguments = %pending.arguments,
+                    %error,
+                    "stream ended with unterminated tool call whose arguments failed to parse; substituting empty object"
+                );
+                serde_json::json!({})
+            }
+        };
+        warn!(
+            provider = %model.provider,
+            model = %model.model,
+            tool_call_id = %pending.tool_call_id,
+            block_id = %block_id,
+            tool_name = %pending.name,
+            "stream ended without ToolCallEnd; auto-closing tool call block"
+        );
+        parts.push(AssistantPart::ToolCall(ToolCall {
+            id: pending.tool_call_id,
+            name: pending.name,
+            arguments,
+        }));
     }
     debug!(
         provider = %model.provider,
@@ -1893,6 +1936,205 @@ mod tests {
             init.system_prompt_seed[0].text,
             crate::prompt::default_system_prompt_text()
         );
+    }
+
+    /// Regression: dropping a short-lived `HalterSession` constructed for an
+    /// already-live session must not close that session's trace writer.
+    /// Previously, `EvictionGuard::drop` invoked `recorder.close_session(...)`,
+    /// which removed the writer entry. Subagent hook dispatch builds
+    /// temporary parent handles via `HalterSession::new`; when those
+    /// temporaries dropped, the parent's trace was silently torn down and
+    /// every subsequent event for that root session id was dropped on the
+    /// floor.
+    #[test]
+    fn dropping_temporary_session_handle_does_not_close_trace_writer() {
+        use halter_protocol::{
+            Delivery, ModelId, PendingEvent, Revision, SessionBlueprint, SessionEventPayload,
+            SessionId,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(crate::TraceRecorder::open(temp.path().to_path_buf())
+            .expect("recorder"));
+        let mut services = RuntimeServices::default();
+        services.trace_recorder = Some(recorder.clone());
+        let services = Arc::new(services);
+
+        let session_id = SessionId::from("regression-trace");
+        let blueprint = SessionBlueprint {
+            session_id: session_id.clone(),
+            parent_session_id: None,
+            default_model: ModelId::from("default"),
+            subagent_model: ModelId::from("subagent"),
+            snapshot_revision: Revision::from("rev-1".to_owned()),
+            working_dir: temp.path().to_path_buf(),
+            system_prompt_seed: Vec::new(),
+            max_turns: None,
+            subagent_depth: 0,
+        };
+        recorder
+            .open_session(&session_id, None, &blueprint)
+            .expect("open session");
+
+        // Construct two independent `HalterSession` handles for the same
+        // session id — the same shape produced by subagent hook dispatch
+        // (parent gets a primary handle, the start-hook code path then
+        // builds a temporary handle for the same parent session id).
+        let primary =
+            HalterSession::new(services.clone(), session_id.clone()).expect("primary handle");
+        {
+            let _temporary = HalterSession::new(services.clone(), session_id.clone())
+                .expect("temporary handle");
+        } // drop the temporary here
+
+        // Recording must still land in the trace file: the primary handle
+        // is still alive, and the recorder must not have been closed by
+        // the temporary's drop.
+        let pending = PendingEvent::new(
+            session_id.clone(),
+            Delivery::Lossless,
+            SessionEventPayload::Warning {
+                message: "post-drop".to_owned(),
+            },
+        );
+        recorder.record(&pending.into_committed(1));
+        // Also keep the primary live until after the recording write.
+        drop(primary);
+
+        let path = temp.path().join(format!("{}.txt", session_id.0));
+        let contents = std::fs::read_to_string(&path).expect("trace contents");
+        assert!(
+            contents.contains("post-drop"),
+            "trace did not capture post-drop event:\n{contents}"
+        );
+    }
+
+    /// Regression: a provider stream that ends without `ToolCallEnd` for an
+    /// in-flight tool call must not abort the whole turn. We synthesize a
+    /// `ToolCall` part using the accumulated arguments (or `{}` when those
+    /// arguments are not valid JSON) and let the tool runtime surface any
+    /// resulting tool-side error to the model. Previously this branch
+    /// `bail!`ed with "unterminated tool call block", which terminated the
+    /// session even though one truncated stream is recoverable.
+    #[tokio::test]
+    async fn materialize_handles_unterminated_tool_call_block() {
+        let model = ResolvedModel {
+            role: ModelRole::default(),
+            id: ModelId::from("default"),
+            provider: ProviderName::from("fake"),
+            provider_kind: ProviderKind::Fake,
+            api_kind: ApiKind::Fake,
+            model: "halter/fake".to_owned(),
+            max_input_tokens: Some(32_000),
+            max_output_tokens: Some(4_096),
+            reasoning: None,
+            tokens_per_minute: None,
+        };
+        let message_id = halter_protocol::MessageId::new();
+        let block_id = BlockId::new();
+        let tool_call_id = ToolCallId::from("call-truncated");
+        // Stream emits ToolCallStart + a partial argument delta, then
+        // MessageEnd, then EOF — no ToolCallEnd.
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> = stream::iter(vec![
+            Ok(StreamEvent::MessageStart {
+                id: message_id.clone(),
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                id: block_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                name: ToolName::from("write"),
+            }),
+            Ok(StreamEvent::ToolArgsDelta {
+                id: block_id.clone(),
+                delta: r#"{"path":"x.txt","content":"hi"}"#.to_owned(),
+            }),
+            Ok(StreamEvent::MessageEnd {
+                id: message_id.clone(),
+                stop_reason: StopReason::ToolUse,
+                response_id: None,
+            }),
+        ])
+        .boxed();
+
+        let materialized = super::materialize_assistant_message(stream, &model)
+            .await
+            .expect("materialize must recover from unterminated tool call");
+        let tool_calls: Vec<_> = materialized
+            .message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                AssistantPart::ToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "one synthetic tool call expected");
+        assert_eq!(tool_calls[0].id, tool_call_id);
+        assert_eq!(tool_calls[0].name.0, "write");
+        assert_eq!(
+            tool_calls[0].arguments,
+            serde_json::json!({"path": "x.txt", "content": "hi"})
+        );
+    }
+
+    /// Same recovery path but the accumulated arguments are not valid JSON
+    /// (truncated mid-string). The synthetic tool call carries `{}` so the
+    /// tool runtime can produce a structured error rather than the whole
+    /// turn aborting.
+    #[tokio::test]
+    async fn materialize_handles_unterminated_tool_call_with_invalid_json() {
+        let model = ResolvedModel {
+            role: ModelRole::default(),
+            id: ModelId::from("default"),
+            provider: ProviderName::from("fake"),
+            provider_kind: ProviderKind::Fake,
+            api_kind: ApiKind::Fake,
+            model: "halter/fake".to_owned(),
+            max_input_tokens: Some(32_000),
+            max_output_tokens: Some(4_096),
+            reasoning: None,
+            tokens_per_minute: None,
+        };
+        let message_id = halter_protocol::MessageId::new();
+        let block_id = BlockId::new();
+        let tool_call_id = ToolCallId::from("call-bad-json");
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> = stream::iter(vec![
+            Ok(StreamEvent::MessageStart {
+                id: message_id.clone(),
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                id: block_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                name: ToolName::from("write"),
+            }),
+            Ok(StreamEvent::ToolArgsDelta {
+                id: block_id.clone(),
+                // Truncated mid-string: serde_json::from_str will fail.
+                delta: r#"{"path":"x.txt","content":"hel"#.to_owned(),
+            }),
+            Ok(StreamEvent::MessageEnd {
+                id: message_id.clone(),
+                stop_reason: StopReason::ToolUse,
+                response_id: None,
+            }),
+        ])
+        .boxed();
+
+        let materialized = super::materialize_assistant_message(stream, &model)
+            .await
+            .expect("materialize must recover even with unparsable arguments");
+        let tool_calls: Vec<_> = materialized
+            .message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                AssistantPart::ToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, tool_call_id);
+        assert_eq!(tool_calls[0].arguments, serde_json::json!({}));
     }
 
     #[test]

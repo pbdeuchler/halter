@@ -82,7 +82,7 @@ impl SpawnAgentTool {
                 "fork_context".to_owned(),
                 json!({
                     "type": "boolean",
-                    "description": "When true, start from the parent session context. Defaults to true."
+                    "description": "When true, the child session inherits the parent's full message history, summaries, and file view cache. Defaults to false: the child starts with a clean context and only the task message you provide. Leave false unless the child genuinely needs the parent's accumulated state."
                 }),
             ),
             ("model".to_owned(), model_schema),
