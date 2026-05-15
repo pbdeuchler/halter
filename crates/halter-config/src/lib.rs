@@ -3,6 +3,7 @@
 mod loader;
 mod schema;
 
+pub use halter_protocol::SubagentEventForwarding;
 pub use loader::{
     LayeredConfigPaths, apply_env_overrides, config_fingerprint, expand_path, export_json_schema,
     generate_starter_config, load_layered, load_path, schema_as_json_value,

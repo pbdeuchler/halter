@@ -281,7 +281,7 @@ mod tests {
 
     use halter_protocol::{
         Delivery, ModelId, PendingEvent, Revision, SessionBlueprint, SessionEventPayload,
-        SessionId,
+        SessionId, SubagentEventForwarding,
     };
     use tempfile::tempdir;
 
@@ -293,6 +293,7 @@ mod tests {
             parent_session_id: None,
             default_model: ModelId::from("default"),
             subagent_model: ModelId::from("subagent"),
+            subagent_event_forwarding: SubagentEventForwarding::Off,
             snapshot_revision: Revision::from("rev-1".to_owned()),
             working_dir: PathBuf::from("/tmp/halter-test"),
             system_prompt_seed: Vec::new(),

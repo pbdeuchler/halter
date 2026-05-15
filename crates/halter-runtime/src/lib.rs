@@ -17,6 +17,7 @@ pub use context::{
     CompactionOutcome, ContextManager, DefaultContextManager, resolve_response_chain,
 };
 pub use event_bus::EventBus;
+pub use halter_protocol::SubagentEventForwarding;
 pub use hooks_runtime::{
     ExecutedHookDispatch, HookInvocationContext, run_notification, run_post_compact,
     run_post_tool_use, run_post_tool_use_failure, run_pre_compact, run_pre_tool_use,
@@ -24,6 +25,9 @@ pub use hooks_runtime::{
     run_user_prompt_submit,
 };
 pub use prompt::{DefaultPromptAssembler, PromptAssembler, skill_prompt_segment};
-pub use session::{HalterSession, ResourceHandle, RuntimeServices, SessionInit, SessionRuntime};
+pub use session::{
+    HalterSession, ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit,
+    SessionRuntime,
+};
 pub use trace_recorder::TraceRecorder;
 pub use turn_registry::{ShutdownReport, TurnRegistry, TurnRegistryError};

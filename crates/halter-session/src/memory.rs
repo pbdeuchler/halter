@@ -136,7 +136,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use halter_protocol::{ModelId, ResourceSnapshot, Revision, SessionBlueprint};
+    use halter_protocol::{
+        ModelId, ResourceSnapshot, Revision, SessionBlueprint, SubagentEventForwarding,
+    };
 
     use super::*;
 
@@ -148,6 +150,7 @@ mod tests {
             parent_session_id: None,
             default_model: ModelId::from("default"),
             subagent_model: ModelId::from("subagent"),
+            subagent_event_forwarding: SubagentEventForwarding::Off,
             snapshot_revision: Revision::from("revision-1"),
             working_dir: PathBuf::from("."),
             system_prompt_seed: Vec::new(),
@@ -181,6 +184,7 @@ mod tests {
             parent_session_id: None,
             default_model: ModelId::from("default"),
             subagent_model: ModelId::from("subagent"),
+            subagent_event_forwarding: SubagentEventForwarding::Off,
             snapshot_revision: Revision::from("revision-1"),
             working_dir: PathBuf::from("."),
             system_prompt_seed: Vec::new(),

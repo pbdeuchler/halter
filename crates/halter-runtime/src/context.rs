@@ -403,7 +403,7 @@ mod tests {
     use chrono::Utc;
     use halter_protocol::{
         ModelId, ModelRole, ProviderCapabilities, ProviderKind, ProviderName, ResolvedModel,
-        SessionId, SummarySlice, ToolCallIdPolicy, Usage, UserMessage,
+        SessionId, SubagentEventForwarding, SummarySlice, ToolCallIdPolicy, Usage, UserMessage,
     };
 
     use super::*;
@@ -418,6 +418,7 @@ mod tests {
                     parent_session_id: None,
                     default_model: "default".into(),
                     subagent_model: "subagent".into(),
+                    subagent_event_forwarding: SubagentEventForwarding::Off,
                     snapshot_revision: "r1".into(),
                     working_dir: ".".into(),
                     system_prompt_seed: Vec::new(),

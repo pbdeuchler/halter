@@ -191,6 +191,34 @@ impl fmt::Display for ModelRole {
     }
 }
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentEventForwarding {
+    #[default]
+    Off,
+    All,
+}
+
+impl SubagentEventForwarding {
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -1002,6 +1030,8 @@ pub struct SessionBlueprint {
     pub parent_session_id: Option<SessionId>,
     pub default_model: ModelId,
     pub subagent_model: ModelId,
+    #[serde(default)]
+    pub subagent_event_forwarding: SubagentEventForwarding,
     pub snapshot_revision: Revision,
     pub working_dir: PathBuf,
     pub system_prompt_seed: Vec<PromptSegment>,

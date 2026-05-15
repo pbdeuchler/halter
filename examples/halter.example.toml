@@ -124,3 +124,9 @@ backend = "memory"
 # # one JSON-encoded SessionEvent per line — sufficient for offline debugging
 # # and for a future restore-from-trace feature. Leave commented to disable.
 traces_dir = "~/.halter/traces/"
+
+# # Forward raw committed events from descendant subagent sessions into the
+# # parent turn stream. Defaults to "off"; use "all" for live UI/logging
+# # firehoses. The cap limits forwarded events per parent turn; 0 is unbounded.
+# subagent_event_forwarding = "all"
+# subagent_event_forwarding_cap = 100_000

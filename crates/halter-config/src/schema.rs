@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use halter_protocol::{
     ApiKind, DEFAULT_TEMPERATURE, ProviderKind, PruneSignalThreshold, ReasoningEffort,
+    SubagentEventForwarding,
 };
 use indexmap::IndexMap;
 use schemars::JsonSchema;
@@ -643,7 +644,7 @@ impl SessionsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default)]
@@ -654,6 +655,21 @@ pub struct RuntimeConfig {
     /// enough to debug a run and to rebuild session state offline.
     #[serde(default)]
     pub traces_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub subagent_event_forwarding: SubagentEventForwarding,
+    #[serde(default = "default_subagent_event_forwarding_cap")]
+    pub subagent_event_forwarding_cap: u64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            working_dir: None,
+            traces_dir: None,
+            subagent_event_forwarding: SubagentEventForwarding::Off,
+            subagent_event_forwarding_cap: default_subagent_event_forwarding_cap(),
+        }
+    }
 }
 
 impl RuntimeConfig {
@@ -665,6 +681,10 @@ impl RuntimeConfig {
         }
         Ok(())
     }
+}
+
+const fn default_subagent_event_forwarding_cap() -> u64 {
+    100_000
 }
 
 #[cfg(test)]
@@ -863,6 +883,45 @@ traces_dir = "/tmp/halter/traces"
             Some(PathBuf::from("/tmp/halter/traces"))
         );
         parsed.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn runtime_subagent_event_forwarding_round_trips_through_toml() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[runtime]
+subagent_event_forwarding = "all"
+subagent_event_forwarding_cap = 42
+"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            parsed.runtime.subagent_event_forwarding,
+            SubagentEventForwarding::All
+        );
+        assert_eq!(parsed.runtime.subagent_event_forwarding_cap, 42);
+        parsed.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn runtime_subagent_event_forwarding_defaults_to_off_with_cap() {
+        let runtime = RuntimeConfig::default();
+
+        assert_eq!(
+            runtime.subagent_event_forwarding,
+            SubagentEventForwarding::Off
+        );
+        assert_eq!(runtime.subagent_event_forwarding_cap, 100_000);
     }
 
     #[test]

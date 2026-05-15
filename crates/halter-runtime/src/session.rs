@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -14,9 +14,9 @@ use halter_protocol::{
     HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState, PendingEvent,
     PendingToolCall, PromptSegment, PromptSegmentId, PromptSegmentKind, ProviderError,
     ProviderRequest, ReplayMeta, ResourceSnapshot, SessionBlueprint, SessionEvent,
-    SessionEventPayload, SessionId, SessionState, StopReason, StreamEvent, SystemMessage, ToolCall,
-    ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn, TurnId, Usage,
-    Volatility,
+    SessionEventPayload, SessionId, SessionState, StopReason, StreamEvent, SubagentEventForwarding,
+    SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn,
+    TurnId, Usage, Volatility,
 };
 use halter_providers::ModelRegistry;
 use halter_session::{SessionStore, StoredSession};
@@ -56,7 +56,10 @@ pub struct RuntimeServices {
     pub prompt_assembler: Arc<dyn PromptAssembler>,
     pub context_manager: Arc<dyn ContextManager>,
     pub event_bus: Arc<EventBus>,
+    pub parent_streams: Arc<ParentStreamRegistry>,
     pub turn_registry: Arc<TurnRegistry>,
+    pub subagent_event_forwarding: SubagentEventForwarding,
+    pub subagent_event_forwarding_cap: u64,
     pub shell_timeout_secs: u64,
     /// Optional sink that mirrors every committed `SessionEvent` into a
     /// per-session JSONL trace file. Disabled (`None`) when
@@ -131,6 +134,7 @@ pub struct SessionInit {
     pub max_turns: Option<u32>,
     pub default_model: Option<ModelId>,
     pub subagent_model: Option<ModelId>,
+    pub subagent_event_forwarding: Option<SubagentEventForwarding>,
     pub subagent_depth: u32,
 }
 
@@ -144,6 +148,7 @@ impl Default for SessionInit {
             max_turns: None,
             default_model: None,
             subagent_model: None,
+            subagent_event_forwarding: None,
             subagent_depth: 0,
         }
     }
@@ -159,6 +164,12 @@ impl SessionInit {
     #[must_use]
     pub fn with_subagent_model(mut self, model: impl Into<ModelId>) -> Self {
         self.subagent_model = Some(model.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_subagent_event_forwarding(mut self, mode: SubagentEventForwarding) -> Self {
+        self.subagent_event_forwarding = Some(mode);
         self
     }
 }
@@ -239,19 +250,159 @@ impl ToolEventDrain {
 #[derive(Clone)]
 struct LiveTurnStream {
     tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>,
+    forwarded_event_cap: Option<u64>,
+    forwarded_state: Arc<Mutex<ForwardedEventState>>,
+}
+
+#[derive(Debug, Default)]
+struct ForwardedEventState {
+    forwarded_events: u64,
+    capped: bool,
 }
 
 impl LiveTurnStream {
-    fn new(tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>) -> Self {
-        Self { tx }
+    fn new(tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>, cap: u64) -> Self {
+        Self {
+            tx,
+            forwarded_event_cap: (cap > 0).then_some(cap),
+            forwarded_state: Arc::new(Mutex::new(ForwardedEventState::default())),
+        }
     }
 
     fn emit_committed(&self, event: SessionEvent) {
         let _ = self.tx.send(Ok(event));
     }
 
+    fn emit_forwarded(&self, event: SessionEvent) {
+        let should_send_lagged = {
+            let mut state = self
+                .forwarded_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.capped {
+                return;
+            }
+            if let Some(cap) = self.forwarded_event_cap
+                && state.forwarded_events >= cap
+            {
+                state.capped = true;
+                true
+            } else {
+                state.forwarded_events = state.forwarded_events.saturating_add(1);
+                false
+            }
+        };
+
+        if should_send_lagged {
+            let _ = self.tx.send(Ok(forwarding_lagged_event()));
+            return;
+        }
+
+        let _ = self.tx.send(Ok(event));
+    }
+
     fn emit_error(&self, error: anyhow::Error) {
         let _ = self.tx.send(Err(error));
+    }
+}
+
+fn forwarding_lagged_event() -> SessionEvent {
+    PendingEvent::new(
+        SessionId::from(crate::event_bus::BUS_SESSION_ID),
+        Delivery::BestEffort,
+        SessionEventPayload::Lagged { dropped_events: 1 },
+    )
+    .into_committed(0)
+}
+
+#[derive(Default)]
+pub struct ParentStreamRegistry {
+    active: Mutex<HashMap<SessionId, Vec<Weak<LiveTurnStream>>>>,
+}
+
+impl ParentStreamRegistry {
+    fn register(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        stream: &Arc<LiveTurnStream>,
+    ) -> ParentStreamRegistration {
+        let weak = Arc::downgrade(stream);
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active
+            .entry(session_id.clone())
+            .or_default()
+            .push(weak.clone());
+        ParentStreamRegistration {
+            registry: self.clone(),
+            session_id,
+            stream: weak,
+        }
+    }
+
+    fn forward_to_ancestors(&self, ancestors: &[SessionId], event: &SessionEvent) {
+        if ancestors.is_empty() {
+            return;
+        }
+
+        let streams = {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut streams = Vec::new();
+            let mut empty_keys = Vec::new();
+            for ancestor in ancestors {
+                if let Some(entries) = active.get_mut(ancestor) {
+                    entries.retain(|entry| {
+                        if let Some(stream) = entry.upgrade() {
+                            streams.push(stream);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if entries.is_empty() {
+                        empty_keys.push(ancestor.clone());
+                    }
+                }
+            }
+            for key in empty_keys {
+                active.remove(&key);
+            }
+            streams
+        };
+
+        for stream in streams {
+            stream.emit_forwarded(event.clone());
+        }
+    }
+
+    fn deregister(&self, session_id: &SessionId, stream: &Weak<LiveTurnStream>) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entries) = active.get_mut(session_id) {
+            entries.retain(|entry| !Weak::ptr_eq(entry, stream) && entry.strong_count() > 0);
+            if entries.is_empty() {
+                active.remove(session_id);
+            }
+        }
+    }
+}
+
+struct ParentStreamRegistration {
+    registry: Arc<ParentStreamRegistry>,
+    session_id: SessionId,
+    stream: Weak<LiveTurnStream>,
+}
+
+impl Drop for ParentStreamRegistration {
+    fn drop(&mut self) {
+        self.registry.deregister(&self.session_id, &self.stream);
     }
 }
 
@@ -426,7 +577,19 @@ impl SessionHandle {
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let live = LiveTurnStream::new(tx);
+        let live = Arc::new(LiveTurnStream::new(
+            tx,
+            self.services.subagent_event_forwarding_cap,
+        ));
+        let parent_stream_registration = stored
+            .blueprint
+            .subagent_event_forwarding
+            .is_enabled()
+            .then(|| {
+                self.services
+                    .parent_streams
+                    .register(self.session_id.clone(), &live)
+            });
         let session = self.clone();
 
         let registry = session.services.turn_registry.clone();
@@ -449,6 +612,7 @@ impl SessionHandle {
                 registry: registry.clone(),
                 turn_id: turn_id_for_dereg,
             };
+            let _parent_stream_registration = parent_stream_registration;
 
             match session.run_turn(stored, turn.clone(), task_cancel).await {
                 Ok(turn_commit) => {
@@ -457,7 +621,7 @@ impl SessionHandle {
                             Some(turn_commit.snapshot),
                             Some(turn_commit.state),
                             turn_commit.events,
-                            Some(&live),
+                            Some(live.as_ref()),
                         )
                         .await
                     {
@@ -494,7 +658,12 @@ impl SessionHandle {
                         }),
                     ];
                     if let Err(commit_error) = session
-                        .commit_and_publish(Some(turn_snapshot), None, failure_events, Some(&live))
+                        .commit_and_publish(
+                            Some(turn_snapshot),
+                            None,
+                            failure_events,
+                            Some(live.as_ref()),
+                        )
                         .await
                     {
                         error!(
@@ -1229,6 +1398,8 @@ impl SessionHandle {
             .sessions
             .commit(&self.session_id, snapshot, None, state, events)
             .await?;
+        let forwarding_ancestors =
+            forwarding_ancestors_for_session(&self.services, &self.session_id).await;
         // Single commit-then-publish point. Events fan out to both sinks, but
         // only *after* the store has assigned monotonic sequences; there is no
         // pre-commit emission path that could race with the real sequence or
@@ -1237,6 +1408,9 @@ impl SessionHandle {
             if let Some(live) = live {
                 live.emit_committed(event.clone());
             }
+            self.services
+                .parent_streams
+                .forward_to_ancestors(&forwarding_ancestors, event);
             self.services.event_bus.publish(event.clone());
             if let Some(recorder) = &self.services.trace_recorder {
                 recorder.record(event);
@@ -1632,6 +1806,73 @@ fn tool_result_from_hook_value(value: serde_json::Value) -> ToolResult {
     }
 }
 
+async fn forwarding_ancestors_for_session(
+    services: &Arc<RuntimeServices>,
+    session_id: &SessionId,
+) -> Vec<SessionId> {
+    let stored = match services.sessions.load_session(session_id).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to load session for subagent event forwarding"
+            );
+            return Vec::new();
+        }
+    };
+
+    forwarding_ancestors_for_blueprint(services, &stored.blueprint).await
+}
+
+async fn forwarding_ancestors_for_blueprint(
+    services: &Arc<RuntimeServices>,
+    blueprint: &SessionBlueprint,
+) -> Vec<SessionId> {
+    if !blueprint.subagent_event_forwarding.is_enabled() {
+        return Vec::new();
+    }
+
+    let mut ancestors = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut next = blueprint.parent_session_id.clone();
+    while let Some(session_id) = next {
+        if !seen.insert(session_id.clone()) {
+            warn!(
+                session_id = %blueprint.session_id,
+                ancestor_session_id = %session_id,
+                "stopped subagent event forwarding ancestor walk at cycle"
+            );
+            break;
+        }
+
+        ancestors.push(session_id.clone());
+        next = match services.sessions.load_session(&session_id).await {
+            Ok(Some(stored)) => stored.blueprint.parent_session_id,
+            Ok(None) => {
+                warn!(
+                    session_id = %blueprint.session_id,
+                    ancestor_session_id = %session_id,
+                    "stopped subagent event forwarding ancestor walk at missing parent"
+                );
+                break;
+            }
+            Err(error) => {
+                warn!(
+                    session_id = %blueprint.session_id,
+                    ancestor_session_id = %session_id,
+                    error = %error,
+                    "stopped subagent event forwarding ancestor walk after load failure"
+                );
+                break;
+            }
+        };
+    }
+
+    ancestors
+}
+
 pub(crate) async fn create_session_seeded(
     services: Arc<RuntimeServices>,
     init: SessionInit,
@@ -1649,11 +1890,15 @@ pub(crate) async fn create_session_seeded(
     services.models.model(&selected_models.default_model)?;
     services.models.model(&selected_models.subagent_model)?;
     let session_id = init.session_id.unwrap_or_default();
+    let subagent_event_forwarding = init
+        .subagent_event_forwarding
+        .unwrap_or(services.subagent_event_forwarding);
     let blueprint = SessionBlueprint {
         session_id: session_id.clone(),
         parent_session_id: init.parent_session_id,
         default_model: selected_models.default_model,
         subagent_model: selected_models.subagent_model,
+        subagent_event_forwarding,
         snapshot_revision: snapshot.revision.clone(),
         working_dir: init.working_dir,
         system_prompt_seed: init.system_prompt_seed,
@@ -1664,6 +1909,7 @@ pub(crate) async fn create_session_seeded(
         session_id = %session_id,
         default_model = %blueprint.default_model,
         subagent_model = %blueprint.subagent_model,
+        subagent_event_forwarding = ?blueprint.subagent_event_forwarding,
         working_dir = %blueprint.working_dir.display(),
         snapshot_revision = %blueprint.snapshot_revision,
         "created session blueprint"
@@ -1703,10 +1949,14 @@ pub(crate) async fn create_session_seeded(
         .sessions
         .commit(&session_id, None, None, None, vec![started])
         .await?;
+    let forwarding_ancestors = forwarding_ancestors_for_blueprint(&services, &blueprint).await;
     for event in committed {
         if let Some(recorder) = &services.trace_recorder {
             recorder.record(&event);
         }
+        services
+            .parent_streams
+            .forward_to_ancestors(&forwarding_ancestors, &event);
         services.event_bus.publish(event);
     }
 
@@ -1891,7 +2141,10 @@ impl Default for RuntimeServices {
             prompt_assembler: Arc::new(crate::DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::default()),
             event_bus: Arc::new(EventBus::default()),
+            parent_streams: Arc::new(ParentStreamRegistry::default()),
             turn_registry: Arc::new(TurnRegistry::new()),
+            subagent_event_forwarding: SubagentEventForwarding::Off,
+            subagent_event_forwarding_cap: 100_000,
             shell_timeout_secs: 30,
             trace_recorder: None,
         }
@@ -1918,6 +2171,7 @@ mod tests {
     use halter_providers::{FakeProvider, Provider};
     use halter_tools::{
         DefaultToolPolicy, PolicySettings, Tool, ToolContext, register_builtin_tools,
+        register_subagent_tools,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -1950,12 +2204,12 @@ mod tests {
     fn dropping_temporary_session_handle_does_not_close_trace_writer() {
         use halter_protocol::{
             Delivery, ModelId, PendingEvent, Revision, SessionBlueprint, SessionEventPayload,
-            SessionId,
+            SessionId, SubagentEventForwarding,
         };
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let recorder = Arc::new(crate::TraceRecorder::open(temp.path().to_path_buf())
-            .expect("recorder"));
+        let recorder =
+            Arc::new(crate::TraceRecorder::open(temp.path().to_path_buf()).expect("recorder"));
         let mut services = RuntimeServices::default();
         services.trace_recorder = Some(recorder.clone());
         let services = Arc::new(services);
@@ -1966,6 +2220,7 @@ mod tests {
             parent_session_id: None,
             default_model: ModelId::from("default"),
             subagent_model: ModelId::from("subagent"),
+            subagent_event_forwarding: SubagentEventForwarding::Off,
             snapshot_revision: Revision::from("rev-1".to_owned()),
             working_dir: temp.path().to_path_buf(),
             system_prompt_seed: Vec::new(),
@@ -1983,8 +2238,8 @@ mod tests {
         let primary =
             HalterSession::new(services.clone(), session_id.clone()).expect("primary handle");
         {
-            let _temporary = HalterSession::new(services.clone(), session_id.clone())
-                .expect("temporary handle");
+            let _temporary =
+                HalterSession::new(services.clone(), session_id.clone()).expect("temporary handle");
         } // drop the temporary here
 
         // Recording must still land in the trace file: the primary handle
@@ -2234,7 +2489,7 @@ mod tests {
         use halter_hooks::{HookRegistrySource, Hooks, HooksFile};
         use halter_protocol::{
             ApiKind, ModelId, ModelRole, PluginId, ProviderKind, ProviderName, ResolvedModel,
-            ResourceSnapshot,
+            ResourceSnapshot, SubagentEventForwarding,
         };
         use halter_providers::Provider;
         use halter_tools::{DefaultToolPolicy, PolicySettings};
@@ -2244,6 +2499,36 @@ mod tests {
         pub(super) fn configured_services(
             provider: Arc<dyn Provider>,
             working_dir: &Path,
+        ) -> Arc<RuntimeServices> {
+            configured_services_with_runtime(
+                provider,
+                working_dir,
+                SubagentEventForwarding::Off,
+                100_000,
+            )
+        }
+
+        pub(super) fn configured_services_with_runtime(
+            provider: Arc<dyn Provider>,
+            working_dir: &Path,
+            subagent_event_forwarding: SubagentEventForwarding,
+            subagent_event_forwarding_cap: u64,
+        ) -> Arc<RuntimeServices> {
+            configured_services_with_runtime_and_trace(
+                provider,
+                working_dir,
+                subagent_event_forwarding,
+                subagent_event_forwarding_cap,
+                None,
+            )
+        }
+
+        pub(super) fn configured_services_with_runtime_and_trace(
+            provider: Arc<dyn Provider>,
+            working_dir: &Path,
+            subagent_event_forwarding: SubagentEventForwarding,
+            subagent_event_forwarding_cap: u64,
+            trace_recorder: Option<Arc<crate::TraceRecorder>>,
         ) -> Arc<RuntimeServices> {
             let mut services = RuntimeServices::default();
             let mut models = ModelRegistry::new();
@@ -2289,6 +2574,9 @@ mod tests {
                 allowed_write_roots: vec![working_dir.to_path_buf()],
                 ..PolicySettings::default()
             }));
+            services.subagent_event_forwarding = subagent_event_forwarding;
+            services.subagent_event_forwarding_cap = subagent_event_forwarding_cap;
+            services.trace_recorder = trace_recorder;
             Arc::new(services)
         }
 
@@ -3219,11 +3507,285 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn subagent_event_forwarding_defaults_off() {
+        let (parent_id, events) =
+            run_subagent_firehose_turn(SubagentEventForwarding::Off, None, 100_000, "single").await;
+
+        assert!(
+            events.iter().all(|event| event.session_id == parent_id),
+            "default-off parent stream should contain only parent session events: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn traces_record_subagent_events_when_forwarding_is_off() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let traces_dir = temp.path().join("traces");
+        let trace_recorder =
+            Arc::new(crate::TraceRecorder::open(traces_dir.clone()).expect("trace recorder"));
+        let provider = Arc::new(SubagentFirehoseProvider::default());
+        let services = test_support::configured_services_with_runtime_and_trace(
+            provider,
+            temp.path(),
+            SubagentEventForwarding::Off,
+            100_000,
+            Some(trace_recorder.clone()),
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        install_subagent_tools(&runtime, &services);
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+        let parent_id = session.session_id().clone();
+
+        let events = session
+            .submit_turn(Turn::user("single"))
+            .await
+            .expect("turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("events");
+        assert!(
+            events.iter().all(|event| event.session_id == parent_id),
+            "forwarding is off, so live stream should stay parent-only: {events:?}"
+        );
+
+        trace_recorder.close_session(&parent_id);
+        let contents = std::fs::read_to_string(traces_dir.join(format!("{}.txt", parent_id.0)))
+            .expect("read trace");
+        let lines = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            lines.iter().any(|line| {
+                line.get("kind").and_then(serde_json::Value::as_str) == Some("subagent_header")
+            }),
+            "trace should include a subagent header even when forwarding is off:\n{contents}"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.get("sequence").is_some()
+                    && line.get("session_id").and_then(serde_json::Value::as_str)
+                        != Some(parent_id.0.as_str())
+                    && line
+                        .pointer("/payload/kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("delta_item")
+                    && line
+                        .pointer("/payload/delta/text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|text| text.contains("child done"))
+            }),
+            "trace should include committed subagent delta events even when forwarding is off:\n{contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_event_forwarding_includes_single_level_events() {
+        let (parent_id, events) =
+            run_subagent_firehose_turn(SubagentEventForwarding::All, None, 100_000, "single").await;
+
+        assert!(
+            events.iter().any(|event| event.session_id == parent_id),
+            "parent events should still be present"
+        );
+        assert!(
+            forwarded_events(&events, &parent_id)
+                .iter()
+                .any(|event| event_has_delta_text(event, "child done")),
+            "parent stream should include child session deltas: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_event_forwarding_includes_recursive_events() {
+        let (parent_id, events) =
+            run_subagent_firehose_turn(SubagentEventForwarding::All, None, 100_000, "recursive")
+                .await;
+        let forwarded = forwarded_events(&events, &parent_id);
+        let forwarded_session_ids = forwarded
+            .iter()
+            .map(|event| event.session_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert!(
+            forwarded_session_ids.len() >= 2,
+            "recursive forwarding should include child and grandchild sessions: {events:?}"
+        );
+        assert!(
+            forwarded
+                .iter()
+                .any(|event| event_has_delta_text(event, "grandchild done")),
+            "top-level stream should include grandchild deltas: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_init_can_override_subagent_event_forwarding() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(SubagentFirehoseProvider::default());
+        let services = test_support::configured_services_with_runtime(
+            provider,
+            temp.path(),
+            SubagentEventForwarding::Off,
+            100_000,
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        install_subagent_tools(&runtime, &services);
+
+        let enabled_session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                subagent_event_forwarding: Some(SubagentEventForwarding::All),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("enabled session");
+        let enabled_parent_id = enabled_session.session_id().clone();
+        let enabled_events = enabled_session
+            .submit_turn(Turn::user("single"))
+            .await
+            .expect("enabled turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("enabled events");
+
+        let default_session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("default session");
+        let default_parent_id = default_session.session_id().clone();
+        let default_events = default_session
+            .submit_turn(Turn::user("single"))
+            .await
+            .expect("default turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("default events");
+
+        assert!(
+            !forwarded_events(&enabled_events, &enabled_parent_id).is_empty(),
+            "per-session override should enable forwarding"
+        );
+        assert!(
+            forwarded_events(&default_events, &default_parent_id).is_empty(),
+            "harness default off should still apply to other sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_event_forwarding_cap_emits_lagged_and_stops_forwarding() {
+        let (parent_id, events) =
+            run_subagent_firehose_turn(SubagentEventForwarding::All, None, 2, "many child events")
+                .await;
+
+        assert!(
+            events.iter().any(|event| {
+                event.session_id.0 == crate::event_bus::BUS_SESSION_ID
+                    && matches!(
+                        event.payload,
+                        SessionEventPayload::Lagged { dropped_events: 1 }
+                    )
+            }),
+            "cap should emit a synthetic lagged event: {events:?}"
+        );
+        assert_eq!(
+            forwarded_events(&events, &parent_id).len(),
+            2,
+            "forwarded child events should stop at the configured cap: {events:?}"
+        );
+    }
+
+    async fn run_subagent_firehose_turn(
+        default_forwarding: SubagentEventForwarding,
+        session_forwarding: Option<SubagentEventForwarding>,
+        cap: u64,
+        prompt: &str,
+    ) -> (SessionId, Vec<SessionEvent>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(SubagentFirehoseProvider::default());
+        let services = test_support::configured_services_with_runtime(
+            provider,
+            temp.path(),
+            default_forwarding,
+            cap,
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        install_subagent_tools(&runtime, &services);
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                subagent_event_forwarding: session_forwarding,
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+        let parent_id = session.session_id().clone();
+        let events = session
+            .submit_turn(Turn::user(prompt))
+            .await
+            .expect("turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("events");
+        (parent_id, events)
+    }
+
+    fn install_subagent_tools(runtime: &SessionRuntime, services: &Arc<RuntimeServices>) {
+        let snapshot = services.resources.snapshot();
+        let available_model_ids = services
+            .models
+            .model_ids()
+            .into_iter()
+            .map(|model_id| model_id.0)
+            .collect::<Vec<_>>();
+        register_subagent_tools(
+            &services.tools,
+            runtime.subagent_control(),
+            &[],
+            snapshot.as_ref(),
+            &available_model_ids,
+        );
+    }
+
+    fn forwarded_events<'a>(
+        events: &'a [SessionEvent],
+        parent_id: &SessionId,
+    ) -> Vec<&'a SessionEvent> {
+        events
+            .iter()
+            .filter(|event| {
+                &event.session_id != parent_id
+                    && event.session_id.0 != crate::event_bus::BUS_SESSION_ID
+            })
+            .collect()
+    }
+
+    fn event_has_delta_text(event: &SessionEvent, needle: &str) -> bool {
+        matches!(
+            &event.payload,
+            SessionEventPayload::DeltaItem { delta } if delta.text.contains(needle)
+        )
+    }
+
     #[derive(Debug)]
     struct ToolLoopProvider;
 
     #[derive(Debug)]
     struct DuplicateToolCallProvider;
+
+    #[derive(Debug, Default)]
+    struct SubagentFirehoseProvider;
 
     #[derive(Debug)]
     struct JsonHookProvider {
@@ -3295,6 +3857,183 @@ mod tests {
             ])
             .boxed())
         }
+    }
+
+    #[async_trait]
+    impl Provider for SubagentFirehoseProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            let latest_user_text = latest_user_text(&request.messages);
+            let has_wait_response = has_wait_response(&request.messages);
+            let latest_agent_id = latest_spawn_agent_id(&request.messages);
+
+            if request.model.id.0 == "subagent" {
+                if latest_user_text.contains("spawn grandchild") {
+                    if has_wait_response {
+                        return Ok(text_stream(vec!["child done"]));
+                    }
+                    if let Some(agent_id) = latest_agent_id {
+                        return Ok(tool_call_stream(
+                            "wait_agent",
+                            json!({ "targets": [agent_id], "timeout_ms": 5_000 }),
+                        ));
+                    }
+                    return Ok(tool_call_stream(
+                        "spawn_agent",
+                        json!({ "message": "grandchild task", "fork_context": false }),
+                    ));
+                }
+
+                if latest_user_text.contains("grandchild") {
+                    return Ok(text_stream(vec!["grandchild done"]));
+                }
+                if latest_user_text.contains("many child events") {
+                    return Ok(text_stream(vec![
+                        "child ", "done ", "with ", "many ", "events",
+                    ]));
+                }
+                return Ok(text_stream(vec!["child done"]));
+            }
+
+            if has_wait_response {
+                return Ok(text_stream(vec!["parent done"]));
+            }
+            if let Some(agent_id) = latest_agent_id {
+                return Ok(tool_call_stream(
+                    "wait_agent",
+                    json!({ "targets": [agent_id], "timeout_ms": 5_000 }),
+                ));
+            }
+
+            let child_task = if latest_user_text.contains("recursive") {
+                "spawn grandchild"
+            } else if latest_user_text.contains("many child events") {
+                "many child events"
+            } else {
+                "child task"
+            };
+            Ok(tool_call_stream(
+                "spawn_agent",
+                json!({ "message": child_task, "fork_context": false }),
+            ))
+        }
+    }
+
+    fn latest_user_text(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User(user) => Some(user.plain_text()),
+                Message::System(_) | Message::Assistant(_) | Message::Tool(_) => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn latest_spawn_agent_id(messages: &[Message]) -> Option<String> {
+        messages.iter().rev().find_map(|message| match message {
+            Message::Tool(tool) => match &tool.content {
+                ToolResult::Json { value } => value
+                    .get("agent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                ToolResult::Empty | ToolResult::Text { .. } => None,
+            },
+            Message::System(_) | Message::User(_) | Message::Assistant(_) => None,
+        })
+    }
+
+    fn has_wait_response(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::Tool(tool)
+                    if matches!(&tool.content, ToolResult::Json { value } if value.get("timed_out").is_some())
+            )
+        })
+    }
+
+    fn text_stream(
+        chunks: Vec<&'static str>,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        let message_id = halter_protocol::MessageId::new();
+        let block_id = BlockId::new();
+        let mut events = vec![
+            Ok(StreamEvent::MessageStart {
+                id: message_id.clone(),
+            }),
+            Ok(StreamEvent::TextStart {
+                id: block_id.clone(),
+            }),
+        ];
+        for chunk in chunks {
+            events.push(Ok(StreamEvent::TextDelta {
+                id: block_id.clone(),
+                delta: chunk.to_owned(),
+            }));
+        }
+        events.extend([
+            Ok(StreamEvent::TextEnd { id: block_id }),
+            Ok(StreamEvent::UsageUpdate {
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+            }),
+            Ok(StreamEvent::MessageEnd {
+                id: message_id,
+                stop_reason: StopReason::EndTurn,
+                response_id: None,
+            }),
+        ]);
+        stream::iter(events).boxed()
+    }
+
+    fn tool_call_stream(
+        name: &'static str,
+        arguments: serde_json::Value,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        let message_id = halter_protocol::MessageId::new();
+        let block_id = BlockId::new();
+        let tool_call_id = ToolCallId::new();
+        stream::iter(vec![
+            Ok(StreamEvent::MessageStart {
+                id: message_id.clone(),
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                id: block_id.clone(),
+                tool_call_id,
+                name: ToolName::from(name),
+            }),
+            Ok(StreamEvent::ToolArgsDelta {
+                id: block_id.clone(),
+                delta: arguments.to_string(),
+            }),
+            Ok(StreamEvent::ToolCallEnd { id: block_id }),
+            Ok(StreamEvent::UsageUpdate {
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+            }),
+            Ok(StreamEvent::MessageEnd {
+                id: message_id,
+                stop_reason: StopReason::ToolUse,
+                response_id: None,
+            }),
+        ])
+        .boxed()
     }
 
     #[async_trait]

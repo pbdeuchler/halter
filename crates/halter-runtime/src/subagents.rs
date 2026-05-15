@@ -233,12 +233,17 @@ impl RuntimeSubagentControl {
                     error: None,
                 };
             }
+            let own_turn_events = turn_events
+                .iter()
+                .filter(|event| event.session_id == session_id)
+                .cloned()
+                .collect::<Vec<_>>();
 
             let Some(parent_session_id) = parent_session_id.as_ref() else {
                 break TurnOutcome {
                     state: SubagentState::Completed,
-                    last_message: extract_subagent_output(&turn_events),
-                    usage: extract_subagent_usage(&turn_events),
+                    last_message: extract_subagent_output(&own_turn_events),
+                    usage: extract_subagent_usage(&own_turn_events),
                     error: None,
                 };
             };
@@ -270,8 +275,8 @@ impl RuntimeSubagentControl {
 
             break TurnOutcome {
                 state: SubagentState::Completed,
-                last_message: extract_subagent_output(&turn_events),
-                usage: extract_subagent_usage(&turn_events),
+                last_message: extract_subagent_output(&own_turn_events),
+                usage: extract_subagent_usage(&own_turn_events),
                 error: None,
             };
         };
@@ -910,7 +915,10 @@ mod tests {
             prompt_assembler: Arc::new(DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager::default()),
             event_bus: Arc::new(EventBus::default()),
+            parent_streams: Arc::new(crate::ParentStreamRegistry::default()),
             turn_registry: Arc::new(crate::TurnRegistry::new()),
+            subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
+            subagent_event_forwarding_cap: 100_000,
             shell_timeout_secs: 30,
             trace_recorder: None,
         })
@@ -923,6 +931,7 @@ mod tests {
                 parent_session_id: None,
                 default_model: ModelId::from("default"),
                 subagent_model: ModelId::from("subagent"),
+                subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
                 snapshot_revision: halter_protocol::Revision::from("revision"),
                 working_dir: ".".into(),
                 system_prompt_seed: Vec::new(),

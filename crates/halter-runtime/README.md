@@ -115,22 +115,18 @@ Fields include:
 - `max_turns`
 - `default_model`
 - `subagent_model`
+- `subagent_event_forwarding`
 - `subagent_depth`
 
 ### Typical use
 
 ```rust
-use halter_runtime::SessionInit;
+use halter_runtime::{SessionInit, SubagentEventForwarding};
 
 let init = SessionInit {
-    session_id: None,
-    parent_session_id: None,
-    working_dir: Some(std::env::current_dir()?),
-    system_prompt_seed: None,
-    max_turns: None,
-    default_model: None,
-    subagent_model: None,
-    subagent_depth: 0,
+    working_dir: std::env::current_dir()?,
+    subagent_event_forwarding: Some(SubagentEventForwarding::All),
+    ..SessionInit::default()
 };
 ```
 
@@ -442,6 +438,8 @@ If your session needs compaction but the provider does not support it, compactio
 ### Event backpressure
 
 If subscribers are slow, `EventBus` can drop events depending on capacity and downstream behavior.
+
+The per-turn stream can also include subagent events when `subagent_event_forwarding` is enabled for the session. Forwarded events keep the child `session_id`; the configured forwarding cap emits a synthetic `Lagged` event and stops forwarding for that parent turn when exceeded.
 
 ### Persistence conflicts
 

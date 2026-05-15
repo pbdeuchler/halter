@@ -870,11 +870,14 @@ async fn run_agent(
         prompt_assembler: sess.services().prompt_assembler.clone(),
         context_manager: sess.services().context_manager.clone(),
         event_bus: sess.services().event_bus.clone(),
+        parent_streams: Arc::new(crate::ParentStreamRegistry::default()),
         // Hook-spawned agents get their own (isolated) turn registry so
         // that draining the parent runtime does not race with cooperative
         // hook agent shutdown. The hook agent's own session lifecycle
         // governs when its turns drain.
         turn_registry: Arc::new(crate::TurnRegistry::new()),
+        subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
+        subagent_event_forwarding_cap: sess.services().subagent_event_forwarding_cap,
         shell_timeout_secs: sess.services().shell_timeout_secs,
         trace_recorder: sess.services().trace_recorder.clone(),
     });
@@ -893,6 +896,7 @@ async fn run_agent(
         max_turns: config.max_turns,
         default_model: Some(model.id.clone()),
         subagent_model: Some(sess.services().models.subagent_model()?.id),
+        subagent_event_forwarding: Some(halter_protocol::SubagentEventForwarding::Off),
         subagent_depth: 0,
     };
     let initial_state = SessionState::default();

@@ -380,9 +380,14 @@ Current runtime-specific config surface:
 ```toml
 [runtime]
 working_dir = "/path/to/project"
+traces_dir = "/tmp/halter/traces"
+subagent_event_forwarding = "off"
+subagent_event_forwarding_cap = 100_000
 ```
 
-The schema is intentionally small today. Most runtime behavior is inferred from session initialization and policy.
+`subagent_event_forwarding` defaults to `"off"`. Set it to `"all"` when the caller consuming a parent turn stream also needs raw committed events from subagents spawned under that parent. Forwarded events keep their source `session_id`; consumers must filter by session when attributing tool calls or messages.
+
+`subagent_event_forwarding_cap` limits forwarded subagent events per parent turn. The default is `100_000`; `0` disables the cap.
 
 ---
 

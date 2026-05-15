@@ -207,7 +207,10 @@ impl HalterBuilder {
                 config.context.prune_signal_threshold,
             )),
             event_bus: Arc::new(EventBus::default()),
+            parent_streams: Arc::new(halter_runtime::ParentStreamRegistry::default()),
             turn_registry: Arc::new(halter_runtime::TurnRegistry::new()),
+            subagent_event_forwarding: config.runtime.subagent_event_forwarding,
+            subagent_event_forwarding_cap: config.runtime.subagent_event_forwarding_cap,
             shell_timeout_secs: config.policy.shell.timeout_secs,
             trace_recorder,
         });

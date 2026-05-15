@@ -36,6 +36,7 @@ pub fn build_subagent_session_init(
                 .unwrap_or_else(|| parent.subagent_model.clone()),
         ),
         subagent_model: Some(parent.subagent_model.clone()),
+        subagent_event_forwarding: Some(parent.blueprint.subagent_event_forwarding),
         subagent_depth: parent.blueprint.subagent_depth + 1,
     })
 }
@@ -158,7 +159,7 @@ mod tests {
     use super::*;
     use halter_protocol::{
         AgentDef, AgentId, MessageId, PromptSegment, Revision, SessionBlueprint, SessionEvent,
-        SessionEventPayload,
+        SessionEventPayload, SubagentEventForwarding,
     };
 
     #[test]
@@ -169,6 +170,7 @@ mod tests {
                 parent_session_id: None,
                 default_model: "default".into(),
                 subagent_model: "subagent".into(),
+                subagent_event_forwarding: SubagentEventForwarding::Off,
                 snapshot_revision: Revision::from("revision"),
                 working_dir: ".".into(),
                 system_prompt_seed: Vec::new(),
@@ -214,6 +216,7 @@ mod tests {
                 parent_session_id: None,
                 default_model: "default".into(),
                 subagent_model: "subagent".into(),
+                subagent_event_forwarding: SubagentEventForwarding::All,
                 snapshot_revision: Revision::from("revision"),
                 working_dir: ".".into(),
                 system_prompt_seed: vec![PromptSegment {
@@ -246,6 +249,10 @@ mod tests {
 
         assert_eq!(init.default_model, Some("custom".into()));
         assert_eq!(init.subagent_model, Some("subagent".into()));
+        assert_eq!(
+            init.subagent_event_forwarding,
+            Some(SubagentEventForwarding::All)
+        );
         assert_eq!(init.subagent_depth, 2);
         assert_eq!(init.system_prompt_seed.len(), 2);
         assert_eq!(init.system_prompt_seed[1].text, "specialized helper prompt");
@@ -268,6 +275,7 @@ mod tests {
                 parent_session_id: None,
                 default_model: "default".into(),
                 subagent_model: "subagent".into(),
+                subagent_event_forwarding: SubagentEventForwarding::Off,
                 snapshot_revision: Revision::from("revision"),
                 working_dir: ".".into(),
                 system_prompt_seed: Vec::new(),

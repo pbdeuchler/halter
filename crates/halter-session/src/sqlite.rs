@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use halter_protocol::{
     Delivery, PendingEvent, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload,
-    SessionId, SessionState,
+    SessionId, SessionState, SubagentEventForwarding,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use tracing::{debug, info};
@@ -1096,6 +1096,7 @@ mod tests {
             parent_session_id: None,
             default_model: ModelId::from("default"),
             subagent_model: ModelId::from("subagent"),
+            subagent_event_forwarding: SubagentEventForwarding::Off,
             snapshot_revision: snapshot.revision.clone(),
             working_dir: PathBuf::from(format!("/tmp/{name}")),
             system_prompt_seed: vec![PromptSegment {

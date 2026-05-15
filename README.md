@@ -142,6 +142,12 @@ backend = "memory"
 # into this directory: one header line followed by every committed SessionEvent.
 # Useful for offline debugging and for restoring session state from disk.
 # traces_dir = "/tmp/halter/traces"
+
+# Optional. Keep off unless the caller wants the parent turn stream to include
+# raw events from subagents spawned under that parent.
+# subagent_event_forwarding = "off"
+# subagent_event_forwarding = "all"
+# subagent_event_forwarding_cap = 100_000 # 0 = unbounded
 ```
 
 You can derive this from `examples/halter.example.toml` and tailor it to your environment.
@@ -676,6 +682,7 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
         },
         runtime: RuntimeConfig {
             working_dir: Some(working_dir),
+            ..RuntimeConfig::default()
         },
     })
 }

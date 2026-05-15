@@ -359,8 +359,8 @@ mod tests {
     use async_trait::async_trait;
     use halter_protocol::{
         AgentId, AgentName, CloseSubagentResponse, ModelId, ResourceSnapshot, SessionBlueprint,
-        SessionId, SessionState, SpawnSubagentRequest, SubagentState, SubagentStatus,
-        WaitSubagentRequest, WaitSubagentResponse,
+        SessionId, SessionState, SpawnSubagentRequest, SubagentEventForwarding, SubagentState,
+        SubagentStatus, WaitSubagentRequest, WaitSubagentResponse,
     };
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
@@ -443,6 +443,7 @@ mod tests {
                     parent_session_id: None,
                     default_model: ModelId::from("default"),
                     subagent_model: ModelId::from("subagent"),
+                    subagent_event_forwarding: SubagentEventForwarding::Off,
                     snapshot_revision: "revision".into(),
                     working_dir: ".".into(),
                     system_prompt_seed: Vec::new(),
@@ -534,6 +535,7 @@ mod tests {
                     parent_session_id: None,
                     default_model: ModelId::from("default"),
                     subagent_model: ModelId::from("subagent"),
+                    subagent_event_forwarding: SubagentEventForwarding::Off,
                     snapshot_revision: "revision".into(),
                     working_dir: ".".into(),
                     system_prompt_seed: Vec::new(),
@@ -590,6 +592,7 @@ mod tests {
                     parent_session_id: None,
                     default_model: ModelId::from("default"),
                     subagent_model: ModelId::from("subagent"),
+                    subagent_event_forwarding: SubagentEventForwarding::Off,
                     snapshot_revision: "revision".into(),
                     working_dir: ".".into(),
                     system_prompt_seed: Vec::new(),
