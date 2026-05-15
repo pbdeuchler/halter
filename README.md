@@ -341,9 +341,9 @@ Built-in providers include:
 
 Important operational differences:
 
-- OpenAI supports compaction
-- OpenRouter does not support compaction
-- Anthropic currently advertises no streaming and no compaction
+- OpenAI supports streaming, prompt caching, and dedicated Responses compaction
+- OpenRouter supports streaming, prompt caching, and inline Responses compaction
+- Anthropic supports streaming, prompt caching, interleaved thinking, and inline Messages compaction
 - capability differences are explicit and should be handled intentionally
 
 ---

@@ -1,17 +1,54 @@
 // pattern: Functional Core
 
+use std::collections::BTreeMap;
+
 use base64::Engine;
 use halter_protocol::{
-    ApiKind, AssistantPart, BlockId, Message, MessageId, PromptSegment, ProviderRequest,
-    ReasoningEffort, StopReason, StreamEvent, ToolResultMessage, Usage, UserPart,
+    ApiKind, AssistantPart, BlockId, Message, MessageId, PromptSegment, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderKind, ProviderRequest, ReasoningEffort, StopReason,
+    StreamEvent, ToolCallId, ToolName, ToolResultMessage, ToolSpec, Usage, UserPart,
 };
 use serde_json::{Map, Value, json};
 
-use crate::codec_common::{normalized_tool_call_id, tool_name_for_provider, tool_result_text};
+use crate::codec_common::{
+    canonical_tool_name, normalized_tool_call_id, tool_name_for_provider, tool_result_text,
+};
 
 const CACHE_CONTROL_EPHEMERAL: &str = "ephemeral";
+const COMPACTED_CONTEXT_TYPE: &str = "halter_compacted_context";
+const COMPACTED_CONTEXT_OPEN: &str = "<compacted_context>";
+const COMPACTED_CONTEXT_CLOSE: &str = "</compacted_context>";
 
+#[derive(Debug, Clone, Copy)]
+struct AnthropicRequestOptions {
+    stream: bool,
+}
+
+#[cfg(test)]
 pub(crate) fn encode_request(request: &ProviderRequest, temperature: f32) -> anyhow::Result<Value> {
+    encode_request_with_options(
+        request,
+        temperature,
+        AnthropicRequestOptions { stream: false },
+    )
+}
+
+pub(crate) fn encode_stream_request(
+    request: &ProviderRequest,
+    temperature: f32,
+) -> anyhow::Result<Value> {
+    encode_request_with_options(
+        request,
+        temperature,
+        AnthropicRequestOptions { stream: true },
+    )
+}
+
+fn encode_request_with_options(
+    request: &ProviderRequest,
+    temperature: f32,
+    options: AnthropicRequestOptions,
+) -> anyhow::Result<Value> {
     if request.model.api_kind != ApiKind::AnthropicMessages {
         anyhow::bail!(
             "failed to encode anthropic request: unsupported api kind '{}'",
@@ -33,6 +70,9 @@ pub(crate) fn encode_request(request: &ProviderRequest, temperature: f32) -> any
         "messages".to_owned(),
         Value::Array(encode_messages(request)?),
     );
+    if options.stream {
+        body.insert("stream".to_owned(), Value::Bool(true));
+    }
 
     if let Some(system) = encode_system_blocks(request) {
         body.insert("system".to_owned(), system);
@@ -40,13 +80,72 @@ pub(crate) fn encode_request(request: &ProviderRequest, temperature: f32) -> any
     if !request.tools.is_empty() {
         body.insert("tools".to_owned(), Value::Array(encode_tools(request)));
     }
-    if let Some(thinking) =
-        encode_thinking(request.model.reasoning, request.model.max_output_tokens)
-    {
-        body.insert("thinking".to_owned(), thinking);
+    if let Some(thinking) = encode_thinking(
+        &request.model.model,
+        request.model.reasoning,
+        request.model.max_output_tokens,
+    ) {
+        if let Some(output_config) = thinking.output_config {
+            body.insert("output_config".to_owned(), output_config);
+        }
+        body.insert("thinking".to_owned(), thinking.thinking);
     }
 
     Ok(Value::Object(body))
+}
+
+pub(crate) fn encode_compaction_request(
+    request: &ProviderCompactionRequest,
+    temperature: f32,
+) -> anyhow::Result<Value> {
+    if request.model.api_kind != ApiKind::AnthropicMessages {
+        anyhow::bail!("failed to encode anthropic compaction request: unsupported api kind");
+    }
+
+    let mut system_sections = vec![request.instructions.trim().to_owned()];
+    if let Some(compacted) = render_compacted_prefix(&request.compacted_prefix) {
+        system_sections.push(compacted);
+    }
+    let system = system_sections
+        .into_iter()
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Ok(json!({
+        "model": request.model.model,
+        "max_tokens": request.model.max_output_tokens.unwrap_or(4096),
+        "temperature": temperature,
+        "system": system,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": render_compaction_messages(&request.messages),
+                    }
+                ],
+            }
+        ],
+    }))
+}
+
+pub(crate) fn decode_compaction_response(
+    response: &Value,
+) -> anyhow::Result<ProviderCompactionResponse> {
+    let text = response_text(response);
+    if text.trim().is_empty() {
+        return Ok(ProviderCompactionResponse {
+            output: Vec::new(),
+            usage: decode_usage(response),
+        });
+    }
+
+    Ok(ProviderCompactionResponse {
+        output: vec![compacted_context_item(text)],
+        usage: decode_usage(response),
+    })
 }
 
 /// Encode the system field as either a flat string (when no breakpoints
@@ -131,6 +230,9 @@ fn render_system_tail(request: &ProviderRequest) -> Option<String> {
     if let Some(text) = render_segments(request.prompt.append_segments()) {
         sections.push(text);
     }
+    if let Some(text) = render_compacted_prefix(&request.compacted_prefix) {
+        sections.push(text);
+    }
     for message in &request.messages {
         if let Message::System(system) = message {
             let text = system.text.trim();
@@ -159,6 +261,7 @@ fn text_block(text: String, cache_breakpoint: bool) -> Value {
     Value::Object(block)
 }
 
+#[cfg(test)]
 pub(crate) fn decode_response(
     request: &ProviderRequest,
     response: &Value,
@@ -367,7 +470,16 @@ fn encode_assistant_parts(
                 "type": "text",
                 "text": text,
             })),
-            AssistantPart::Text { .. } | AssistantPart::Thinking(_) => {}
+            AssistantPart::Thinking(block) => {
+                let mut encoded = Map::new();
+                encoded.insert("type".to_owned(), json!("thinking"));
+                encoded.insert("thinking".to_owned(), json!(block.text));
+                if let Some(signature) = &block.signature {
+                    encoded.insert("signature".to_owned(), json!(signature));
+                }
+                content.push(Value::Object(encoded));
+            }
+            AssistantPart::Text { .. } => {}
             AssistantPart::ToolCall(call) => {
                 content.push(json!({
                     "type": "tool_use",
@@ -430,11 +542,33 @@ fn encode_tools(request: &ProviderRequest) -> Vec<Value> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct EncodedThinking {
+    thinking: Value,
+    output_config: Option<Value>,
+}
+
 fn encode_thinking(
+    model: &str,
     reasoning: Option<ReasoningEffort>,
     max_output_tokens: Option<u32>,
-) -> Option<Value> {
+) -> Option<EncodedThinking> {
     let reasoning = reasoning?;
+    if prefers_adaptive_thinking(model) {
+        let mut output_config = Map::new();
+        output_config.insert(
+            "effort".to_owned(),
+            json!(adaptive_effort_for_model(model, reasoning)),
+        );
+        return Some(EncodedThinking {
+            thinking: json!({
+                "type": "adaptive",
+                "display": "summarized",
+            }),
+            output_config: Some(Value::Object(output_config)),
+        });
+    }
+
     let Some(max_output_tokens) = max_output_tokens else {
         tracing::warn!(
             ?reasoning,
@@ -457,24 +591,41 @@ fn encode_thinking(
         return None;
     }
 
-    Some(json!({
-        "type": "enabled",
-        "budget_tokens": budget_tokens,
-    }))
+    Some(EncodedThinking {
+        thinking: json!({
+            "type": "enabled",
+            "budget_tokens": budget_tokens,
+        }),
+        output_config: None,
+    })
 }
 
-fn decode_stop_reason(response: &Value) -> StopReason {
-    match response
-        .get("stop_reason")
-        .and_then(Value::as_str)
-        .unwrap_or("end_turn")
-    {
-        "tool_use" => StopReason::ToolUse,
-        "max_tokens" => StopReason::MaxTokens,
-        "pause_turn" => StopReason::Interrupted,
-        "refusal" => StopReason::Error,
-        _ => StopReason::EndTurn,
+fn prefers_adaptive_thinking(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("claude-opus-4-7")
+        || model.contains("claude-opus-4-6")
+        || model.contains("claude-sonnet-4-6")
+        || model.contains("claude-mythos")
+}
+
+fn adaptive_effort_for_model(model: &str, reasoning: ReasoningEffort) -> &'static str {
+    match reasoning {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh if model.to_ascii_lowercase().contains("claude-opus-4-7") => "xhigh",
+        ReasoningEffort::Xhigh => "high",
     }
+}
+
+#[cfg(test)]
+fn decode_stop_reason(response: &Value) -> StopReason {
+    decode_stop_reason_value(
+        response
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("end_turn"),
+    )
 }
 
 fn decode_usage(response: &Value) -> Usage {
@@ -498,6 +649,390 @@ fn decode_usage(response: &Value) -> Usage {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AnthropicStreamDecoder {
+    tool_specs: Vec<ToolSpec>,
+    provider_kind: ProviderKind,
+    message_id: Option<MessageId>,
+    stop_reason: StopReason,
+    usage: Usage,
+    blocks: BTreeMap<usize, AnthropicStreamBlock>,
+}
+
+#[derive(Debug, Clone)]
+enum AnthropicStreamBlock {
+    Text {
+        id: BlockId,
+    },
+    Thinking {
+        id: BlockId,
+        signature: Option<String>,
+    },
+    ToolUse {
+        id: BlockId,
+    },
+}
+
+impl AnthropicStreamDecoder {
+    pub(crate) fn new(request: &ProviderRequest) -> Self {
+        Self {
+            tool_specs: request.tools.clone(),
+            provider_kind: request.model.provider_kind,
+            message_id: None,
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+            blocks: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn decode(&mut self, event: &Value) -> anyhow::Result<Vec<StreamEvent>> {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match event_type {
+            "message_start" => Ok(self.decode_message_start(event)),
+            "content_block_start" => self.decode_content_block_start(event),
+            "content_block_delta" => self.decode_content_block_delta(event),
+            "content_block_stop" => self.decode_content_block_stop(event),
+            "message_delta" => Ok(self.decode_message_delta(event)),
+            "message_stop" => Ok(self.decode_message_stop()),
+            "ping" => Ok(Vec::new()),
+            "error" => {
+                let message = event
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("anthropic stream error");
+                Ok(vec![StreamEvent::Error {
+                    error: halter_protocol::ProviderError::new(
+                        format!("failed to execute provider request: {message}"),
+                        false,
+                    ),
+                }])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn decode_message_start(&mut self, event: &Value) -> Vec<StreamEvent> {
+        let message_id = event
+            .pointer("/message/id")
+            .and_then(Value::as_str)
+            .map(|id| MessageId::from(id.to_owned()))
+            .unwrap_or_default();
+        self.message_id = Some(message_id.clone());
+        self.usage = decode_usage(event.pointer("/message").unwrap_or(event));
+        vec![StreamEvent::MessageStart { id: message_id }]
+    }
+
+    fn decode_content_block_start(&mut self, event: &Value) -> anyhow::Result<Vec<StreamEvent>> {
+        let index = event_index(event)?;
+        let content_block = event.get("content_block").unwrap_or(event);
+        match content_block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "text" => {
+                let id = BlockId::new();
+                self.blocks
+                    .insert(index, AnthropicStreamBlock::Text { id: id.clone() });
+                let mut events = vec![StreamEvent::TextStart { id: id.clone() }];
+                if let Some(text) = content_block.get("text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    events.push(StreamEvent::TextDelta {
+                        id,
+                        delta: text.to_owned(),
+                    });
+                }
+                Ok(events)
+            }
+            "thinking" => {
+                let id = BlockId::new();
+                let signature = content_block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .filter(|signature| !signature.is_empty())
+                    .map(str::to_owned);
+                self.blocks.insert(
+                    index,
+                    AnthropicStreamBlock::Thinking {
+                        id: id.clone(),
+                        signature,
+                    },
+                );
+                let mut events = vec![StreamEvent::ThinkingStart { id: id.clone() }];
+                if let Some(text) = content_block.get("thinking").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    events.push(StreamEvent::ThinkingDelta {
+                        id,
+                        delta: text.to_owned(),
+                    });
+                }
+                Ok(events)
+            }
+            "tool_use" => {
+                let id = BlockId::new();
+                let tool_call_id = content_block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToolCallId::from)
+                    .unwrap_or_default();
+                let name = content_block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(|name| canonical_tool_name(name, &self.tool_specs, self.provider_kind))
+                    .unwrap_or_else(|| ToolName::from("tool"));
+                self.blocks
+                    .insert(index, AnthropicStreamBlock::ToolUse { id: id.clone() });
+                let mut events = vec![StreamEvent::ToolCallStart {
+                    id: id.clone(),
+                    tool_call_id,
+                    name,
+                }];
+                if let Some(input) = content_block.get("input")
+                    && input.as_object().is_some_and(|object| !object.is_empty())
+                {
+                    events.push(StreamEvent::ToolArgsDelta {
+                        id,
+                        delta: input.to_string(),
+                    });
+                }
+                Ok(events)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn decode_content_block_delta(&mut self, event: &Value) -> anyhow::Result<Vec<StreamEvent>> {
+        let index = event_index(event)?;
+        let Some(block) = self.blocks.get_mut(&index) else {
+            return Ok(Vec::new());
+        };
+        let delta = event.get("delta").unwrap_or(event);
+        match delta
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "text_delta" => match block {
+                AnthropicStreamBlock::Text { id } => Ok(delta
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| {
+                        vec![StreamEvent::TextDelta {
+                            id: id.clone(),
+                            delta: text.to_owned(),
+                        }]
+                    })
+                    .unwrap_or_default()),
+                AnthropicStreamBlock::Thinking { .. } | AnthropicStreamBlock::ToolUse { .. } => {
+                    Ok(Vec::new())
+                }
+            },
+            "thinking_delta" => match block {
+                AnthropicStreamBlock::Thinking { id, .. } => Ok(delta
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| {
+                        vec![StreamEvent::ThinkingDelta {
+                            id: id.clone(),
+                            delta: text.to_owned(),
+                        }]
+                    })
+                    .unwrap_or_default()),
+                AnthropicStreamBlock::Text { .. } | AnthropicStreamBlock::ToolUse { .. } => {
+                    Ok(Vec::new())
+                }
+            },
+            "signature_delta" => {
+                if let AnthropicStreamBlock::Thinking { signature, .. } = block {
+                    *signature = delta
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                Ok(Vec::new())
+            }
+            "input_json_delta" => match block {
+                AnthropicStreamBlock::ToolUse { id } => Ok(delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| {
+                        vec![StreamEvent::ToolArgsDelta {
+                            id: id.clone(),
+                            delta: text.to_owned(),
+                        }]
+                    })
+                    .unwrap_or_default()),
+                AnthropicStreamBlock::Text { .. } | AnthropicStreamBlock::Thinking { .. } => {
+                    Ok(Vec::new())
+                }
+            },
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn decode_content_block_stop(&mut self, event: &Value) -> anyhow::Result<Vec<StreamEvent>> {
+        let index = event_index(event)?;
+        let Some(block) = self.blocks.remove(&index) else {
+            return Ok(Vec::new());
+        };
+        Ok(match block {
+            AnthropicStreamBlock::Text { id } => vec![StreamEvent::TextEnd { id }],
+            AnthropicStreamBlock::Thinking { id, signature } => {
+                vec![StreamEvent::ThinkingEnd { id, signature }]
+            }
+            AnthropicStreamBlock::ToolUse { id } => vec![StreamEvent::ToolCallEnd { id }],
+        })
+    }
+
+    fn decode_message_delta(&mut self, event: &Value) -> Vec<StreamEvent> {
+        if let Some(stop_reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
+            self.stop_reason = decode_stop_reason_value(stop_reason);
+        }
+        if let Some(usage) = event.get("usage") {
+            self.usage.output_tokens = usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.usage.output_tokens);
+        }
+        vec![StreamEvent::UsageUpdate {
+            usage: self.usage.clone(),
+        }]
+    }
+
+    fn decode_message_stop(&mut self) -> Vec<StreamEvent> {
+        vec![StreamEvent::MessageEnd {
+            id: self.message_id.clone().unwrap_or_default(),
+            stop_reason: self.stop_reason,
+            response_id: None,
+        }]
+    }
+}
+
+fn event_index(event: &Value) -> anyhow::Result<usize> {
+    event
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
+        .ok_or_else(|| anyhow::anyhow!("failed to decode anthropic stream event: missing index"))
+}
+
+fn decode_stop_reason_value(value: &str) -> StopReason {
+    match value {
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::MaxTokens,
+        "pause_turn" => StopReason::Interrupted,
+        "refusal" => StopReason::Error,
+        _ => StopReason::EndTurn,
+    }
+}
+
+fn response_text(response: &Value) -> String {
+    response
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+            Some("text") => block.get("text").and_then(Value::as_str),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compacted_context_item(text: String) -> Value {
+    json!({
+        "type": COMPACTED_CONTEXT_TYPE,
+        "text": text,
+    })
+}
+
+fn render_compacted_prefix(items: &[Value]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let rendered = items
+        .iter()
+        .map(render_compacted_prefix_item)
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if rendered.trim().is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{COMPACTED_CONTEXT_OPEN}\n{rendered}\n{COMPACTED_CONTEXT_CLOSE}"
+        ))
+    }
+}
+
+fn render_compacted_prefix_item(item: &Value) -> String {
+    if item.get("type").and_then(Value::as_str) == Some(COMPACTED_CONTEXT_TYPE)
+        && let Some(text) = item.get("text").and_then(Value::as_str)
+    {
+        return text.to_owned();
+    }
+    item.to_string()
+}
+
+fn render_compaction_messages(messages: &[Message]) -> String {
+    if messages.is_empty() {
+        return "No prior messages are eligible for compaction.".to_owned();
+    }
+    messages
+        .iter()
+        .map(render_compaction_message)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_compaction_message(message: &Message) -> String {
+    match message {
+        Message::System(system) => format!("system:\n{}", system.text),
+        Message::User(user) => format!("user:\n{}", render_user_parts(&user.parts)),
+        Message::Assistant(assistant) => {
+            let parts = assistant
+                .parts
+                .iter()
+                .map(|part| match part {
+                    AssistantPart::Text { text } => text.clone(),
+                    AssistantPart::Thinking(block) => format!("[thinking]\n{}", block.text),
+                    AssistantPart::ToolCall(call) => {
+                        format!("[tool_call {}]\n{}", call.name, call.arguments)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("assistant:\n{parts}")
+        }
+        Message::Tool(tool) => format!(
+            "tool_result {}:\n{}",
+            tool.call_id,
+            tool_result_text(&tool.content, &tool.error)
+        ),
+    }
+}
+
+fn render_user_parts(parts: &[UserPart]) -> String {
+    parts
+        .iter()
+        .map(|part| match part {
+            UserPart::Text { text } => text.clone(),
+            UserPart::Image { media_type, .. } => format!("[image: {media_type}]"),
+            UserPart::Document { media_type, .. } => format!("[document: {media_type}]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -505,8 +1040,9 @@ mod tests {
     use halter_protocol::{
         ApiKind, AssembledPrompt, AssistantMessage, AssistantPart, CacheBreakpoints, CacheScope,
         Message, MessageId, ModelId, ModelRole, PromptSegment, PromptSegmentId, PromptSegmentKind,
-        ProviderKind, ProviderName, ProviderRequest, ResolvedModel, ToolAlias, ToolCall,
-        ToolCallId, ToolCapabilities, ToolConcurrency, ToolSpec, TurnId, UserMessage, Volatility,
+        ProviderCompactionRequest, ProviderKind, ProviderName, ProviderRequest, ReasoningEffort,
+        ResolvedModel, ToolAlias, ToolCall, ToolCallId, ToolCapabilities, ToolConcurrency,
+        ToolResult, ToolSpec, TurnId, UserMessage, Volatility,
     };
     use indexmap::IndexMap;
     use serde_json::json;
@@ -580,6 +1116,72 @@ mod tests {
     }
 
     #[test]
+    fn stream_request_enables_sse_and_renders_compacted_prefix_after_cache_boundaries() {
+        let mut request = sample_request(Vec::new());
+        request.prompt.ordered_segments = request.prompt.segments.clone();
+        request.prompt.system_segment_count = 1;
+        request.prompt.cache_breakpoints.after_system = true;
+        request.compacted_prefix = vec![json!({
+            "type": COMPACTED_CONTEXT_TYPE,
+            "text": "older decisions are summarized",
+        })];
+
+        let body =
+            encode_stream_request(&request, halter_protocol::DEFAULT_TEMPERATURE).expect("encode");
+
+        assert_eq!(body["stream"], true);
+        let system = body["system"].as_array().expect("system blocks");
+        assert_eq!(system[0]["cache_control"]["type"], CACHE_CONTROL_EPHEMERAL);
+        assert!(
+            system
+                .last()
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("older decisions are summarized"))
+        );
+    }
+
+    #[test]
+    fn request_replays_thinking_blocks_with_signatures() {
+        let request = sample_request(vec![Message::Assistant(AssistantMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            parts: vec![
+                AssistantPart::Thinking(halter_protocol::ThinkingBlock {
+                    text: "reasoned".to_owned(),
+                    signature: Some("sig-123".to_owned()),
+                }),
+                AssistantPart::Text {
+                    text: "answer".to_owned(),
+                },
+            ],
+            stop_reason: None,
+            usage: None,
+            replay_meta: Default::default(),
+        })]);
+
+        let body = encode_request(&request, halter_protocol::DEFAULT_TEMPERATURE).expect("encode");
+
+        assert_eq!(body["messages"][0]["content"][0]["type"], "thinking");
+        assert_eq!(body["messages"][0]["content"][0]["thinking"], "reasoned");
+        assert_eq!(body["messages"][0]["content"][0]["signature"], "sig-123");
+    }
+
+    #[test]
+    fn adaptive_models_use_current_anthropic_thinking_shape() {
+        let mut request = sample_request(Vec::new());
+        request.model.model = "claude-opus-4-7-latest".to_owned();
+        request.model.reasoning = Some(ReasoningEffort::Xhigh);
+
+        let body =
+            encode_stream_request(&request, halter_protocol::DEFAULT_TEMPERATURE).expect("encode");
+
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
     fn response_maps_text_and_tool_use_blocks() {
         let request = sample_request(Vec::new());
         let response = json!({
@@ -612,6 +1214,105 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn stream_decoder_maps_text_thinking_tool_use_usage_and_stop_reason() {
+        let request = sample_request(Vec::new());
+        let mut decoder = AnthropicStreamDecoder::new(&request);
+        let mut events = Vec::new();
+        for event in [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_123",
+                    "usage": {
+                        "input_tokens": 11,
+                        "output_tokens": 1,
+                        "cache_creation_input_tokens": 2,
+                        "cache_read_input_tokens": 3,
+                    }
+                }
+            }),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "done"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "thinking_delta", "thinking": "think"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "signature_delta", "signature": "sig-123"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "toolu_123", "name": "fs_read", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"path\""}}),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": ":\"README.md\"}"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 7}}),
+            json!({"type": "message_stop"}),
+        ] {
+            events.extend(decoder.decode(&event).expect("decode event"));
+        }
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageStart { id } if id.0 == "msg_123"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "done"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ThinkingDelta { delta, .. } if delta == "think"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ThinkingEnd { signature, .. } if signature.as_deref() == Some("sig-123")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallStart { name, .. } if name.0 == "read"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolArgsDelta { delta, .. } if delta.contains("README.md")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::UsageUpdate { usage } if usage.input_tokens == 11 && usage.output_tokens == 7
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageEnd { stop_reason, .. } if *stop_reason == StopReason::ToolUse
+        )));
+    }
+
+    #[test]
+    fn compaction_request_and_response_use_anthropic_inline_summary_shape() {
+        let request = sample_compaction_request();
+        let body = encode_compaction_request(&request, halter_protocol::DEFAULT_TEMPERATURE)
+            .expect("encode compaction");
+
+        assert_eq!(body["model"], "claude-sonnet-4-5");
+        assert!(
+            body["messages"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("assistant:"))
+        );
+
+        let response = json!({
+            "id": "msg_summary",
+            "content": [
+                {"type": "text", "text": "Summary of the compacted turn"}
+            ],
+            "usage": {
+                "input_tokens": 30,
+                "output_tokens": 9,
+            }
+        });
+        let decoded = decode_compaction_response(&response).expect("decode compaction");
+
+        assert_eq!(decoded.usage.input_tokens, 30);
+        assert_eq!(decoded.output[0]["type"], COMPACTED_CONTEXT_TYPE);
+        assert_eq!(decoded.output[0]["text"], "Summary of the compacted turn");
     }
 
     fn sample_request(messages: Vec<Message>) -> ProviderRequest {
@@ -663,6 +1364,49 @@ mod tests {
             }],
             previous_response_id: None,
             new_messages_start: 0,
+        }
+    }
+
+    fn sample_compaction_request() -> ProviderCompactionRequest {
+        let request = sample_request(vec![
+            Message::User(UserMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: vec![UserPart::Text {
+                    text: "inspect README".to_owned(),
+                }],
+            }),
+            Message::Assistant(AssistantMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: vec![AssistantPart::Text {
+                    text: "I inspected it.".to_owned(),
+                }],
+                stop_reason: None,
+                usage: None,
+                replay_meta: Default::default(),
+            }),
+            Message::Tool(ToolResultMessage {
+                id: MessageId::new(),
+                call_id: ToolCallId::from("toolu_123"),
+                content: ToolResult::Text {
+                    text: "README contents".to_owned(),
+                },
+                error: None,
+                created_at: Utc::now(),
+            }),
+        ]);
+
+        ProviderCompactionRequest {
+            session_id: Default::default(),
+            model: request.model,
+            compacted_prefix: vec![json!({
+                "type": COMPACTED_CONTEXT_TYPE,
+                "text": "Earlier summary",
+            })],
+            messages: request.messages,
+            tools: request.tools,
+            instructions: "Summarize the session".to_owned(),
         }
     }
 }

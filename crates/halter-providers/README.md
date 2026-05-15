@@ -197,9 +197,11 @@ Characteristics:
 
 - also uses the Responses-style adapter path
 - supports streaming
-- does **not** support compaction
+- supports inline compaction through the regular Responses endpoint
 
-That means runtime compaction attempts on an OpenRouter-backed session will fail unless the runtime is configured not to rely on provider compaction for that workload.
+OpenRouter does not expose OpenAI's dedicated `/v1/responses/compact` endpoint,
+so the runtime treats OpenRouter compaction as inline/lossy and narrows the
+eligible window before summarizing.
 
 Typical use:
 
@@ -220,12 +222,18 @@ let provider = OpenRouterProvider::new(
 
 Notable reported capabilities:
 
-- `supports_streaming: false`
-- `supports_compaction: false`
+- `supports_streaming: true`
+- `supports_prompt_cache: true`
+- `supports_reasoning: true`
+- `supports_interleaved_reasoning: true`
+- `supports_compaction: true`
+- `compaction_strategy: Inline`
 - `requires_non_empty_assistant_content: true`
 - `tool_call_id_policy: StableReplayNormalized`
 
-This is an important example of why the capability model exists. Anthropic integration does not behave exactly like the Responses-based providers.
+Anthropic uses the Messages API rather than the Responses-style adapter path.
+It has feature parity at the runtime capability level, but its replay and
+compaction wire shapes remain Anthropic-native.
 
 Typical use:
 
@@ -308,17 +316,15 @@ A technically correct provider integration requires capability-aware code.
 
 ### Streaming
 
-Do not assume every provider streams.
-
-Anthropic currently advertises `supports_streaming: false`.
+OpenAI, OpenRouter, Anthropic, and Fake stream canonical halter chunks.
 
 ### Compaction
 
 Do not assume every provider supports compaction.
 
 - OpenAI: yes
-- OpenRouter: no
-- Anthropic: no
+- OpenRouter: yes, inline
+- Anthropic: yes, inline
 - Fake: yes
 
 ### Tool-call replay rules
@@ -429,17 +435,18 @@ Even if you never import this crate directly, you should choose providers intent
 - Responses-style integration
 - broad upstream model access
 
-But remember: no compaction support.
+But remember: compaction is inline/lossy rather than dedicated endpoint backed.
 
 ### Choose Anthropic when you want
 
 - Anthropic-native backend behavior
+- Messages API streaming
+- prompt caching and interleaved thinking
 
 But remember:
 
-- no streaming support advertised here
-- no compaction support
-- some additional content-normalization constraints
+- compaction is inline/lossy rather than dedicated endpoint backed
+- some additional replay and content-normalization constraints
 
 ---
 
