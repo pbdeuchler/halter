@@ -9,14 +9,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use halter_protocol::{SessionId, ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{
+    SessionId, ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext};
 
-use super::common::{ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string};
+use super::common::{
+    ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string,
+};
 
 /// Status of a single task. Kept minimal on purpose: the tool only exposes
 /// `create`, `list`, and `complete`, which maps to two states. Adding richer
@@ -392,11 +396,7 @@ mod tests {
             .execute(context, json!({ "action": "create" }))
             .await
             .expect_err("missing subject is rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("missing string field 'subject'")
-        );
+        assert!(error.to_string().contains("missing string field 'subject'"));
     }
 
     #[tokio::test]
@@ -404,10 +404,7 @@ mod tests {
         let sessions = Arc::new(ToolSessionStore::default());
         let context = tool_context(sessions);
         let error = TaskTool
-            .execute(
-                context,
-                json!({ "action": "create", "subject": "   " }),
-            )
+            .execute(context, json!({ "action": "create", "subject": "   " }))
             .await
             .expect_err("empty subject is rejected");
         assert!(
@@ -447,7 +444,11 @@ mod tests {
             .execute(context, json!({ "action": "delete", "id": 1 }))
             .await
             .expect_err("unknown action is rejected");
-        assert!(error.to_string().contains("must be one of 'create', 'list', 'complete'"));
+        assert!(
+            error
+                .to_string()
+                .contains("must be one of 'create', 'list', 'complete'")
+        );
     }
 
     #[tokio::test]

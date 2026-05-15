@@ -22,9 +22,7 @@ pub mod prelude {
     pub use halter_protocol::{
         Message, ResourceSnapshot, SessionEvent, SessionEventPayload, SessionId, Turn,
     };
-    pub use halter_runtime::{
-        HalterSession, SessionInit, SessionRuntime, SubagentEventForwarding,
-    };
+    pub use halter_runtime::{HalterSession, SessionInit, SessionRuntime, SubagentEventForwarding};
 
     pub use crate::{Halter, HalterBuilder, PluginLoader, ResourceCompiler, SkillLoader};
 }

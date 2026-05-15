@@ -45,9 +45,8 @@ impl TraceRecorder {
                 dir.display()
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(&dir).with_context(|| {
-                    format!("failed to create traces_dir {}", dir.display())
-                })?;
+                fs::create_dir_all(&dir)
+                    .with_context(|| format!("failed to create traces_dir {}", dir.display()))?;
             }
             Err(error) => {
                 return Err(anyhow::Error::new(error)
@@ -79,9 +78,7 @@ impl TraceRecorder {
         if let Some(parent_id) = parent_session_id {
             let parent_writer = {
                 let writers = self.writers.lock().map_err(|_| {
-                    anyhow::anyhow!(
-                        "trace recorder writer map mutex poisoned during open_session"
-                    )
+                    anyhow::anyhow!("trace recorder writer map mutex poisoned during open_session")
                 })?;
                 writers.get(parent_id).cloned()
             };
@@ -101,8 +98,8 @@ impl TraceRecorder {
                 "started_at": Utc::now().to_rfc3339(),
                 "blueprint": blueprint,
             });
-            let mut line = serde_json::to_vec(&header)
-                .context("failed to serialize subagent trace header")?;
+            let mut line =
+                serde_json::to_vec(&header).context("failed to serialize subagent trace header")?;
             line.push(b'\n');
             {
                 let mut writer = parent_writer.lock().map_err(|_| {
@@ -246,7 +243,8 @@ impl TraceRecorder {
     }
 
     fn session_path(&self, session_id: &SessionId) -> PathBuf {
-        self.dir.join(format!("{}.txt", sanitize_session_id(&session_id.0)))
+        self.dir
+            .join(format!("{}.txt", sanitize_session_id(&session_id.0)))
     }
 
     /// Test-only accessor returning the directory backing this recorder.
@@ -312,7 +310,11 @@ mod tests {
         )
     }
 
-    fn warning_event(session_id: &SessionId, sequence: u64, text: &str) -> halter_protocol::SessionEvent {
+    fn warning_event(
+        session_id: &SessionId,
+        sequence: u64,
+        text: &str,
+    ) -> halter_protocol::SessionEvent {
         warning_pending(session_id, text).into_committed(sequence)
     }
 
@@ -490,8 +492,7 @@ mod tests {
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 4, "contents:\n{contents}");
 
-        let header: serde_json::Value =
-            serde_json::from_str(lines[0]).expect("trace header json");
+        let header: serde_json::Value = serde_json::from_str(lines[0]).expect("trace header json");
         assert_eq!(header["kind"], "trace_header");
         assert_eq!(header["session_id"], "session-parent");
 

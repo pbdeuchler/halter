@@ -745,8 +745,7 @@ mod tests {
         assert_eq!(header["kind"], "trace_header");
         assert_eq!(header["session_id"], session_id);
         let started: halter_protocol::SessionEvent =
-            serde_json::from_str(lines.next().expect("session-started event"))
-                .expect("event json");
+            serde_json::from_str(lines.next().expect("session-started event")).expect("event json");
         assert!(matches!(
             started.payload,
             halter_protocol::SessionEventPayload::SessionStarted
