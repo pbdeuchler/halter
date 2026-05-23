@@ -133,6 +133,10 @@ impl TurnRegistry {
 
         debug!(in_flight = handles.len(), drain_ms = %drain.as_millis(), "turn registry shutdown: draining");
 
+        let abort_handles: Vec<_> = handles
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
         let total = handles.len();
         let drained = Arc::new(AtomicUsize::new(0));
         let drained_in_loop = drained.clone();
@@ -152,15 +156,15 @@ impl TurnRegistry {
             Err(_) => {
                 let drained_count = drained.load(Ordering::Relaxed);
                 let aborted = total - drained_count;
+                for abort_handle in abort_handles {
+                    abort_handle.abort();
+                }
                 warn!(
                     drained = drained_count,
                     pending = aborted,
                     drain_ms = %drain.as_millis(),
                     "turn registry shutdown: drain timeout, aborting remaining tasks"
                 );
-                // Tasks left in flight have already been moved out of the
-                // registry; the JoinHandles inside the timed-out future
-                // have been dropped, which signals abort to those tasks.
                 ShutdownReport {
                     turns_drained: drained_count,
                     turns_aborted: aborted,
@@ -186,6 +190,7 @@ impl TurnRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -247,8 +252,19 @@ mod tests {
     async fn shutdown_aborts_uncancellable_tasks_after_deadline() {
         let registry = TurnRegistry::new();
         let cancel = CancellationToken::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = dropped.clone();
         // Task ignores cancellation and waits forever.
-        let handle = tokio::spawn(async { std::future::pending::<()>().await });
+        let handle = tokio::spawn(async move {
+            struct DropFlag(Arc<AtomicBool>);
+            impl Drop for DropFlag {
+                fn drop(&mut self) {
+                    self.0.store(true, AtomicOrdering::SeqCst);
+                }
+            }
+            let _flag = DropFlag(dropped_in_task);
+            std::future::pending::<()>().await
+        });
         registry
             .register(TurnId::from("turn-stuck"), cancel, handle)
             .expect("register");
@@ -258,6 +274,13 @@ mod tests {
         assert_eq!(report.turns_aborted, 1);
         assert!(report.timed_out);
         assert!(registry.is_shutting_down());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(AtomicOrdering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted task should be dropped");
     }
 
     #[tokio::test]

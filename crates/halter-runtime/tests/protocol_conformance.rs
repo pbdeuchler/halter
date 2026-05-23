@@ -169,6 +169,7 @@ fn session_event_payload_variants_have_stable_kind() {
         SessionEventPayload::TurnFailed {
             turn_id: TurnId::from("t1"),
             error: "e".into(),
+            cancelled: false,
             retryable: false,
         },
         SessionEventPayload::Lagged { dropped_events: 1 },

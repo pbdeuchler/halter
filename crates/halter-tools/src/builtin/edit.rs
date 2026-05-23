@@ -8,8 +8,7 @@ use tracing::debug;
 use crate::{Tool, ToolContext};
 
 use super::common::{
-    ToolScope, atomic_write_blocking, ensure_not_cancelled, hash_text, optional_bool,
-    required_string, resolve_path,
+    ToolScope, ensure_not_cancelled, hash_text, optional_bool, required_string, resolve_path,
 };
 
 #[derive(Debug)]
@@ -65,15 +64,20 @@ impl Tool for EditTool {
         );
 
         let canonical = context.policy.check_write_path(&path).await?;
-        let canonical_path = canonical.into_path();
+        let canonical_path = canonical.path().to_path_buf();
         let path_locks = context.path_locks.clone();
         let path_for_edit = canonical_path.clone();
         let old = old_string.to_owned();
         let new = new_string.to_owned();
         let expected_sha256 = expected_sha256.clone();
         let result = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+
             let _lock = path_locks.acquire_write(&path_for_edit)?;
-            let original = std::fs::read_to_string(&path_for_edit)?;
+            let mut original = String::new();
+            canonical
+                .open_read_blocking()?
+                .read_to_string(&mut original)?;
             let file_hash_before = hash_text(&original);
             if let Some(expected_sha256) = expected_sha256.as_deref()
                 && expected_sha256 != file_hash_before
@@ -104,7 +108,7 @@ impl Tool for EditTool {
                 original.replacen(&old, &new, 1)
             };
             let file_hash_after = hash_text(&updated);
-            atomic_write_blocking(&path_for_edit, updated.as_bytes())?;
+            canonical.atomic_write_blocking(updated.as_bytes())?;
 
             Ok::<_, anyhow::Error>((matches, file_hash_before, file_hash_after))
         })

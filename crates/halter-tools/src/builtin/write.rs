@@ -7,9 +7,7 @@ use tracing::debug;
 
 use crate::{Tool, ToolContext};
 
-use super::common::{
-    ToolScope, atomic_write_blocking, ensure_not_cancelled, required_string, resolve_path,
-};
+use super::common::{ToolScope, ensure_not_cancelled, required_string, resolve_path};
 
 #[derive(Debug)]
 pub struct WriteTool;
@@ -47,13 +45,14 @@ impl Tool for WriteTool {
         debug!(session_id = %context.session_id, path = %path.display(), bytes = content.len(), "writing file");
 
         let canonical = context.policy.check_write_path(&path).await?;
-        let canonical_path = canonical.into_path();
+        let canonical_path = canonical.path().to_path_buf();
         let path_locks = context.path_locks.clone();
         let path_for_write = canonical_path.clone();
         let bytes = content.as_bytes().to_vec();
         tokio::task::spawn_blocking(move || {
             let _lock = path_locks.acquire_write(&path_for_write)?;
-            atomic_write_blocking(&path_for_write, &bytes)
+            canonical.atomic_write_blocking(&bytes)?;
+            Ok::<_, anyhow::Error>(())
         })
         .await??;
         Ok(ToolResult::Json {

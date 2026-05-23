@@ -67,6 +67,16 @@ struct TurnOutcome {
 
 const PARENT_HOOK_DISPATCH_MAX_RETRIES: usize = 3;
 
+fn active_subagent_count(registry: &SubagentRegistry) -> usize {
+    registry
+        .entries
+        .values()
+        .filter(|entry| {
+            entry.running.is_some() || matches!(entry.status.state, SubagentState::Running)
+        })
+        .count()
+}
+
 impl RuntimeSubagentControl {
     #[must_use]
     pub fn new(services: Arc<RuntimeServices>) -> Self {
@@ -83,6 +93,49 @@ impl RuntimeSubagentControl {
     fn signal_change(&self) {
         self.inner.version.fetch_add(1, Ordering::SeqCst);
         self.inner.changed.notify_waiters();
+    }
+
+    async fn reserve_subagent_slot(
+        &self,
+        parent_depth: u32,
+        agent_id: &AgentId,
+        status: SubagentStatus,
+    ) -> anyhow::Result<()> {
+        loop {
+            let active = {
+                let registry = self.inner.registry.lock().await;
+                active_subagent_count(&registry)
+            };
+            self.inner
+                .services
+                .policy
+                .check_subagent_spawn_typed(parent_depth, active)
+                .await?;
+
+            let mut registry = self.inner.registry.lock().await;
+            let active_now = active_subagent_count(&registry);
+            if active_now != active {
+                continue;
+            }
+            registry.entries.insert(
+                agent_id.0.clone(),
+                RegisteredSubagent {
+                    status,
+                    generation: 0,
+                    running: None,
+                },
+            );
+            drop(registry);
+            self.signal_change();
+            return Ok(());
+        }
+    }
+
+    async fn remove_reserved_subagent(&self, agent_id: &AgentId) {
+        let mut registry = self.inner.registry.lock().await;
+        registry.entries.remove(&agent_id.0);
+        drop(registry);
+        self.signal_change();
     }
 
     async fn start_turn(
@@ -526,33 +579,11 @@ impl SubagentControl for RuntimeSubagentControl {
             anyhow::bail!("failed to execute spawn_agent tool: message cannot be empty");
         }
 
-        let active_subagents = {
-            let registry = self.inner.registry.lock().await;
-            registry
-                .entries
-                .values()
-                .filter(|entry| entry.running.is_some())
-                .count()
-        };
-        self.inner
-            .services
-            .policy
-            .check_subagent_spawn_typed(parent.blueprint.subagent_depth, active_subagents)
-            .await?;
-
         let session_id = SessionId::new();
         let agent_id = AgentId::new();
         let init = build_subagent_session_init(parent, &session_id, &request)?;
         let state =
             build_subagent_state(parent, &session_id, &request.message, request.fork_context);
-        create_session_seeded(
-            self.inner.services.clone(),
-            init,
-            state,
-            parent.snapshot.clone(),
-        )
-        .await?;
-
         let status = SubagentStatus {
             agent_id: agent_id.clone(),
             session_id: session_id.clone(),
@@ -563,19 +594,26 @@ impl SubagentControl for RuntimeSubagentControl {
             usage: None,
             error: None,
         };
+
+        self.reserve_subagent_slot(parent.blueprint.subagent_depth, &agent_id, status.clone())
+            .await?;
+
+        if let Err(error) = create_session_seeded(
+            self.inner.services.clone(),
+            init,
+            state,
+            parent.snapshot.clone(),
+        )
+        .await
         {
-            let mut registry = self.inner.registry.lock().await;
-            registry.entries.insert(
-                agent_id.0.clone(),
-                RegisteredSubagent {
-                    status: status.clone(),
-                    generation: 0,
-                    running: None,
-                },
-            );
+            self.remove_reserved_subagent(&agent_id).await;
+            return Err(error);
         }
 
-        self.run_subagent_start_hooks(parent, &status).await?;
+        if let Err(error) = self.run_subagent_start_hooks(parent, &status).await {
+            self.remove_reserved_subagent(&agent_id).await;
+            return Err(error);
+        }
 
         self.start_turn(
             &agent_id,

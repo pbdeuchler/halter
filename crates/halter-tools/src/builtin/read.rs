@@ -50,7 +50,7 @@ impl Tool for ReadTool {
                         "default": DEFAULT_READ_TIMEOUT_SECS
                     }
                 },
-                "required": ["path", "limit"],
+                "required": ["path"],
             }),
             concurrency: ToolConcurrency::ReadOnly,
             capabilities: ToolCapabilities::default(),
@@ -77,26 +77,32 @@ impl Tool for ReadTool {
             "reading file"
         );
 
-        // Authorize the path before any I/O. We don't yet know how many bytes
-        // we'll read (it's bounded by line count, not bytes), so pass 0 here
-        // and re-check the actual byte size below — pre-authorization rejects
-        // sensitive paths before we open them.
         let canonical = context.policy.check_read_path(&path, 0).await?;
-        let canonical_path = canonical.into_path();
+        let path_locks = context.path_locks.clone();
+        let canonical_path = canonical.path().to_path_buf();
+        let path_for_read = canonical_path.clone();
+        let (file, readable_bytes) = tokio::task::spawn_blocking(move || {
+            let _lock = path_locks.acquire_read(&path_for_read)?;
+            let file = canonical.open_read_blocking()?;
+            let len = usize::try_from(file.metadata()?.len()).map_err(|_| {
+                anyhow::anyhow!("failed to execute read tool: file is too large for this platform")
+            })?;
+            Ok::<_, anyhow::Error>((file, len))
+        })
+        .await??;
+        context
+            .policy
+            .check_read_path(&canonical_path, readable_bytes)
+            .await?;
 
         let path_locks = context.path_locks.clone();
         let path_for_read = canonical_path.clone();
         let read_window = tokio::task::spawn_blocking(move || {
             let _lock = path_locks.acquire_read(&path_for_read)?;
-            let file = std::fs::File::open(&path_for_read)?;
             let reader = BufReader::new(file);
-            read_window_from_reader(reader, offset, limit, timeout, deadline)
+            read_window_from_reader(reader, offset, limit, timeout, deadline, readable_bytes)
         })
         .await??;
-        context
-            .policy
-            .check_read_path(&canonical_path, read_window.content.len())
-            .await?;
 
         Ok(ToolResult::Json {
             value: json!({
@@ -131,6 +137,7 @@ fn read_window_from_reader<R: BufRead>(
     limit: u64,
     timeout: Duration,
     deadline: Instant,
+    max_bytes: usize,
 ) -> anyhow::Result<ReadWindow> {
     let start_line = offset.max(1);
     let end_line = start_line.saturating_add(limit).saturating_sub(1);
@@ -138,11 +145,18 @@ fn read_window_from_reader<R: BufRead>(
     let mut total_lines = 0;
     let mut current_line = String::new();
     let mut hasher = Sha256::new();
+    let mut bytes_read = 0usize;
 
     loop {
         ensure_before_deadline(timeout, deadline)?;
         current_line.clear();
         let read = reader.read_line(&mut current_line)?;
+        bytes_read = bytes_read.saturating_add(read);
+        if bytes_read > max_bytes {
+            anyhow::bail!(
+                "failed to execute read tool: read exceeded authorized byte limit of {max_bytes}"
+            );
+        }
         ensure_before_deadline(timeout, deadline)?;
         if read == 0 {
             break;
@@ -197,6 +211,7 @@ mod tests {
             Instant::now()
                 .checked_add(Duration::from_secs(10))
                 .expect("future deadline"),
+            usize::MAX,
         )
         .expect("window read succeeds");
 
@@ -224,13 +239,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_checks_returned_slice_size() {
+    async fn read_checks_total_file_size_before_reading() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "a\nb\n").expect("write");
+
+        let error = ReadTool
+            .execute(
+                tool_context(temp.path(), 2),
+                json!({
+                    "path": "note.txt",
+                    "offset": 2,
+                    "limit": 1
+                }),
+            )
+            .await
+            .expect_err("full file size exceeds policy");
+
+        assert!(
+            error
+                .to_string()
+                .contains("read size 4 exceeds max_read_bytes 2")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_returns_requested_slice_when_file_fits_policy() {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\n").expect("write");
 
         let ToolResult::Json { value } = ReadTool
             .execute(
-                tool_context(temp.path(), 2),
+                tool_context(temp.path(), 4),
                 json!({
                     "path": "note.txt",
                     "offset": 2,
@@ -305,6 +344,7 @@ mod tests {
             Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .expect("past deadline"),
+            usize::MAX,
         )
         .expect_err("read should time out");
 
@@ -312,6 +352,27 @@ mod tests {
             error
                 .to_string()
                 .contains("failed to execute read tool: timed out after 10 seconds")
+        );
+    }
+
+    #[test]
+    fn read_window_fails_when_reader_exceeds_authorized_bytes() {
+        let error = read_window_from_reader(
+            Cursor::new("a\nb\n"),
+            1,
+            2,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_add(Duration::from_secs(10))
+                .expect("future deadline"),
+            2,
+        )
+        .expect_err("read should exceed authorized bytes");
+
+        assert!(
+            error
+                .to_string()
+                .contains("read exceeded authorized byte limit")
         );
     }
 }

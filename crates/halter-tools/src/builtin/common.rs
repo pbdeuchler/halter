@@ -1,17 +1,14 @@
 // pattern: Functional Core
 //
 // This module holds pure helpers (input parsing, path resolution, ToolScope
-// RAII). The only side-effecting path — atomic_write_blocking — is scoped to
-// tmpfile + rename, not general I/O. (finding L30)
+// RAII).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 
 use crate::{ToolContext, ToolEventSink, ToolRuntimeEvent};
@@ -122,25 +119,4 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 #[must_use]
 pub fn hash_text(text: &str) -> String {
     hash_bytes(text.as_bytes())
-}
-
-pub(crate) fn atomic_write_blocking(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let parent = path.parent().with_context(|| {
-        format!(
-            "failed to write '{}': target path has no parent directory",
-            path.display()
-        )
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let mut temp = NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create temp file in '{}'", parent.display()))?;
-    std::io::Write::write_all(&mut temp, bytes)?;
-    std::io::Write::flush(&mut temp)?;
-    temp.persist(path).map(|_| ()).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to persist temp file to '{}': {}",
-            path.display(),
-            error.error
-        )
-    })
 }

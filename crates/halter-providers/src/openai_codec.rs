@@ -65,7 +65,16 @@ pub(crate) fn encode_responses_request(
             "previous_response_id".to_owned(),
             Value::String(prev_id.clone()),
         );
-        let new_messages = &request.messages[request.new_messages_start..];
+        let new_messages = request
+            .messages
+            .get(request.new_messages_start..)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to encode openai responses request: new_messages_start {} exceeds message count {}",
+                    request.new_messages_start,
+                    request.messages.len()
+                )
+            })?;
         let input = encode_responses_input_slice(new_messages, request)?;
         validate_responses_input_item_ids(&input)?;
         body.insert("input".to_owned(), Value::Array(input));
@@ -1727,6 +1736,28 @@ mod tests {
             .find(|item| item["type"] == "message" && item["role"] == "assistant")
             .expect("assistant message");
         assert!(assistant_message.get("id").is_none());
+    }
+
+    #[test]
+    fn openai_responses_request_rejects_invalid_chained_message_start() {
+        let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        request.previous_response_id = Some("resp_previous".to_owned());
+        request.new_messages_start = request.messages.len() + 1;
+
+        let error = encode_responses_request(
+            &request,
+            ResponsesRequestOptions {
+                stream: false,
+                store: Some(false),
+                prompt_cache_key: None,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+                temperature: None,
+            },
+        )
+        .expect_err("invalid chained start should fail");
+
+        assert!(error.to_string().contains("new_messages_start"));
     }
 
     #[test]

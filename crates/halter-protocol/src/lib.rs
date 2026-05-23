@@ -711,6 +711,9 @@ pub enum SessionEventPayload {
     TurnFailed {
         turn_id: TurnId,
         error: String,
+        /// Whether the failure came from explicit user/runtime cancellation.
+        #[serde(default)]
+        cancelled: bool,
         /// Whether the underlying provider error advertised itself as
         /// retryable. Defaults to `false` so historical replays without this
         /// field deserialize cleanly.

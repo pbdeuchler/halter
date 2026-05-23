@@ -97,7 +97,15 @@ impl Hooks {
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(CompiledMatcher::compile_regex)
+                .map(|pattern| {
+                    if registered.hook.event.matcher_field().is_none() {
+                        anyhow::bail!(
+                            "hook event '{}' does not support matcher",
+                            registered.hook.event.canonical_name()
+                        );
+                    }
+                    Ok(CompiledMatcher::compile_regex(pattern)?)
+                })
                 .transpose()
                 .with_context(|| {
                     format!(
@@ -263,7 +271,8 @@ impl ConfiguredHandler {
                 .matcher_value
                 .as_deref()
                 .is_some_and(|value| matcher.is_match(value)),
-            (Some(_), None) | (None, _) => true,
+            (Some(_), None) => false,
+            (None, _) => true,
         };
         matcher_hit
             && self
@@ -339,7 +348,10 @@ fn matches_if_condition(condition: &str, request: &HookDispatchRequest) -> bool 
 
 fn parse_if_condition(condition: &str) -> Option<(&str, &str)> {
     let open = condition.find('(')?;
-    let close = condition.rfind(')')?;
+    if !condition.ends_with(')') {
+        return None;
+    }
+    let close = condition.len().saturating_sub(1);
     if close <= open {
         return None;
     }
@@ -492,6 +504,21 @@ mod tests {
 
         assert!(!matches_if_condition("Shell(git *)", &request));
         assert!(!matches_if_condition("Shell(", &request));
+    }
+
+    #[test]
+    fn if_condition_rejects_trailing_text_after_group() {
+        let request = HookDispatchRequest {
+            event_name: HookEventName::PreToolUse,
+            matcher_value: Some("Shell".to_owned()),
+            payload: json!({
+                "tool_name": "Shell",
+                "tool_input": { "command": "git status" },
+            }),
+            fired_hook_ids: BTreeSet::new(),
+        };
+
+        assert!(!matches_if_condition("Shell(git *) trailing", &request));
     }
 
     #[test]

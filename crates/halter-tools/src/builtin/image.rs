@@ -13,11 +13,10 @@ use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat as ImageCrateFormat, io::Reader as ImageReader};
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext};
+use crate::{CanonicalPath, Tool, ToolContext};
 
 use super::common::{
-    ToolScope, atomic_write_blocking, ensure_not_cancelled, optional_string, optional_u64,
-    required_string, resolve_path,
+    ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string, resolve_path,
 };
 
 #[derive(Debug)]
@@ -94,25 +93,36 @@ impl Tool for ImageTool {
             .policy
             .check_read_path(&input_path, input_len)
             .await?;
-        let input_path = canonical_input.into_path();
+        let input_path = canonical_input.path().to_path_buf();
         let output_path = if let Some(output_path) = output_path {
             let canonical_output = context.policy.check_write_path(&output_path).await?;
-            Some(canonical_output.into_path())
+            let output_path = canonical_output.path().to_path_buf();
+            Some((canonical_output, output_path))
         } else {
             None
         };
+        let writes_input_path = output_path
+            .as_ref()
+            .is_some_and(|(_, output_path)| output_path == &input_path);
 
         let path_locks = context.path_locks.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let bytes = if output_path
-                .as_ref()
-                .is_some_and(|output_path| output_path == &input_path)
-            {
+            use std::io::Read;
+
+            let bytes = if writes_input_path {
                 let _lock = path_locks.acquire_write(&input_path)?;
-                std::fs::read(&input_path)?
+                let mut bytes = Vec::new();
+                canonical_input
+                    .open_read_blocking()?
+                    .read_to_end(&mut bytes)?;
+                bytes
             } else {
                 let _lock = path_locks.acquire_read(&input_path)?;
-                std::fs::read(&input_path)?
+                let mut bytes = Vec::new();
+                canonical_input
+                    .open_read_blocking()?
+                    .read_to_end(&mut bytes)?;
+                bytes
             };
             let detected_format = image::guess_format(&bytes).ok().map(ImageFormat::from);
             let image = decode_image(&bytes)?;
@@ -136,13 +146,13 @@ impl Tool for ImageTool {
                     let format = requested_format
                         .or(detected_format)
                         .unwrap_or(ImageFormat::Png);
-                    render_output(resized, format, quality, output_path.as_deref())
+                    render_output(resized, format, quality, output_path.as_ref())
                 }
                 "convert" => {
                     let format = requested_format.or(detected_format).ok_or_else(|| {
                         anyhow::anyhow!("failed to execute image tool: convert requires format")
                     })?;
-                    render_output(image, format, quality, output_path.as_deref())
+                    render_output(image, format, quality, output_path.as_ref())
                 }
                 other => anyhow::bail!("failed to execute image tool: unknown action '{other}'"),
             }
@@ -220,11 +230,11 @@ fn render_output(
     image: DynamicImage,
     format: ImageFormat,
     quality: u8,
-    output_path: Option<&Path>,
+    output_path: Option<&(CanonicalPath, std::path::PathBuf)>,
 ) -> anyhow::Result<Value> {
     let encoded = encode_image(&image, format, quality)?;
-    if let Some(output_path) = output_path {
-        atomic_write_blocking(output_path, &encoded)?;
+    if let Some((canonical_output, output_path)) = output_path {
+        canonical_output.atomic_write_blocking(&encoded)?;
         Ok(json!({
             "output_path": output_path,
             "format": format.as_str(),

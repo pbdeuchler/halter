@@ -280,18 +280,27 @@ async fn action_screenshot(context: &ToolContext, input: &Value) -> anyhow::Resu
         // Authorize the destination before writing. We don't yet know the
         // size of the screenshot, so pre-check the parent path first.
         let canonical = context.policy.check_write_path(path).await?;
-        let canonical_path = canonical.into_path();
+        let canonical_path = canonical.path().to_path_buf();
         let session_handle = context.tool_sessions.browser_session(&context.session_id);
         let mut guard = session_handle.lock().await;
         let session = require_open_session(&mut guard)?;
         let bytes = session
             .page()
-            .screenshot_to_file(&canonical_path, Some(options))
+            .screenshot(Some(options))
             .await
             .map_err(|err| anyhow::anyhow!("failed to capture screenshot: {err}"))?;
+        let path_locks = context.path_locks.clone();
+        let path_for_write = canonical_path.clone();
+        let byte_len = bytes.len();
+        tokio::task::spawn_blocking(move || {
+            let _lock = path_locks.acquire_write(&path_for_write)?;
+            canonical.atomic_write_blocking(&bytes)?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
         Ok(json!({
             "path": canonical_path,
-            "bytes": bytes.len(),
+            "bytes": byte_len,
         }))
     } else {
         let session_handle = context.tool_sessions.browser_session(&context.session_id);

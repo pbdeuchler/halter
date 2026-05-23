@@ -89,12 +89,20 @@ impl HookMatcherGroup {
             .filter(|value| !value.is_empty());
 
         let matcher = match raw_matcher {
-            Some(pattern) => Some(CompiledMatcher::compile_regex(&pattern).with_context(|| {
-                format!(
-                    "invalid matcher regex for '{}': {pattern}",
-                    event.canonical_name()
-                )
-            })?),
+            Some(pattern) => {
+                if event.matcher_field().is_none() {
+                    anyhow::bail!(
+                        "hook event '{}' does not support matcher",
+                        event.canonical_name()
+                    );
+                }
+                Some(CompiledMatcher::compile_regex(&pattern).with_context(|| {
+                    format!(
+                        "invalid matcher regex for '{}': {pattern}",
+                        event.canonical_name()
+                    )
+                })?)
+            }
             None => None,
         };
 
@@ -663,5 +671,30 @@ mod tests {
         assert_eq!(groups[0].hooks[1].timeout, Duration::from_secs(9));
         assert_eq!(second.allowed_tools, vec!["write".to_owned()]);
         assert_eq!(second.max_turns, Some(3));
+    }
+
+    #[test]
+    fn matcher_on_event_without_matcher_field_is_rejected() {
+        let error = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "Stop": [
+                        {
+                            "matcher": "never",
+                            "hooks": [
+                                {
+                                    "type": "prompt",
+                                    "prompt": "noop"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect_err("Stop does not support matcher");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("hook event 'Stop' does not support matcher"));
     }
 }

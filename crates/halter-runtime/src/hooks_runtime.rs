@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
 use futures::TryStreamExt;
-use futures::stream::{FuturesUnordered, StreamExt};
 use halter_hooks::{
     AgentHookConfig, CommandHookConfig, ConfiguredHandler, ConfiguredHandlerConfig,
     HOOK_PROTOCOL_VERSION, HookDispatchRequest, HookEventName, HookInput, HookMergedOutcome,
@@ -432,36 +431,24 @@ async fn execute_hooks(
 ) -> anyhow::Result<ExecutedHookDispatch> {
     let hooks = sess.services().resources.hooks();
     let prepared = Hooks::prepare_many([hooks.as_ref(), sess.session_hooks().as_ref()], request);
-    let mut preview_runs = prepared.preview_runs().to_vec();
+    let prepared_previews = prepared.preview_runs().to_vec();
+    let mut preview_runs = Vec::new();
     let matched_handlers = prepared.matched_handlers().to_vec();
     let request = prepared.request().clone();
 
     let mut completed_runs = Vec::with_capacity(matched_handlers.len());
     let mut merge_inputs = Vec::new();
     let mut fired_hook_ids = Vec::new();
-    let cancel = CancellationToken::new();
-    let mut running = FuturesUnordered::new();
 
-    for (handler, preview) in matched_handlers
-        .iter()
-        .cloned()
-        .zip(preview_runs.iter_mut())
-    {
+    for (handler, mut preview) in matched_handlers.into_iter().zip(prepared_previews) {
         preview.started_at = chrono::Utc::now();
-        let token = cancel.child_token();
-        let request = request.clone();
-        let preview = preview.clone();
-        running.push(async move { run_handler(sess, &request, handler, preview, token).await });
-    }
-
-    while let Some(result) = running.next().await {
-        if result.handler.once {
+        preview_runs.push(preview.clone());
+        let result = run_handler(sess, &request, handler, preview, CancellationToken::new()).await;
+        if result.handler.once && result.output.is_some() {
             fired_hook_ids.push(result.handler.handler_id.clone());
         }
+        let should_stop = result.output.as_ref().is_some_and(should_cancel_siblings);
         if let Some(output) = result.output.clone() {
-            if should_cancel_siblings(&output) && !cancel.is_cancelled() {
-                cancel.cancel();
-            }
             merge_inputs.push(MergeInput {
                 handler_id: result.handler.handler_id.clone(),
                 priority: result.handler.priority.clone(),
@@ -469,6 +456,9 @@ async fn execute_hooks(
             });
         }
         completed_runs.push(result.summary);
+        if should_stop {
+            break;
+        }
     }
 
     let (merged, conflicts) = merge_outputs(&merge_inputs);

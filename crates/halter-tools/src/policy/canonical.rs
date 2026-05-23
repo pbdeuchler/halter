@@ -29,6 +29,14 @@ impl CanonicalPath {
         self.path
     }
 
+    pub fn open_read_blocking(&self) -> Result<std::fs::File, PolicyError> {
+        open_leaf_read(self)
+    }
+
+    pub fn atomic_write_blocking(&self, bytes: &[u8]) -> Result<(), PolicyError> {
+        write_leaf_atomic(self, bytes)
+    }
+
     #[cfg(unix)]
     pub fn parent_dir_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         use std::os::fd::AsFd;
@@ -89,6 +97,110 @@ impl CanonicalPath {
             parent_dir: parent,
         }
     }
+}
+
+#[cfg(unix)]
+fn open_leaf_read(path: &CanonicalPath) -> Result<std::fs::File, PolicyError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let leaf = leaf_c_string(path)?;
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let raw = unsafe { libc::openat(path.parent_dir_fd.as_raw_fd(), leaf.as_ptr(), flags) };
+    if raw < 0 {
+        return Err(PolicyError::io(
+            path.path.clone(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `raw` is a fresh fd returned by `openat`; `File` takes ownership
+    // and closes it on drop.
+    Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+}
+
+#[cfg(windows)]
+fn open_leaf_read(path: &CanonicalPath) -> Result<std::fs::File, PolicyError> {
+    std::fs::File::open(&path.path).map_err(|error| PolicyError::io(path.path.clone(), error))
+}
+
+#[cfg(unix)]
+fn write_leaf_atomic(path: &CanonicalPath, bytes: &[u8]) -> Result<(), PolicyError> {
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let leaf = leaf_c_string(path)?;
+    let dirfd = path.parent_dir_fd.as_raw_fd();
+    let temp_name = CString::new(format!(
+        ".halter-tmp-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+    .map_err(|error| PolicyError::io(path.path.clone(), std::io::Error::other(error)))?;
+
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    let raw = unsafe { libc::openat(dirfd, temp_name.as_ptr(), flags, 0o600) };
+    if raw < 0 {
+        return Err(PolicyError::io(
+            path.path.clone(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    // SAFETY: `raw` is a fresh fd returned by `openat`; `File` takes ownership
+    // and closes it on every return path.
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.flush()) {
+        let _ = unsafe { libc::unlinkat(dirfd, temp_name.as_ptr(), 0) };
+        return Err(PolicyError::io(path.path.clone(), error));
+    }
+    drop(file);
+
+    let renamed = unsafe { libc::renameat(dirfd, temp_name.as_ptr(), dirfd, leaf.as_ptr()) };
+    if renamed < 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe { libc::unlinkat(dirfd, temp_name.as_ptr(), 0) };
+        return Err(PolicyError::io(path.path.clone(), error));
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_leaf_atomic(path: &CanonicalPath, bytes: &[u8]) -> Result<(), PolicyError> {
+    use std::io::Write;
+
+    let parent = path
+        .path
+        .parent()
+        .ok_or_else(|| PolicyError::ParentTraversal {
+            attempted: path.path.clone(),
+        })?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| PolicyError::io(parent.to_path_buf(), error))?;
+    temp.write_all(bytes)
+        .and_then(|()| temp.flush())
+        .map_err(|error| PolicyError::io(path.path.clone(), error))?;
+    temp.persist(&path.path)
+        .map(|_| ())
+        .map_err(|error| PolicyError::io(path.path.clone(), error.error))
+}
+
+#[cfg(unix)]
+fn leaf_c_string(path: &CanonicalPath) -> Result<std::ffi::CString, PolicyError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let leaf = path
+        .path
+        .file_name()
+        .ok_or_else(|| PolicyError::ParentTraversal {
+            attempted: path.path.clone(),
+        })?;
+    std::ffi::CString::new(leaf.as_bytes()).map_err(|_| PolicyError::ParentTraversal {
+        attempted: path.path.clone(),
+    })
 }
 
 #[cfg(unix)]

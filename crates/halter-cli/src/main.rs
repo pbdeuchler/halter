@@ -195,6 +195,7 @@ async fn run_once(
         biased;
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received, draining runtime before exit");
+            let _ = session.shutdown("interrupted").await;
             let report = harness.shutdown(SHUTDOWN_DRAIN).await;
             info!(
                 drained = report.turns_drained,
@@ -206,8 +207,10 @@ async fn run_once(
         }
         result = run_once_body(&session, task, output_mode, output) => result,
     };
+    let session_shutdown = session.shutdown("run_complete").await;
     let _ = harness.shutdown(SHUTDOWN_DRAIN).await;
-    result
+    result?;
+    session_shutdown
 }
 
 async fn run_once_body(
@@ -251,10 +254,12 @@ async fn chat(path: &Path, output: &mut dyn Write) -> anyhow::Result<()> {
         biased;
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received, draining runtime before exit");
+            let _ = session.shutdown("interrupted").await;
             Err(anyhow::anyhow!("interrupted by signal"))
         }
         result = chat_body(&session, output) => result,
     };
+    let session_shutdown = session.shutdown("chat_complete").await;
     let report = harness.shutdown(SHUTDOWN_DRAIN).await;
     info!(
         drained = report.turns_drained,
@@ -262,7 +267,8 @@ async fn chat(path: &Path, output: &mut dyn Write) -> anyhow::Result<()> {
         timed_out = report.timed_out,
         "runtime drained on chat exit"
     );
-    result
+    result?;
+    session_shutdown
 }
 
 async fn chat_body(session: &HalterSession, output: &mut dyn Write) -> anyhow::Result<()> {
@@ -323,12 +329,10 @@ struct OutputHandles {
 #[derive(Clone)]
 enum TraceWriter {
     Stderr,
-    SharedFile(SharedFileWriter),
 }
 
 enum TraceWriteHandle {
     Stderr(io::Stderr),
-    SharedFile(SharedFileWriter),
 }
 
 #[derive(Clone)]
@@ -375,21 +379,18 @@ impl Write for TraceWriteHandle {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Self::Stderr(writer) => writer.write(buf),
-            Self::SharedFile(writer) => writer.write(buf),
         }
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match self {
             Self::Stderr(writer) => writer.write_all(buf),
-            Self::SharedFile(writer) => writer.write_all(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Stderr(writer) => writer.flush(),
-            Self::SharedFile(writer) => writer.flush(),
         }
     }
 }
@@ -400,7 +401,6 @@ impl<'a> MakeWriter<'a> for TraceWriter {
     fn make_writer(&'a self) -> Self::Writer {
         match self {
             Self::Stderr => TraceWriteHandle::Stderr(io::stderr()),
-            Self::SharedFile(writer) => TraceWriteHandle::SharedFile(writer.clone()),
         }
     }
 }
@@ -410,8 +410,8 @@ fn open_output_handles(path: Option<&Path>) -> anyhow::Result<OutputHandles> {
         Some(path) => {
             let writer = SharedFileWriter::create(path)?;
             Ok(OutputHandles {
-                output: Box::new(writer.clone()),
-                trace: TraceWriter::SharedFile(writer),
+                output: Box::new(writer),
+                trace: TraceWriter::Stderr,
             })
         }
         None => Ok(OutputHandles {
@@ -532,21 +532,17 @@ mod tests {
     }
 
     #[test]
-    fn open_output_handles_redirect_output_and_traces_to_same_file() {
+    fn open_output_handles_redirects_only_command_output_to_file() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("output.txt");
         let OutputHandles { mut output, trace } =
             open_output_handles(Some(&path)).expect("open output");
 
         write_output_line(output.as_mut(), "hello world").expect("write output");
-        let mut trace_output = trace.make_writer();
-        trace_output
-            .write_all(b"trace line\n")
-            .expect("write trace output");
         output.flush().expect("flush output");
-        trace_output.flush().expect("flush trace output");
+        assert!(matches!(trace, TraceWriter::Stderr));
 
         let contents = std::fs::read_to_string(&path).expect("read output");
-        assert_eq!(contents, "hello world\ntrace line\n");
+        assert_eq!(contents, "hello world\n");
     }
 }

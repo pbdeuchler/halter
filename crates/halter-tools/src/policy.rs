@@ -29,13 +29,12 @@ pub use errors::{Pid, PolicyError};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ShellMode {
-    /// Reject function definitions and `eval`/`exec`/`source`/`.` commands.
-    /// Default. The brush-parser AST walk is the enforcement point; this is a
-    /// defensive rejection layer, not a complete isolation boundary.
+    /// Reject function definitions and `eval`/`exec`/`source`/`.` commands,
+    /// then apply the configured program allowlist.
     #[default]
     Strict,
-    /// Retain the prior program-token allowlist behavior. Documented as *not*
-    /// a security boundary; available for workflows that need function
+    /// Apply only the configured program allowlist. Documented as *not* a
+    /// complete isolation boundary; available for workflows that need function
     /// definitions or `eval`.
     Relaxed,
 }
@@ -58,11 +57,8 @@ pub struct PolicySettings {
     pub max_read_bytes: usize,
     pub shell_enabled: bool,
     pub shell_mode: ShellMode,
-    /// Carried for forward compatibility with config files. The current
-    /// `Strict`/`Relaxed` mode split does not consult this list — the
-    /// brush-parser AST walk in `check_shell_command_strict` enforces shell
-    /// rules without a per-program allowlist. Reintroducing allowlisting on
-    /// top of strict mode is a Phase 3 design decision.
+    /// Program names allowed through the shell tool. An empty list denies every
+    /// external command. Shell assignments without a command are still allowed.
     pub allowed_shell_commands: Vec<String>,
     pub shell_timeout_secs: u64,
     pub network_enabled: bool,
@@ -306,10 +302,12 @@ impl ToolPolicy for DefaultToolPolicy {
         if pid <= 1 {
             return Err(PolicyError::ProcessOutsideTree { pid });
         }
-        // Phase 2 threads `process_tree_root` into the live session and walks
-        // the descendant tree. For Phase 1 we enforce only the init-PID floor
-        // so that AC1.6 holds; AC1.7 lands with Phase 2.
-        let _ = self.settings.process_tree_root;
+        if let Some(root) = self.settings.process_tree_root {
+            let descendants = crate::builtin::process::list_descendants(root);
+            if !descendants.contains(&pid) {
+                return Err(PolicyError::ProcessOutsideTree { pid });
+            }
+        }
         Ok(())
     }
 
@@ -334,6 +332,7 @@ impl ToolPolicy for DefaultToolPolicy {
         if matches!(mode, ShellMode::Strict) {
             reject_strict_mode_constructs(&program)?;
         }
+        reject_unallowed_shell_commands(&program, &self.settings.allowed_shell_commands)?;
         Ok(())
     }
 
@@ -635,4 +634,116 @@ fn visit_simple_strict(simple: &ast::SimpleCommand) -> Result<(), PolicyError> {
         }),
         _ => Ok(()),
     }
+}
+
+fn reject_unallowed_shell_commands(
+    program: &ast::Program,
+    allowed: &[String],
+) -> Result<(), PolicyError> {
+    for command in &program.complete_commands {
+        visit_compound_list_allowlist(command, allowed)?;
+    }
+    Ok(())
+}
+
+fn visit_compound_list_allowlist(
+    list: &ast::CompoundList,
+    allowed: &[String],
+) -> Result<(), PolicyError> {
+    for item in &list.0 {
+        visit_and_or_list_allowlist(&item.0, allowed)?;
+    }
+    Ok(())
+}
+
+fn visit_and_or_list_allowlist(
+    list: &ast::AndOrList,
+    allowed: &[String],
+) -> Result<(), PolicyError> {
+    visit_pipeline_allowlist(&list.first, allowed)?;
+    for item in &list.additional {
+        match item {
+            ast::AndOr::And(pipeline) | ast::AndOr::Or(pipeline) => {
+                visit_pipeline_allowlist(pipeline, allowed)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn visit_pipeline_allowlist(
+    pipeline: &ast::Pipeline,
+    allowed: &[String],
+) -> Result<(), PolicyError> {
+    for command in &pipeline.seq {
+        visit_command_allowlist(command, allowed)?;
+    }
+    Ok(())
+}
+
+fn visit_command_allowlist(command: &ast::Command, allowed: &[String]) -> Result<(), PolicyError> {
+    match command {
+        ast::Command::Simple(simple) => visit_simple_allowlist(simple, allowed),
+        ast::Command::Compound(compound, _) => visit_compound_allowlist(compound, allowed),
+        ast::Command::Function(_) | ast::Command::ExtendedTest(_) => Ok(()),
+    }
+}
+
+fn visit_compound_allowlist(
+    command: &ast::CompoundCommand,
+    allowed: &[String],
+) -> Result<(), PolicyError> {
+    match command {
+        ast::CompoundCommand::Arithmetic(_) => Ok(()),
+        ast::CompoundCommand::ArithmeticForClause(cmd) => {
+            visit_compound_list_allowlist(&cmd.body.list, allowed)
+        }
+        ast::CompoundCommand::BraceGroup(cmd) => visit_compound_list_allowlist(&cmd.list, allowed),
+        ast::CompoundCommand::Subshell(cmd) => visit_compound_list_allowlist(&cmd.list, allowed),
+        ast::CompoundCommand::ForClause(cmd) => {
+            visit_compound_list_allowlist(&cmd.body.list, allowed)
+        }
+        ast::CompoundCommand::CaseClause(cmd) => {
+            for case in &cmd.cases {
+                if let Some(list) = &case.cmd {
+                    visit_compound_list_allowlist(list, allowed)?;
+                }
+            }
+            Ok(())
+        }
+        ast::CompoundCommand::IfClause(cmd) => {
+            visit_compound_list_allowlist(&cmd.condition, allowed)?;
+            visit_compound_list_allowlist(&cmd.then, allowed)?;
+            if let Some(elses) = &cmd.elses {
+                for else_clause in elses {
+                    if let Some(condition) = &else_clause.condition {
+                        visit_compound_list_allowlist(condition, allowed)?;
+                    }
+                    visit_compound_list_allowlist(&else_clause.body, allowed)?;
+                }
+            }
+            Ok(())
+        }
+        ast::CompoundCommand::WhileClause(cmd) | ast::CompoundCommand::UntilClause(cmd) => {
+            visit_compound_list_allowlist(&cmd.0, allowed)?;
+            visit_compound_list_allowlist(&cmd.1.list, allowed)
+        }
+    }
+}
+
+fn visit_simple_allowlist(
+    simple: &ast::SimpleCommand,
+    allowed: &[String],
+) -> Result<(), PolicyError> {
+    let Some(program) = simple.word_or_name.as_ref() else {
+        return Ok(());
+    };
+    let program = program.value.trim();
+    if allowed.iter().any(|allowed| allowed == program) {
+        return Ok(());
+    }
+    Err(PolicyError::ShellCommandRejected {
+        reason: "command_not_allowed",
+        fragment: program.to_owned(),
+    })
 }

@@ -11,6 +11,8 @@ use crate::{ToolEventSink, ToolRuntimeEvent};
 
 const REPLACEMENT: &str = "\u{FFFD}";
 const BUFFER_SIZE: usize = 65_536;
+const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
+const TRUNCATION_NOTICE: &str = "\n[output truncated after 1048576 bytes]\n";
 
 pub async fn collect_output(
     reader: fs::File,
@@ -22,6 +24,7 @@ pub async fn collect_output(
     let mut collected = String::new();
     let mut buffer = vec![0u8; BUFFER_SIZE + 4];
     let mut pending = 0usize;
+    let mut truncated = false;
 
     #[cfg(unix)]
     let reader = register_nonblocking_pipe(reader)?;
@@ -76,7 +79,7 @@ pub async fn collect_output(
             let available = &buffer[..pending];
             match str::from_utf8(available) {
                 Ok(text) => {
-                    emit_chunk(&mut collected, &emit, tool_name, text);
+                    emit_chunk(&mut collected, &emit, tool_name, text, &mut truncated);
                     pending = 0;
                     break;
                 }
@@ -92,14 +95,20 @@ pub async fn collect_output(
                         let valid = str::from_utf8(valid_bytes).map_err(|err| {
                             anyhow::anyhow!("shell streaming: valid prefix failed to decode: {err}")
                         })?;
-                        emit_chunk(&mut collected, &emit, tool_name, valid);
+                        emit_chunk(&mut collected, &emit, tool_name, valid, &mut truncated);
                         buffer.copy_within(valid_up_to..pending, 0);
                         pending -= valid_up_to;
                     }
 
                     match error.error_len() {
                         Some(invalid_len) => {
-                            emit_chunk(&mut collected, &emit, tool_name, REPLACEMENT);
+                            emit_chunk(
+                                &mut collected,
+                                &emit,
+                                tool_name,
+                                REPLACEMENT,
+                                &mut truncated,
+                            );
                             buffer.copy_within(invalid_len..pending, 0);
                             pending -= invalid_len;
                         }
@@ -112,10 +121,22 @@ pub async fn collect_output(
 
     for chunk in buffer[..pending].utf8_chunks() {
         if !chunk.valid().is_empty() {
-            emit_chunk(&mut collected, &emit, tool_name, chunk.valid());
+            emit_chunk(
+                &mut collected,
+                &emit,
+                tool_name,
+                chunk.valid(),
+                &mut truncated,
+            );
         }
         if !chunk.invalid().is_empty() {
-            emit_chunk(&mut collected, &emit, tool_name, REPLACEMENT);
+            emit_chunk(
+                &mut collected,
+                &emit,
+                tool_name,
+                REPLACEMENT,
+                &mut truncated,
+            );
         }
     }
 
@@ -127,12 +148,41 @@ fn emit_chunk(
     emit: &std::sync::Arc<dyn ToolEventSink>,
     tool_name: &'static str,
     chunk: &str,
+    truncated: &mut bool,
 ) {
-    collected.push_str(chunk);
-    emit.emit(ToolRuntimeEvent::ToolOutput {
-        tool_name: tool_name.to_owned(),
-        chunk: chunk.to_owned(),
-    });
+    if *truncated {
+        return;
+    }
+    let original_len = chunk.len();
+    let remaining = OUTPUT_CAP_BYTES.saturating_sub(collected.len());
+    let emitted = truncate_to_char_boundary(chunk, remaining);
+    if !emitted.is_empty() {
+        collected.push_str(emitted);
+        emit.emit(ToolRuntimeEvent::ToolOutput {
+            tool_name: tool_name.to_owned(),
+            chunk: emitted.to_owned(),
+        });
+    }
+
+    if emitted.len() < original_len {
+        collected.push_str(TRUNCATION_NOTICE);
+        emit.emit(ToolRuntimeEvent::ToolOutput {
+            tool_name: tool_name.to_owned(),
+            chunk: TRUNCATION_NOTICE.to_owned(),
+        });
+        *truncated = true;
+    }
+}
+
+fn truncate_to_char_boundary(value: &str, cap: usize) -> &str {
+    if value.len() <= cap {
+        return value;
+    }
+    let mut boundary = cap;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &value[..boundary]
 }
 
 #[cfg(unix)]

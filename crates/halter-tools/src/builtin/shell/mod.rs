@@ -40,8 +40,8 @@ impl Tool for ShellTool {
             }),
             concurrency: ToolConcurrency::Exclusive,
             capabilities: ToolCapabilities {
-                mutating: false,
-                requires_approval: false,
+                mutating: true,
+                requires_approval: true,
                 cancellable: true,
                 long_running: true,
             },
@@ -52,11 +52,14 @@ impl Tool for ShellTool {
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
         let _scope = ToolScope::new(&context, "shell");
         ensure_not_cancelled(&context.cancel)?;
+        let timeout = optional_u64(&input, "timeout_ms")?
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_secs(context.shell_timeout_secs.max(1)));
         let options = ShellRunOptions {
             command: required_string(&input, "command")?.to_owned(),
             cwd: optional_string(&input, "cwd").map(ToOwned::to_owned),
             env: parse_env_map(input.get("env"))?,
-            timeout: optional_u64(&input, "timeout_ms")?.map(Duration::from_millis),
+            timeout: Some(timeout),
         };
         let mode = context.policy.shell_mode();
         context

@@ -302,14 +302,14 @@ impl Tool for ProcessTool {
                 "properties": {
                     "action": { "type": "string", "enum": ["kill_tree", "list_descendants"] },
                     "pid": { "type": "integer", "minimum": 1 },
-                    "signal": { "type": "integer", "minimum": 1 }
+                    "signal": { "type": "integer", "minimum": 1, "default": 9 }
                 },
                 "required": ["action", "pid"],
             }),
             concurrency: ToolConcurrency::Exclusive,
             capabilities: ToolCapabilities {
                 mutating: true,
-                requires_approval: false,
+                requires_approval: true,
                 cancellable: false,
                 long_running: false,
             },

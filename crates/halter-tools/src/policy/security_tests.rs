@@ -209,13 +209,44 @@ async fn ac1_11_strict_mode_rejects_eval_exec_source_dot_and_functions() {
 
 #[tokio::test]
 async fn ac1_11_relaxed_mode_accepts_eval() {
-    let policy = DefaultToolPolicy::new(PolicySettings::default());
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        allowed_shell_commands: vec!["eval".to_owned()],
+        ..PolicySettings::default()
+    });
     // Relaxed mode is documented as not a security boundary. It should not
-    // reject `eval`.
+    // reject `eval` when the program is explicitly allowlisted.
     policy
         .check_shell_command_strict("eval true", ShellMode::Relaxed)
         .await
         .expect("relaxed mode accepts eval");
+}
+
+#[tokio::test]
+async fn shell_allowlist_rejects_unlisted_programs() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        allowed_shell_commands: vec!["git".to_owned()],
+        ..PolicySettings::default()
+    });
+
+    policy
+        .check_shell_command_strict("git status", ShellMode::Strict)
+        .await
+        .expect("allowlisted command should pass");
+    let err = policy
+        .check_shell_command_strict("python -c 'print(1)'", ShellMode::Strict)
+        .await
+        .expect_err("unlisted command must be rejected");
+
+    assert!(
+        matches!(
+            err,
+            PolicyError::ShellCommandRejected {
+                reason: "command_not_allowed",
+                ..
+            }
+        ),
+        "wrong error: {err:?}"
+    );
 }
 
 // ------------- AC1.12: loopback IP denied unless allowlisted
@@ -276,24 +307,21 @@ async fn ac1_6_check_process_signal_rejects_init_pid() {
 
 // ------------- AC1.7: PIDs outside the session tracked tree are denied
 //
-// Phase 2 status: the policy currently enforces only the init/kernel floor
-// (AC1.6). Threading the live session's `process_tree_root` and walking the
-// descendant set is a follow-up. This test pins the *enforced* surface so a
-// regression that, say, accepts pid=1 fails. When descendant-tree enforcement
-// lands, an additional case will be added here.
-
 #[tokio::test]
-async fn ac1_7_check_process_signal_pin_init_floor_until_tree_walk_lands() {
+async fn ac1_7_check_process_signal_rejects_pid_outside_tree() {
     let policy = DefaultToolPolicy::new(PolicySettings {
         process_tree_root: Some(424242),
         ..PolicySettings::default()
     });
-    // Init floor still applies even with a configured tree root.
+
     let err = policy
-        .check_process_signal(1)
+        .check_process_signal(424243)
         .await
-        .expect_err("init floor still applies with a tree root configured");
-    assert!(matches!(err, PolicyError::ProcessOutsideTree { pid: 1 }));
+        .expect_err("pid outside configured process tree must be denied");
+    assert!(matches!(
+        err,
+        PolicyError::ProcessOutsideTree { pid: 424243 }
+    ));
 }
 
 // ------------- AC1.10: function definitions cannot be smuggled across turns

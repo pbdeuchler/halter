@@ -178,7 +178,7 @@ where
             .into_string()
             .map_err(|value| anyhow::anyhow!("invalid utf-8 in env override {:?}", value))?;
         let value = (spec.parse)(&raw)?;
-        set_toml_path(config, spec.path, value);
+        set_toml_path(config, spec.path, value)?;
     }
 
     Ok(())
@@ -193,6 +193,7 @@ where
 {
     for provider in [
         Some(config.default_model()?.provider),
+        config.small_model().map(|model| model.provider),
         config.subagent_model().map(|model| model.provider),
     ]
     .into_iter()
@@ -294,26 +295,41 @@ fn env_override_specs() -> &'static [EnvOverrideSpec] {
     ]
 }
 
-fn set_toml_path(root: &mut toml::Value, path: &[&str], value: toml::Value) {
+fn set_toml_path(root: &mut toml::Value, path: &[&str], value: toml::Value) -> anyhow::Result<()> {
     if path.is_empty() {
         *root = value;
-        return;
+        return Ok(());
     }
 
     let mut cursor = root;
     for segment in &path[..path.len() - 1] {
-        let table = cursor
-            .as_table_mut()
-            .expect("toml path traversal requires a table");
+        let table = cursor.as_table_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to apply environment override: '{}' must be a table",
+                path_component_prefix(path, segment)
+            )
+        })?;
         cursor = table
             .entry((*segment).to_owned())
             .or_insert_with(|| toml::Value::Table(Default::default()));
     }
 
-    let table = cursor
-        .as_table_mut()
-        .expect("terminal toml path traversal requires a table");
+    let table = cursor.as_table_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to apply environment override: '{}' must be a table",
+            path[..path.len() - 1].join(".")
+        )
+    })?;
     table.insert(path[path.len() - 1].to_owned(), value);
+    Ok(())
+}
+
+fn path_component_prefix(path: &[&str], segment: &str) -> String {
+    let end = path
+        .iter()
+        .position(|candidate| *candidate == segment)
+        .map_or(path.len(), |index| index + 1);
+    path[..end].join(".")
 }
 
 fn merge_toml(base: &mut toml::Value, patch: toml::Value) {
@@ -511,6 +527,37 @@ api_key = "openai-key"
     }
 
     #[test]
+    fn runtime_requirements_include_small_provider_credentials() {
+        let parsed = parse_toml(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[models.small]
+provider = "openrouter"
+model = "openai/gpt-5-mini"
+
+[providers.openai]
+api_key = "openai-key"
+"#,
+        )
+        .expect("parse config");
+        let config: HarnessConfig = parsed.try_into().expect("decode config");
+        config.validate().expect("config should validate");
+
+        let error = validate_runtime_requirements_with(&config, |name| match name {
+            "OPENAI_API_KEY" => Some(OsString::from("openai-key")),
+            _ => None,
+        })
+        .expect_err("runtime requirements should fail");
+
+        assert!(error.to_string().contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
     fn env_overrides_apply_from_table() {
         let mut value = toml::Value::try_from(HarnessConfig::default()).expect("defaults");
         let overrides = BTreeMap::from([
@@ -536,6 +583,28 @@ api_key = "openai-key"
         );
         assert_eq!(decoded.policy.shell.allow, vec!["git", "just"]);
         assert_eq!(decoded.tools.enabled, vec!["read", "glob"]);
+    }
+
+    #[test]
+    fn env_overrides_return_error_when_layer_replaces_parent_table() {
+        let mut value = parse_toml(
+            r#"
+version = 1
+policy = "bad"
+"#,
+        )
+        .expect("parse config");
+        let overrides = BTreeMap::from([("HALTER_POLICY_SHELL_ENABLED", "true")]);
+
+        let error =
+            apply_env_overrides_with(&mut value, |name| overrides.get(name).map(OsString::from))
+                .expect_err("malformed parent table should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to apply environment override")
+        );
     }
 
     #[cfg(feature = "sqlite")]

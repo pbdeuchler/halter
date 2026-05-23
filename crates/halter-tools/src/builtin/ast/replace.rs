@@ -12,9 +12,7 @@ use crate::ToolPolicy;
 
 use super::FileCandidate;
 use super::language::{parse_strictness, resolve_language};
-use crate::builtin::common::{
-    atomic_write_blocking, ensure_not_cancelled, optional_bool, optional_string, optional_u64,
-};
+use crate::builtin::common::{ensure_not_cancelled, optional_bool, optional_string, optional_u64};
 
 #[derive(Clone)]
 pub(super) struct ReplaceConfig {
@@ -194,7 +192,7 @@ pub(super) fn run(
                             candidate.display_path,
                         )
                     })?;
-                atomic_write_blocking(canonical.path(), output.as_bytes())?;
+                canonical.atomic_write_blocking(output.as_bytes())?;
             }
         }
         drop(guard);
