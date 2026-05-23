@@ -126,7 +126,7 @@ halter --output-file run.jsonl run --streaming-json "Summarize this repo"
 ```text
 halter init
 halter chat
-halter run [--json-result | --streaming-json] <TASK>
+halter run [--json-result | --streaming-json] (<TASK> | --prompt-file <PROMPT_FILE>)
 halter resources
 halter validate
 halter config schema
@@ -226,13 +226,20 @@ Runs a single user task in a fresh session.
 halter run "Review the staged diff and summarize the main risk"
 ```
 
+For longer prompts, keep the prompt in a file and pass the file path:
+
+```bash
+halter run --prompt-file ./prompt.md
+```
+
 Internally this command does the following:
 
 1. loads the config
 2. builds a `Halter`
 3. creates `SessionInit::default()`
-4. submits one `Turn::user(task)`
-5. prints either the final assistant message or the full event stream
+4. reads `--prompt-file` when provided
+5. submits one `Turn::user(task)`
+6. prints either the final assistant message or the full event stream
 
 ### Output modes
 
@@ -286,6 +293,12 @@ Single-shot human use:
 
 ```bash
 halter run "List the crates in this workspace and what each one does"
+```
+
+File-backed prompt:
+
+```bash
+halter run --prompt-file ./prompts/release-review.md
 ```
 
 Write final JSON result to a file:

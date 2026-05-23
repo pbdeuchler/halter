@@ -5,8 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use halter_protocol::{
-    ApiKind, DEFAULT_TEMPERATURE, ProviderKind, PruneSignalThreshold, ReasoningEffort,
-    SubagentEventForwarding,
+    ApiKind, ProviderKind, PruneSignalThreshold, ReasoningEffort, SubagentEventForwarding,
 };
 use indexmap::IndexMap;
 use schemars::JsonSchema;
@@ -235,8 +234,8 @@ pub struct ProviderConfig {
     /// default or hardcoded provider header (Authorization, x-api-key, etc.).
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub headers: IndexMap<String, String>,
-    /// Optional override for the sampling temperature. Falls back to the
-    /// global `DEFAULT_TEMPERATURE` (0.7) when unset. Must be in `0.0..=2.0`.
+    /// Optional override for the sampling temperature. When unset, no
+    /// temperature is sent to the provider. Must be in `0.0..=2.0`.
     #[serde(default)]
     pub temperature: Option<f32>,
 }
@@ -265,9 +264,8 @@ pub struct ResolvedProviderConfig {
     /// over provider defaults using case-insensitive name matching.
     pub headers: Vec<(String, String)>,
     /// Sampling temperature forwarded to every request this provider emits.
-    /// Defaults to `DEFAULT_TEMPERATURE` (0.7) when the user does not override
-    /// `[providers.<name>].temperature`.
-    pub temperature: f32,
+    /// When unset, request bodies omit temperature and defer to the provider.
+    pub temperature: Option<f32>,
 }
 
 pub fn resolve_provider_runtime_config<F>(
@@ -317,9 +315,7 @@ where
         })
         .unwrap_or_default();
 
-    let temperature = configured
-        .and_then(|config| config.temperature)
-        .unwrap_or(DEFAULT_TEMPERATURE);
+    let temperature = configured.and_then(|config| config.temperature);
 
     Ok(ResolvedProviderConfig {
         provider,
@@ -720,7 +716,7 @@ mod tests {
 
         assert_eq!(resolved.base_url, "https://proxy.example.com");
         assert_eq!(resolved.api_key, "configured-key");
-        assert_eq!(resolved.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(resolved.temperature, None);
     }
 
     #[test]
@@ -737,17 +733,17 @@ mod tests {
         )
         .expect("resolve provider");
 
-        assert!((resolved.temperature - 0.2).abs() < f32::EPSILON);
+        assert_eq!(resolved.temperature, Some(0.2));
     }
 
     #[test]
-    fn provider_resolution_defaults_temperature_when_unset() {
+    fn provider_resolution_leaves_temperature_unset_when_unconfigured() {
         let resolved = resolve_provider_runtime_config(ConfiguredProvider::Anthropic, None, |_| {
             Ok(Some("env-key".to_owned()))
         })
         .expect("resolve provider");
 
-        assert_eq!(resolved.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(resolved.temperature, None);
     }
 
     #[test]

@@ -50,7 +50,19 @@ enum Commands {
     Run {
         #[command(flatten)]
         output: RunOutputArgs,
-        task: String,
+        #[arg(
+            long,
+            value_name = "PROMPT_FILE",
+            conflicts_with = "task",
+            help = "Read the run prompt from a file instead of a command-line string"
+        )]
+        prompt_file: Option<PathBuf>,
+        #[arg(
+            value_name = "TASK",
+            required_unless_present = "prompt_file",
+            conflicts_with = "prompt_file"
+        )]
+        task: Option<String>,
     },
     Resources,
     Validate,
@@ -78,8 +90,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Chat => chat(&cli.config, output.as_mut()).await,
         Commands::Run {
             task,
+            prompt_file,
             output: run_output,
-        } => run_once(&cli.config, &task, run_output.mode(), output.as_mut()).await,
+        } => {
+            let task = read_run_prompt(task, prompt_file).await?;
+            run_once(&cli.config, &task, run_output.mode(), output.as_mut()).await
+        }
         Commands::Resources => show_resources(&cli.config, output.as_mut()).await,
         Commands::Validate => validate(&cli.config, output.as_mut()).await,
         Commands::Config {
@@ -133,6 +149,28 @@ async fn show_resources(path: &Path, output: &mut dyn Write) -> anyhow::Result<(
         output,
         format!("plugins: {}", resources.snapshot.plugins.len()),
     )
+}
+
+async fn read_run_prompt(
+    task: Option<String>,
+    prompt_file: Option<PathBuf>,
+) -> anyhow::Result<String> {
+    match (task, prompt_file) {
+        (Some(task), None) => Ok(task),
+        (None, Some(path)) => tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read prompt file {}", path.display())),
+        (None, None) => {
+            anyhow::bail!(
+                "failed to resolve run prompt: pass <TASK> or --prompt-file <PROMPT_FILE>"
+            )
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!(
+                "failed to resolve run prompt: pass either <TASK> or --prompt-file <PROMPT_FILE>, not both"
+            )
+        }
+    }
 }
 
 /// Bound on how long the runtime gets to drain in-flight turns after a
@@ -435,6 +473,62 @@ mod tests {
 
         assert_eq!(cli.output_file, Some(PathBuf::from("out.jsonl")));
         assert!(matches!(cli.command, Commands::Run { .. }));
+    }
+
+    #[test]
+    fn cli_accepts_run_prompt_file() {
+        let cli =
+            Cli::try_parse_from(["halter", "run", "--prompt-file", "prompt.md"]).expect("parse");
+
+        match cli.command {
+            Commands::Run {
+                prompt_file, task, ..
+            } => {
+                assert_eq!(prompt_file, Some(PathBuf::from("prompt.md")));
+                assert_eq!(task, None);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_missing_run_prompt_source() {
+        let error = Cli::try_parse_from(["halter", "run"])
+            .expect_err("run should require a task or prompt file");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn cli_rejects_run_task_and_prompt_file() {
+        let error = Cli::try_parse_from([
+            "halter",
+            "run",
+            "--prompt-file",
+            "prompt.md",
+            "command-line task",
+        ])
+        .expect_err("run should reject multiple prompt sources");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[tokio::test]
+    async fn read_run_prompt_reads_prompt_file() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("prompt.md");
+        tokio::fs::write(&path, "prompt from file\n")
+            .await
+            .expect("write prompt");
+
+        let prompt = read_run_prompt(None, Some(path))
+            .await
+            .expect("read prompt");
+
+        assert_eq!(prompt, "prompt from file\n");
     }
 
     #[test]

@@ -220,6 +220,12 @@ cargo run -p halter-cli -- run "Summarize this repository's architecture"
 
 By default, `run` emits the final assistant result as JSON.
 
+For longer prompts, pass a prompt file instead of an inline task:
+
+```bash
+cargo run -p halter-cli -- run --prompt-file ./prompt.md
+```
+
 To stream raw session events instead:
 
 ```bash
@@ -529,6 +535,7 @@ Useful flags:
 
 - `--json-result` — final answer as JSON
 - `--streaming-json` — newline-delimited `SessionEvent` JSON
+- `--prompt-file <PROMPT_FILE>` — read the prompt from a file
 
 ### `halter chat`
 

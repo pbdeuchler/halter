@@ -15,9 +15,9 @@ use uuid::Uuid;
 /// Shared string payloads stay as `String` for now; this is the swap point for any future `Arc<str>` migration.
 pub type SharedStr = String;
 
-/// Default sampling temperature applied to every provider request. Individual
-/// providers may override this through their `[providers.<name>].temperature`
-/// config. 0.7 is the historical default across modern chat/responses APIs.
+/// Historical sampling temperature used by older config resolution. Provider
+/// requests now omit temperature unless `[providers.<name>].temperature` is
+/// configured explicitly.
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub type MediaType = String;
 pub type ReplaySignature = String;

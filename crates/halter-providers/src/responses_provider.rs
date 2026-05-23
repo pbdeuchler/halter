@@ -54,7 +54,7 @@ pub(crate) struct ResponsesProviderConfig {
 pub(crate) struct ResponsesProvider {
     config: ResponsesProviderConfig,
     transport: ResponsesTransport,
-    temperature: f32,
+    temperature: Option<f32>,
 }
 
 impl ResponsesProvider {
@@ -63,7 +63,7 @@ impl ResponsesProvider {
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
-        temperature: f32,
+        temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             config,
@@ -546,7 +546,7 @@ mod tests {
             "test-key",
             "http://127.0.0.1:1",
             &[],
-            halter_protocol::DEFAULT_TEMPERATURE,
+            None,
         )
         .expect("responses provider");
 
@@ -761,7 +761,7 @@ mod tests {
             "test-key",
             base_url,
             &[],
-            halter_protocol::DEFAULT_TEMPERATURE,
+            None,
         )
         .expect("responses provider");
 
