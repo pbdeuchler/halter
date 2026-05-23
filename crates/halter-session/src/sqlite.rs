@@ -657,7 +657,7 @@ mod tests {
 
     use halter_protocol::{
         InstructionFile, ModelId, PromptSegment, ResourceSnapshot, Revision, SubagentRef,
-        SummarySlice,
+        SubagentEventForwarding, SummarySlice,
     };
     use tempfile::tempdir;
 
