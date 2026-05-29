@@ -1,13 +1,13 @@
 [package]
 name = "halter"
 edition = "2024"
-license-file = "../LICENSE"
+license-file = "../../LICENSE"
 version = "0.1.0"
 authors = ["pbdeuchler"]
 description = "Programmatic agent runtime, protocol, and tool harness"
 repository = "https://github.com/pbdeuchler/halter"
 homepage = "https://github.com/pbdeuchler/halter"
-readme = "../README.md"
+readme = "../../README.md"
 keywords = ["ai", "agent", "llm", "harness", "tools"]
 categories = ["development-tools"]
 rust-version = "1.95"
