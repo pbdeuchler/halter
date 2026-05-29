@@ -656,8 +656,8 @@ mod tests {
     use std::sync::Arc;
 
     use halter_protocol::{
-        InstructionFile, ModelId, PromptSegment, ResourceSnapshot, Revision, SubagentRef,
-        SubagentEventForwarding, SummarySlice,
+        InstructionFile, ModelId, PromptSegment, ResourceSnapshot, Revision,
+        SubagentEventForwarding, SubagentRef, SummarySlice,
     };
     use tempfile::tempdir;
 

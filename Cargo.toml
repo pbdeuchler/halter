@@ -12,6 +12,10 @@ members = [
 ]
 resolver = "3"
 
+[workspace.package]
+rust-version = "1.96"
+edition = "2024"
+
 # The [patch.crates-io] override points every transitive `brush-core`
 # dependency (most notably our own `brush-builtins` fork) at the vendored
 # copy in `vendor/brush-core-vendored`. Without the patch, Cargo would

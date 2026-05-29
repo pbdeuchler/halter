@@ -1,6 +1,6 @@
 [package]
 name = "halter"
-edition = "2024"
+edition.workspace = true
 license-file = "../../LICENSE"
 version = "0.1.0"
 authors = ["pbdeuchler"]
@@ -10,7 +10,7 @@ homepage = "https://github.com/pbdeuchler/halter"
 readme = "../../README.md"
 keywords = ["ai", "agent", "llm", "harness", "tools"]
 categories = ["development-tools"]
-rust-version = "1.95"
+rust-version.workspace = true
 
 [features]
 advanced-tools = ["halter-runtime/advanced-tools", "halter-tools/advanced-tools"]
