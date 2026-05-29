@@ -22,6 +22,7 @@ resolver = "3"
 # as confusing `expected X, found X` errors. (finding M14)
 [patch.crates-io]
 brush-core = { path = "vendor/brush-core-vendored" }
+brush-builtins = { path = "vendor/brush-builtins-vendored" }
 
 [workspace.dependencies]
 anyhow = "1.0.100"
