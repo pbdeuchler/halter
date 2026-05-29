@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 rust-version = "1.87.0"
-name = "brush-core"
+name = "halter-brush-core"
 version = "0.4.0"
 build = false
 autolib = false
@@ -20,7 +20,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Reusable core of a POSIX/bash shell (used by brush-shell)"
+description = "Halter vendored fork of brush-core"
 readme = "README.md"
 keywords = [
     "cli",
@@ -34,7 +34,7 @@ categories = [
     "development-tools",
 ]
 license = "MIT"
-repository = "https://github.com/reubeno/brush"
+repository = "https://github.com/pbdeuchler/halter"
 
 [lib]
 name = "brush_core"
@@ -117,6 +117,7 @@ version = "1.48.0"
 features = [
     "io-util",
     "macros",
+    "net",
     "process",
     "rt",
     "rt-multi-thread",

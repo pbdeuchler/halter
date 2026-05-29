@@ -7,7 +7,7 @@ authors = ["pbdeuchler"]
 description = "Programmatic agent runtime, protocol, and tool harness"
 repository = "https://github.com/pbdeuchler/halter"
 homepage = "https://github.com/pbdeuchler/halter"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["ai", "agent", "llm", "harness", "tools"]
 categories = ["development-tools"]
 rust-version.workspace = true
@@ -21,10 +21,6 @@ pty = ["halter-runtime/pty", "halter-tools/pty"]
 profiling = ["halter-runtime/profiling", "halter-tools/profiling"]
 full = ["advanced-tools", "ast-tools", "browser-tools", "image-tools", "pty", "profiling"]
 sqlite = ["halter-config/sqlite", "halter-session/sqlite"]
-
-[patch.crates-io]
-brush-core = { path = "vendor/brush-core-vendored" }
-brush-builtins = { path = "vendor/brush-builtins-vendored" }
 
 [dependencies]
 anyhow.workspace = true

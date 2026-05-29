@@ -9,24 +9,14 @@ members = [
     "crates/halter-session",
     "crates/halter",
     "crates/halter-cli",
+    "vendor/brush-builtins-vendored",
+    "vendor/brush-core-vendored",
 ]
 resolver = "3"
 
 [workspace.package]
 rust-version = "1.96"
 edition = "2024"
-
-# The [patch.crates-io] override points every transitive `brush-core`
-# dependency (most notably our own `brush-builtins` fork) at the vendored
-# copy in `vendor/brush-core-vendored`. Without the patch, Cargo would
-# resolve two distinct `brush-core` versions: the vendored fork used
-# directly by `halter-tools` and the crates.io release pulled in
-# transitively by `brush-builtins`. That split breaks cross-crate type
-# identity for shared types (e.g. shell-evaluator handles) and surfaces
-# as confusing `expected X, found X` errors. (finding M14)
-[patch.crates-io]
-brush-core = { path = "vendor/brush-core-vendored" }
-brush-builtins = { path = "vendor/brush-builtins-vendored" }
 
 [workspace.dependencies]
 anyhow = "1.0.100"
@@ -36,8 +26,8 @@ ast-grep-language = { version = "0.42.1", default-features = false, features = [
 async-openai = { version = "0.34.0", default-features = false, features = ["byot", "chat-completion", "responses", "rustls"] }
 async-trait = "0.1.89"
 base64 = "0.22.1"
-brush-builtins = { version = "0.1.0", path = "vendor/brush-builtins-vendored" }
-brush-core = { version = "0.4.0", path = "vendor/brush-core-vendored" }
+brush-builtins = { package = "halter-brush-builtins", version = "0.1.0", path = "vendor/brush-builtins-vendored" }
+brush-core = { package = "halter-brush-core", version = "0.4.0", path = "vendor/brush-core-vendored" }
 brush-parser = "0.3.0"
 bytes = { version = "1.10.1", features = ["serde"] }
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
