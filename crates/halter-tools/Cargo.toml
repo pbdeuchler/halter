@@ -12,6 +12,10 @@ pty = ["dep:portable-pty"]
 profiling = ["dep:inferno"]
 full = ["advanced-tools", "ast-tools", "browser-tools", "image-tools", "pty", "profiling"]
 
+[patch.crates-io]
+brush-core = { path = "vendor/brush-core-vendored" }
+brush-builtins = { path = "vendor/brush-builtins-vendored" }
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
