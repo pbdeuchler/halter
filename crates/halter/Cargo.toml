@@ -1,14 +1,16 @@
 [package]
 name = "halter"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description.workspace = true
-repository.workspace = true
-readme.workspace = true
-keywords.workspace = true
-categories.workspace = true
-rust-version.workspace = true
+edition = "2024"
+license-file = "../LICENSE"
+version = "0.1.0"
+authors = ["pbdeuchler"]
+description = "Programmatic agent runtime, protocol, and tool harness"
+repository = "https://github.com/pbdeuchler/halter"
+homepage = "https://github.com/pbdeuchler/halter"
+readme = "../README.md"
+keywords = ["ai", "agent", "llm", "harness", "tools"]
+categories = ["development-tools"]
+rust-version = "1.95"
 
 [features]
 advanced-tools = ["halter-runtime/advanced-tools", "halter-tools/advanced-tools"]
@@ -23,13 +25,13 @@ sqlite = ["halter-config/sqlite", "halter-session/sqlite"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-halter-config = { path = "../halter-config" }
-halter-hooks = { path = "../halter-hooks" }
-halter-protocol = { path = "../halter-protocol" }
-halter-providers = { path = "../halter-providers" }
-halter-runtime = { path = "../halter-runtime" }
-halter-session = { path = "../halter-session" }
-halter-tools = { path = "../halter-tools" }
+halter-config = { path = "../halter-config", version = "0.1.0" }
+halter-hooks = { path = "../halter-hooks", version = "0.1.0"  }
+halter-protocol = { path = "../halter-protocol", version = "0.1.0"  }
+halter-providers = { path = "../halter-providers", version = "0.1.0"  }
+halter-runtime = { path = "../halter-runtime", version = "0.1.0"  }
+halter-session = { path = "../halter-session", version = "0.1.0"  }
+halter-tools = { path = "../halter-tools", version = "0.1.0"  }
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true

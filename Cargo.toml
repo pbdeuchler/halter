@@ -23,18 +23,6 @@ resolver = "3"
 [patch.crates-io]
 brush-core = { path = "vendor/brush-core-vendored" }
 
-[workspace.package]
-edition = "2024"
-license = "MIT"
-version = "0.1.0"
-authors = ["pbdeuchler"]
-description = "Local-first agent runtime, protocol, and tool harness"
-repository = "https://github.com/pbdeuchler/halter"
-readme = "README.md"
-keywords = ["ai", "agent", "tools"]
-categories = ["development-tools"]
-rust-version = "1.95"
-
 [workspace.dependencies]
 anyhow = "1.0.100"
 arc-swap = "1.7.1"
