@@ -913,7 +913,6 @@ impl SessionHandle {
             Some(result) => result.summary,
             None => "No compaction needed.".to_owned(),
         };
-        state.pending_session_start_source = Some(HookSessionStartSource::Compact);
         self.push_event(
             &mut events,
             SessionEventPayload::ContextCompacted {
@@ -1075,6 +1074,7 @@ impl SessionHandle {
                 messages: plan.messages.clone(),
                 compacted_prefix: plan.compacted_prefix.clone(),
                 compaction: plan.compaction.clone(),
+                session_start_latch: None,
             };
             if let Some(result) = plan_outcome.apply(&mut state) {
                 self.push_event(

@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
-    ProviderRequest, StreamEvent, ToolCallIdPolicy,
+    CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -55,6 +55,10 @@ impl OpenRouterProvider {
 impl Provider for OpenRouterProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
+    }
+
+    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
+        self.inner.compaction_window(messages)
     }
 
     async fn stream(
@@ -152,6 +156,51 @@ mod tests {
 
         assert!(capabilities.supports_prompt_cache);
         assert!(capabilities.supports_compaction);
+    }
+
+    #[test]
+    fn openrouter_provider_compaction_window_preserves_through_latest_user() {
+        let provider = OpenRouterProvider::new("test-key", "https://openrouter.ai/api")
+            .expect("openrouter provider");
+        let tool_call_id = ToolCallId::from("call_1");
+        let messages = vec![
+            Message::User(UserMessage::text("first")),
+            assistant_text("answer"),
+            Message::User(UserMessage::text("latest")),
+            Message::Assistant(AssistantMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: vec![AssistantPart::ToolCall(ToolCall {
+                    id: tool_call_id.clone(),
+                    name: "read".into(),
+                    arguments: json!({}),
+                })],
+                stop_reason: None,
+                usage: None,
+                replay_meta: Default::default(),
+            }),
+            Message::Tool(ToolResultMessage {
+                id: MessageId::new(),
+                call_id: tool_call_id,
+                content: ToolResult::Text {
+                    text: "tail".to_owned(),
+                },
+                error: None,
+                created_at: Utc::now(),
+            }),
+        ];
+
+        let window = provider
+            .compaction_window(&messages)
+            .expect("compaction window");
+
+        assert_eq!(window.preserved_messages.len(), 3);
+        assert!(matches!(
+            window.preserved_messages.last(),
+            Some(Message::User(_))
+        ));
+        assert_eq!(window.eligible_messages.len(), 2);
+        assert!(!window.reserved_response_block);
     }
 
     #[tokio::test]
@@ -291,6 +340,19 @@ mod tests {
             previous_response_id: None,
             new_messages_start: 0,
         }
+    }
+
+    fn assistant_text(text: &str) -> Message {
+        Message::Assistant(AssistantMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            parts: vec![AssistantPart::Text {
+                text: text.to_owned(),
+            }],
+            stop_reason: None,
+            usage: None,
+            replay_meta: Default::default(),
+        })
     }
 
     fn sample_compaction_request() -> ProviderCompactionRequest {

@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 use halter_protocol::{
-    CompactionResult, ContextPlan, FileViewSlice, Message, ObservedState, PromptSegment,
-    ProviderCompactionRequest, ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionState,
-    ToolSpec, TranscriptWindow,
+    CompactedContext, CompactionResult, ContextPlan, FileViewSlice, HookSessionStartSource,
+    Message, ObservedState, PromptSegment, ProviderCompactionRequest, ResolvedModel,
+    ResourceSnapshot, SessionBlueprint, SessionState, ToolSpec, TranscriptWindow,
 };
 use halter_providers::Provider;
 use serde_json::Value;
@@ -41,6 +41,39 @@ pub struct CompactionOutcome {
     pub messages: Vec<Message>,
     pub compacted_prefix: Vec<Value>,
     pub compaction: Option<CompactionResult>,
+    pub session_start_latch: Option<HookSessionStartSource>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactionEffects {
+    pub messages: Vec<Message>,
+    pub compacted_context: CompactedContext,
+    pub result: Option<CompactionResult>,
+    pub session_start_latch: Option<HookSessionStartSource>,
+}
+
+impl CompactionEffects {
+    pub fn apply(self, state: &mut SessionState) -> Option<CompactionResult> {
+        let CompactionEffects {
+            messages,
+            compacted_context,
+            result,
+            session_start_latch,
+        } = self;
+        if result.is_some() {
+            state.compacted_prefix = compacted_context.into_items();
+            state.messages = messages;
+            // Compaction breaks the previous_response_id chain: the provider
+            // has no record of the synthetic `compacted_prefix` we just
+            // injected, so the next request must replay everything.
+            state.last_response_id = None;
+            state.messages_seen_by_provider = 0;
+        }
+        if let Some(source) = session_start_latch {
+            state.pending_session_start_source = Some(source);
+        }
+        result
+    }
 }
 
 impl CompactionOutcome {
@@ -53,20 +86,52 @@ impl CompactionOutcome {
     /// (so callers can publish the event), or `None` when there was
     /// nothing to compact and the state was left untouched.
     pub fn apply(self, state: &mut SessionState) -> Option<CompactionResult> {
+        self.into_effects().apply(state)
+    }
+
+    fn into_effects(self) -> CompactionEffects {
         let CompactionOutcome {
             messages,
             compacted_prefix,
             compaction,
+            session_start_latch,
         } = self;
-        let result = compaction?;
-        state.compacted_prefix = compacted_prefix;
-        state.messages = messages;
-        // Compaction breaks the previous_response_id chain: the provider
-        // has no record of the synthetic `compacted_prefix` we just
-        // injected, so the next request must replay everything.
-        state.last_response_id = None;
-        state.messages_seen_by_provider = 0;
-        Some(result)
+        CompactionEffects {
+            messages,
+            compacted_context: CompactedContext::from(compacted_prefix),
+            result: compaction,
+            session_start_latch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompactionMode<'a> {
+    AutoThreshold,
+    Manual {
+        custom_instructions: Option<&'a str>,
+    },
+}
+
+impl<'a> CompactionMode<'a> {
+    fn is_forced(self) -> bool {
+        matches!(self, Self::Manual { .. })
+    }
+
+    fn custom_instructions(self) -> Option<&'a str> {
+        match self {
+            Self::AutoThreshold => None,
+            Self::Manual {
+                custom_instructions,
+            } => custom_instructions,
+        }
+    }
+
+    fn session_start_latch(self) -> Option<HookSessionStartSource> {
+        match self {
+            Self::AutoThreshold => None,
+            Self::Manual { .. } => Some(HookSessionStartSource::Compact),
+        }
     }
 }
 
@@ -137,8 +202,7 @@ impl DefaultContextManager {
         tool_specs: &[ToolSpec],
         compaction_model: &ResolvedModel,
         compaction_provider: &(dyn Provider + Send + Sync),
-        force: bool,
-        custom_instructions: Option<&str>,
+        mode: CompactionMode<'_>,
     ) -> anyhow::Result<CompactionOutcome> {
         let estimated_tokens = estimate_context_tokens(
             prompt_segments,
@@ -146,11 +210,12 @@ impl DefaultContextManager {
             &state.compacted_prefix,
             &state.messages,
         );
-        if !force && !should_trigger_compaction(estimated_tokens, &self.settings) {
+        if !mode.is_forced() && !should_trigger_compaction(estimated_tokens, &self.settings) {
             return Ok(CompactionOutcome {
                 messages: state.messages.clone(),
                 compacted_prefix: state.compacted_prefix.clone(),
                 compaction: None,
+                session_start_latch: mode.session_start_latch(),
             });
         }
 
@@ -162,17 +227,28 @@ impl DefaultContextManager {
             );
         }
 
-        let preparation = prepare_compaction(
-            &self.settings,
-            &state.compacted_prefix,
-            &state.messages,
-            capabilities.compaction_strategy,
-        );
-        if state.compacted_prefix.is_empty() && preparation.compact_messages.is_empty() {
+        let Some(window) = compaction_provider.compaction_window(&state.messages) else {
+            if mode.is_forced() {
+                anyhow::bail!(
+                    "failed to compact session: provider '{}' did not provide a compaction window",
+                    compaction_model.provider
+                );
+            }
             return Ok(CompactionOutcome {
                 messages: state.messages.clone(),
                 compacted_prefix: state.compacted_prefix.clone(),
                 compaction: None,
+                session_start_latch: mode.session_start_latch(),
+            });
+        };
+        let compacted_context = CompactedContext::from(state.compacted_prefix.clone());
+        let preparation = prepare_compaction(&self.settings, &compacted_context, window);
+        if compacted_context.is_empty() && preparation.compact_messages.is_empty() {
+            return Ok(CompactionOutcome {
+                messages: state.messages.clone(),
+                compacted_prefix: state.compacted_prefix.clone(),
+                compaction: None,
+                session_start_latch: mode.session_start_latch(),
             });
         }
 
@@ -184,7 +260,7 @@ impl DefaultContextManager {
                     compacted_prefix: state.compacted_prefix.clone(),
                     messages: preparation.compact_messages.clone(),
                     tools: tool_specs.to_vec(),
-                    instructions: compaction_instructions(custom_instructions),
+                    instructions: compaction_instructions(mode.custom_instructions()),
                 },
                 tokio_util::sync::CancellationToken::new(),
             )
@@ -197,12 +273,13 @@ impl DefaultContextManager {
         );
 
         Ok(CompactionOutcome {
-            messages: preparation.reserved_suffix,
+            messages: preparation.preserved_messages,
             compacted_prefix: response.output,
             compaction: Some(CompactionResult {
                 compacted_count: preparation.compacted_message_count,
                 summary,
             }),
+            session_start_latch: mode.session_start_latch(),
         })
     }
 }
@@ -243,8 +320,7 @@ impl ContextManager for DefaultContextManager {
                 tool_specs,
                 compaction_model,
                 compaction_provider,
-                false,
-                None,
+                CompactionMode::AutoThreshold,
             )
             .await?;
         let estimated_tokens = estimate_context_tokens(
@@ -320,8 +396,9 @@ impl ContextManager for DefaultContextManager {
             tool_specs,
             compaction_model,
             compaction_provider,
-            true,
-            custom_instructions,
+            CompactionMode::Manual {
+                custom_instructions,
+            },
         )
         .await
     }

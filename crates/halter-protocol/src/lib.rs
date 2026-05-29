@@ -1001,6 +1001,106 @@ pub struct TranscriptWindow {
     pub elided_message_count: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(transparent)]
+pub struct CompactedContext(pub Vec<Value>);
+
+impl CompactedContext {
+    #[must_use]
+    pub fn new(items: Vec<Value>) -> Self {
+        Self(items)
+    }
+
+    #[must_use]
+    pub fn items(&self) -> &[Value] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_items(self) -> Vec<Value> {
+        self.0
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl From<Vec<Value>> for CompactedContext {
+    fn from(value: Vec<Value>) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<[Value]> for CompactedContext {
+    fn as_ref(&self) -> &[Value] {
+        self.items()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct CompactionWindow {
+    pub eligible_messages: Vec<Message>,
+    pub preserved_messages: Vec<Message>,
+    pub reserved_response_block: bool,
+}
+
+impl CompactionWindow {
+    /// Preserve the latest assistant response block and compact the older
+    /// prefix. Providers with a first-class compaction endpoint use this
+    /// broader window because the provider restores the compacted context as
+    /// provider-native content.
+    #[must_use]
+    pub fn preserve_latest_assistant_response_block(messages: &[Message]) -> Self {
+        let Some(last_assistant_index) = messages
+            .iter()
+            .rposition(|message| matches!(message, Message::Assistant(_)))
+        else {
+            return Self {
+                eligible_messages: messages.to_vec(),
+                preserved_messages: Vec::new(),
+                reserved_response_block: false,
+            };
+        };
+
+        Self {
+            eligible_messages: messages[..last_assistant_index].to_vec(),
+            preserved_messages: messages[last_assistant_index..].to_vec(),
+            reserved_response_block: true,
+        }
+    }
+
+    /// Preserve every message through the latest user message and compact
+    /// only the post-user tail. Inline compaction providers use this narrower
+    /// window so system, tool, skill, and latest-user cache anchors remain
+    /// verbatim.
+    #[must_use]
+    pub fn preserve_through_latest_user(messages: &[Message]) -> Self {
+        let Some(last_user_index) = messages
+            .iter()
+            .rposition(|message| matches!(message, Message::User(_)))
+        else {
+            return Self {
+                eligible_messages: Vec::new(),
+                preserved_messages: messages.to_vec(),
+                reserved_response_block: false,
+            };
+        };
+        let pivot = last_user_index + 1;
+        Self {
+            eligible_messages: messages[pivot..].to_vec(),
+            preserved_messages: messages[..pivot].to_vec(),
+            reserved_response_block: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct FileViewSlice {
     pub path: PathBuf,
@@ -1150,10 +1250,9 @@ pub struct ProviderCapabilities {
     pub supports_documents: bool,
     pub supports_prompt_cache: bool,
     pub supports_compaction: bool,
-    /// How the provider implements compaction. The runtime narrows the
-    /// compaction window for `Inline` providers (only the segment after the
-    /// last cache breakpoint is eligible) because in-band summarization is
-    /// lossy and ratchets context fast when the surface is too wide.
+    /// How the provider implements compaction. This remains exposed for
+    /// diagnostics and external callers, but runtime planning asks the
+    /// provider for a `CompactionWindow` instead of branching on this value.
     #[serde(default)]
     pub compaction_strategy: Option<ProviderCompactionStrategy>,
     pub supports_tool_result_media: bool,
@@ -1456,6 +1555,79 @@ mod tests {
     }
 
     #[test]
+    fn compacted_context_serializes_as_existing_prefix_array() {
+        let context = CompactedContext::new(vec![
+            serde_json::json!({"type": "reasoning", "encrypted_content": "summary"}),
+        ]);
+
+        let encoded = serde_json::to_string(&context).expect("serialize compacted context");
+        assert!(encoded.starts_with('['));
+
+        let decoded: CompactedContext =
+            serde_json::from_str(&encoded).expect("deserialize compacted context");
+        assert_eq!(decoded, context);
+
+        let state: SessionState = serde_json::from_value(serde_json::json!({
+            "messages": [],
+            "compacted_prefix": [
+                {"type": "reasoning", "encrypted_content": "summary"}
+            ],
+            "file_view_cache": {},
+            "appended_prompt_segments": [],
+            "pending_tool_calls": {},
+            "usage_so_far": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            },
+            "summaries": [],
+            "lineage": [],
+            "fired_hook_ids": [],
+            "pending_session_start_source": null,
+            "pending_warning_messages": [],
+            "messages_seen_by_provider": 0
+        }))
+        .expect("deserialize existing session state");
+        assert_eq!(state.compacted_prefix.len(), 1);
+    }
+
+    #[test]
+    fn compaction_window_preserves_latest_assistant_response_block() {
+        let messages = vec![
+            Message::User(UserMessage::text("first")),
+            assistant_text("answer"),
+            Message::User(UserMessage::text("follow up")),
+        ];
+
+        let window = CompactionWindow::preserve_latest_assistant_response_block(&messages);
+
+        assert_eq!(window.eligible_messages.len(), 1);
+        assert_eq!(window.preserved_messages.len(), 2);
+        assert!(window.reserved_response_block);
+    }
+
+    #[test]
+    fn compaction_window_preserves_through_latest_user() {
+        let messages = vec![
+            Message::User(UserMessage::text("first")),
+            assistant_text("answer"),
+            Message::User(UserMessage::text("follow up")),
+            assistant_text("tail"),
+        ];
+
+        let window = CompactionWindow::preserve_through_latest_user(&messages);
+
+        assert_eq!(window.preserved_messages.len(), 3);
+        assert!(matches!(
+            window.preserved_messages.last(),
+            Some(Message::User(_))
+        ));
+        assert_eq!(window.eligible_messages.len(), 1);
+        assert!(!window.reserved_response_block);
+    }
+
+    #[test]
     fn user_message_with_media_roundtrips() {
         let message = Message::User(UserMessage {
             id: MessageId::new(),
@@ -1490,5 +1662,18 @@ mod tests {
         let encoded = serde_json::to_string(&event).expect("serialize event");
         let decoded: StreamEvent = serde_json::from_str(&encoded).expect("deserialize event");
         assert_eq!(decoded, event);
+    }
+
+    fn assistant_text(text: &str) -> Message {
+        Message::Assistant(AssistantMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            parts: vec![AssistantPart::Text {
+                text: text.to_owned(),
+            }],
+            stop_reason: None,
+            usage: None,
+            replay_meta: ReplayMeta::default(),
+        })
     }
 }

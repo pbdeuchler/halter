@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use async_openai::error::OpenAIError;
 use futures::{Stream, StreamExt, channel::mpsc, stream::BoxStream};
 use halter_protocol::{
-    ApiKind, MessageId, ProviderCapabilities, ProviderCompactionRequest,
+    ApiKind, CompactionWindow, Message, MessageId, ProviderCapabilities, ProviderCompactionRequest,
     ProviderCompactionResponse, ProviderCompactionStrategy, ProviderError, ProviderRequest,
     StreamEvent,
 };
@@ -82,6 +82,18 @@ impl ResponsesProvider {
                 CompactStrategy::InlineResponses => ProviderCompactionStrategy::Inline,
             });
         capabilities
+    }
+
+    pub(crate) fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
+        match self.config.compact_strategy {
+            Some(CompactStrategy::DedicatedEndpoint) => Some(
+                CompactionWindow::preserve_latest_assistant_response_block(messages),
+            ),
+            Some(CompactStrategy::InlineResponses) => {
+                Some(CompactionWindow::preserve_through_latest_user(messages))
+            }
+            None => None,
+        }
     }
 
     pub(crate) async fn stream(

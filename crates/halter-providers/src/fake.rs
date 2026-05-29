@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use halter_protocol::{
-    BlockId, Message, MessageId, ProviderCapabilities, ProviderCompactionRequest,
+    BlockId, CompactionWindow, Message, MessageId, ProviderCapabilities, ProviderCompactionRequest,
     ProviderCompactionResponse, ProviderError, ProviderRequest, StopReason, StreamEvent, Usage,
 };
 use serde_json::{Value, json};
@@ -57,6 +57,12 @@ impl Provider for FakeProvider {
             supports_compaction: true,
             ..ProviderCapabilities::default()
         }
+    }
+
+    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
+        Some(CompactionWindow::preserve_latest_assistant_response_block(
+            messages,
+        ))
     }
 
     async fn stream(

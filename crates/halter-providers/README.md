@@ -80,6 +80,7 @@ At the center of the crate is the `Provider` trait.
 Important methods:
 
 - `capabilities()`
+- `compaction_window(messages)` — chooses the provider-safe compaction window
 - `stream(request, cancel)`
 - `compact(request, cancel)` — optional, with a default error implementation
 
@@ -101,6 +102,10 @@ Streams a model turn as canonical halter chunks.
 ### `compact(...)`
 
 If supported, compacts session history for context management.
+
+The runtime does not branch on whether the provider uses a dedicated compaction
+endpoint or an inline request. It asks `compaction_window(...)` which messages
+can be summarized, then sends that prepared job through `compact(...)`.
 
 The default behavior is an error:
 
@@ -200,8 +205,9 @@ Characteristics:
 - supports inline compaction through the regular Responses endpoint
 
 OpenRouter does not expose OpenAI's dedicated `/v1/responses/compact` endpoint,
-so the runtime treats OpenRouter compaction as inline/lossy and narrows the
-eligible window before summarizing.
+so the provider selects a conservative window: messages through the latest user
+prompt stay verbatim, and only the post-user tail is summarized. Runtime treats
+that window the same way it treats other provider-selected windows.
 
 Typical use:
 
@@ -227,13 +233,13 @@ Notable reported capabilities:
 - `supports_reasoning: true`
 - `supports_interleaved_reasoning: true`
 - `supports_compaction: true`
-- `compaction_strategy: Inline`
 - `requires_non_empty_assistant_content: true`
 - `tool_call_id_policy: StableReplayNormalized`
 
 Anthropic uses the Messages API rather than the Responses-style adapter path.
 It has feature parity at the runtime capability level, but its replay and
-compaction wire shapes remain Anthropic-native.
+compaction wire shapes remain Anthropic-native. Its compaction window preserves
+messages through the latest user prompt and summarizes only the post-user tail.
 
 Typical use:
 
@@ -323,8 +329,8 @@ OpenAI, OpenRouter, Anthropic, and Fake stream canonical halter chunks.
 Do not assume every provider supports compaction.
 
 - OpenAI: yes
-- OpenRouter: yes, inline
-- Anthropic: yes, inline
+- OpenRouter: yes, provider-selected inline window
+- Anthropic: yes, provider-selected inline window
 - Fake: yes
 
 ### Tool-call replay rules
@@ -435,7 +441,8 @@ Even if you never import this crate directly, you should choose providers intent
 - Responses-style integration
 - broad upstream model access
 
-But remember: compaction is inline/lossy rather than dedicated endpoint backed.
+But remember: compaction is inline/lossy rather than dedicated endpoint backed,
+so OpenRouter selects a narrower compaction window.
 
 ### Choose Anthropic when you want
 
@@ -446,6 +453,7 @@ But remember: compaction is inline/lossy rather than dedicated endpoint backed.
 But remember:
 
 - compaction is inline/lossy rather than dedicated endpoint backed
+- Anthropic selects a narrower compaction window
 - some additional replay and content-normalization constraints
 
 ---

@@ -29,8 +29,8 @@ mod unsupported;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
-    ProviderRequest, StreamEvent,
+    CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +45,10 @@ pub use unsupported::UnsupportedProvider;
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities;
+
+    fn compaction_window(&self, _messages: &[Message]) -> Option<CompactionWindow> {
+        None
+    }
 
     async fn stream(
         &self,

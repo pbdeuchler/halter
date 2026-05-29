@@ -218,6 +218,9 @@ Injects runtime notifications into the session stream.
 ### `compact(...)`
 
 Triggers session compaction according to the configured context manager and provider support.
+The runtime asks the provider for a safe compaction window, then runs the same
+preparation, provider request, event, and state-application path used by
+automatic compaction.
 
 If the underlying provider does not support compaction, you can see an error like:
 
@@ -289,7 +292,7 @@ That includes:
 
 - estimating message weight/importance
 - honoring compaction thresholds
-- selecting candidates for pruning or summarization
+- pruning within the provider-selected compaction window
 - coordinating with provider-backed compaction when available
 
 ### `score_message(...)`
@@ -433,7 +436,10 @@ If you don't want to assemble all of that manually, use `halter::Halter`.
 
 ### Provider capability mismatch
 
-If your session needs compaction but the provider does not support it, compaction fails.
+If your session needs compaction but the provider does not support it,
+compaction fails. Providers that do support compaction own the safe window
+selection; runtime does not need to know whether that provider uses a dedicated
+endpoint or an inline request.
 
 ### Event backpressure
 

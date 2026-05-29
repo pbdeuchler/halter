@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use halter_protocol::{
-    AssistantPart, Message, MessageSignal, PromptSegment, ProviderCompactionStrategy,
+    AssistantPart, CompactedContext, CompactionWindow, Message, MessageSignal, PromptSegment,
     PruneSignalThreshold, SummarySlice, ToolCall, ToolCallId, ToolName, ToolResult,
     ToolResultMessage,
 };
@@ -29,16 +29,9 @@ impl Default for ContextSettings {
 }
 
 #[derive(Debug, Clone)]
-pub struct ReservedSuffix {
-    pub eligible_prefix: Vec<Message>,
-    pub reserved_suffix: Vec<Message>,
-    pub reserved_response_block: bool,
-}
-
-#[derive(Debug, Clone)]
 pub struct CompactionPreparation {
     pub compact_messages: Vec<Message>,
-    pub reserved_suffix: Vec<Message>,
+    pub preserved_messages: Vec<Message>,
     pub reserved_response_block: bool,
     pub compacted_message_count: usize,
     pub evicted_unit_count: usize,
@@ -58,91 +51,32 @@ pub fn should_trigger_compaction(estimated_tokens: u64, settings: &ContextSettin
 }
 
 #[must_use]
-pub fn split_reserved_suffix(messages: &[Message]) -> ReservedSuffix {
-    let Some(last_assistant_index) = messages
-        .iter()
-        .rposition(|message| matches!(message, Message::Assistant(_)))
-    else {
-        return ReservedSuffix {
-            eligible_prefix: messages.to_vec(),
-            reserved_suffix: Vec::new(),
-            reserved_response_block: false,
-        };
-    };
-
-    ReservedSuffix {
-        eligible_prefix: messages[..last_assistant_index].to_vec(),
-        reserved_suffix: messages[last_assistant_index..].to_vec(),
-        reserved_response_block: true,
-    }
-}
-
-/// Inline-strategy split: for non-dedicated providers, only the segment
-/// strictly after the last cache breakpoint (i.e. after the most recent
-/// user message) is eligible for compaction. Everything up to and
-/// including that user message is preserved verbatim. With no user
-/// messages, nothing is eligible.
-///
-/// Field semantics match `split_reserved_suffix`: `eligible_prefix` is
-/// the slice handed to the provider for compaction, `reserved_suffix` is
-/// the slice kept verbatim in the live transcript.
-#[must_use]
-pub fn split_reserved_suffix_after_last_user(messages: &[Message]) -> ReservedSuffix {
-    let Some(last_user_index) = messages
-        .iter()
-        .rposition(|message| matches!(message, Message::User(_)))
-    else {
-        return ReservedSuffix {
-            eligible_prefix: Vec::new(),
-            reserved_suffix: messages.to_vec(),
-            reserved_response_block: false,
-        };
-    };
-    let pivot = last_user_index + 1;
-    ReservedSuffix {
-        // Post-user tail = candidates for compaction.
-        eligible_prefix: messages[pivot..].to_vec(),
-        // System/skills/prior turns + the latest user message survive verbatim.
-        reserved_suffix: messages[..pivot].to_vec(),
-        reserved_response_block: false,
-    }
-}
-
-#[must_use]
 pub fn prepare_compaction(
     settings: &ContextSettings,
-    compacted_prefix: &[Value],
-    messages: &[Message],
-    strategy: Option<ProviderCompactionStrategy>,
+    compacted_context: &CompactedContext,
+    window: CompactionWindow,
 ) -> CompactionPreparation {
-    let reserved = match strategy {
-        // In-band compaction must not touch the system prompt, tools,
-        // skills, or the most recent user message — those are the four
-        // cache breakpoints. Only the trailing assistant + tool window
-        // is eligible.
-        Some(ProviderCompactionStrategy::Inline) => split_reserved_suffix_after_last_user(messages),
-        _ => split_reserved_suffix(messages),
-    };
-    let units = build_compaction_units(&reserved.eligible_prefix);
-    let compacted_prefix_tokens = estimate_compacted_prefix_tokens(compacted_prefix);
+    let units = build_compaction_units(&window.eligible_messages);
+    let compacted_prefix_tokens = estimate_compacted_context_tokens(compacted_context);
     let retained_units = prune_units(settings, compacted_prefix_tokens, &units);
     let retained_indices = retained_units
         .iter()
         .flat_map(|unit| unit.message_indices.iter().copied())
         .collect::<BTreeSet<_>>();
-    let compact_messages = reserved
-        .eligible_prefix
+    let compact_messages = window
+        .eligible_messages
         .iter()
         .enumerate()
         .filter(|(index, _)| retained_indices.contains(index))
         .map(|(_, message)| message.clone())
         .collect::<Vec<_>>();
+    let compacted_message_count = compact_messages.len();
 
     CompactionPreparation {
-        compact_messages: compact_messages.clone(),
-        reserved_suffix: reserved.reserved_suffix,
-        reserved_response_block: reserved.reserved_response_block,
-        compacted_message_count: compact_messages.len(),
+        compact_messages,
+        preserved_messages: window.preserved_messages,
+        reserved_response_block: window.reserved_response_block,
+        compacted_message_count,
         evicted_unit_count: units.len().saturating_sub(retained_units.len()),
     }
 }
@@ -179,6 +113,11 @@ pub fn estimate_summary_tokens(summaries: &[SummarySlice]) -> u64 {
 #[must_use]
 pub fn estimate_compacted_prefix_tokens(compacted_prefix: &[Value]) -> u64 {
     compacted_prefix.iter().map(estimate_json_tokens).sum()
+}
+
+#[must_use]
+pub fn estimate_compacted_context_tokens(compacted_context: &CompactedContext) -> u64 {
+    estimate_compacted_prefix_tokens(compacted_context.items())
 }
 
 #[must_use]
@@ -457,7 +396,9 @@ pub(crate) fn stable_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use halter_protocol::{AssistantMessage, MessageId, ToolError, UserMessage};
+    use halter_protocol::{
+        AssistantMessage, CompactedContext, CompactionWindow, MessageId, ToolError, UserMessage,
+    };
     use serde_json::json;
 
     use super::*;
@@ -470,7 +411,23 @@ mod tests {
     }
 
     #[test]
-    fn split_reserved_suffix_reserves_latest_assistant_block_and_tail() {
+    fn compacted_context_estimation_uses_stable_json_rendering() {
+        let context = CompactedContext::new(vec![json!({
+            "b": true,
+            "a": "abcd",
+        })]);
+
+        let rendered = stable_json(&context.items()[0]);
+
+        assert_eq!(rendered, "{\"a\":\"abcd\",\"b\":true}");
+        assert_eq!(
+            estimate_compacted_context_tokens(&context),
+            estimate_text_tokens(&rendered)
+        );
+    }
+
+    #[test]
+    fn compaction_window_reserves_latest_assistant_block_and_tail() {
         let messages = vec![
             Message::User(UserMessage::text("first")),
             Message::Assistant(AssistantMessage {
@@ -486,10 +443,10 @@ mod tests {
             Message::User(UserMessage::text("follow up")),
         ];
 
-        let reserved = split_reserved_suffix(&messages);
+        let reserved = CompactionWindow::preserve_latest_assistant_response_block(&messages);
 
-        assert_eq!(reserved.eligible_prefix.len(), 1);
-        assert_eq!(reserved.reserved_suffix.len(), 2);
+        assert_eq!(reserved.eligible_messages.len(), 1);
+        assert_eq!(reserved.preserved_messages.len(), 2);
         assert!(reserved.reserved_response_block);
     }
 
@@ -550,13 +507,12 @@ mod tests {
                 pre_compaction_target: 1,
                 prune_signal_threshold: PruneSignalThreshold::Normal,
             },
-            &[],
-            &messages,
-            None,
+            &CompactedContext::default(),
+            CompactionWindow::preserve_latest_assistant_response_block(&messages),
         );
 
         assert!(preparation.compact_messages.is_empty());
-        assert_eq!(preparation.reserved_suffix.len(), 1);
+        assert_eq!(preparation.preserved_messages.len(), 1);
     }
 
     fn build_threshold_fixture() -> Vec<Message> {
@@ -652,9 +608,8 @@ mod tests {
                     pre_compaction_target: 1,
                     prune_signal_threshold: case.threshold,
                 },
-                &[],
-                &messages,
-                None,
+                &CompactedContext::default(),
+                CompactionWindow::preserve_latest_assistant_response_block(&messages),
             );
 
             let surviving: Vec<MessageSignal> = preparation
@@ -727,15 +682,15 @@ mod tests {
             }),
         ];
 
-        let split = split_reserved_suffix_after_last_user(&messages);
+        let split = CompactionWindow::preserve_through_latest_user(&messages);
         // Reserved up to and including the most recent user message...
-        assert_eq!(split.reserved_suffix.len(), 3);
+        assert_eq!(split.preserved_messages.len(), 3);
         assert!(matches!(
-            split.reserved_suffix.last(),
+            split.preserved_messages.last(),
             Some(Message::User(_))
         ));
         // ...and the post-user tail (assistant + tool) is eligible for compaction.
-        assert_eq!(split.eligible_prefix.len(), 2);
+        assert_eq!(split.eligible_messages.len(), 2);
     }
 
     #[test]
@@ -772,15 +727,14 @@ mod tests {
                 pre_compaction_target: 1,
                 prune_signal_threshold: PruneSignalThreshold::Normal,
             },
-            &[],
-            &messages,
-            Some(ProviderCompactionStrategy::Inline),
+            &CompactedContext::default(),
+            CompactionWindow::preserve_through_latest_user(&messages),
         );
 
         // Reserved suffix = messages we keep verbatim (the user anchor).
         // Compact messages = post-user tail eligible for in-band summarization.
-        assert_eq!(prepared.reserved_suffix.len(), 1);
-        assert!(matches!(prepared.reserved_suffix[0], Message::User(_)));
+        assert_eq!(prepared.preserved_messages.len(), 1);
+        assert!(matches!(prepared.preserved_messages[0], Message::User(_)));
         assert!(!prepared.reserved_response_block);
     }
 }
