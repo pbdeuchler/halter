@@ -2,3 +2,4 @@ docs/
 target/
 .secrets
 traces/
+Cargo.lock
