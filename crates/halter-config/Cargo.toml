@@ -7,7 +7,7 @@ sqlite = []
 
 [dependencies]
 anyhow.workspace = true
-halter-protocol = { path = "../halter-protocol" }
+halter-protocol = { path = "../halter-protocol", version = "0.1.0"  }
 indexmap.workspace = true
 schemars.workspace = true
 serde.workspace = true

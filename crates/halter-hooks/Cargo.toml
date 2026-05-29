@@ -7,7 +7,7 @@ anyhow.workspace = true
 chrono.workspace = true
 futures.workspace = true
 globset.workspace = true
-halter-protocol = { path = "../halter-protocol" }
+halter-protocol = { path = "../halter-protocol", version = "0.1.0"  }
 indexmap.workspace = true
 regex.workspace = true
 serde.workspace = true
