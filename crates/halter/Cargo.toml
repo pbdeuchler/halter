@@ -22,6 +22,10 @@ profiling = ["halter-runtime/profiling", "halter-tools/profiling"]
 full = ["advanced-tools", "ast-tools", "browser-tools", "image-tools", "pty", "profiling"]
 sqlite = ["halter-config/sqlite", "halter-session/sqlite"]
 
+[patch.crates-io]
+brush-core = { path = "vendor/brush-core-vendored" }
+brush-builtins = { path = "vendor/brush-builtins-vendored" }
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
