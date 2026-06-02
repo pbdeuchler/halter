@@ -5,20 +5,13 @@
 > [!CAUTION]
 > `halter` is still a heavy work in progress. Proceed at your own risk.
 
-> [!TIP]
-> `halter` is explictly designed for long running, multi model, and dynamic workflows. If you have a preferred model family you like to use, don't need to spin up agents dynamically, or keep your workflow or agent setup local then `halter` is probably not for you
-
 ## Design Goals
 
-- Cache Friendliness
+- Cache friendliness
 - Obsessive token optimization
 - Best in class multi model support
 - Best in class tool calling and hook support
-
-## Tradeoffs
-
-- halter implements it's own compaction strategy. This _can be_ (but is not always) less token effecient than the managed compaction functionality offered by inference providers. The goal of the custom compaction is to result in a _higher quality_ context window, hopefully reducing overall token use throughout the turn. This also allows halter to provide a consistent, baseline experience regardless of which inference provider or model is used.
-- There are no plans for halter to implement MCP. It's a bad, poorly designed protocol that serves little to no purpose. If you absolutely need MCP like functionality you can provide it with either skills or custom tools.
+- Simple and expressive API
 
 ## What halter gives you
 
@@ -30,35 +23,12 @@ At a high level, halter combines:
 - **resource loading** for repo-local skills and plugins
 - **policy enforcement** around filesystem writes, shell usage, tool output size, and subagent fanout
 - **session persistence** with memory and SQLite backends
-- a usable **CLI** for day-to-day workflows
-
-If you're familiar with agentic coding systems, halter is the substrate that lets you build one cleanly rather than re-deriving the same runtime and tool patterns from scratch.
 
 ---
 
-## Workspace layout
+## Quickstart
 
-This repository contains these crates:
-
-- `crates/halter` — high-level SDK and builder
-- `crates/halter-cli` — command-line entrypoint
-- `crates/halter-config` — config schema, loading, overrides, validation
-- `crates/halter-protocol` — shared types and wire-format vocabulary
-- `crates/halter-runtime` — session engine, prompt assembly, event bus, compaction, subagents
-- `crates/halter-providers` — provider adapters and model registry
-- `crates/halter-tools` — tool runtime, built-in tools, policy, subagent control tools
-- `crates/halter-hooks` — event-driven hook and policy interception layer
-- `crates/halter-session` — session persistence and replay
-
----
-
-## Two usage modes
-
-## 1) SDK / embedding mode
-
-You embed halter into your own Rust program and use it as an agent runtime.
-
-Typical responsibilities:
+Halter is designed to be plug and play in existing Rust code and services. The goal of the `halter` SDK is to abstract away the details of a harness, however there is still some small boilerplate:
 
 - loading config
 - compiling resources
@@ -66,23 +36,231 @@ Typical responsibilities:
 - selecting persistence strategy
 - consuming session events programmatically
 
-## 2) CLI / operator mode
+### Basic example with config file
 
-You create a `halter.toml`, point the CLI at a repo or environment, and run tasks.
+```rust
+use futures::StreamExt;
+use halter::prelude::*;
 
-Typical responsibilities:
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let harness = Halter::from_config_file("halter.toml").await?;
+    let session = harness.new_session(SessionInit::default()).await?;
 
-- managing credentials
-- choosing enabled tools and shell allowlists
-- inspecting loaded skills/plugins
-- capturing JSON output for automation
-- tuning policy and compaction thresholds
+    let mut events = session
+        .submit_turn(Turn::user("Summarize the session persistence design"))
+        .await?;
+
+    while let Some(event) = events.next().await {
+        let event = event?;
+        println!("{:?}", event.payload);
+    }
+
+    Ok(())
+}
+```
+
+This code does all of the following:
+
+- loads and validates config
+- compiles resources
+- builds providers, tools, hooks, policy, and session storage
+- creates a runtime
+- creates a session
+- executes one turn and streams the resulting events
+
+### Detailed events
+
+```rust
+use futures::StreamExt;
+use halter::prelude::*;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let harness = Halter::from_config_file("halter.toml").await?;
+
+    let session = harness
+        .new_session(SessionInit {
+            working_dir: std::env::current_dir()?,
+            ..SessionInit::default()
+        })
+        .await?;
+
+    let mut stream = session.submit_turn(Turn::user("List the major crates in this repo")).await?;
+    while let Some(event) = stream.next().await {
+        let event = event?;
+        match event.payload {
+            SessionEventPayload::DeltaItem { delta } => print!("{}", delta.text),
+            SessionEventPayload::TurnCompleted { usage, .. } => {
+                println!("\nusage: in={} out={}", usage.input_tokens, usage.output_tokens);
+            }
+            SessionEventPayload::TurnFailed { error, .. } => {
+                eprintln!("turn failed: {error}");
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+```
+
+### From an in-memory config and snapshot
+
+```rust
+use halter::prelude::*;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = HarnessConfig::default(); // Include model config
+    let snapshot = ResourceSnapshot::empty();
+
+    let harness = Halter::from_config(config, snapshot).await?;
+    let _session = harness.new_session(SessionInit::default()).await?;
+    Ok(())
+}
+```
+
+### Build from config + compiled resources
+
+```rust
+use halter::{HalterBuilder, ResourceCompiler};
+use halter_config::load_path;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = load_path("halter.toml").await?;
+    let resources = ResourceCompiler::from_config(&config).compile().await?;
+
+    let harness = HalterBuilder::new()
+        .with_config(config)
+        .with_compiled_resources(resources)
+        .build()
+        .await?;
+
+    println!("default model = {:?}", harness.config().default_model()?.model);
+    Ok(())
+}
+```
+
+### Add a custom tool
+
+```rust
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use halter::HalterBuilder;
+use halter_config::load_path;
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_tools::{Tool, ToolContext};
+use serde_json::{json, Value};
+
+#[derive(Debug)]
+struct EchoTool;
+
+#[async_trait]
+impl Tool for EchoTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: ToolName::from("echo_json"),
+            description: "Return the input JSON unchanged".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": true
+            }),
+            concurrency: ToolConcurrency::ParallelSafe,
+            capabilities: ToolCapabilities::default(),
+            provider_aliases: Default::default(),
+        }
+    }
+
+    async fn execute(&self, _context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+        Ok(ToolResult::Json { value: input })
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = load_path("halter.toml").await?;
+    let resources = halter::ResourceCompiler::from_config(&config).compile().await?;
+
+    let _halter = HalterBuilder::new()
+        .with_config(config)
+        .with_compiled_resources(resources)
+        .with_tool(Arc::new(EchoTool))
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+### Provide your own session store
+
+```rust
+use std::sync::Arc;
+
+use halter::{HalterBuilder, ResourceCompiler};
+use halter_config::load_path;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = load_path("halter.toml").await?;
+    let resources = ResourceCompiler::from_config(&config).compile().await?;
+    let store = Arc::new(MyFancySessionStore::default());
+
+    let _halter = HalterBuilder::new()
+        .with_config(config)
+        .with_compiled_resources(resources)
+        .with_session_store(store)
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
 
 ---
 
-## A realistic config
+## Crates
 
-This is the central contract for both SDK and CLI usage.
+- `halter` — high-level SDK and builder
+- `halter-config` — config schema, loading, overrides, validation
+- `halter-protocol` — shared types and wire-format vocabulary
+- `halter-runtime` — session engine, prompt assembly, event bus, compaction, subagents
+- `halter-providers` — provider adapters and model registry
+- `halter-tools` — tool runtime, built-in tools, policy, subagent control tools
+- `halter-hooks` — event-driven hook and policy interception layer
+- `halter-session` — session persistence and replay
+
+### halter-config
+
+`halter-config` defines the schema for:
+
+- providers
+- model roles (`default`, `small`, `subagent`)
+- resource roots
+- prompts
+- context compaction settings
+- tool enablement
+- policy
+- session persistence
+- runtime settings
+
+It also handles:
+
+- file loading
+- environment overrides
+- layered merges
+- JSON Schema export
+- starter config generation
+
+`halter` provides convienence functionality for consuming `.toml` config files for where that makes sense operationally.
+
+> [!NOTE]
+> `.toml` config file usage is a thin serialization veneer over the programmatic config. For full customization programmatic configuration should be used, and probably preferred in headless, automated, or dynamic environments.
+
+A non exhuastive example:
 
 ```toml
 version = 1
@@ -150,423 +328,7 @@ backend = "memory"
 # subagent_event_forwarding_cap = 100_000 # 0 = unbounded
 ```
 
-You can derive this from `examples/halter.example.toml` and tailor it to your environment.
-
----
-
-## Quick start for CLI users
-
-### 1. Create a config
-
-```bash
-cargo run -p halter-cli -- init
-```
-
-This writes a starter `halter.toml`.
-
-You can also inspect the example config in:
-
-- `examples/halter.example.toml`
-
----
-
-### 2. Set credentials
-
-At minimum, configure the API key for the provider used by `[models.default]`.
-
-Examples:
-
-```bash
-export OPENAI_API_KEY=...
-export ANTHROPIC_API_KEY=...
-export OPENROUTER_API_KEY=...
-```
-
-Which one you need depends on your config.
-
----
-
-### 3. Validate config and runtime prerequisites
-
-```bash
-cargo run -p halter-cli -- validate
-```
-
-This checks more than TOML syntax. It also checks things like:
-
-- `version = 1`
-- `[models.default]` exists
-- selected providers have credentials available
-- context thresholds are coherent
-- session backend settings are valid
-
----
-
-### 4. Inspect discovered resources
-
-```bash
-cargo run -p halter-cli -- resources
-```
-
-Use this to verify that your skill and plugin roots are being discovered and compiled the way you expect.
-
----
-
-### 5. Run a task
-
-```bash
-cargo run -p halter-cli -- run "Summarize this repository's architecture"
-```
-
-By default, `run` emits the final assistant result as JSON.
-
-For longer prompts, pass a prompt file instead of an inline task:
-
-```bash
-cargo run -p halter-cli -- run --prompt-file ./prompt.md
-```
-
-To stream raw session events instead:
-
-```bash
-cargo run -p halter-cli -- run --streaming-json "Summarize this repository's architecture"
-```
-
-To write output and tracing to one file:
-
-```bash
-cargo run -p halter-cli -- \
-  --output-file out.jsonl \
-  run --streaming-json "Summarize this repository's architecture"
-```
-
----
-
-### 6. Use interactive mode
-
-```bash
-cargo run -p halter-cli -- chat
-```
-
-This opens a REPL-style interactive session backed by the same runtime and config.
-
----
-
-## Quick start for SDK users
-
-The simplest path is to use the high-level `halter` crate.
-
-```rust
-use futures::StreamExt;
-use halter::prelude::*;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let harness = Halter::from_config_file("halter.toml").await?;
-    let session = harness.new_session(SessionInit::default()).await?;
-
-    let mut events = session
-        .submit_turn(Turn::user("Summarize the session persistence design"))
-        .await?;
-
-    while let Some(event) = events.next().await {
-        let event = event?;
-        println!("{:?}", event.payload);
-    }
-
-    Ok(())
-}
-```
-
-That flow does all of the following:
-
-- loads and validates config
-- compiles resources
-- builds providers, tools, hooks, policy, and session storage
-- creates a runtime
-- creates a session
-- executes one turn and streams the resulting events
-
-For a deeper walkthrough, read `crates/halter/README.md`.
-
----
-
-## How the system is structured
-
-## Configuration layer
-
-`halter-config` defines the schema for:
-
-- providers
-- model roles (`default`, `small`, `subagent`)
-- resource roots
-- prompts
-- context compaction settings
-- tool enablement
-- policy
-- session persistence
-- runtime settings
-
-It also handles:
-
-- file loading
-- environment overrides
-- layered merges
-- JSON Schema export
-- starter config generation
-
-If you care about what is valid in `halter.toml`, read `crates/halter-config/README.md`.
-
-> [!NOTE]
-> .toml config file usage is a thin serialization veneer over the programmatic config. For full customization programmatic configuration should be used, and probably preferred in headless, automated, or dynamic environments.
-
----
-
-## Protocol layer
-
-`halter-protocol` defines the shared vocabulary used by the rest of the workspace.
-
-That includes types for:
-
-- turns
-- messages
-- session events
-- tool calls and tool results
-- resources and compiled artifacts
-- provider-facing request/response chunks
-
-If you are building integrations or parsing structured output, this crate matters a lot.
-
----
-
-## Provider layer
-
-`halter-providers` adapts concrete model backends into halter's normalized provider interface.
-
-Built-in providers include:
-
-- OpenAI
-- Anthropic
-- OpenRouter
-- Fake/test provider
-- Unsupported placeholder for builds where a transport is not wired in
-
-Important operational differences:
-
-- OpenAI supports streaming, prompt caching, and dedicated Responses compaction
-- OpenRouter supports streaming, prompt caching, and inline Responses compaction
-- Anthropic supports streaming, prompt caching, interleaved thinking, and inline Messages compaction
-- capability differences are explicit and should be handled intentionally
-
----
-
-## Tool layer
-
-`halter-tools` is what makes the agent do real work in the local environment.
-
-> [!NOTE]
-> The vast majority of original ideas (and code) in this crate is taken from other FOSS projects, namely [pi-mono](https://github.com/badlogic/pi-mono) and [oh-my-pi](https://github.com/can1357/oh-my-pi/tree/main/crates/pi-natives)'s native Rust tool.
-
-Built-in tools include:
-
-- `read`
-- `glob`
-- `grep`
-- `write`
-- `edit`
-- `shell`
-- `process`
-- `task` (in-memory todo list scoped to the session)
-
-Optional feature-gated tools include:
-
-- `pty`
-- `ast_grep`
-- `image`
-- `profile`
-
-Subagent tools include:
-
-- `spawn_agent`
-- `send_input`
-- `wait_agent`
-- `close_agent`
-
-This crate also enforces policy boundaries such as:
-
-- shell allowlisting
-- write-root restrictions
-- read/output size limits
-- subagent depth and concurrency limits
-
----
-
-## Hook layer
-
-`halter-hooks` lets you observe and influence runtime behavior by reacting to lifecycle events.
-
-Hooks can:
-
-- approve or block actions
-- request or deny permissions
-- add system messages
-- attach additional context
-- rewrite inputs and outputs
-- suppress output visibility
-- stop execution
-
-This is where you implement runtime policy that is more semantic than the hard mechanical policy enforced by the tool layer.
-
----
-
-## Session layer
-
-`halter-session` provides persistence and replay.
-
-Built-in backends:
-
-- `InMemorySessionStore`
-- `SqliteSessionStore` (behind the `sqlite` feature)
-
-Use memory for:
-
-- tests
-- ephemeral local runs
-- simplest setup
-
-Use SQLite for:
-
-- resumable local agents
-- durable transcripts
-- replay after process restart
-
----
-
-## Runtime layer
-
-`halter-runtime` executes sessions.
-
-It owns:
-
-- session lifecycle
-- prompt assembly
-- context management and compaction
-- event publication
-- hook dispatch
-- tool execution orchestration
-- subagent lineage and coordination
-- session replay/resume
-
-If you want to understand what really happens after `submit_turn(...)`, this is the crate to read.
-
----
-
-## High-level assembly layer
-
-`halter` is the convenience layer that builds the whole runtime from config and resources.
-
-Key types:
-
-- `Halter`
-- `HalterBuilder`
-- `ResourceCompiler`
-- `PluginLoader`
-- `SkillLoader`
-
-Use `Halter` unless you have a good reason to assemble the lower-level crates manually.
-
----
-
-## CLI layer
-
-`halter-cli` exposes a practical command surface:
-
-- `halter init`
-- `halter validate`
-- `halter resources`
-- `halter run`
-- `halter chat`
-- `halter config schema`
-
-It is intentionally thin. Reading its `README.md` is useful both for users and for programmers who want a reference implementation of how to wire the SDK together.
-
----
-
-## CLI reference
-
-All CLI commands accept:
-
-- `--config <CONFIG>` (default: `halter.toml`)
-- `--output-file <OUTPUT_FILE>`
-
-### `halter init`
-
-Generate a starter config.
-
-```bash
-halter init
-```
-
-### `halter validate`
-
-Validate config and runtime prerequisites.
-
-```bash
-halter validate
-```
-
-### `halter resources`
-
-Compile and summarize resources.
-
-```bash
-halter resources
-```
-
-### `halter run`
-
-Run one task in a fresh session.
-
-```bash
-halter run "Summarize this repository"
-```
-
-Useful flags:
-
-- `--json-result` — final answer as JSON
-- `--streaming-json` — newline-delimited `SessionEvent` JSON
-- `--prompt-file <PROMPT_FILE>` — read the prompt from a file
-
-### `halter chat`
-
-Open an interactive chat loop.
-
-```bash
-halter chat
-```
-
-### `halter config schema`
-
-Print the JSON Schema for `halter.toml`.
-
-```bash
-halter config schema
-```
-
----
-
-## SDK reference
-
-The most common entrypoints for library users are:
-
-- `Halter::from_config_file(...)`
-- `Halter::from_config(...)`
-- `Halter::from_compiled_resources(...)`
-- `Halter::new_session(...)`
-- `Halter::replace_resources(...)`
-- `HalterBuilder`
-
-A realistic advanced composition path, built entirely in Rust:
+And a detailed programmatic config:
 
 ```rust
 use std::path::PathBuf;
@@ -726,29 +488,178 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-This skips `halter.toml` entirely: model roles, policy, runtime settings, and even skills are assembled in memory before the harness is built.
+### halter-protocol
 
-For deeper examples, use the crate-specific READMEs.
+`halter-protocol` defines the shared vocabulary used by the rest of the workspace.
+
+That includes types for:
+
+- turns
+- messages
+- session events
+- tool calls and tool results
+- resources and compiled artifacts
+- provider-facing request/response chunks
+
+If you are building integrations or parsing structured output, this crate matters a lot.
+
+### halter-providers
+
+`halter-providers` adapts concrete model backends into halter's normalized provider interface.
+
+Built-in providers include:
+
+- OpenAI
+- Anthropic
+- OpenRouter
+- Fake/test provider
+- Unsupported placeholder for builds where a transport is not wired in
+
+Important operational differences:
+
+- OpenAI supports streaming, prompt caching, and dedicated Responses compaction
+- OpenRouter supports streaming, prompt caching, and inline Responses compaction
+- Anthropic supports streaming, prompt caching, interleaved thinking, and inline Messages compaction
+- capability differences are explicit and should be handled intentionally
+
+### halter-tools
+
+> [!NOTE]
+> Many of the original ideas (and code) in this crate are taken from other FOSS projects, namely [pi-mono](https://github.com/badlogic/pi-mono) and [oh-my-pi](https://github.com/can1357/oh-my-pi/tree/main/crates/pi-natives)'s native Rust tool.
+
+Built-in tools include:
+
+- `read`
+- `glob`
+- `grep`
+- `write`
+- `edit`
+- `shell`
+- `process`
+- `task` (in-memory todo list scoped to the session)
+
+Optional feature-gated tools include:
+
+- `pty`
+- `ast_grep`
+- `image`
+- `profile`
+
+Subagent tools include:
+
+- `spawn_agent`
+- `send_input`
+- `wait_agent`
+- `close_agent`
+
+This crate also enforces policy boundaries such as:
+
+- shell allowlisting
+- write-root restrictions
+- read/output size limits
+- subagent depth and concurrency limits
+
+### halter-hooks
+
+`halter-hooks` lets you observe and influence runtime behavior by reacting to lifecycle events.
+
+Hooks can:
+
+- approve or block actions
+- request or deny permissions
+- add system messages
+- attach additional context
+- rewrite inputs and outputs
+- suppress output visibility
+- stop execution
+
+#### Example
+
+```rust
+use halter::HalterBuilder;
+use halter_hooks::{Hook, HookEventName, HookResponse, RegisteredHookPriority};
+use halter_protocol::PluginId;
+
+let hook = Hook::callback(HookEventName::PreToolUse, |input| async move {
+    if input.tool_name() == Some("shell") {
+        Ok(HookResponse::passthrough().with_system_message(
+            "Shell usage was requested; verify the command is minimal and necessary.",
+        ))
+    } else {
+        Ok(HookResponse::passthrough())
+    }
+});
+
+let _builder = HalterBuilder::new()
+    .with_plugin_hook_priority(
+        PluginId::from("sdk-observer"),
+        RegisteredHookPriority::BeforePlugins,
+        hook,
+    );
+```
+
+See `../halter-hooks/README.md` for more information.
+
+### halter-session
+
+`halter-session` provides persistence and replay.
+
+Built-in backends:
+
+- `InMemorySessionStore`
+- `SqliteSessionStore` (behind the `sqlite` feature)
+
+Use memory for:
+
+- tests
+- ephemeral local runs
+- simplest setup
+
+Use SQLite for:
+
+- resumable local agents
+- durable transcripts
+- replay after process restart
+
+### halter-runtime
+
+`halter-runtime` executes sessions.
+
+It owns:
+
+- session lifecycle
+- prompt assembly
+- context management and compaction
+- event publication
+- hook dispatch
+- tool execution orchestration
+- subagent lineage and coordination
+- session replay/resume
+
+> [!NOTE]
+> halter implements it's own compaction strategy. This _can be_ (but is not always) less token effecient than the managed compaction functionality offered by inference providers or frontier harnesses. The goal of the custom compaction is to result in a _higher quality_ context window, hopefully reducing overall token use throughout the turn. This also allows halter to provide a consistent, baseline experience regardless of which inference provider or model is used.
+
+#### Example
 
 ---
 
-## Policy and safety model
+## Security model
 
-Halter's model is deliberately layered.
+Halter does it's best to operate in a sane and safe way, but does not provide any hard security boundaries. As always, run sensitive workloads in fully sandboxed environments with the requisite defense in depth beyond process level safeguards.
 
-### Hard boundaries
+### Tool boundaries
 
-Enforced mechanically by tool policy:
+Enforced mechanically, best effort, by tool policy:
 
 - where writes may occur
-- which shell programs may run
+- which shell programs may run (kind of)
 - how much can be read or emitted
 - how many subagents may be active
 - how deep delegation may go
 
 ### Semantic/runtime boundaries
 
-Enforced or influenced by hooks:
+The following can all be implemented in custom hooks:
 
 - approvals
 - denials
@@ -756,8 +667,6 @@ Enforced or influenced by hooks:
 - input/output rewriting
 - extra context or warnings
 - audit annotations
-
-This is a good design because it keeps non-negotiable constraints in the tool layer while leaving richer workflow policy to hooks.
 
 ---
 
@@ -772,18 +681,6 @@ Across the workspace, common optional features include:
 - `profiling`
 - `full`
 - `sqlite`
-
-Practical rules:
-
-- a feature-gated tool must be compiled in before it can be enabled in config
-- `sqlite` must be enabled if you want SQLite-backed sessions
-- `full` is the easiest way to turn on the broadest tool set
-
-Example install:
-
-```bash
-cargo install --path crates/halter-cli --features full,sqlite
-```
 
 ---
 
