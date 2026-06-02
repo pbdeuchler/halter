@@ -2431,8 +2431,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let recorder =
             Arc::new(crate::TraceRecorder::open(temp.path().to_path_buf()).expect("recorder"));
-        let mut services = RuntimeServices::default();
-        services.trace_recorder = Some(recorder.clone());
+        let services = RuntimeServices {
+            trace_recorder: Some(recorder.clone()),
+            ..RuntimeServices::default()
+        };
         let services = Arc::new(services);
 
         let session_id = SessionId::from("regression-trace");
@@ -3868,7 +3870,7 @@ mod tests {
         let traces_dir = temp.path().join("traces");
         let trace_recorder =
             Arc::new(crate::TraceRecorder::open(traces_dir.clone()).expect("trace recorder"));
-        let provider = Arc::new(SubagentFirehoseProvider::default());
+        let provider = Arc::new(SubagentFirehoseProvider);
         let services = test_support::configured_services_with_runtime_and_trace(
             provider,
             temp.path(),
@@ -3974,7 +3976,7 @@ mod tests {
     #[tokio::test]
     async fn session_init_can_override_subagent_event_forwarding() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let provider = Arc::new(SubagentFirehoseProvider::default());
+        let provider = Arc::new(SubagentFirehoseProvider);
         let services = test_support::configured_services_with_runtime(
             provider,
             temp.path(),
@@ -4057,7 +4059,7 @@ mod tests {
         prompt: &str,
     ) -> (SessionId, Vec<SessionEvent>) {
         let temp = tempfile::tempdir().expect("tempdir");
-        let provider = Arc::new(SubagentFirehoseProvider::default());
+        let provider = Arc::new(SubagentFirehoseProvider);
         let services = test_support::configured_services_with_runtime(
             provider,
             temp.path(),
