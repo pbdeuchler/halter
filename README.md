@@ -105,14 +105,38 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### From an in-memory config and snapshot
+### Simple programmatic config with snapshot
 
 ```rust
 use halter::prelude::*;
+use halter_config::{
+    ConfiguredProvider, ModelConfig, ModelsConfig, ProviderConfig, ProvidersConfig,
+};
+use halter_protocol::ReasoningEffort;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = HarnessConfig::default(); // Include model config
+    let config = HarnessConfig {
+        providers: ProvidersConfig {
+            openai: Some(ProviderConfig {
+                api_key: Some(std::env::var("OPENAI_API_KEY")?),
+                ..ProviderConfig::default()
+            }),
+            ..ProvidersConfig::default()
+        },
+        models: ModelsConfig {
+            default: Some(ModelConfig {
+                provider: ConfiguredProvider::OpenAi,
+                model: "gpt-5".to_owned(),
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(8_192),
+                reasoning: Some(ReasoningEffort::Medium),
+                tokens_per_minute: Some(500_000),
+            }),
+            ..ModelsConfig::default()
+        },
+        ..HarnessConfig::default()
+    };
     let snapshot = ResourceSnapshot::empty();
 
     let harness = Halter::from_config(config, snapshot).await?;
@@ -244,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
 - context compaction settings
 - tool enablement
 - policy
+- network access
 - session persistence
 - runtime settings
 
@@ -255,24 +280,77 @@ It also handles:
 - JSON Schema export
 - starter config generation
 
-`halter` provides convienence functionality for consuming `.toml` config files for where that makes sense operationally.
+`halter` provides convenience functionality for consuming `.toml` config files where that makes sense operationally.
 
 > [!NOTE]
 > `.toml` config file usage is a thin serialization veneer over the programmatic config. For full customization programmatic configuration should be used, and probably preferred in headless, automated, or dynamic environments.
 
-A non exhuastive example:
+#### API keys and overrides
+
+When using config files, halter resolves the effective config first, then resolves provider credentials.
+
+Config value hierarchy:
+
+1. Built-in defaults.
+2. Layered config files, when using `load_layered`: user config, then project config, then the explicit config path. Later files replace earlier values, except skill and plugin root arrays append and dedupe.
+3. Supported `HALTER_*` environment overrides, such as `HALTER_TOOLS_ENABLED` or `HALTER_POLICY_SHELL_ALLOW`. These are applied after file loading, so they win over file values.
+
+API key hierarchy:
+
+1. `[providers.<name>].api_key` in the effective config wins when it is present and non-empty.
+2. If no explicit API key is configured, halter reads the provider-specific process environment variable: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`.
+3. If neither source is available for a selected provider, config loading fails.
+
+Halter reads process environment variables. It does not parse `.env` files directly; if you use a `.env` file, load it into the process environment before starting the CLI or SDK process.
+
+#### Disk resource parsing
+
+`ResourceCompiler::from_config(&config).compile()` loads disk resources from `[resources.skills].roots` and `[resources.plugins].roots`. `Halter::from_config_file(...)` uses this path automatically.
+
+Resource root paths expand a leading `~/` through `$HOME`. Other shell-style substitutions, such as `$VAR`, `${VAR}`, and `~user`, are not expanded. Missing resource roots are skipped.
+
+Standalone skills are discovered recursively under each skill root:
+
+1. Each directory is scanned for child directories.
+2. A child directory containing `SKILL.md` is loaded as one skill.
+3. If a child directory does not contain `SKILL.md`, scanning continues inside it.
+
+`SKILL.md` frontmatter is intentionally small. If the file starts with `---`, halter reads `key: value` lines until the next `---`. The loader currently uses `name` and `description`; missing `name` falls back to the directory name, and missing `description` becomes an empty string. The compiled snapshot stores the skill id, name, description, and full `SKILL.md` body. Files under a skill's immediate `scripts/` directory are recorded on the loaded skill, but arbitrary supporting files are not loaded into the compiled snapshot today.
+
+> [!NOTE]
+> Halter attempts to replicate Codex and Claude Code behavior when parsing plugins for all supported functionality. Right now this is a moving target, so minor bugs and differences may manifest. File an issue or PR to fix any inconsistencies.
+
+Plugins are discovered one level below each plugin root. Each child directory is treated as a plugin only if it contains a manifest at one of these paths, checked in order:
+
+1. `.claude-plugin/plugin.json`
+2. `.agent-plugin/plugin.json`
+3. `.halter-plugin/plugin.json`
+4. `plugin.json`
+
+The manifest must include non-empty string fields `name` and `version`. Optional manifest fields include `skills`, `agents`, `hooks`, `mcpServers`, `lspServers`, `allowedHttpHosts`, and `allowedEnvVars`. Skill and agent entries must be paths relative to the plugin root and must start with `./`, unless they use a plugin alias. Supported aliases include `${CLAUDE_PLUGIN_ROOT}`, `${PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, `${PLUGIN_DATA}`, and . Parent-directory traversal is rejected, and resolved paths must stay inside the plugin root.
+
+Plugin `skills` entries can point at a single skill directory containing `SKILL.md` or at a directory tree that should be searched recursively for skills. Plugin `agents` entries can point at one prompt file or a directory of prompt files; each file becomes an agent named after its file stem. Hooks are loaded from the manifest's `hooks` path, or from `hooks/hooks.json` when the manifest omits `hooks`. Hook parse failures are retained as hook warnings instead of aborting the whole resource compile.
+
+Compiled resources use stable identifiers. Skill ids are based on the canonical skill path, plugin ids are based on plugin name, version, and canonical plugin path, and the final resource snapshot revision is derived from loaded skill revisions, plugin name/version pairs, and hook revisions.
+
+A non-exhaustive example:
 
 ```toml
 version = 1
 
 [models.default]
 provider = "openai"
-model = "gpt-5.4"
-reasoning = "high"
+model = "gpt-5"
+reasoning = "medium"
+
+[models.small]
+provider = "openai"
+model = "gpt-5-mini"
+reasoning = "low"
 
 [models.subagent]
 provider = "openai"
-model = "gpt-5.4-mini"
+model = "gpt-5-mini"
 reasoning = "medium"
 
 [resources.skills]
@@ -290,6 +368,7 @@ enabled = [
   "edit",
   "shell",
   "process",
+  "task",
   "wait_agent",
   "spawn_agent",
   "send_input",
@@ -307,6 +386,10 @@ max_read_bytes = 1048576
 max_subagent_depth = 3
 max_concurrent_subagents = 8
 
+[policy.network]
+enabled = false
+allowed_hosts = []
+
 [policy.shell]
 enabled = true
 allow = ["git", "cargo", "rg", "ls", "find", "python", "pwd", "cwd", "echo"]
@@ -318,7 +401,7 @@ backend = "memory"
 [runtime]
 # Optional. When set, halter writes a `<session_id>.txt` JSONL trace per session
 # into this directory: one header line followed by every committed SessionEvent.
-# Useful for offline debugging and for restoring session state from disk.
+# Useful for offline debugging and replay tooling.
 # traces_dir = "/tmp/halter/traces"
 
 # Optional. Keep off unless the caller wants the parent turn stream to include
@@ -363,6 +446,7 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
             openai: Some(ProviderConfig {
                 base_url: Some("https://api.openai.com".to_owned()),
                 api_key: Some(std::env::var("OPENAI_API_KEY")?),
+                ..ProviderConfig::default()
             }),
             anthropic: None,
             openrouter: None,
@@ -370,15 +454,15 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
         models: ModelsConfig {
             default: Some(ModelConfig {
                 provider: ConfiguredProvider::OpenAi,
-                model: "gpt-5.4".to_owned(),
+                model: "gpt-5".to_owned(),
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(8_192),
                 reasoning: Some(ReasoningEffort::High),
                 tokens_per_minute: Some(500_000),
             }),
-            fast: Some(ModelConfig {
+            small: Some(ModelConfig {
                 provider: ConfiguredProvider::OpenAi,
-                model: "gpt-5.4-mini".to_owned(),
+                model: "gpt-5-mini".to_owned(),
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(4_096),
                 reasoning: Some(ReasoningEffort::Low),
@@ -386,7 +470,7 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
             }),
             subagent: Some(ModelConfig {
                 provider: ConfiguredProvider::OpenAi,
-                model: "gpt-5.4-mini".to_owned(),
+                model: "gpt-5-mini".to_owned(),
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(4_096),
                 reasoning: Some(ReasoningEffort::Medium),
@@ -543,6 +627,7 @@ Optional feature-gated tools include:
 - `pty`
 - `ast_grep`
 - `image`
+- `browser`
 - `profile`
 
 Subagent tools include:
@@ -556,6 +641,7 @@ This crate also enforces policy boundaries such as:
 
 - shell allowlisting
 - write-root restrictions
+- network host and loopback restrictions
 - read/output size limits
 - subagent depth and concurrency limits
 
@@ -592,13 +678,11 @@ let hook = Hook::callback(HookEventName::PreToolUse, |input| async move {
 
 let _builder = HalterBuilder::new()
     .with_plugin_hook_priority(
-        PluginId::from("sdk-observer"),
+        PluginId::from("example-tool-id"),
         RegisteredHookPriority::BeforePlugins,
         hook,
     );
 ```
-
-See `../halter-hooks/README.md` for more information.
 
 ### halter-session
 
@@ -636,23 +720,24 @@ It owns:
 - subagent lineage and coordination
 - session replay/resume
 
-> [!NOTE]
-> halter implements it's own compaction strategy. This _can be_ (but is not always) less token effecient than the managed compaction functionality offered by inference providers or frontier harnesses. The goal of the custom compaction is to result in a _higher quality_ context window, hopefully reducing overall token use throughout the turn. This also allows halter to provide a consistent, baseline experience regardless of which inference provider or model is used.
+The public session handle is `SessionHandle`; `HalterSession` remains a backwards-compatible alias.
 
-#### Example
+> [!NOTE]
+> halter implements its own compaction strategy. This can be less token efficient than managed compaction from inference providers or frontier harnesses. The goal is a higher-quality context window, which can reduce overall token use throughout the turn and gives halter a consistent baseline across providers and models.
 
 ---
 
 ## Security model
 
-Halter does it's best to operate in a sane and safe way, but does not provide any hard security boundaries. As always, run sensitive workloads in fully sandboxed environments with the requisite defense in depth beyond process level safeguards.
+Halter does its best to operate in a sane and safe way, but does not provide hard security boundaries. Run sensitive workloads in fully sandboxed environments with defense in depth beyond process-level safeguards.
 
 ### Tool boundaries
 
 Enforced mechanically, best effort, by tool policy:
 
 - where writes may occur
-- which shell programs may run (kind of)
+- which shell programs may run through the shell parser and allowlist
+- which network hosts may be reached; loopback requires a separate allowlist
 - how much can be read or emitted
 - how many subagents may be active
 - how deep delegation may go
@@ -676,6 +761,7 @@ Across the workspace, common optional features include:
 
 - `advanced-tools`
 - `ast-tools`
+- `browser-tools`
 - `image-tools`
 - `pty`
 - `profiling`

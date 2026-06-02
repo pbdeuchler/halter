@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "${repo_root}"
+
+if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+  echo "error: CARGO_REGISTRY_TOKEN is required" >&2
+  exit 1
+fi
+
+sparse_index_path() {
+  local crate="$1"
+  python3 -c '
+import sys
+
+name = sys.argv[1]
+if len(name) == 1:
+    print(f"1/{name}")
+elif len(name) == 2:
+    print(f"2/{name}")
+elif len(name) == 3:
+    print(f"3/{name[0]}/{name}")
+else:
+    print(f"{name[0:2]}/{name[2:4]}/{name}")
+' "${crate}"
+}
+
+version_published() {
+  local crate="$1"
+  local version="$2"
+  local path
+  local entries
+
+  path="$(sparse_index_path "${crate}")"
+  if ! entries="$(curl -fsSL "https://index.crates.io/${path}" 2>/dev/null)"; then
+    return 1
+  fi
+
+  python3 -c '
+import json
+import sys
+
+wanted = sys.argv[1]
+for line in sys.stdin:
+    if json.loads(line).get("vers") == wanted:
+        sys.exit(0)
+
+sys.exit(1)
+' "${version}" <<<"${entries}"
+}
+
+wait_for_crate() {
+  local crate="$1"
+  local version="$2"
+
+  for attempt in {1..30}; do
+    if version_published "${crate}" "${version}"; then
+      echo "${crate} ${version} is available in the crates.io index"
+      return 0
+    fi
+
+    echo "waiting for ${crate} ${version} to reach the crates.io index (${attempt}/30)"
+    sleep 10
+  done
+
+  echo "error: ${crate} ${version} was not visible in the crates.io index after publishing" >&2
+  return 1
+}
+
+candidates="$(cat)"
+
+if [[ -z "${candidates//[[:space:]]/}" ]]; then
+  echo "no crate release candidates to publish"
+  exit 0
+fi
+
+while IFS="|" read -r crate version manifest; do
+  if [[ -z "${crate:-}" && -z "${version:-}" && -z "${manifest:-}" ]]; then
+    continue
+  fi
+
+  if [[ -z "${crate:-}" || -z "${version:-}" || -z "${manifest:-}" ]]; then
+    echo "error: invalid candidate row: ${crate:-}|${version:-}|${manifest:-}" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "${manifest}" ]]; then
+    echo "error: candidate manifest does not exist: ${manifest}" >&2
+    exit 1
+  fi
+
+  if version_published "${crate}" "${version}"; then
+    echo "skipping ${crate} ${version}; already published"
+    continue
+  fi
+
+  echo "publishing ${crate} ${version} from ${manifest}"
+  cargo publish --package "${crate}"
+  wait_for_crate "${crate}" "${version}"
+done <<<"${candidates}"

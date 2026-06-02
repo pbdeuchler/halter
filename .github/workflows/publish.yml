@@ -1,0 +1,56 @@
+name: Publish to crates.io
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish_all:
+        description: "Publish every listed crate whose current version is not already on crates.io"
+        required: false
+        default: false
+        type: boolean
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Detect crate release candidates
+        id: detect
+        shell: bash
+        env:
+          PUBLISH_ALL: ${{ github.event.inputs.publish_all || 'false' }}
+        run: |
+          set -euo pipefail
+
+          candidates_file="${RUNNER_TEMP}/crate-release-candidates"
+          if [[ "${PUBLISH_ALL}" == "true" ]]; then
+            bin/crate-release-candidates --publish-all >"${candidates_file}"
+          else
+            bin/crate-release-candidates >"${candidates_file}"
+          fi
+
+          if [[ -s "${candidates_file}" ]]; then
+            echo "has_candidates=true" >>"${GITHUB_OUTPUT}"
+            echo "candidates_file=${candidates_file}" >>"${GITHUB_OUTPUT}"
+            cat "${candidates_file}"
+          else
+            echo "has_candidates=false" >>"${GITHUB_OUTPUT}"
+            echo "No crate version changes detected."
+          fi
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.detect.outputs.has_candidates == 'true'
+        id: auth
+      - name: Publish crate release candidates
+        if: steps.detect.outputs.has_candidates == 'true'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CANDIDATES_FILE: ${{ steps.detect.outputs.candidates_file }}
+        run: bin/publish-crate-release-candidates <"${CANDIDATES_FILE}"

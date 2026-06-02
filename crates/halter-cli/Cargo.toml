@@ -1,6 +1,7 @@
 [package]
 name = "halter-cli"
 version = "0.1.0"
+publish = false
 rust-version.workspace = true
 edition.workspace = true
 

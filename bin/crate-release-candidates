@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: bin/crate-release-candidates [--base <git-ref>] [--publish-all]
+
+Print release candidates as pipe-delimited rows:
+  crate-name|version|manifest-path
+
+By default, versions are compared against the best available base ref:
+GITHUB_EVENT_BEFORE for branch pushes, the previous v* tag for tag pushes,
+or HEAD^ as a fallback.
+USAGE
+}
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "${repo_root}"
+
+base_ref="${CRATE_RELEASE_BASE_REF:-}"
+publish_all=false
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --base)
+      if [[ "$#" -lt 2 ]]; then
+        echo "error: --base requires a git ref" >&2
+        usage
+        exit 2
+      fi
+      base_ref="$2"
+      shift 2
+      ;;
+    --publish-all)
+      publish_all=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+# Publish order is dependency order. halter-cli is intentionally omitted.
+crates=(
+  "halter-brush-core|vendor/brush-core-vendored/Cargo.toml"
+  "halter-brush-builtins|vendor/brush-builtins-vendored/Cargo.toml"
+  "halter-protocol|crates/halter-protocol/Cargo.toml"
+  "halter-config|crates/halter-config/Cargo.toml"
+  "halter-hooks|crates/halter-hooks/Cargo.toml"
+  "halter-providers|crates/halter-providers/Cargo.toml"
+  "halter-session|crates/halter-session/Cargo.toml"
+  "halter-tools|crates/halter-tools/Cargo.toml"
+  "halter-runtime|crates/halter-runtime/Cargo.toml"
+  "halter|crates/halter/Cargo.toml"
+)
+
+manifest_field_from_stdin() {
+  local field="$1"
+  awk -v field="${field}" '
+    /^[[:space:]]*\[package\][[:space:]]*$/ {
+      in_package = 1
+      next
+    }
+
+    /^[[:space:]]*\[/ {
+      if (in_package) {
+        exit
+      }
+    }
+
+    in_package {
+      line = $0
+      sub(/[[:space:]]*#.*/, "", line)
+      if (line ~ "^[[:space:]]*" field "[[:space:]]*=") {
+        sub(/^[^=]*=[[:space:]]*/, "", line)
+        gsub(/^[[:space:]]*"|"[[:space:]]*$/, "", line)
+        print line
+        found = 1
+        exit
+      }
+    }
+
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  '
+}
+
+manifest_field() {
+  local manifest="$1"
+  local field="$2"
+  manifest_field_from_stdin "${field}" <"${manifest}"
+}
+
+manifest_field_at_ref() {
+  local ref="$1"
+  local manifest="$2"
+  local field="$3"
+  git show "${ref}:${manifest}" | manifest_field_from_stdin "${field}"
+}
+
+zero_sha="0000000000000000000000000000000000000000"
+
+if [[ "${publish_all}" != "true" && -z "${base_ref}" ]]; then
+  if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_EVENT_BEFORE:-}" != "" && "${GITHUB_EVENT_BEFORE:-}" != "${zero_sha}" ]]; then
+    base_ref="${GITHUB_EVENT_BEFORE}"
+  elif [[ "${GITHUB_REF_TYPE:-}" == "tag" || "${GITHUB_REF:-}" == refs/tags/* ]]; then
+    base_ref="$(git describe --tags --match 'v*' --abbrev=0 HEAD^ 2>/dev/null || true)"
+  elif base_ref="$(git describe --tags --match 'v*' --abbrev=0 HEAD^ 2>/dev/null)"; then
+    :
+  elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+    base_ref="HEAD^"
+  else
+    base_ref=""
+  fi
+fi
+
+if [[ "${publish_all}" == "true" ]]; then
+  echo "detecting all unpublished publishable crates" >&2
+elif [[ -n "${base_ref}" ]]; then
+  echo "detecting crate version changes against ${base_ref}" >&2
+else
+  echo "detecting crate version changes without a base ref; all listed crates are candidates" >&2
+fi
+
+for entry in "${crates[@]}"; do
+  IFS="|" read -r crate manifest <<<"${entry}"
+
+  actual_name="$(manifest_field "${manifest}" name)"
+  if [[ "${actual_name}" != "${crate}" ]]; then
+    echo "error: expected package name ${crate} in ${manifest}, found ${actual_name}" >&2
+    exit 1
+  fi
+
+  current_version="$(manifest_field "${manifest}" version)"
+
+  if [[ "${publish_all}" == "true" ]]; then
+    previous_version="<publish_all>"
+  elif [[ -n "${base_ref}" ]] && git cat-file -e "${base_ref}:${manifest}" 2>/dev/null; then
+    previous_version="$(manifest_field_at_ref "${base_ref}" "${manifest}" version)"
+  else
+    previous_version="<absent>"
+  fi
+
+  if [[ "${publish_all}" == "true" || "${current_version}" != "${previous_version}" ]]; then
+    echo "candidate: ${crate} ${current_version} (${previous_version} -> ${current_version})" >&2
+    printf '%s|%s|%s\n' "${crate}" "${current_version}" "${manifest}"
+  else
+    echo "unchanged: ${crate} ${current_version}" >&2
+  fi
+done
