@@ -153,7 +153,7 @@ impl TraceRecorder {
     /// soon as the event is generated, before the session store has assigned
     /// a sequence. Lets a long-running turn show progress in the trace
     /// instead of buffering everything until the turn commits. The committed
-    /// counterpart still arrives via [`record`] after the commit, so replay
+    /// counterpart still arrives via [`TraceRecorder::record`] after the commit, so replay
     /// tools can ignore `pending_event` lines and rely on `SessionEvent`
     /// lines as ground truth. Best-effort: failures are logged at WARN and
     /// do not interrupt the caller.

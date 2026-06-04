@@ -15,9 +15,11 @@ use crate::matcher::CompiledMatcher;
 use crate::merge::{HandlerPriority, HandlerPriorityGroup, HookMergedOutcome};
 use crate::sdk::{HookCallback, HookKind, RegisteredHook, RegisteredHookPriority};
 
+/// Current hook file protocol version.
 pub const HOOK_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
+/// One plugin hook source used to build a registry.
 pub struct HookRegistrySource {
     pub plugin_id: PluginId,
     pub plugin_root: PathBuf,
@@ -28,11 +30,13 @@ pub struct HookRegistrySource {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Prepared hook registry keyed by event.
 pub struct Hooks {
     handlers_by_event: BTreeMap<HookEventName, Vec<ConfiguredHandler>>,
 }
 
 impl Hooks {
+    /// Build a hook registry from plugin hook files.
     #[must_use]
     pub fn from_sources(sources: impl IntoIterator<Item = HookRegistrySource>) -> Self {
         let mut handlers_by_event = BTreeMap::new();
@@ -85,6 +89,7 @@ impl Hooks {
         Self { handlers_by_event }
     }
 
+    /// Build a hook registry from SDK-registered hooks.
     pub fn from_registered(
         hooks: impl IntoIterator<Item = RegisteredHook>,
     ) -> anyhow::Result<Self> {
@@ -162,11 +167,13 @@ impl Hooks {
         Ok(Self { handlers_by_event })
     }
 
+    /// Prepare matching handlers for one event dispatch.
     #[must_use]
     pub fn prepare(&self, request: HookDispatchRequest) -> PreparedHookDispatch {
         Self::prepare_many([self], request)
     }
 
+    /// Prepare matching handlers across multiple hook registries.
     #[must_use]
     pub fn prepare_many<'a>(
         hook_sets: impl IntoIterator<Item = &'a Hooks>,
@@ -204,6 +211,7 @@ impl Hooks {
 }
 
 #[derive(Debug, Clone)]
+/// Input used to select and run hooks for one event.
 pub struct HookDispatchRequest {
     pub event_name: HookEventName,
     pub matcher_value: Option<String>,
@@ -212,6 +220,7 @@ pub struct HookDispatchRequest {
 }
 
 #[derive(Debug, Clone)]
+/// Hook dispatch plan before handlers have executed.
 pub struct PreparedHookDispatch {
     request: HookDispatchRequest,
     previews: Vec<HookRunSummary>,
@@ -219,16 +228,19 @@ pub struct PreparedHookDispatch {
 }
 
 impl PreparedHookDispatch {
+    /// Original dispatch request.
     #[must_use]
     pub fn request(&self) -> &HookDispatchRequest {
         &self.request
     }
 
+    /// Synthetic running summaries emitted before handlers complete.
     #[must_use]
     pub fn preview_runs(&self) -> &[HookRunSummary] {
         &self.previews
     }
 
+    /// Handlers that matched the request, ordered by priority.
     #[must_use]
     pub fn matched_handlers(&self) -> &[ConfiguredHandler] {
         &self.matched_handlers
@@ -236,6 +248,7 @@ impl PreparedHookDispatch {
 }
 
 #[derive(Debug, Clone)]
+/// Final hook dispatch result after merging all handler outputs.
 pub struct HookDispatchOutcome {
     pub merged: HookMergedOutcome,
     pub runs: Vec<HookRunSummary>,
@@ -243,6 +256,7 @@ pub struct HookDispatchOutcome {
 }
 
 #[derive(Debug, Clone)]
+/// Runtime-ready hook handler.
 pub struct ConfiguredHandler {
     pub handler_id: String,
     pub plugin_id: PluginId,
@@ -283,9 +297,13 @@ impl ConfiguredHandler {
 }
 
 #[derive(Clone)]
+/// Executable handler configuration.
 pub enum ConfiguredHandlerConfig {
+    /// Handler loaded from a plugin hook file.
     File(FileHookHandlerConfig),
+    /// SDK callback handler.
     Callback(HookCallback),
+    /// SDK function handler after factory instantiation.
     Function(HookCallback),
 }
 

@@ -59,11 +59,13 @@ const _: () = {
     }
 };
 
+/// Sqlite-backed session store.
 pub struct SqliteSessionStore {
     connection: Arc<Mutex<Connection>>,
 }
 
 impl SqliteSessionStore {
+    /// Open or create a sqlite session database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if !is_in_memory_path(path)
@@ -97,6 +99,7 @@ impl SqliteSessionStore {
         })
     }
 
+    /// Open the default sqlite session database path.
     pub fn open_default() -> Result<Self> {
         let path = default_db_path()?;
         Self::open(path)

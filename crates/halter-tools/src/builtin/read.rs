@@ -18,6 +18,7 @@ const DEFAULT_READ_LIMIT: u64 = MAX_READ_LIMIT;
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug)]
+/// Built-in tool for reading UTF-8 file windows.
 pub struct ReadTool;
 
 #[derive(Debug, PartialEq, Eq)]

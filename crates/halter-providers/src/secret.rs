@@ -10,6 +10,7 @@ use std::fmt;
 pub struct SecretString(String);
 
 impl SecretString {
+    /// Wrap a secret value.
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())

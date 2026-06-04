@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
+/// File loaded as part of a skill or plugin resource.
 pub struct LoadedResourceFile {
     pub path: PathBuf,
     pub body: String,
@@ -25,11 +26,13 @@ pub struct LoadedResourceFile {
 }
 
 #[derive(Debug, Clone)]
+/// Executable path discovered under a resource root.
 pub struct LoadedExecutable {
     pub path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
+/// Fully loaded skill directory, including its `SKILL.md` body.
 pub struct LoadedSkill {
     pub id: SkillId,
     pub name: String,
@@ -42,6 +45,7 @@ pub struct LoadedSkill {
 }
 
 #[derive(Debug, Clone)]
+/// Loaded agent definition from a plugin.
 pub struct LoadedAgent {
     pub id: AgentId,
     pub name: String,
@@ -49,6 +53,7 @@ pub struct LoadedAgent {
 }
 
 #[derive(Debug, Clone)]
+/// Parsed hook file plus load warnings from one plugin.
 pub struct LoadedHooksFile {
     pub plugin_id: PluginId,
     pub plugin_root: PathBuf,
@@ -59,28 +64,33 @@ pub struct LoadedHooksFile {
 }
 
 #[derive(Debug, Clone)]
+/// Raw MCP server definition loaded from a plugin.
 pub struct LoadedMcpServer {
     pub path: PathBuf,
     pub body: Value,
 }
 
 #[derive(Debug, Clone)]
+/// Raw LSP server definition loaded from a plugin.
 pub struct LoadedLspServer {
     pub path: PathBuf,
     pub body: Value,
 }
 
 #[derive(Debug, Clone)]
+/// Output-style resource discovered in a plugin.
 pub struct LoadedOutputStyle {
     pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Plugin default settings preserved for future consumers.
 pub struct PluginDefaults {
     pub settings: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone)]
+/// Fully loaded plugin root and all supported plugin resources.
 pub struct LoadedPlugin {
     pub id: PluginId,
     pub root: PathBuf,
@@ -96,6 +106,7 @@ pub struct LoadedPlugin {
 }
 
 #[derive(Clone, Debug)]
+/// Resource snapshot plus compiled hooks ready for runtime use.
 pub struct CompiledResources {
     pub snapshot: ResourceSnapshot,
     pub hooks: Arc<Hooks>,
@@ -103,9 +114,11 @@ pub struct CompiledResources {
 }
 
 #[derive(Debug, Default, Clone)]
+/// Loader for standalone skill roots.
 pub struct SkillLoader;
 
 impl SkillLoader {
+    /// Load all skills under the configured roots.
     pub fn load_roots(&self, roots: &[PathBuf]) -> anyhow::Result<Vec<LoadedSkill>> {
         debug!(root_count = roots.len(), "loading skill roots");
         let mut skills = Vec::new();
@@ -123,9 +136,11 @@ impl SkillLoader {
 }
 
 #[derive(Debug, Default, Clone)]
+/// Loader for plugin roots.
 pub struct PluginLoader;
 
 impl PluginLoader {
+    /// Load every plugin directory found under the configured roots.
     pub fn load_roots(&self, roots: &[PathBuf]) -> anyhow::Result<Vec<LoadedPlugin>> {
         debug!(root_count = roots.len(), "loading plugin roots");
         let mut plugins = Vec::new();
@@ -152,6 +167,7 @@ impl PluginLoader {
 }
 
 #[derive(Debug, Clone)]
+/// Compiles loaded or on-disk resources into a runtime snapshot.
 pub struct ResourceCompiler {
     config: HarnessConfig,
     skill_roots: Option<Vec<PathBuf>>,
@@ -161,6 +177,7 @@ pub struct ResourceCompiler {
 }
 
 impl ResourceCompiler {
+    /// Start from harness config defaults.
     #[must_use]
     pub fn from_config(config: &HarnessConfig) -> Self {
         Self {
@@ -172,30 +189,35 @@ impl ResourceCompiler {
         }
     }
 
+    /// Override skill search roots.
     #[must_use]
     pub fn with_skill_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.skill_roots = Some(roots);
         self
     }
 
+    /// Override plugin search roots.
     #[must_use]
     pub fn with_plugin_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.plugin_roots = Some(roots);
         self
     }
 
+    /// Use preloaded skills instead of reading skill roots.
     #[must_use]
     pub fn with_loaded_skills(mut self, skills: Vec<LoadedSkill>) -> Self {
         self.loaded_skills = skills;
         self
     }
 
+    /// Use preloaded plugins instead of reading plugin roots.
     #[must_use]
     pub fn with_loaded_plugins(mut self, plugins: Vec<LoadedPlugin>) -> Self {
         self.loaded_plugins = plugins;
         self
     }
 
+    /// Compile resources on a blocking worker.
     pub async fn compile(self) -> anyhow::Result<CompiledResources> {
         tokio::task::spawn_blocking(move || compile_resources(self))
             .await

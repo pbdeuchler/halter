@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use super::errors::PolicyError;
 
 #[derive(Debug)]
+/// Canonicalized path plus parent-directory handle for safe open/write.
 pub struct CanonicalPath {
     path: PathBuf,
     #[cfg(unix)]
@@ -21,22 +22,27 @@ pub struct CanonicalPath {
 }
 
 impl CanonicalPath {
+    /// Canonical absolute path authorized by policy.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Consume the wrapper and return the canonical path.
     pub fn into_path(self) -> PathBuf {
         self.path
     }
 
+    /// Open the authorized leaf for reading without following a new symlink.
     pub fn open_read_blocking(&self) -> Result<std::fs::File, PolicyError> {
         open_leaf_read(self)
     }
 
+    /// Atomically replace the authorized leaf with `bytes`.
     pub fn atomic_write_blocking(&self, bytes: &[u8]) -> Result<(), PolicyError> {
         write_leaf_atomic(self, bytes)
     }
 
+    /// Borrow the pinned parent directory file descriptor.
     #[cfg(unix)]
     pub fn parent_dir_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         use std::os::fd::AsFd;

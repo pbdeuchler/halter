@@ -1,12 +1,10 @@
-// pattern: Functional Core
-//!
 //! # halter
-//! 
+//!
 //! `halter` is a **simple and configurable agent harness and SDK** for building and
 //! operating thoroughbred agents. It assembles config loading, resource compilation,
 //! providers, tools, hooks, policy, runtime sessions, and persistence behind a small
 //! builder API.
-//! 
+//!
 //! ## Example
 //!
 //! ```rust,no_run
@@ -34,6 +32,8 @@
 //!
 //! - Rustdoc API reference: <https://docs.rs/halter>
 //! - Full project README: <https://github.com/pbdeuchler/halter/blob/main/README.md>
+
+// pattern: Functional Core
 
 mod builder;
 mod resources;

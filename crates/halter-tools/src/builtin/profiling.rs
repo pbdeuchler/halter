@@ -134,6 +134,7 @@ pub fn get_work_profile_for_session(last_seconds: f64, session_id: Option<&str>)
 
 #[cfg(feature = "profiling")]
 #[derive(Debug)]
+/// Built-in tool for inspecting tool execution profile samples.
 pub struct ProfilingTool;
 
 #[cfg(feature = "profiling")]

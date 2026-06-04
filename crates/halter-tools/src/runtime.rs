@@ -17,17 +17,21 @@ use tracing::{debug, warn};
 use crate::{PathLockMap, ToolPolicy, ToolSessionStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Runtime event emitted while a tool executes.
 pub enum ToolRuntimeEvent {
     Started { tool_name: String },
     Completed { tool_name: String },
     ToolOutput { tool_name: String, chunk: String },
 }
 
+/// Sink for tool runtime events.
 pub trait ToolEventSink: Send + Sync {
+    /// Emit one tool event.
     fn emit(&self, event: ToolRuntimeEvent);
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
+/// Tool event sink that drops all events.
 pub struct NoopToolEventSink;
 
 impl ToolEventSink for NoopToolEventSink {
@@ -35,6 +39,7 @@ impl ToolEventSink for NoopToolEventSink {
 }
 
 #[derive(Debug, Clone)]
+/// Parent-session material available to subagent tools.
 pub struct SubagentParentContext {
     pub blueprint: SessionBlueprint,
     pub state: SessionState,
@@ -43,19 +48,25 @@ pub struct SubagentParentContext {
 }
 
 #[async_trait]
+/// Control plane used by the built-in subagent tools.
 pub trait SubagentControl: Send + Sync {
+    /// Spawn a subagent from a parent session context.
     async fn spawn(
         &self,
         parent: &SubagentParentContext,
         request: SpawnSubagentRequest,
     ) -> anyhow::Result<SubagentStatus>;
+    /// Send additional input to a running subagent.
     async fn send_input(&self, request: SendSubagentInputRequest)
     -> anyhow::Result<SubagentStatus>;
+    /// Wait for subagent progress or completion.
     async fn wait(&self, request: WaitSubagentRequest) -> anyhow::Result<WaitSubagentResponse>;
+    /// Close a subagent and return its previous status.
     async fn close(&self, request: CloseSubagentRequest) -> anyhow::Result<CloseSubagentResponse>;
 }
 
 #[derive(Debug, Default)]
+/// Subagent control implementation used when subagents are unavailable.
 pub struct NoopSubagentControl;
 
 #[async_trait]
@@ -85,6 +96,7 @@ impl SubagentControl for NoopSubagentControl {
 }
 
 #[derive(Clone)]
+/// Per-execution context passed to every tool.
 pub struct ToolContext {
     pub session_id: SessionId,
     pub working_dir: PathBuf,
@@ -99,22 +111,28 @@ pub struct ToolContext {
 }
 
 #[async_trait]
+/// Trait implemented by built-in and custom tools.
 pub trait Tool: Send + Sync {
+    /// Provider-visible tool specification.
     fn spec(&self) -> ToolSpec;
+    /// Execute the tool with validated runtime context and raw JSON input.
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult>;
 }
 
 #[derive(Default)]
+/// Registry and dispatcher for tools.
 pub struct ToolRuntime {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
 }
 
 impl ToolRuntime {
+    /// Create an empty tool runtime.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Register or replace a tool by its canonical spec name.
     pub fn register(&self, tool: Arc<dyn Tool>) {
         let spec = tool.spec();
         debug!(tool_name = %spec.name, "registering tool");
@@ -139,7 +157,7 @@ impl ToolRuntime {
         specs
     }
 
-    /// Look up the declared [`ToolConcurrency`] for a registered tool by name.
+    /// Look up the declared [`halter_protocol::ToolConcurrency`] for a registered tool by name.
     ///
     /// Returns `None` when the tool is not registered, letting the caller pick
     /// a conservative default (e.g. `Exclusive`) rather than guessing.
@@ -152,6 +170,9 @@ impl ToolRuntime {
             .map(|tool| tool.spec().concurrency)
     }
 
+    /// Clone a runtime containing only allowed tools.
+    ///
+    /// An empty allowlist means all registered tools are retained.
     #[must_use]
     pub fn clone_filtered(&self, allowed: &[String]) -> Self {
         let allow_all = allowed.is_empty();
@@ -169,6 +190,7 @@ impl ToolRuntime {
         }
     }
 
+    /// Execute a registered tool by name.
     pub async fn execute(
         &self,
         name: &str,

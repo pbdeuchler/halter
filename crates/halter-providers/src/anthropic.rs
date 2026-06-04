@@ -19,6 +19,7 @@ use crate::secret::SecretString;
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 
 #[derive(Debug, Clone)]
+/// Anthropic Messages API provider.
 pub struct AnthropicProvider {
     api_key: SecretString,
     base_url: String,
@@ -28,6 +29,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// Construct an Anthropic provider with default headers and no temperature override.
     pub fn new(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,

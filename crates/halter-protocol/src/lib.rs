@@ -1,3 +1,10 @@
+//! Shared wire types and runtime contracts for the halter workspace.
+//!
+//! This crate contains the serializable protocol structs that the runtime,
+//! providers, hooks, tools, and session stores exchange. It intentionally
+//! stays dependency-light and mostly data-oriented so higher-level crates can
+//! agree on event, message, provider, and resource shapes without depending on
+//! each other.
 // pattern: Functional Core
 
 use std::fmt;
@@ -19,9 +26,13 @@ pub type SharedStr = String;
 /// requests now omit temperature unless `[providers.<name>].temperature` is
 /// configured explicitly.
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+/// MIME/media type label used for binary message parts.
 pub type MediaType = String;
+/// Provider-issued signature attached to replayable reasoning blocks.
 pub type ReplaySignature = String;
+/// Stable hash of prompt, resource, file-view, or context content.
 pub type ContentHash = String;
+/// UTC timestamp used throughout session and event records.
 pub type Timestamp = DateTime<Utc>;
 
 macro_rules! id_type {
@@ -29,9 +40,11 @@ macro_rules! id_type {
         #[derive(
             Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
         )]
+        #[doc = concat!("Opaque identifier for a protocol `", stringify!($name), "`.")]
         pub struct $name(pub String);
 
         impl $name {
+            /// Generate a new random identifier.
             #[must_use]
             pub fn new() -> Self {
                 Self(Uuid::new_v4().to_string())
@@ -79,6 +92,7 @@ macro_rules! string_wrapper {
             Deserialize,
             JsonSchema,
         )]
+        #[doc = concat!("String newtype for a protocol `", stringify!($name), "`.")]
         pub struct $name(pub String);
 
         impl fmt::Display for $name {
@@ -124,34 +138,44 @@ string_wrapper!(ProviderName);
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
+/// Logical model slot selected by a turn or subagent request.
 pub enum ModelRole {
+    /// General model used for normal turn execution.
     Default,
+    /// Planning model.
     Plan,
+    /// Model used by spawned subagents.
     Subagent,
+    /// Cheaper or faster model for small supporting tasks.
     Small,
 }
 
 impl ModelRole {
+    /// Role used when no role-specific override is requested.
     #[must_use]
     pub const fn default_role() -> Self {
         Self::Default
     }
 
+    /// Planning role.
     #[must_use]
     pub const fn plan() -> Self {
         Self::Plan
     }
 
+    /// Subagent role.
     #[must_use]
     pub const fn subagent() -> Self {
         Self::Subagent
     }
 
+    /// Small-task role.
     #[must_use]
     pub const fn small() -> Self {
         Self::Small
     }
 
+    /// Stable config and wire-format spelling for the role.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
@@ -206,13 +230,17 @@ impl fmt::Display for ModelRole {
     JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
+/// Controls whether child subagent events are forwarded into the parent stream.
 pub enum SubagentEventForwarding {
+    /// Keep subagent events in the subagent session only.
     #[default]
     Off,
+    /// Forward subagent events into the parent session event stream.
     All,
 }
 
 impl SubagentEventForwarding {
+    /// Whether forwarding is active.
     #[must_use]
     pub const fn is_enabled(self) -> bool {
         matches!(self, Self::All)
@@ -221,32 +249,48 @@ impl SubagentEventForwarding {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+/// Provider family used for capability selection and registry lookup.
 pub enum ProviderKind {
+    /// Anthropic Messages API.
     Anthropic,
+    /// OpenAI APIs.
     OpenAi,
+    /// OpenRouter passthrough APIs.
     OpenRouter,
+    /// Deterministic local test provider.
     Fake,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Wire API shape a resolved model expects its provider to use.
 pub enum ApiKind {
+    /// Anthropic `/v1/messages`.
     AnthropicMessages,
+    /// OpenAI-compatible Responses API.
     OpenAiResponses,
+    /// OpenAI-compatible Chat Completions API.
     OpenAiChat,
+    /// Local fake provider.
     Fake,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Provider reasoning budget requested for a model.
 pub enum ReasoningEffort {
+    /// Low reasoning budget.
     Low,
+    /// Medium reasoning budget.
     Medium,
+    /// High reasoning budget.
     High,
+    /// Extra-high reasoning budget, for providers that expose it.
     Xhigh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Token accounting reported by providers and accumulated by sessions.
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -256,15 +300,22 @@ pub struct Usage {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Why an assistant message ended.
 pub enum StopReason {
+    /// The model completed the turn normally.
     EndTurn,
+    /// The model requested tool execution.
     ToolUse,
+    /// The turn was interrupted before natural completion.
     Interrupted,
+    /// The provider stopped after reaching the output-token limit.
     MaxTokens,
+    /// The provider or runtime reported an error.
     Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Provider metadata preserved on assistant messages for replay and diagnostics.
 pub struct ReplayMeta {
     pub provider_name: Option<ProviderName>,
     pub model: Option<ModelId>,
@@ -272,12 +323,15 @@ pub struct ReplayMeta {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+/// Severity for non-fatal hook loading problems.
 pub enum HookWarningSeverity {
+    /// Warning that does not block resource compilation.
     #[default]
     Warning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Warning emitted while loading plugin hook files.
 pub struct HookWarning {
     pub severity: HookWarningSeverity,
     pub category: SharedStr,
@@ -288,6 +342,7 @@ pub struct HookWarning {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// System instruction message carried in the transcript.
 pub struct SystemMessage {
     pub id: MessageId,
     pub created_at: Timestamp,
@@ -295,6 +350,7 @@ pub struct SystemMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// User message, including text and optional media parts.
 pub struct UserMessage {
     pub id: MessageId,
     pub created_at: Timestamp,
@@ -302,6 +358,7 @@ pub struct UserMessage {
 }
 
 impl UserMessage {
+    /// Build a text-only user message with a fresh id and current timestamp.
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
         Self {
@@ -311,6 +368,7 @@ impl UserMessage {
         }
     }
 
+    /// Concatenate text parts with newlines, ignoring image and document parts.
     #[must_use]
     pub fn plain_text(&self) -> String {
         self.parts
@@ -326,15 +384,17 @@ impl UserMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+/// Part of a user message.
 pub enum UserPart {
-    Text {
-        text: SharedStr,
-    },
+    /// Plain text input.
+    Text { text: SharedStr },
+    /// Binary image payload plus media type.
     Image {
         media_type: MediaType,
         #[schemars(with = "Vec<u8>")]
         data: Bytes,
     },
+    /// Binary document payload plus media type.
     Document {
         media_type: MediaType,
         #[schemars(with = "Vec<u8>")]
@@ -343,6 +403,7 @@ pub enum UserPart {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Assistant message assembled from provider stream events.
 pub struct AssistantMessage {
     pub id: MessageId,
     pub created_at: Timestamp,
@@ -354,19 +415,25 @@ pub struct AssistantMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+/// Part of an assistant message.
 pub enum AssistantPart {
+    /// Text visible to the user.
     Text { text: SharedStr },
+    /// Reasoning or thinking content, optionally replay-signed.
     Thinking(ThinkingBlock),
+    /// Tool invocation requested by the model.
     ToolCall(ToolCall),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Provider thinking block with optional replay signature.
 pub struct ThinkingBlock {
     pub text: SharedStr,
     pub signature: Option<ReplaySignature>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Tool invocation requested by an assistant message.
 pub struct ToolCall {
     pub id: ToolCallId,
     pub name: ToolName,
@@ -374,6 +441,7 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Result message that answers a prior [`ToolCall`].
 pub struct ToolResultMessage {
     pub id: MessageId,
     pub call_id: ToolCallId,
@@ -384,55 +452,52 @@ pub struct ToolResultMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "role", rename_all = "snake_case")]
+/// A transcript item visible to providers and session stores.
 pub enum Message {
+    /// System instructions.
     System(SystemMessage),
+    /// User input.
     User(UserMessage),
+    /// Assistant output.
     Assistant(AssistantMessage),
+    /// Tool result.
     Tool(ToolResultMessage),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+/// Incremental provider output event.
 pub enum StreamEvent {
-    MessageStart {
-        id: MessageId,
-    },
-    TextStart {
-        id: BlockId,
-    },
-    TextDelta {
-        id: BlockId,
-        delta: SharedStr,
-    },
-    TextEnd {
-        id: BlockId,
-    },
-    ThinkingStart {
-        id: BlockId,
-    },
-    ThinkingDelta {
-        id: BlockId,
-        delta: SharedStr,
-    },
+    /// Start of an assistant message.
+    MessageStart { id: MessageId },
+    /// Start of a text block.
+    TextStart { id: BlockId },
+    /// Text block delta.
+    TextDelta { id: BlockId, delta: SharedStr },
+    /// End of a text block.
+    TextEnd { id: BlockId },
+    /// Start of a thinking block.
+    ThinkingStart { id: BlockId },
+    /// Thinking block delta.
+    ThinkingDelta { id: BlockId, delta: SharedStr },
+    /// End of a thinking block.
     ThinkingEnd {
         id: BlockId,
         signature: Option<ReplaySignature>,
     },
+    /// Start of a tool call block.
     ToolCallStart {
         id: BlockId,
         tool_call_id: ToolCallId,
         name: ToolName,
     },
-    ToolArgsDelta {
-        id: BlockId,
-        delta: SharedStr,
-    },
-    ToolCallEnd {
-        id: BlockId,
-    },
-    UsageUpdate {
-        usage: Usage,
-    },
+    /// Tool arguments delta, usually a JSON fragment.
+    ToolArgsDelta { id: BlockId, delta: SharedStr },
+    /// End of a tool call block.
+    ToolCallEnd { id: BlockId },
+    /// Provider token usage update.
+    UsageUpdate { usage: Usage },
+    /// End of an assistant message.
     MessageEnd {
         id: MessageId,
         stop_reason: StopReason,
@@ -440,15 +505,14 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_id: Option<String>,
     },
-    ProviderWarning {
-        message: SharedStr,
-    },
-    Error {
-        error: ProviderError,
-    },
+    /// Non-fatal warning surfaced by the provider adapter.
+    ProviderWarning { message: SharedStr },
+    /// Provider error surfaced through the stream.
+    Error { error: ProviderError },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// User-submitted work unit for a session.
 pub struct Turn {
     pub id: TurnId,
     pub user_message: UserMessage,
@@ -459,6 +523,7 @@ pub struct Turn {
 }
 
 impl Turn {
+    /// Build a turn from a text-only user message.
     #[must_use]
     pub fn user(text: impl Into<String>) -> Self {
         Self {
@@ -469,12 +534,14 @@ impl Turn {
         }
     }
 
+    /// Override the default model for this turn.
     #[must_use]
     pub fn with_default_model(mut self, model: impl Into<ModelId>) -> Self {
         self.default_model = Some(model.into());
         self
     }
 
+    /// Override the subagent model for subagents spawned during this turn.
     #[must_use]
     pub fn with_subagent_model(mut self, model: impl Into<ModelId>) -> Self {
         self.subagent_model = Some(model.into());
@@ -484,15 +551,22 @@ impl Turn {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Runtime state of a spawned subagent.
 pub enum SubagentState {
+    /// The subagent is still executing.
     Running,
+    /// The subagent finished successfully.
     Completed,
+    /// The subagent failed.
     Failed,
+    /// The subagent was cancelled.
     Cancelled,
+    /// The subagent was closed by the parent.
     Closed,
 }
 
 impl SubagentState {
+    /// Whether the state cannot transition back to running.
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -503,6 +577,7 @@ impl SubagentState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Request payload for the `spawn_subagent` tool.
 pub struct SpawnSubagentRequest {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -514,12 +589,14 @@ pub struct SpawnSubagentRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Request payload for sending additional input to a subagent.
 pub struct SendSubagentInputRequest {
     pub target: AgentId,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Request payload for waiting on one or more subagents.
 pub struct WaitSubagentRequest {
     pub targets: Vec<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -527,11 +604,13 @@ pub struct WaitSubagentRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Request payload for closing a subagent.
 pub struct CloseSubagentRequest {
     pub target: AgentId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Snapshot of a subagent's visible state.
 pub struct SubagentStatus {
     pub agent_id: AgentId,
     pub session_id: SessionId,
@@ -548,6 +627,7 @@ pub struct SubagentStatus {
 }
 
 impl SubagentStatus {
+    /// Whether the subagent is no longer running.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.state.is_terminal()
@@ -555,6 +635,7 @@ impl SubagentStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Response from a subagent wait operation.
 pub struct WaitSubagentResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<SubagentStatus>,
@@ -562,11 +643,13 @@ pub struct WaitSubagentResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Response returned after closing a subagent.
 pub struct CloseSubagentResponse {
     pub previous_status: SubagentStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Minimal subagent spec used by session commands.
 pub struct SubagentSpecWire {
     pub role: Option<ModelRole>,
     pub task: String,
@@ -574,29 +657,43 @@ pub struct SubagentSpecWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+/// Command accepted by a session control plane.
 pub enum SessionCommand {
+    /// Submit a new turn.
     SubmitTurn { turn: Turn },
+    /// Interrupt the active turn.
     InterruptTurn,
+    /// Append session-scoped system guidance.
     AppendSystemPrompt { id: PromptId, text: SharedStr },
+    /// Switch the active model role.
     SetModelRole { role: ModelRole },
+    /// Switch to a concrete model id.
     SetModel { model: ModelId },
+    /// Spawn a subagent.
     SpawnSubagent { spec: SubagentSpecWire },
+    /// Reload resources before continuing.
     ReloadResources,
+    /// Shut down the session.
     Shutdown,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Delivery semantics for committed session events.
 pub enum Delivery {
+    /// Must be persisted and delivered in order.
     Lossless,
+    /// May be dropped under pressure.
     BestEffort,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Text delta emitted into the public session event stream.
 pub struct DeltaItem {
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Completed tool execution paired with the original call.
 pub struct ToolExecutionOutcome {
     pub call: ToolCall,
     pub result: Result<ToolResult, ToolError>,
@@ -604,6 +701,7 @@ pub struct ToolExecutionOutcome {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Backend used to execute a configured hook handler.
 pub enum HookHandlerType {
     Command,
     Http,
@@ -615,6 +713,7 @@ pub enum HookHandlerType {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Lifecycle state of one hook run.
 pub enum HookRunStatus {
     Running,
     Completed,
@@ -626,6 +725,7 @@ pub enum HookRunStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Category assigned to a hook output entry.
 pub enum HookOutputKind {
     Warning,
     Stop,
@@ -635,6 +735,7 @@ pub enum HookOutputKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Human-readable hook output shown on a run summary.
 pub struct HookOutputEntry {
     pub kind: HookOutputKind,
     pub text: String,
@@ -642,6 +743,7 @@ pub struct HookOutputEntry {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Source reason passed to session-start hooks.
 pub enum HookSessionStartSource {
     Startup,
     Resume,
@@ -650,6 +752,7 @@ pub enum HookSessionStartSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Public record of one hook handler execution.
 pub struct HookRunSummary {
     pub run_id: String,
     pub event_name: String,
@@ -666,6 +769,7 @@ pub struct HookRunSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+/// Event payload emitted by the session runtime.
 pub enum SessionEventPayload {
     SessionStarted,
     Warning {
@@ -758,6 +862,7 @@ impl SessionEvent {
         }
     }
 
+    /// Monotonic sequence assigned by the session store.
     #[must_use]
     pub fn sequence(&self) -> u64 {
         self.sequence
@@ -776,6 +881,7 @@ pub struct PendingEvent {
 }
 
 impl PendingEvent {
+    /// Build an uncommitted event. The session store assigns its sequence.
     #[must_use]
     pub fn new(session_id: SessionId, delivery: Delivery, payload: SessionEventPayload) -> Self {
         Self {
@@ -785,6 +891,7 @@ impl PendingEvent {
         }
     }
 
+    /// Attach the commit sequence and convert into a committed event.
     #[must_use]
     pub fn into_committed(self, sequence: u64) -> SessionEvent {
         SessionEvent {
@@ -797,13 +904,18 @@ impl PendingEvent {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Scheduler hint for how tool calls may be batched.
 pub enum ToolConcurrency {
+    /// Run alone and preserve strict ordering.
     Exclusive,
+    /// Can run with other non-mutating tools.
     ReadOnly,
+    /// Can run concurrently with any other parallel-safe tool.
     ParallelSafe,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Capabilities exposed by a tool specification.
 pub struct ToolCapabilities {
     pub mutating: bool,
     pub requires_approval: bool,
@@ -812,6 +924,7 @@ pub struct ToolCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Provider-visible tool declaration.
 pub struct ToolSpec {
     pub name: ToolName,
     pub description: SharedStr,
@@ -823,19 +936,25 @@ pub struct ToolSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+/// Output returned by a tool execution.
 pub enum ToolResult {
+    /// No content.
     Empty,
+    /// Plain text content.
     Text { text: String },
+    /// Structured JSON content.
     Json { value: Value },
 }
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[error("{message}")]
+/// Error returned by a tool execution.
 pub struct ToolError {
     pub message: String,
 }
 
 impl ToolError {
+    /// Build a tool error from a displayable message.
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
@@ -846,6 +965,7 @@ impl ToolError {
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[error("{message}")]
+/// Error surfaced by a provider adapter.
 pub struct ProviderError {
     pub message: String,
     pub retryable: bool,
@@ -857,6 +977,7 @@ impl ProviderError {
     /// predicate over inline message comparison.
     pub const CANCELLED_MESSAGE: &str = "failed to execute provider request: request cancelled";
 
+    /// Build a provider error with an explicit retryability flag.
     #[must_use]
     pub fn new(message: impl Into<String>, retryable: bool) -> Self {
         Self {
@@ -876,6 +997,7 @@ impl ProviderError {
         }
     }
 
+    /// Whether this error is the canonical cancellation sentinel.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.message == Self::CANCELLED_MESSAGE
@@ -883,6 +1005,7 @@ impl ProviderError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Prompt fragment assembled before provider encoding.
 pub struct PromptSegment {
     pub id: PromptSegmentId,
     pub text: SharedStr,
@@ -899,24 +1022,36 @@ pub struct PromptSegment {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+/// Logical prompt section for cache breakpoint placement.
 pub enum PromptSegmentKind {
+    /// System prompt section.
     #[default]
     System,
+    /// Loaded skill section.
     Skill,
+    /// Runtime-appended context section.
     Append,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// How often a prompt segment is expected to change.
 pub enum Volatility {
+    /// Stable across all sessions for a given build/config.
     Static,
+    /// Stable for the lifetime of a session.
     SessionStable,
+    /// May change every turn.
     TurnDynamic,
+    /// Always treated as dynamic.
     AlwaysDynamic,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Whether a segment can participate in prefix caching.
 pub enum CacheScope {
+    /// Eligible for provider prefix-cache placement.
     PrefixCacheable,
+    /// Not eligible for prefix caching.
     Dynamic,
 }
 
@@ -949,6 +1084,7 @@ impl CacheBreakpoints {
         }
     }
 
+    /// Number of active breakpoints.
     #[must_use]
     pub fn count_active(&self) -> usize {
         usize::from(self.after_system)
@@ -958,9 +1094,11 @@ impl CacheBreakpoints {
     }
 }
 
+/// Per-session cache of file ranges already shown to the model.
 pub type FileViewCache = IndexMap<PathBuf, FileViewEntry>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Cached metadata for a file view.
 pub struct FileViewEntry {
     pub path: PathBuf,
     pub full_hash: ContentHash,
@@ -971,6 +1109,7 @@ pub struct FileViewEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Inclusive range of file lines previously shown to the model.
 pub struct ViewedRange {
     pub start_line: u32,
     pub end_line: u32,
@@ -978,24 +1117,28 @@ pub struct ViewedRange {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Small content anchor used to detect shifted viewed ranges.
 pub struct LineAnchor {
     pub line: u32,
     pub anchor: [u8; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Tool call that has been emitted but not yet answered.
 pub struct PendingToolCall {
     pub call: ToolCall,
     pub submitted_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Summary retained after older context has been compacted.
 pub struct SummarySlice {
     pub id: String,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Active transcript window after pruning and compaction planning.
 pub struct TranscriptWindow {
     pub messages: Vec<Message>,
     pub elided_message_count: u64,
@@ -1003,29 +1146,35 @@ pub struct TranscriptWindow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(transparent)]
+/// Provider-native compacted context items carried across turns.
 pub struct CompactedContext(pub Vec<Value>);
 
 impl CompactedContext {
+    /// Wrap provider-native compacted context items.
     #[must_use]
     pub fn new(items: Vec<Value>) -> Self {
         Self(items)
     }
 
+    /// Borrow the compacted context items.
     #[must_use]
     pub fn items(&self) -> &[Value] {
         &self.0
     }
 
+    /// Consume the wrapper and return the raw items.
     #[must_use]
     pub fn into_items(self) -> Vec<Value> {
         self.0
     }
 
+    /// Whether there are no compacted context items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Number of compacted context items.
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
@@ -1045,6 +1194,7 @@ impl AsRef<[Value]> for CompactedContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Split of messages selected for provider compaction.
 pub struct CompactionWindow {
     pub eligible_messages: Vec<Message>,
     pub preserved_messages: Vec<Message>,
@@ -1102,6 +1252,7 @@ impl CompactionWindow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// File-view data included in a context plan.
 pub struct FileViewSlice {
     pub path: PathBuf,
     pub full_hash: ContentHash,
@@ -1110,24 +1261,28 @@ pub struct FileViewSlice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Marker describing content omitted from the active context.
 pub struct ElisionMarker {
     pub kind: String,
     pub count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Long-lived memory item available to context planning.
 pub struct MemoryItem {
     pub key: String,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Link from a parent session to a spawned subagent session.
 pub struct SubagentRef {
     pub session_id: SessionId,
     pub task: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Immutable session metadata created at session start.
 pub struct SessionBlueprint {
     pub session_id: SessionId,
     pub parent_session_id: Option<SessionId>,
@@ -1143,6 +1298,7 @@ pub struct SessionBlueprint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Mutable state persisted for a session.
 pub struct SessionState {
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -1167,6 +1323,7 @@ pub struct SessionState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Environment facts captured while building a context plan.
 pub struct ObservedState {
     pub cwd: PathBuf,
     pub git_branch: Option<String>,
@@ -1176,12 +1333,14 @@ pub struct ObservedState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Instruction file loaded into a resource snapshot.
 pub struct InstructionFile {
     pub path: PathBuf,
     pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Loaded skill definition made available to prompt assembly.
 pub struct SkillDef {
     pub id: SkillId,
     pub name: String,
@@ -1190,6 +1349,7 @@ pub struct SkillDef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Loaded agent definition used by subagent tools.
 pub struct AgentDef {
     pub id: AgentId,
     pub name: String,
@@ -1197,6 +1357,7 @@ pub struct AgentDef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Manifest data loaded from a plugin root.
 pub struct PluginManifest {
     pub name: String,
     pub version: String,
@@ -1210,11 +1371,13 @@ pub struct PluginManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// Named prompt segments loaded from resources.
 pub struct PromptRegistry {
     pub prompts: IndexMap<String, Vec<PromptSegment>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Complete resource set visible to a session runtime.
 pub struct ResourceSnapshot {
     pub revision: Revision,
     pub tools: IndexMap<ToolName, ToolSpec>,
@@ -1226,6 +1389,7 @@ pub struct ResourceSnapshot {
 }
 
 impl ResourceSnapshot {
+    /// Build an empty snapshot for tests and custom SDK assembly.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -1241,6 +1405,7 @@ impl ResourceSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Capability flags advertised by a provider adapter.
 pub struct ProviderCapabilities {
     pub supports_tools: bool,
     pub supports_streaming: bool,
@@ -1301,13 +1466,18 @@ impl Default for ProviderCapabilities {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// How provider tool-call ids are assigned and normalized.
 pub enum ToolCallIdPolicy {
+    /// Provider supplies ids and they can be used directly.
     ProviderSupplied,
+    /// Runtime must synthesize ids when the provider omits them.
     RuntimeSynthesized,
+    /// Runtime normalizes ids for stable replay across providers.
     StableReplayNormalized,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Fully resolved model and provider configuration.
 pub struct ResolvedModel {
     pub role: ModelRole,
     pub id: ModelId,
@@ -1326,6 +1496,7 @@ pub struct ResolvedModel {
     Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
 )]
 #[serde(rename_all = "snake_case")]
+/// Relative value of a message when pruning context before compaction.
 pub enum MessageSignal {
     /// Compact first -- orientation commands, empty results, duplicate failures.
     VeryLow = 0,
@@ -1345,6 +1516,7 @@ pub enum MessageSignal {
     Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
 )]
 #[serde(rename_all = "snake_case")]
+/// Highest message-signal tier eligible for pre-compaction pruning.
 pub enum PruneSignalThreshold {
     VeryLow,
     Low,
@@ -1354,6 +1526,7 @@ pub enum PruneSignalThreshold {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Result of applying a compaction output to session state.
 pub struct CompactionResult {
     /// Number of messages compacted into the raw prefix.
     pub compacted_count: usize,
@@ -1362,6 +1535,7 @@ pub struct CompactionResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Context manager output consumed by prompt assembly and provider codecs.
 pub struct ContextPlan {
     pub prompt_segments: Vec<PromptSegment>,
     pub transcript_window: TranscriptWindow,
@@ -1389,6 +1563,7 @@ pub struct ContextPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Fully assembled prompt and transcript material ready for provider encoding.
 pub struct AssembledPrompt {
     pub segments: Vec<PromptSegment>,
     pub transcript: Vec<Message>,
@@ -1442,6 +1617,7 @@ impl AssembledPrompt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Request sent from the runtime to a provider for normal generation.
 pub struct ProviderRequest {
     pub session_id: SessionId,
     pub turn_id: TurnId,
@@ -1463,6 +1639,7 @@ pub struct ProviderRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Request sent to a provider for context compaction.
 pub struct ProviderCompactionRequest {
     pub session_id: SessionId,
     pub model: ResolvedModel,
@@ -1474,12 +1651,14 @@ pub struct ProviderCompactionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Provider response containing compacted context items.
 pub struct ProviderCompactionResponse {
     pub output: Vec<Value>,
     pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Final output returned from a completed subagent.
 pub struct SubagentResult {
     pub session_id: SessionId,
     pub output: String,

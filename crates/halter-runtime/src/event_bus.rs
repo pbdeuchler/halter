@@ -17,6 +17,7 @@ use tokio_stream::{
 pub const BUS_SESSION_ID: &str = "__bus__";
 
 #[derive(Debug)]
+/// Broadcast bus for committed session events.
 pub struct EventBus {
     sender: broadcast::Sender<SessionEvent>,
     /// Counts publish attempts that found no active subscriber. Exposed via
@@ -33,6 +34,7 @@ impl Default for EventBus {
 }
 
 impl EventBus {
+    /// Create a bus with a fixed broadcast buffer capacity.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
@@ -42,6 +44,7 @@ impl EventBus {
         }
     }
 
+    /// Publish a committed event to all subscribers.
     pub fn publish(&self, event: SessionEvent) {
         if self.sender.send(event).is_err() {
             self.dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -68,6 +71,7 @@ impl EventBus {
         self.sender.subscribe()
     }
 
+    /// Count events dropped because no subscriber was active.
     #[must_use]
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)

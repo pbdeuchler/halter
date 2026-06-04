@@ -15,6 +15,7 @@ use crate::builtin::shell::session::ShellSessionCore;
 use crate::builtin::task::TaskList;
 
 #[derive(Default)]
+/// Per-session storage for stateful tools.
 pub struct ToolSessionStore {
     shell_sessions: DashMap<String, Arc<TokioMutex<Option<ShellSessionCore>>>>,
     task_sessions: DashMap<String, Arc<Mutex<TaskList>>>,
@@ -25,6 +26,7 @@ pub struct ToolSessionStore {
 }
 
 impl ToolSessionStore {
+    /// Return the persistent shell session slot for a halter session.
     #[must_use]
     pub fn shell_session(
         &self,
@@ -49,6 +51,7 @@ impl ToolSessionStore {
     }
 
     #[cfg(feature = "pty")]
+    /// Return the PTY session slot for a halter session.
     #[must_use]
     pub fn pty_session(&self, session_id: &SessionId) -> Arc<Mutex<Option<PtySessionHandle>>> {
         self.pty_sessions
@@ -58,6 +61,7 @@ impl ToolSessionStore {
     }
 
     #[cfg(feature = "browser-tools")]
+    /// Return the browser session slot for a halter session.
     #[must_use]
     pub fn browser_session(
         &self,

@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Provider;
 
 #[derive(Debug, Clone)]
+/// Deterministic local provider used for tests and offline SDK exercises.
 pub struct FakeProvider {
     prefix: String,
 }
@@ -25,6 +26,7 @@ impl Default for FakeProvider {
 }
 
 impl FakeProvider {
+    /// Construct a fake provider with a custom reply prefix.
     #[must_use]
     pub fn with_prefix(prefix: impl Into<String>) -> Self {
         Self {

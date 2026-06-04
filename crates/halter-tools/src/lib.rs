@@ -1,3 +1,7 @@
+//! Built-in tool implementations, policy enforcement, and tool runtime wiring.
+//!
+//! This crate exposes the tools available to sessions by default, plus the
+//! capability-oriented policy and runtime traits custom tools implement.
 // pattern: Functional Core
 
 mod builtin;

@@ -16,11 +16,13 @@ use crate::retry::RetryPolicy;
 use crate::secret::SecretString;
 
 #[derive(Debug, Clone)]
+/// OpenRouter provider using the Responses-compatible transport.
 pub struct OpenRouterProvider {
     inner: ResponsesProvider,
 }
 
 impl OpenRouterProvider {
+    /// Construct an OpenRouter provider with default headers and no temperature override.
     pub fn new(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,

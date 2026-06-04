@@ -246,6 +246,7 @@ mod platform {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Per-process result returned by [`kill_tree`].
 pub struct KillTreeEntry {
     pub pid: i32,
     pub killed: bool,
@@ -273,15 +274,18 @@ pub fn kill_tree(pid: i32, signal: i32) -> Vec<KillTreeEntry> {
 }
 
 #[cfg_attr(not(feature = "pty"), allow(dead_code))]
+/// Return the process group id for a pid when the platform supports it.
 pub fn process_group_id(pid: i32) -> Option<i32> {
     platform::process_group_id(pid)
 }
 
 #[cfg_attr(not(feature = "pty"), allow(dead_code))]
+/// Send a signal to a process group when the platform supports it.
 pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
     platform::kill_process_group(pgid, signal)
 }
 
+/// List descendants of a process id.
 pub fn list_descendants(pid: i32) -> Vec<i32> {
     let mut descendants = Vec::new();
     platform::collect_descendants(pid, &mut descendants);
@@ -289,6 +293,7 @@ pub fn list_descendants(pid: i32) -> Vec<i32> {
 }
 
 #[derive(Debug)]
+/// Built-in tool for inspecting or terminating process trees.
 pub struct ProcessTool;
 
 #[async_trait]

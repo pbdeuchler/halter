@@ -5,13 +5,18 @@ use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Priority lane used when ordering hook handlers.
 pub enum HandlerPriorityGroup {
+    /// SDK hook registered before plugin hooks.
     SdkBeforePlugins,
+    /// Hook loaded from plugin files.
     PluginFiles,
+    /// SDK hook registered after plugin hooks.
     SdkAfterPlugins,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Full ordering key for one hook handler.
 pub struct HandlerPriority {
     pub group: HandlerPriorityGroup,
     pub plugin_load_order: usize,
@@ -21,6 +26,7 @@ pub struct HandlerPriority {
 }
 
 #[derive(Debug, Clone)]
+/// Hook output plus the metadata needed to merge it deterministically.
 pub struct MergeInput {
     pub handler_id: String,
     pub priority: HandlerPriority,
@@ -28,6 +34,7 @@ pub struct MergeInput {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+/// Single effective outcome after all hook outputs are merged.
 pub struct HookMergedOutcome {
     pub stop_reason: Option<String>,
     pub block_reason: Option<String>,
@@ -41,6 +48,7 @@ pub struct HookMergedOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Record of a field-level merge conflict.
 pub struct MergeConflict {
     pub field: &'static str,
     pub winner: String,
@@ -48,6 +56,7 @@ pub struct MergeConflict {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+/// Wire-compatible hook output accepted from plugin and SDK handlers.
 pub struct HookOutput {
     #[serde(default, rename = "continue")]
     pub continue_execution: Option<bool>,
@@ -67,12 +76,16 @@ pub struct HookOutput {
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Basic allow/block decision emitted by hooks.
 pub enum HookDecision {
+    /// Approve the operation.
     Approve,
+    /// Block the operation.
     Block,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+/// Hook output fields whose meaning depends on the event type.
 pub struct HookSpecificOutput {
     #[serde(default, rename = "hookEventName")]
     pub hook_event_name: Option<String>,
@@ -102,6 +115,10 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// Merge ordered hook outputs into one runtime outcome.
+///
+/// Earlier outputs win for single-writer fields such as updated input/output.
+/// Permission decisions use the strongest semantic decision instead.
 pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConflict>) {
     // Sort references, not values — `HookOutput` carries `serde_json::Value`
     // payloads whose clones can be large. (M24)
@@ -231,6 +248,7 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
     (merged, conflicts)
 }
 
+/// Convert one hook output into summary entries for event reporting.
 pub fn summary_entries(output: &HookOutput) -> Vec<HookOutputEntry> {
     let mut entries = Vec::new();
     if let Some(reason) = output

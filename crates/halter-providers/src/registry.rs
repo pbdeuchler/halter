@@ -10,6 +10,7 @@ use tracing::debug;
 use crate::Provider;
 
 #[derive(Default, Clone)]
+/// Registry of resolved models and provider adapters.
 pub struct ModelRegistry {
     models: HashMap<String, ResolvedModel>,
     default_model: Option<ResolvedModel>,
@@ -20,29 +21,34 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
+    /// Create an empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Set the default model and make it resolvable by id.
     pub fn set_default_model(&mut self, model: ResolvedModel) {
         debug!(model_id = %model.id, provider = %model.provider, "setting default model");
         self.models.insert(model.id.0.clone(), model.clone());
         self.default_model = Some(model);
     }
 
+    /// Resolve the default model.
     pub fn default_model(&self) -> anyhow::Result<ResolvedModel> {
         self.default_model
             .clone()
             .context("failed to resolve model: default model is not configured")
     }
 
+    /// Set the optional small-task model and make it resolvable by id.
     pub fn set_small_model(&mut self, model: ResolvedModel) {
         debug!(model_id = %model.id, provider = %model.provider, "setting small model");
         self.models.insert(model.id.0.clone(), model.clone());
         self.small_model = Some(model);
     }
 
+    /// Resolve the small-task model, falling back to the default model.
     pub fn small_model(&self) -> anyhow::Result<ResolvedModel> {
         self.small_model
             .clone()
@@ -50,6 +56,7 @@ impl ModelRegistry {
             .context("failed to resolve model: small model is not configured")
     }
 
+    /// Set the subagent model and make it resolvable by id.
     pub fn set_subagent_model(&mut self, model: ResolvedModel) {
         debug!(
             model_id = %model.id,
@@ -60,6 +67,7 @@ impl ModelRegistry {
         self.subagent_model = Some(model);
     }
 
+    /// Resolve the subagent model, falling back to the default model.
     pub fn subagent_model(&self) -> anyhow::Result<ResolvedModel> {
         self.subagent_model
             .clone()
@@ -67,12 +75,14 @@ impl ModelRegistry {
             .context("failed to resolve model: subagent model is not configured")
     }
 
+    /// Set the planning model and make it resolvable by id.
     pub fn set_plan_model(&mut self, model: ResolvedModel) {
         debug!(model_id = %model.id, provider = %model.provider, "setting plan model");
         self.models.insert(model.id.0.clone(), model.clone());
         self.plan_model = Some(model);
     }
 
+    /// Resolve the planning model, falling back to the default model.
     pub fn plan_model(&self) -> anyhow::Result<ResolvedModel> {
         self.plan_model
             .clone()
@@ -80,6 +90,7 @@ impl ModelRegistry {
             .context("failed to resolve model: plan model is not configured")
     }
 
+    /// Resolve a concrete model id.
     pub fn model(&self, model_id: &ModelId) -> anyhow::Result<ResolvedModel> {
         debug!(model_id = %model_id, "resolving model");
         self.models
@@ -88,6 +99,7 @@ impl ModelRegistry {
             .with_context(|| format!("failed to resolve model: unknown model '{}'", model_id.0))
     }
 
+    /// List registered model ids in stable order.
     #[must_use]
     pub fn model_ids(&self) -> Vec<ModelId> {
         let mut model_ids = self
@@ -100,11 +112,13 @@ impl ModelRegistry {
         model_ids
     }
 
+    /// Register a provider adapter by provider name.
     pub fn register_provider(&mut self, name: ProviderName, provider: Arc<dyn Provider>) {
         debug!(provider = %name, "registering provider");
         self.providers.insert(name.0, provider);
     }
 
+    /// Resolve a provider adapter by provider name.
     pub fn provider(&self, name: &ProviderName) -> anyhow::Result<Arc<dyn Provider>> {
         debug!(provider = %name, "resolving provider");
         self.providers

@@ -17,6 +17,7 @@ pub struct RemoteSession {
 }
 
 #[async_trait]
+/// Provider abstraction for allocating and closing remote browser sessions.
 pub trait BrowserProvider: Send + Sync + std::fmt::Debug {
     /// Short, stable identifier for diagnostics (`browserbase`, `local`, ...).
     fn name(&self) -> &'static str;

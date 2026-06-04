@@ -1,3 +1,9 @@
+//! Session runtime, context planning, prompt assembly, hooks, and event flow.
+//!
+//! `halter-runtime` is the orchestration layer between providers, tools,
+//! hooks, session storage, and resource snapshots. Embedders usually access it
+//! through `halter::Halter`, but the exported types are useful for custom SDK
+//! assembly and tests.
 // pattern: Functional Core
 
 mod compaction;

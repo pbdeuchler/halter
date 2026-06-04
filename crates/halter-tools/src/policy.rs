@@ -50,6 +50,7 @@ pub struct LoopbackAllow {
 }
 
 #[derive(Debug, Clone)]
+/// Concrete settings used by [`DefaultToolPolicy`].
 pub struct PolicySettings {
     pub allowed_write_roots: Vec<PathBuf>,
     pub allowed_read_roots: Vec<PathBuf>,
@@ -124,6 +125,7 @@ fn default_sensitive_patterns() -> Vec<String> {
 }
 
 #[async_trait]
+/// Capability checks enforced before built-in tools perform side effects.
 pub trait ToolPolicy: Send + Sync {
     /// Resolve and authorize `path` for a read that will read at most `bytes`
     /// bytes. Returns a `CanonicalPath` pinning the parent directory fd so
@@ -140,7 +142,7 @@ pub trait ToolPolicy: Send + Sync {
     /// holds the parent fd.
     async fn check_write_path(&self, path: &Path) -> Result<CanonicalPath, PolicyError>;
 
-    /// Synchronous mirror of [`check_write_path`]. Callers running on a
+    /// Synchronous mirror of [`Self::check_write_path`]. Callers running on a
     /// blocking worker (e.g. `spawn_blocking`) use this to move the
     /// authorization check next to the actual filesystem write, closing the
     /// TOCTOU window between check and open (finding H33). Default
@@ -185,16 +187,19 @@ pub trait ToolPolicy: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+/// Default tool policy implementation.
 pub struct DefaultToolPolicy {
     settings: PolicySettings,
 }
 
 impl DefaultToolPolicy {
+    /// Build a policy from explicit settings.
     #[must_use]
     pub fn new(settings: PolicySettings) -> Self {
         Self { settings }
     }
 
+    /// Borrow the underlying policy settings.
     #[must_use]
     pub fn settings(&self) -> &PolicySettings {
         &self.settings

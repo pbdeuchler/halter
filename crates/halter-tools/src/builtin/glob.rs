@@ -17,6 +17,7 @@ use super::common::{
 const MAX_SORTED_CANDIDATES: usize = 10_000;
 
 #[derive(Debug)]
+/// Built-in tool for filesystem glob expansion.
 pub struct GlobTool;
 
 #[async_trait]

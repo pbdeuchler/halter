@@ -72,11 +72,13 @@ fn checked_u16(input: &Value, key: &str, default: u16) -> anyhow::Result<u16> {
     })
 }
 
+/// Handle for an active PTY session stored per halter session.
 pub struct PtySessionHandle {
     control_tx: mpsc::Sender<ControlMessage>,
 }
 
 #[derive(Debug)]
+/// Built-in tool for interacting with a persistent pseudo-terminal.
 pub struct PtyTool;
 
 #[derive(Clone)]

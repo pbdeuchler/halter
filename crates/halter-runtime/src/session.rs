@@ -41,6 +41,7 @@ use crate::{
     run_user_prompt_submit,
 };
 
+/// Stream of committed session events returned by turn submission.
 pub type SessionEventStream = BoxStream<'static, anyhow::Result<SessionEvent>>;
 
 const PROVIDER_STREAM_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
@@ -48,6 +49,7 @@ const PROVIDER_STREAM_EVENT_CAP: usize = 8_192;
 const TOOL_RUNTIME_EVENT_CAP: usize = 4_096;
 const TOOL_RUNTIME_EVENT_BYTES_CAP: usize = 1024 * 1024;
 
+/// Shared dependencies used by session handles and spawned turn tasks.
 pub struct RuntimeServices {
     pub resources: Arc<ResourceHandle>,
     pub registered_hooks: Arc<RegisteredHooks>,
@@ -73,6 +75,7 @@ pub struct RuntimeServices {
 }
 
 #[derive(Debug, Clone)]
+/// Atomically replaceable resource snapshot and hook registry.
 pub struct ResourceHandle {
     current: Arc<ArcSwap<ResourceState>>,
 }
@@ -85,6 +88,7 @@ struct ResourceState {
 }
 
 impl ResourceHandle {
+    /// Create a resource handle from an initial snapshot and hook registry.
     #[must_use]
     pub fn new(
         snapshot: ResourceSnapshot,
@@ -100,21 +104,25 @@ impl ResourceHandle {
         }
     }
 
+    /// Clone the current resource snapshot.
     #[must_use]
     pub fn snapshot(&self) -> Arc<ResourceSnapshot> {
         Arc::new(self.current.load().snapshot.clone())
     }
 
+    /// Clone the current hook registry.
     #[must_use]
     pub fn hooks(&self) -> Arc<Hooks> {
         self.current.load().hooks.clone()
     }
 
+    /// Clone current resource hook warnings.
     #[must_use]
     pub fn hook_warnings(&self) -> Arc<Vec<HookWarning>> {
         self.current.load().hook_warnings.clone()
     }
 
+    /// Replace the live resource state atomically.
     pub fn replace(
         &self,
         snapshot: ResourceSnapshot,
@@ -131,6 +139,7 @@ impl ResourceHandle {
 }
 
 #[derive(Debug, Clone)]
+/// Options used when creating a new session.
 pub struct SessionInit {
     pub session_id: Option<SessionId>,
     pub parent_session_id: Option<SessionId>,
@@ -160,18 +169,21 @@ impl Default for SessionInit {
 }
 
 impl SessionInit {
+    /// Override the default model for the new session.
     #[must_use]
     pub fn with_default_model(mut self, model: impl Into<ModelId>) -> Self {
         self.default_model = Some(model.into());
         self
     }
 
+    /// Override the subagent model for the new session.
     #[must_use]
     pub fn with_subagent_model(mut self, model: impl Into<ModelId>) -> Self {
         self.subagent_model = Some(model.into());
         self
     }
 
+    /// Override subagent event forwarding for the new session.
     #[must_use]
     pub fn with_subagent_event_forwarding(mut self, mode: SubagentEventForwarding) -> Self {
         self.subagent_event_forwarding = Some(mode);
@@ -349,6 +361,7 @@ fn forwarding_lagged_event() -> SessionEvent {
 }
 
 #[derive(Default)]
+/// Tracks live parent turn streams so subagent events can be forwarded.
 pub struct ParentStreamRegistry {
     active: Mutex<HashMap<SessionId, Vec<Weak<LiveTurnStream>>>>,
 }
@@ -446,12 +459,14 @@ fn track_fired_hook_ids(fired_hook_ids: &mut BTreeSet<String>, dispatch: &Execut
 }
 
 #[derive(Clone)]
+/// Runtime handle used to create, resume, list, and shut down sessions.
 pub struct SessionRuntime {
     services: Arc<RuntimeServices>,
     subagents: Arc<dyn SubagentControl>,
 }
 
 impl SessionRuntime {
+    /// Create a runtime from shared services.
     #[must_use]
     pub fn new(services: Arc<RuntimeServices>) -> Self {
         let subagents: Arc<dyn SubagentControl> = Arc::new(
@@ -463,11 +478,13 @@ impl SessionRuntime {
         }
     }
 
+    /// Subagent control backed by this runtime.
     #[must_use]
     pub fn subagent_control(&self) -> Arc<dyn SubagentControl> {
         self.subagents.clone()
     }
 
+    /// Create and persist a new session.
     pub async fn new_session(&self, init: SessionInit) -> anyhow::Result<HalterSession> {
         debug!(
             working_dir = %init.working_dir.display(),
@@ -487,6 +504,7 @@ impl SessionRuntime {
         .await
     }
 
+    /// Resume an existing session and fire resume-time hooks.
     pub async fn resume(&self, session_id: &SessionId) -> anyhow::Result<Option<HalterSession>> {
         let existing = self.services.sessions.load_session(session_id).await?;
         debug!(session_id = %session_id, found = existing.is_some(), "resuming session");
@@ -511,12 +529,14 @@ impl SessionRuntime {
         Ok(None)
     }
 
+    /// List persisted session blueprints.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionBlueprint>> {
         let sessions = self.services.sessions.list_sessions().await?;
         debug!(session_count = sessions.len(), "listed sessions");
         Ok(sessions)
     }
 
+    /// Replace resources used by future turns and resumed sessions.
     pub fn replace_resources(
         &self,
         snapshot: ResourceSnapshot,
@@ -566,6 +586,7 @@ impl SessionHandle {
         })
     }
 
+    /// Session id for this handle.
     #[must_use]
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
@@ -579,6 +600,7 @@ impl SessionHandle {
         &self.session_hooks
     }
 
+    /// Submit a turn and return a stream of committed events for that turn.
     pub async fn submit_turn(&self, turn: Turn) -> anyhow::Result<SessionEventStream> {
         self.submit_turn_with_cancel(turn, CancellationToken::new())
             .await
@@ -755,10 +777,12 @@ impl SessionHandle {
         Ok(UnboundedReceiverStream::new(rx).boxed())
     }
 
+    /// Replay committed events for this session.
     pub async fn replay(&self) -> anyhow::Result<Vec<SessionEvent>> {
         self.services.sessions.replay(&self.session_id).await
     }
 
+    /// Shut down this session and run session-end hooks.
     pub async fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
         let stored = self
             .services
@@ -801,6 +825,7 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Emit a notification event through notification hooks.
     pub async fn notify(&self, notification_type: &str, message: &str) -> anyhow::Result<()> {
         let stored = self
             .services
@@ -839,6 +864,7 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Compact the session immediately using the configured provider.
     pub async fn compact(
         &self,
         trigger: &str,

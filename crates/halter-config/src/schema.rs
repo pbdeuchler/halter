@@ -11,12 +11,16 @@ use indexmap::IndexMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Built-in id for the required default model slot.
 pub const DEFAULT_MODEL_ID: &str = "default";
+/// Built-in id for the optional small-task model slot.
 pub const SMALL_MODEL_ID: &str = "small";
+/// Built-in id for the optional subagent model slot.
 pub const SUBAGENT_MODEL_ID: &str = "subagent";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// Top-level TOML configuration for a halter runtime.
 pub struct HarnessConfig {
     pub version: u32,
     #[serde(default)]
@@ -57,6 +61,7 @@ impl Default for HarnessConfig {
 }
 
 impl HarnessConfig {
+    /// Validate cross-field requirements that serde cannot express.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.version != 1 {
             anyhow::bail!(
@@ -87,6 +92,7 @@ impl HarnessConfig {
         Ok(())
     }
 
+    /// Required default model configuration.
     pub fn default_model(&self) -> anyhow::Result<&ModelConfig> {
         self.models
             .default
@@ -94,16 +100,19 @@ impl HarnessConfig {
             .context("invalid configuration: [models.default] is required")
     }
 
+    /// Optional subagent model override.
     #[must_use]
     pub fn subagent_model(&self) -> Option<&ModelConfig> {
         self.models.subagent.as_ref()
     }
 
+    /// Optional small-task model override.
     #[must_use]
     pub fn small_model(&self) -> Option<&ModelConfig> {
         self.models.small.as_ref()
     }
 
+    /// Provider config for a known provider family.
     #[must_use]
     pub fn provider_config(&self, provider: ConfiguredProvider) -> Option<&ProviderConfig> {
         self.providers.get(provider)
@@ -112,6 +121,7 @@ impl HarnessConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
+/// Provider-specific connection settings keyed by provider family.
 pub struct ProvidersConfig {
     #[serde(default)]
     pub openai: Option<ProviderConfig>,
@@ -137,6 +147,7 @@ impl ProvidersConfig {
     }
 
     #[must_use]
+    /// Return the configured provider block for a provider family.
     pub fn get(&self, provider: ConfiguredProvider) -> Option<&ProviderConfig> {
         match provider {
             ConfiguredProvider::OpenAi => self.openai.as_ref(),
@@ -148,6 +159,7 @@ impl ProvidersConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
+/// Model slots used by the runtime.
 pub struct ModelsConfig {
     #[serde(default)]
     pub default: Option<ModelConfig>,
@@ -160,6 +172,7 @@ pub struct ModelsConfig {
 #[derive(
     Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
+/// Provider family accepted by user config.
 pub enum ConfiguredProvider {
     #[serde(rename = "anthropic")]
     Anthropic,
@@ -170,6 +183,7 @@ pub enum ConfiguredProvider {
 }
 
 impl ConfiguredProvider {
+    /// TOML section spelling for this provider.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -179,6 +193,7 @@ impl ConfiguredProvider {
         }
     }
 
+    /// Protocol provider kind used after config resolution.
     #[must_use]
     pub const fn provider_kind(self) -> ProviderKind {
         match self {
@@ -188,6 +203,7 @@ impl ConfiguredProvider {
         }
     }
 
+    /// Default API kind used by this provider.
     #[must_use]
     pub const fn api_kind(self) -> ApiKind {
         match self {
@@ -197,6 +213,7 @@ impl ConfiguredProvider {
         }
     }
 
+    /// Environment variable used as a fallback API key source.
     #[must_use]
     pub const fn api_key_env_var(self) -> &'static str {
         match self {
@@ -206,6 +223,7 @@ impl ConfiguredProvider {
         }
     }
 
+    /// Default upstream base URL.
     #[must_use]
     pub const fn default_base_url(self) -> &'static str {
         match self {
@@ -224,6 +242,7 @@ impl fmt::Display for ConfiguredProvider {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
+/// Runtime connection settings for one provider.
 pub struct ProviderConfig {
     #[serde(default)]
     pub base_url: Option<String>,
@@ -242,6 +261,7 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Model name plus provider and optional runtime limits.
 pub struct ModelConfig {
     pub provider: ConfiguredProvider,
     pub model: String,
@@ -256,6 +276,7 @@ pub struct ModelConfig {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Provider settings after defaults, env fallbacks, and validation are applied.
 pub struct ResolvedProviderConfig {
     pub provider: ConfiguredProvider,
     pub base_url: String,
@@ -268,6 +289,10 @@ pub struct ResolvedProviderConfig {
     pub temperature: Option<f32>,
 }
 
+/// Resolve provider runtime settings from config plus an environment lookup.
+///
+/// Configured API keys win over environment variables. Empty strings are
+/// treated as missing so accidental whitespace does not mask a fallback.
 pub fn resolve_provider_runtime_config<F>(
     provider: ConfiguredProvider,
     configured: Option<&ProviderConfig>,
@@ -400,6 +425,7 @@ fn validate_optional_positive_u32(path: &str, value: Option<u32>) -> anyhow::Res
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
+/// Resource search roots.
 pub struct ResourcesConfig {
     #[serde(default)]
     pub skills: SearchRoots,
@@ -409,6 +435,7 @@ pub struct ResourcesConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
+/// Ordered filesystem roots searched by a loader.
 pub struct SearchRoots {
     #[serde(default)]
     pub roots: Vec<PathBuf>,
@@ -416,6 +443,7 @@ pub struct SearchRoots {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
+/// Prompt-related config.
 pub struct PromptsConfig {
     #[serde(default)]
     pub system_prompt: Option<String>,
@@ -423,6 +451,7 @@ pub struct PromptsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Context window and compaction thresholds.
 pub struct ContextConfig {
     /// Trigger compaction when the estimated input reaches this threshold, with a 100-token buffer.
     #[serde(default = "default_compaction_threshold")]
@@ -476,6 +505,7 @@ const fn default_pre_compaction_target() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
+/// Built-in tool selection.
 pub struct ToolsConfig {
     #[serde(default)]
     pub enabled: Vec<String>,
@@ -483,6 +513,7 @@ pub struct ToolsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Policy settings applied by built-in tools.
 pub struct PolicyConfig {
     #[serde(default = "default_write_roots")]
     pub allowed_write_roots: Vec<PathBuf>,
@@ -529,6 +560,7 @@ const fn default_max_concurrent_subagents() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Shell tool policy.
 pub struct ShellPolicyConfig {
     #[serde(default = "default_shell_enabled")]
     pub enabled: bool,
@@ -568,6 +600,7 @@ const fn default_shell_timeout_secs() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
+/// Network tool policy.
 pub struct NetworkPolicyConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -581,6 +614,7 @@ pub struct NetworkPolicyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// One loopback host/port exception.
 pub struct LoopbackAllowConfig {
     pub host: String,
     #[serde(default)]
@@ -589,6 +623,7 @@ pub struct LoopbackAllowConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Session persistence backend selected by config.
 pub enum SessionBackend {
     #[default]
     Memory,
@@ -598,6 +633,7 @@ pub enum SessionBackend {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Session persistence settings.
 pub struct SessionsConfig {
     #[serde(default)]
     pub backend: SessionBackend,
@@ -642,6 +678,7 @@ impl SessionsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Runtime process and tracing settings.
 pub struct RuntimeConfig {
     #[serde(default)]
     pub working_dir: Option<PathBuf>,

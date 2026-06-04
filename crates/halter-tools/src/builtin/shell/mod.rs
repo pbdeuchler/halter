@@ -17,6 +17,7 @@ use super::common::{
 };
 
 #[derive(Debug)]
+/// Built-in tool for running commands in a persistent shell session.
 pub struct ShellTool;
 
 #[async_trait]

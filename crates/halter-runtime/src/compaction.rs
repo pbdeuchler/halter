@@ -9,9 +9,11 @@ use halter_protocol::{
 };
 use serde_json::Value;
 
+/// Token buffer applied before triggering automatic compaction.
 pub const COMPACTION_TRIGGER_BUFFER: u64 = 100;
 
 #[derive(Debug, Clone, Copy)]
+/// Token thresholds used by context planning.
 pub struct ContextSettings {
     pub compaction_threshold: u64,
     pub pre_compaction_target: u64,
@@ -29,6 +31,7 @@ impl Default for ContextSettings {
 }
 
 #[derive(Debug, Clone)]
+/// Messages selected for a provider compaction request.
 pub struct CompactionPreparation {
     pub compact_messages: Vec<Message>,
     pub preserved_messages: Vec<Message>,
@@ -46,11 +49,13 @@ struct CompactionUnit {
 }
 
 #[must_use]
+/// Whether the estimated context is close enough to trigger compaction.
 pub fn should_trigger_compaction(estimated_tokens: u64, settings: &ContextSettings) -> bool {
     estimated_tokens.saturating_add(COMPACTION_TRIGGER_BUFFER) >= settings.compaction_threshold
 }
 
 #[must_use]
+/// Select messages to compact after pruning low-signal units.
 pub fn prepare_compaction(
     settings: &ContextSettings,
     compacted_context: &CompactedContext,
@@ -82,6 +87,7 @@ pub fn prepare_compaction(
 }
 
 #[must_use]
+/// Estimate total context tokens for prompt, summaries, compacted prefix, and messages.
 pub fn estimate_context_tokens(
     prompt_segments: &[PromptSegment],
     summaries: &[SummarySlice],
@@ -95,6 +101,7 @@ pub fn estimate_context_tokens(
 }
 
 #[must_use]
+/// Estimate tokens for prompt segments.
 pub fn estimate_segment_tokens(segments: &[PromptSegment]) -> u64 {
     segments
         .iter()
@@ -103,6 +110,7 @@ pub fn estimate_segment_tokens(segments: &[PromptSegment]) -> u64 {
 }
 
 #[must_use]
+/// Estimate tokens for carried summaries.
 pub fn estimate_summary_tokens(summaries: &[SummarySlice]) -> u64 {
     summaries
         .iter()
@@ -111,21 +119,25 @@ pub fn estimate_summary_tokens(summaries: &[SummarySlice]) -> u64 {
 }
 
 #[must_use]
+/// Estimate tokens for provider-native compacted prefix items.
 pub fn estimate_compacted_prefix_tokens(compacted_prefix: &[Value]) -> u64 {
     compacted_prefix.iter().map(estimate_json_tokens).sum()
 }
 
 #[must_use]
+/// Estimate tokens for a compacted context wrapper.
 pub fn estimate_compacted_context_tokens(compacted_context: &CompactedContext) -> u64 {
     estimate_compacted_prefix_tokens(compacted_context.items())
 }
 
 #[must_use]
+/// Estimate tokens for a transcript slice.
 pub fn estimate_messages_tokens(messages: &[Message]) -> u64 {
     messages.iter().map(estimate_message_tokens).sum()
 }
 
 #[must_use]
+/// Estimate tokens for one transcript message.
 pub fn estimate_message_tokens(message: &Message) -> u64 {
     match message {
         Message::System(message) => estimate_text_tokens(&message.text),
@@ -188,6 +200,7 @@ impl TokenEstimator for CharHeuristicEstimator {
 }
 
 #[must_use]
+/// Score a message for context pruning.
 pub fn score_message(message: &Message) -> MessageSignal {
     match message {
         Message::User(_) => MessageSignal::Anchor,
@@ -198,6 +211,7 @@ pub fn score_message(message: &Message) -> MessageSignal {
 }
 
 #[must_use]
+/// Human-readable summary for a compaction event.
 pub fn render_compaction_event_summary(
     compacted_message_count: usize,
     compacted_item_count: usize,

@@ -1,3 +1,8 @@
+//! Hook configuration, matching, merging, and SDK registration.
+//!
+//! This crate converts plugin `hooks.json` files and SDK-registered callbacks
+//! into ordered hook dispatch plans. It also contains the merge rules that turn
+//! multiple hook outputs into one runtime decision.
 // pattern: Functional Core
 
 mod config;

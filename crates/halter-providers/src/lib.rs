@@ -1,3 +1,9 @@
+//! Provider adapters and model registry support.
+//!
+//! Providers translate the protocol-level [`ProviderRequest`] into upstream
+//! API calls and stream protocol-level [`StreamEvent`] values back to the
+//! runtime. The concrete adapters keep transport concerns here so the runtime
+//! can stay provider-agnostic.
 // pattern: Crate Boundary
 //
 // This file is the `halter-providers` crate root. It declares modules and
@@ -43,19 +49,29 @@ pub use secret::SecretString;
 pub use unsupported::UnsupportedProvider;
 
 #[async_trait]
+/// Common interface implemented by all model providers.
 pub trait Provider: Send + Sync {
+    /// Capability flags used by the runtime and prompt codecs.
     fn capabilities(&self) -> ProviderCapabilities;
 
+    /// Return the provider-specific compaction window for a transcript.
+    ///
+    /// Providers that do not support compaction return `None`.
     fn compaction_window(&self, _messages: &[Message]) -> Option<CompactionWindow> {
         None
     }
 
+    /// Start a streaming generation request.
     async fn stream(
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>>;
 
+    /// Compact a transcript into provider-native context items.
+    ///
+    /// The default implementation rejects the call for providers without
+    /// compaction support.
     async fn compact(
         &self,
         _request: ProviderCompactionRequest,

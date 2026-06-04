@@ -14,12 +14,14 @@ use tracing::{debug, info};
 use crate::schema::{HarnessConfig, resolve_provider_runtime_config};
 
 #[derive(Debug, Clone, Default)]
+/// Config files merged in increasing precedence: user, project, explicit.
 pub struct LayeredConfigPaths {
     pub user_config: Option<PathBuf>,
     pub project_config: Option<PathBuf>,
     pub explicit_config: Option<PathBuf>,
 }
 
+/// Load one TOML config file and apply environment overrides.
 pub async fn load_path(path: impl AsRef<Path>) -> anyhow::Result<HarnessConfig> {
     let path = path.as_ref();
     debug!(path = %path.display(), "loading config file");
@@ -48,6 +50,10 @@ pub async fn load_path(path: impl AsRef<Path>) -> anyhow::Result<HarnessConfig> 
     Ok(config)
 }
 
+/// Load layered config files, skipping missing layers.
+///
+/// Later layers override earlier scalar values. Resource root arrays append
+/// with deduplication; other arrays replace.
 pub async fn load_layered(paths: LayeredConfigPaths) -> anyhow::Result<HarnessConfig> {
     debug!(
         user_config = ?paths.user_config.as_ref().map(|path| path.display().to_string()),
@@ -99,6 +105,7 @@ pub async fn load_layered(paths: LayeredConfigPaths) -> anyhow::Result<HarnessCo
     Ok(config)
 }
 
+/// Apply supported `HALTER_*` environment overrides to a TOML value.
 pub fn apply_env_overrides(config: &mut toml::Value) -> anyhow::Result<()> {
     apply_env_overrides_with(config, |name| env::var_os(name))
 }
@@ -109,6 +116,7 @@ pub fn export_json_schema() -> anyhow::Result<String> {
     serde_json::to_string_pretty(&schema).context("failed to render json schema")
 }
 
+/// Generate a minimal starter TOML config.
 pub fn generate_starter_config() -> String {
     let sqlite_comment = if cfg!(feature = "sqlite") {
         "\n[sessions]\nbackend = \"memory\"\n# sqlite_path = \"/tmp/halter/sessions.db\"\n"

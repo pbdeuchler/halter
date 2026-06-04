@@ -10,6 +10,7 @@ use crate::{Tool, ToolContext};
 use super::common::{ToolScope, ensure_not_cancelled, required_string, resolve_path};
 
 #[derive(Debug)]
+/// Built-in tool for atomically writing UTF-8 files.
 pub struct WriteTool;
 
 #[async_trait]

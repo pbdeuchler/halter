@@ -17,11 +17,13 @@ use crate::retry::RetryPolicy;
 use crate::secret::SecretString;
 
 #[derive(Debug, Clone)]
+/// OpenAI Responses API provider.
 pub struct OpenAiProvider {
     inner: ResponsesProvider,
 }
 
 impl OpenAiProvider {
+    /// Construct an OpenAI provider with default headers and no temperature override.
     pub fn new(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,

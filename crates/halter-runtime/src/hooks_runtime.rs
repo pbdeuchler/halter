@@ -76,12 +76,14 @@ use crate::session::{
 use crate::{HalterSession, ResourceHandle, RuntimeServices, SessionInit};
 
 #[derive(Clone, Copy)]
+/// Shared context included in hook payloads for one invocation.
 pub struct HookInvocationContext<'a> {
     pub turn_id: &'a TurnId,
     pub model: &'a ModelId,
     pub working_dir: &'a Path,
 }
 
+/// Completed hook dispatch, including preview and final run summaries.
 pub struct ExecutedHookDispatch {
     pub preview_runs: Vec<HookRunSummary>,
     pub completed_runs: Vec<HookRunSummary>,
@@ -89,6 +91,7 @@ pub struct ExecutedHookDispatch {
     pub fired_hook_ids: Vec<String>,
 }
 
+/// Run `SessionStart` hooks.
 pub async fn run_session_start(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -115,6 +118,7 @@ pub async fn run_session_start(
     .await
 }
 
+/// Run `SessionEnd` hooks.
 pub async fn run_session_end(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -140,6 +144,7 @@ pub async fn run_session_end(
     .await
 }
 
+/// Run `UserPromptSubmit` hooks.
 pub async fn run_user_prompt_submit(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -165,6 +170,7 @@ pub async fn run_user_prompt_submit(
     .await
 }
 
+/// Run `PreToolUse` hooks for a tool call.
 pub async fn run_pre_tool_use(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -192,6 +198,7 @@ pub async fn run_pre_tool_use(
     .await
 }
 
+/// Run `PostToolUse` hooks after a successful tool call.
 pub async fn run_post_tool_use(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -221,6 +228,7 @@ pub async fn run_post_tool_use(
     .await
 }
 
+/// Run `PostToolUseFailure` hooks after a failed tool call.
 pub async fn run_post_tool_use_failure(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -250,6 +258,7 @@ pub async fn run_post_tool_use_failure(
     .await
 }
 
+/// Run `Stop` hooks at the end of assistant generation.
 pub async fn run_stop(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -277,6 +286,7 @@ pub async fn run_stop(
     .await
 }
 
+/// Run `SubagentStart` hooks.
 pub async fn run_subagent_start(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -306,6 +316,7 @@ pub async fn run_subagent_start(
     .await
 }
 
+/// Run `SubagentStop` hooks.
 pub async fn run_subagent_stop(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -344,6 +355,7 @@ pub async fn run_subagent_stop(
     .await
 }
 
+/// Run `PreCompact` hooks before a compaction attempt.
 pub async fn run_pre_compact(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -371,6 +383,7 @@ pub async fn run_pre_compact(
     .await
 }
 
+/// Run `PostCompact` hooks after compaction.
 pub async fn run_post_compact(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,
@@ -398,6 +411,7 @@ pub async fn run_post_compact(
     .await
 }
 
+/// Run `Notification` hooks.
 pub async fn run_notification(
     sess: &HalterSession,
     fired_hook_ids: &BTreeSet<String>,

@@ -17,6 +17,7 @@ use crate::{Tool, ToolContext};
 use super::common::{ToolScope, ensure_not_cancelled, optional_string};
 
 #[derive(Debug)]
+/// Built-in tool for structural source search and replacement.
 pub struct AstGrepTool;
 
 #[derive(Debug, Clone)]

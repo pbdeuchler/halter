@@ -15,18 +15,25 @@ use serde_json::Value;
 use crate::config::HookEventName;
 use crate::merge::{HookDecision, HookOutput, HookSpecificOutput, PermissionDecision};
 
+/// Boxed future returned by an SDK hook callback.
 pub type HookCallbackFuture = BoxFuture<'static, anyhow::Result<HookResponse>>;
+/// Shared callback used by SDK-registered hooks.
 pub type HookCallback = Arc<dyn Fn(HookInput) -> HookCallbackFuture + Send + Sync>;
+/// Factory for hooks that need a fresh callback instance per dispatch.
 pub type HookFunctionFactory = Arc<dyn Fn() -> HookCallback + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Relative priority for SDK hooks compared with plugin-file hooks.
 pub enum RegisteredHookPriority {
+    /// Run before hooks loaded from plugin files.
     BeforePlugins,
+    /// Run after hooks loaded from plugin files.
     #[default]
     AfterPlugins,
 }
 
 #[derive(Debug, Clone)]
+/// Input passed to an SDK hook callback.
 pub struct HookInput {
     pub event_name: HookEventName,
     pub matcher_value: Option<String>,
@@ -34,42 +41,50 @@ pub struct HookInput {
 }
 
 impl HookInput {
+    /// Return a raw JSON payload field.
     #[must_use]
     pub fn field(&self, key: &str) -> Option<&Value> {
         self.payload.get(key)
     }
 
+    /// Return a string payload field.
     #[must_use]
     pub fn string_field(&self, key: &str) -> Option<&str> {
         self.field(key).and_then(Value::as_str)
     }
 
+    /// Tool name for tool-related hook events.
     #[must_use]
     pub fn tool_name(&self) -> Option<&str> {
         self.string_field("tool_name")
     }
 
+    /// Tool use id for tool-related hook events.
     #[must_use]
     pub fn tool_use_id(&self) -> Option<&str> {
         self.string_field("tool_use_id")
     }
 
+    /// Decode the entire hook payload into a typed struct.
     pub fn decode<T: DeserializeOwned>(&self) -> anyhow::Result<T> {
         serde_json::from_value(self.payload.clone()).context("failed to decode hook input")
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+/// Builder-style response returned by SDK hooks.
 pub struct HookResponse {
     output: HookOutput,
 }
 
 impl HookResponse {
+    /// Return no changes and allow execution to continue.
     #[must_use]
     pub fn passthrough() -> Self {
         Self::default()
     }
 
+    /// Block the current operation with a reason.
     #[must_use]
     pub fn block(reason: impl Into<String>) -> Self {
         Self {
@@ -81,6 +96,7 @@ impl HookResponse {
         }
     }
 
+    /// Stop the current turn with a reason.
     #[must_use]
     pub fn stop(reason: impl Into<String>) -> Self {
         Self {
@@ -92,12 +108,14 @@ impl HookResponse {
         }
     }
 
+    /// Add a system message to the merged hook outcome.
     #[must_use]
     pub fn with_system_message(mut self, message: impl Into<String>) -> Self {
         self.output.system_message = Some(message.into());
         self
     }
 
+    /// Add context to the next model request.
     #[must_use]
     pub fn with_additional_context(mut self, context: impl Into<String>) -> Self {
         self.output
@@ -107,6 +125,7 @@ impl HookResponse {
         self
     }
 
+    /// Replace the tool input seen by downstream execution.
     #[must_use]
     pub fn with_updated_input(mut self, input: Value) -> Self {
         self.output
@@ -116,6 +135,7 @@ impl HookResponse {
         self
     }
 
+    /// Replace the tool output seen by downstream execution.
     #[must_use]
     pub fn with_updated_output(mut self, output: Value) -> Self {
         self.output
@@ -125,6 +145,7 @@ impl HookResponse {
         self
     }
 
+    /// Set a permission decision for permission-request hooks.
     #[must_use]
     pub fn with_permission(
         mut self,
@@ -140,12 +161,14 @@ impl HookResponse {
         self
     }
 
+    /// Suppress user-visible tool output when supported by the caller.
     #[must_use]
     pub fn with_suppress_output(mut self, suppress_output: bool) -> Self {
         self.output.suppress_output = Some(suppress_output);
         self
     }
 
+    /// Convert into the wire-compatible hook output.
     #[must_use]
     pub fn into_output(self) -> HookOutput {
         self.output
@@ -158,7 +181,9 @@ impl From<HookOutput> for HookResponse {
     }
 }
 
+/// Accepted return types for SDK hook callbacks.
 pub trait IntoHookResponse {
+    /// Convert a callback result into a [`HookResponse`].
     fn into_hook_response(self) -> anyhow::Result<HookResponse>;
 }
 
@@ -181,8 +206,11 @@ impl IntoHookResponse for anyhow::Result<HookResponse> {
 }
 
 #[derive(Clone)]
+/// Executable SDK hook backend.
 pub enum HookKind {
+    /// Reuse the same callback for every matching hook dispatch.
     Callback(HookCallback),
+    /// Build a callback per dispatch.
     Function(HookFunctionFactory),
 }
 
@@ -196,6 +224,7 @@ impl fmt::Debug for HookKind {
 }
 
 impl HookKind {
+    /// Hook handler type reported in run summaries.
     #[must_use]
     pub fn handler_type(&self) -> HookHandlerType {
         match self {
@@ -206,6 +235,7 @@ impl HookKind {
 }
 
 #[derive(Debug, Clone)]
+/// SDK hook definition registered into a builder.
 pub struct Hook {
     pub event: HookEventName,
     pub matcher: Option<String>,
@@ -217,6 +247,7 @@ pub struct Hook {
 }
 
 impl Hook {
+    /// Create a callback hook for an event.
     #[must_use]
     pub fn callback<F, Fut, R>(event: HookEventName, callback: F) -> Self
     where
@@ -238,6 +269,7 @@ impl Hook {
         }
     }
 
+    /// Create a hook that builds its callback per dispatch.
     #[must_use]
     pub fn function<Factory, F, Fut, R>(event: HookEventName, factory: Factory) -> Self
     where
@@ -263,30 +295,35 @@ impl Hook {
         }
     }
 
+    /// Restrict the hook to matching event values.
     #[must_use]
     pub fn with_matcher(mut self, matcher: impl Into<String>) -> Self {
         self.matcher = Some(matcher.into());
         self
     }
 
+    /// Override the hook timeout.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
+    /// Set the status message shown while the hook runs.
     #[must_use]
     pub fn with_status_message(mut self, status_message: impl Into<String>) -> Self {
         self.status_message = Some(status_message.into());
         self
     }
 
+    /// Set a simple hook condition expression.
     #[must_use]
     pub fn with_if_condition(mut self, if_condition: impl Into<String>) -> Self {
         self.if_condition = Some(if_condition.into());
         self
     }
 
+    /// Run this hook only once per session when true.
     #[must_use]
     pub fn with_once(mut self, once: bool) -> Self {
         self.once = once;
@@ -295,6 +332,7 @@ impl Hook {
 }
 
 #[derive(Debug, Clone)]
+/// SDK hook with plugin identity and priority metadata.
 pub struct RegisteredHook {
     pub plugin_id: PluginId,
     pub plugin_root: PathBuf,
@@ -303,16 +341,19 @@ pub struct RegisteredHook {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Collection of SDK hooks registered before runtime construction.
 pub struct RegisteredHooks {
     hooks: Vec<RegisteredHook>,
 }
 
 impl RegisteredHooks {
+    /// Whether no SDK hooks are registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty()
     }
 
+    /// Register a hook for one plugin id.
     pub fn register(&mut self, plugin_id: PluginId, priority: RegisteredHookPriority, hook: Hook) {
         self.hooks.push(RegisteredHook {
             plugin_id,
@@ -322,6 +363,7 @@ impl RegisteredHooks {
         });
     }
 
+    /// Validate SDK hook matchers before runtime construction.
     pub fn validate(&self) -> anyhow::Result<()> {
         for hook in &self.hooks {
             if let Some(matcher) = hook
@@ -343,6 +385,7 @@ impl RegisteredHooks {
         Ok(())
     }
 
+    /// Convert registered SDK hooks into a runtime hook registry.
     pub fn instantiate(&self) -> anyhow::Result<crate::Hooks> {
         self.validate()?;
         crate::Hooks::from_registered(self.hooks.clone())

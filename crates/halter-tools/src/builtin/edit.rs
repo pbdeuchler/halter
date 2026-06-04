@@ -12,6 +12,7 @@ use super::common::{
 };
 
 #[derive(Debug)]
+/// Built-in tool for exact-string file edits.
 pub struct EditTool;
 
 #[async_trait]

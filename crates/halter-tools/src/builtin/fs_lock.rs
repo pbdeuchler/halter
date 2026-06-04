@@ -9,6 +9,7 @@ use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, RawRwLock, RwLock};
 type PathGuardMap = Arc<DashMap<PathBuf, Arc<RwLock<()>>>>;
 
 #[derive(Debug, Clone)]
+/// Per-path read/write lock map shared by file-mutating tools.
 pub struct PathLockMap {
     entries: PathGuardMap,
 }
@@ -22,6 +23,7 @@ impl Default for PathLockMap {
 }
 
 impl PathLockMap {
+    /// Acquire a shared read lock for a path.
     pub fn acquire_read(&self, path: &Path) -> anyhow::Result<PathReadGuard> {
         let key = canonical_lock_path(path)?;
         let entry = self.entry_for(&key);
@@ -30,6 +32,7 @@ impl PathLockMap {
         })
     }
 
+    /// Acquire an exclusive write lock for a path.
     pub fn acquire_write(&self, path: &Path) -> anyhow::Result<PathWriteGuard> {
         let key = canonical_lock_path(path)?;
         let entry = self.entry_for(&key);
@@ -46,10 +49,12 @@ impl PathLockMap {
     }
 }
 
+/// Read guard returned by [`PathLockMap::acquire_read`].
 pub struct PathReadGuard {
     _guard: ArcRwLockReadGuard<RawRwLock, ()>,
 }
 
+/// Write guard returned by [`PathLockMap::acquire_write`].
 pub struct PathWriteGuard {
     _guard: ArcRwLockWriteGuard<RawRwLock, ()>,
 }

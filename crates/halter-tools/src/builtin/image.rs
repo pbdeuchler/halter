@@ -20,6 +20,7 @@ use super::common::{
 };
 
 #[derive(Debug)]
+/// Built-in tool for raster image inspection and conversion.
 pub struct ImageTool;
 
 #[async_trait]

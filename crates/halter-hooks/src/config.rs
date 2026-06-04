@@ -11,11 +11,13 @@ use strum_macros::{EnumString, IntoStaticStr};
 use crate::matcher::CompiledMatcher;
 
 #[derive(Debug, Clone, Default)]
+/// Parsed `hooks.json` file.
 pub struct HooksFile {
     pub hooks: IndexMap<HookEventName, Vec<HookMatcherGroup>>,
 }
 
 impl HooksFile {
+    /// Parse and validate a hook file from JSON bytes.
     pub fn from_json_bytes(bytes: &[u8]) -> anyhow::Result<(Self, Vec<HooksLoadWarning>)> {
         let raw: HooksFileRaw =
             serde_json::from_slice(bytes).context("failed to parse hooks.json")?;
@@ -72,6 +74,7 @@ impl HooksFile {
 }
 
 #[derive(Debug, Clone)]
+/// Hooks that share one optional matcher for an event.
 pub struct HookMatcherGroup {
     pub matcher: Option<CompiledMatcher>,
     pub hooks: Vec<HookHandler>,
@@ -118,6 +121,7 @@ impl HookMatcherGroup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed hook handler with common metadata and backend config.
 pub struct HookHandler {
     pub handler_type: HookHandlerType,
     pub timeout: Duration,
@@ -242,14 +246,20 @@ impl HookHandler {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Backend-specific hook handler configuration.
 pub enum HookHandlerConfig {
+    /// Shell command handler.
     Command(CommandHookConfig),
+    /// HTTP request handler.
     Http(HttpHookConfig),
+    /// Prompt handler.
     Prompt(PromptHookConfig),
+    /// Agent handler.
     Agent(AgentHookConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Command hook configuration.
 pub struct CommandHookConfig {
     pub command: String,
     pub shell: HookShell,
@@ -257,6 +267,7 @@ pub struct CommandHookConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// HTTP hook configuration.
 pub struct HttpHookConfig {
     pub url: String,
     pub headers: IndexMap<String, String>,
@@ -264,12 +275,14 @@ pub struct HttpHookConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Prompt hook configuration.
 pub struct PromptHookConfig {
     pub prompt: String,
     pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Agent hook configuration.
 pub struct AgentHookConfig {
     pub prompt: String,
     pub model: Option<String>,
@@ -279,14 +292,18 @@ pub struct AgentHookConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Shell used by command hooks.
 pub enum HookShell {
+    /// Bash.
     #[default]
     Bash,
+    /// PowerShell.
     Pwsh,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, IntoStaticStr)]
 #[strum(ascii_case_insensitive)]
+/// Canonical hook event name.
 pub enum HookEventName {
     SessionStart,
     SessionEnd,
@@ -319,6 +336,7 @@ pub enum HookEventName {
 }
 
 impl HookEventName {
+    /// Canonical PascalCase event spelling.
     #[must_use]
     pub fn canonical_name(self) -> &'static str {
         // `strum::IntoStaticStr` provides a `From<Self> for &'static str`
@@ -326,6 +344,7 @@ impl HookEventName {
         self.into()
     }
 
+    /// Payload field used for event matcher evaluation.
     #[must_use]
     pub fn matcher_field(self) -> Option<&'static str> {
         match self {
@@ -368,12 +387,14 @@ impl HookEventName {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Non-fatal issue found while loading a hook file.
 pub struct HooksLoadWarning {
     pub category: String,
     pub message: String,
 }
 
 impl HooksLoadWarning {
+    /// Build a hook load warning.
     #[must_use]
     pub fn new(category: impl Into<String>, message: String) -> Self {
         Self {

@@ -7,9 +7,11 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Process identifier used by policy checks.
 pub type Pid = i32;
 
 #[derive(Debug, Error)]
+/// Typed error returned by tool policy checks.
 pub enum PolicyError {
     #[error("path '{}' is not under any allowed root (roots: {roots:?})", attempted.display())]
     NotInRoot {

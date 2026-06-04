@@ -333,7 +333,7 @@ Plugin `skills` entries can point at a single skill directory containing `SKILL.
 
 Compiled resources use stable identifiers. Skill ids are based on the canonical skill path, plugin ids are based on plugin name, version, and canonical plugin path, and the final resource snapshot revision is derived from loaded skill revisions, plugin name/version pairs, and hook revisions.
 
-A non-exhaustive example:
+#### Config File Example (non-exhaustive)
 
 ```toml
 version = 1
@@ -411,7 +411,7 @@ backend = "memory"
 # subagent_event_forwarding_cap = 100_000 # 0 = unbounded
 ```
 
-And a detailed programmatic config:
+#### Programmatic Example (non-exhaustive)
 
 ```rust
 use std::path::PathBuf;

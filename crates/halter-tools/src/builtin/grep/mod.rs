@@ -19,6 +19,7 @@ use self::types::run_basic_search;
 use self::types::{DEFAULT_MAX_MATCHES, OutputMode, SearchConfig};
 
 #[derive(Debug)]
+/// Built-in tool for regex search across files.
 pub struct GrepTool;
 
 #[async_trait]

@@ -33,6 +33,7 @@ use crate::{CompiledResources, LoadedPlugin, LoadedSkill, ResourceCompiler};
 use halter_session::SqliteSessionStore;
 
 #[derive(Default)]
+/// Builder for assembling a [`Halter`] runtime from config, resources, tools, and stores.
 pub struct HalterBuilder {
     config: HarnessConfig,
     resource_snapshot: Option<ResourceSnapshot>,
@@ -46,23 +47,27 @@ pub struct HalterBuilder {
 }
 
 impl HalterBuilder {
+    /// Start a builder with default configuration.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Replace the default harness configuration.
     #[must_use]
     pub fn with_config(mut self, config: HarnessConfig) -> Self {
         self.config = config;
         self
     }
 
+    /// Provide a precompiled resource snapshot without hook metadata.
     #[must_use]
     pub fn with_resource_snapshot(mut self, snapshot: ResourceSnapshot) -> Self {
         self.resource_snapshot = Some(snapshot);
         self
     }
 
+    /// Provide resources compiled by [`ResourceCompiler`].
     #[must_use]
     pub fn with_compiled_resources(mut self, resources: CompiledResources) -> Self {
         self.resource_snapshot = Some(resources.snapshot);
@@ -71,18 +76,21 @@ impl HalterBuilder {
         self
     }
 
+    /// Provide loaded skills to compile during [`HalterBuilder::build`].
     #[must_use]
     pub fn with_loaded_skills(mut self, skills: Vec<LoadedSkill>) -> Self {
         self.loaded_skills = skills;
         self
     }
 
+    /// Provide loaded plugins to compile during [`HalterBuilder::build`].
     #[must_use]
     pub fn with_loaded_plugins(mut self, plugins: Vec<LoadedPlugin>) -> Self {
         self.loaded_plugins = plugins;
         self
     }
 
+    /// Register an SDK hook that runs after plugin-file hooks.
     #[must_use]
     pub fn with_plugin_hook(mut self, plugin_id: halter_protocol::PluginId, hook: Hook) -> Self {
         self.registered_hooks
@@ -90,6 +98,7 @@ impl HalterBuilder {
         self
     }
 
+    /// Register an SDK hook with explicit priority relative to plugin-file hooks.
     #[must_use]
     pub fn with_plugin_hook_priority(
         mut self,
@@ -101,18 +110,21 @@ impl HalterBuilder {
         self
     }
 
+    /// Add a custom tool to the runtime.
     #[must_use]
     pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
     }
 
+    /// Use a custom session store instead of the configured built-in backend.
     #[must_use]
     pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
         self.session_store = Some(store);
         self
     }
 
+    /// Validate configuration, register tools/providers/hooks, and build the runtime.
     pub async fn build(self) -> anyhow::Result<Halter> {
         let HalterBuilder {
             config,
@@ -245,17 +257,20 @@ impl HalterBuilder {
 }
 
 #[derive(Clone)]
+/// High-level SDK handle for creating and managing halter sessions.
 pub struct Halter {
     config: HarnessConfig,
     runtime: SessionRuntime,
 }
 
 impl Halter {
+    /// Start a [`HalterBuilder`].
     #[must_use]
     pub fn builder() -> HalterBuilder {
         HalterBuilder::default()
     }
 
+    /// Load config and resources from a TOML file, then build a harness.
     pub async fn from_config_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         debug!(path = %path.as_ref().display(), "building halter from config file");
         let config = load_path(path).await?;
@@ -263,6 +278,7 @@ impl Halter {
         Self::from_compiled_resources(config, resources).await
     }
 
+    /// Build from config and a resource snapshot.
     pub async fn from_config(
         config: HarnessConfig,
         snapshot: ResourceSnapshot,
@@ -274,6 +290,7 @@ impl Halter {
             .await
     }
 
+    /// Build from config and compiled resources, including hooks and warnings.
     pub async fn from_compiled_resources(
         config: HarnessConfig,
         resources: CompiledResources,
@@ -285,10 +302,12 @@ impl Halter {
             .await
     }
 
+    /// Create a new session.
     pub async fn new_session(&self, init: SessionInit) -> anyhow::Result<HalterSession> {
         self.runtime.new_session(init).await
     }
 
+    /// Replace the live resource snapshot and hook registry for future work.
     pub fn replace_resources(&self, resources: CompiledResources) {
         self.runtime.replace_resources(
             resources.snapshot,
@@ -297,11 +316,13 @@ impl Halter {
         );
     }
 
+    /// Borrow the underlying session runtime.
     #[must_use]
     pub fn runtime(&self) -> &SessionRuntime {
         &self.runtime
     }
 
+    /// Borrow the effective harness configuration.
     #[must_use]
     pub fn config(&self) -> &HarnessConfig {
         &self.config

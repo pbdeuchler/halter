@@ -34,6 +34,7 @@ pub enum TaskStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// User-visible task tracked by the task tool.
 pub struct Task {
     pub id: u64,
     pub subject: String,
@@ -51,6 +52,7 @@ pub struct TaskList {
 }
 
 impl TaskList {
+    /// Create a pending task.
     pub fn create(&mut self, subject: String, description: Option<String>) -> Task {
         self.next_id += 1;
         let task = Task {
@@ -63,6 +65,7 @@ impl TaskList {
         task
     }
 
+    /// Return all tasks in creation order.
     pub fn list(&self) -> Vec<Task> {
         self.items.values().cloned().collect()
     }
@@ -78,6 +81,7 @@ impl TaskList {
         Ok(task.clone())
     }
 
+    /// Count tasks by status.
     pub fn summary(&self) -> TaskSummary {
         let mut pending = 0u64;
         let mut completed = 0u64;
@@ -96,6 +100,7 @@ impl TaskList {
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
+/// Aggregate task counts.
 pub struct TaskSummary {
     pub total: u64,
     pub pending: u64,
@@ -106,6 +111,7 @@ pub struct TaskSummary {
 /// is wired in via `ToolSessionStore`, but a persistent backend (sqlite, file,
 /// remote) can implement this trait without touching the tool itself.
 pub trait TaskStore: Send + Sync {
+    /// Return the task list for a session.
     fn task_list(&self, session_id: &SessionId) -> Arc<Mutex<TaskList>>;
 }
 
@@ -126,6 +132,7 @@ impl TaskStore for InMemoryTaskStore {
 }
 
 #[derive(Debug)]
+/// Built-in tool for a per-session task list.
 pub struct TaskTool;
 
 #[async_trait]

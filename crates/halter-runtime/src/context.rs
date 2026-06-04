@@ -37,6 +37,7 @@ fn skill_prompt_segments(snapshot: &ResourceSnapshot) -> Vec<PromptSegment> {
 const DEFAULT_COMPACTION_PROMPT_MARKDOWN: &str = include_str!("../prompts/default-compaction.md");
 
 #[derive(Debug, Clone)]
+/// Result of a compaction pass before it is applied to session state.
 pub struct CompactionOutcome {
     pub messages: Vec<Message>,
     pub compacted_prefix: Vec<Value>,
@@ -45,6 +46,7 @@ pub struct CompactionOutcome {
 }
 
 #[derive(Debug, Clone)]
+/// State mutation produced by compaction.
 pub struct CompactionEffects {
     pub messages: Vec<Message>,
     pub compacted_context: CompactedContext,
@@ -53,6 +55,7 @@ pub struct CompactionEffects {
 }
 
 impl CompactionEffects {
+    /// Apply compaction side effects to session state.
     pub fn apply(self, state: &mut SessionState) -> Option<CompactionResult> {
         let CompactionEffects {
             messages,
@@ -137,7 +140,9 @@ impl<'a> CompactionMode<'a> {
 
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
+/// Builds context plans and performs compaction.
 pub trait ContextManager: Send + Sync {
+    /// Plan the next provider request.
     async fn plan(
         &self,
         blueprint: &SessionBlueprint,
@@ -149,6 +154,7 @@ pub trait ContextManager: Send + Sync {
         compaction_provider: &(dyn Provider + Send + Sync),
     ) -> anyhow::Result<ContextPlan>;
 
+    /// Force a compaction pass, optionally with additional instructions.
     async fn compact_now(
         &self,
         blueprint: &SessionBlueprint,
@@ -163,11 +169,13 @@ pub trait ContextManager: Send + Sync {
 }
 
 #[derive(Debug, Default)]
+/// Default context manager using heuristic token estimates and signal pruning.
 pub struct DefaultContextManager {
     settings: ContextSettings,
 }
 
 impl DefaultContextManager {
+    /// Construct from explicit compaction settings.
     #[must_use]
     pub fn new(
         compaction_threshold: u64,
@@ -183,11 +191,13 @@ impl DefaultContextManager {
         }
     }
 
+    /// Construct from a settings struct.
     #[must_use]
     pub fn from_settings(settings: ContextSettings) -> Self {
         Self { settings }
     }
 
+    /// Current context settings.
     #[must_use]
     pub fn settings(&self) -> ContextSettings {
         self.settings

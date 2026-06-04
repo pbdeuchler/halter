@@ -36,6 +36,7 @@ use session::{BrowserSession, default_goto_options, default_screenshot_options};
 const SNAPSHOT_TRUNCATE_THRESHOLD: usize = 8_000;
 
 #[derive(Debug)]
+/// Built-in tool for browser automation through Playwright.
 pub struct BrowserTool;
 
 #[async_trait]

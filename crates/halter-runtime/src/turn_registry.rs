@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 #[derive(Debug, Error)]
+/// Error returned when a turn cannot be registered.
 pub enum TurnRegistryError {
     #[error("runtime is shutting down: refusing to register turn '{0}'")]
     ShuttingDown(TurnId),
@@ -30,6 +31,7 @@ pub enum TurnRegistryError {
 }
 
 #[derive(Debug)]
+/// Summary returned by runtime shutdown.
 pub struct ShutdownReport {
     pub turns_drained: usize,
     pub turns_aborted: usize,
@@ -57,6 +59,7 @@ struct RegisteredTurn {
 }
 
 impl TurnRegistry {
+    /// Create an empty turn registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -97,11 +100,13 @@ impl TurnRegistry {
         inner.in_flight.remove(turn_id);
     }
 
+    /// Whether shutdown has started and new turns are rejected.
     #[must_use]
     pub fn is_shutting_down(&self) -> bool {
         self.lock().shutting_down
     }
 
+    /// Number of currently registered turns.
     #[must_use]
     pub fn in_flight_count(&self) -> usize {
         self.lock().in_flight.len()

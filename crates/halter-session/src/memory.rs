@@ -18,6 +18,7 @@ struct MemoryStoreState {
 }
 
 #[derive(Debug, Default, Clone)]
+/// In-process session store used by default and in tests.
 pub struct InMemorySessionStore {
     state: Arc<RwLock<MemoryStoreState>>,
 }

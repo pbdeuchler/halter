@@ -12,11 +12,14 @@ use crate::compaction::stable_json;
 const DEFAULT_SYSTEM_PROMPT_MARKDOWN: &str = include_str!("../prompts/default-system.md");
 
 #[async_trait]
+/// Turns a [`ContextPlan`] into provider-ready prompt material.
 pub trait PromptAssembler: Send + Sync {
+    /// Assemble prompt segments and transcript into an [`AssembledPrompt`].
     async fn assemble(&self, plan: &ContextPlan) -> anyhow::Result<AssembledPrompt>;
 }
 
 #[derive(Debug, Default)]
+/// Default prompt assembler used by the runtime.
 pub struct DefaultPromptAssembler;
 
 #[must_use]

@@ -10,11 +10,13 @@ use tokio_util::sync::CancellationToken;
 use crate::Provider;
 
 #[derive(Debug, Clone)]
+/// Provider stub used when a provider kind is configured but unavailable.
 pub struct UnsupportedProvider {
     kind: ProviderKind,
 }
 
 impl UnsupportedProvider {
+    /// Construct a stub for the unavailable provider kind.
     #[must_use]
     pub fn new(kind: ProviderKind) -> Self {
         Self { kind }
