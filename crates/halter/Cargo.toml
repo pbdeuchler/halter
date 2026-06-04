@@ -2,7 +2,7 @@
 name = "halter"
 edition.workspace = true
 license-file = "../../LICENSE"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["pbdeuchler"]
 description = "Programmatic agent runtime, protocol, and tool harness"
 repository = "https://github.com/pbdeuchler/halter"
