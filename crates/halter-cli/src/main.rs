@@ -1,5 +1,7 @@
 // pattern: Imperative Shell
 
+mod openai_oauth;
+mod openai_oauth_core;
 mod run_output;
 
 use std::env;
@@ -66,10 +68,20 @@ enum Commands {
     },
     Resources,
     Validate,
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommands {
+    #[command(name = "openai-oauth")]
+    OpenAiOauth(openai_oauth::OpenAiOAuthCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,6 +110,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Resources => show_resources(&cli.config, output.as_mut()).await,
         Commands::Validate => validate(&cli.config, output.as_mut()).await,
+        Commands::Auth {
+            command: AuthCommands::OpenAiOauth(command),
+        } => openai_oauth::run(command, output.as_mut()).await,
         Commands::Config {
             command: ConfigCommands::Schema,
         } => {
@@ -512,6 +527,40 @@ mod tests {
             "command-line task",
         ])
         .expect_err("run should reject multiple prompt sources");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cli_accepts_openai_oauth_auth_command() {
+        let cli = Cli::try_parse_from([
+            "halter",
+            "auth",
+            "openai-oauth",
+            "--no-open-browser",
+            "--format",
+            "env",
+        ])
+        .expect("parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                command: AuthCommands::OpenAiOauth(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_openai_oauth_api_key_exchange_flags() {
+        let error = Cli::try_parse_from([
+            "halter",
+            "auth",
+            "openai-oauth",
+            "--skip-api-key-exchange",
+            "--require-api-key-exchange",
+        ])
+        .expect_err("conflicting flags should fail");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }

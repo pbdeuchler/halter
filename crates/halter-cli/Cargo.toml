@@ -25,15 +25,20 @@ sqlite = ["halter/sqlite", "halter-config/sqlite"]
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
 futures.workspace = true
 halter = { path = "../halter" }
 halter-config = { path = "../halter-config" }
 halter-protocol = { path = "../halter-protocol" }
+reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
