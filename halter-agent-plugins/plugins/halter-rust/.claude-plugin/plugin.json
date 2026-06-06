@@ -6,5 +6,12 @@
     "name": "Philip Deuchler",
     "email": "pbdeuchler@gmail.com"
   },
+  "skills": "./skills/",
+  "keywords": [
+    "rust",
+    "halter",
+    "basic-rust",
+    "workflows-rust"
+  ],
   "license": "MIT"
 }

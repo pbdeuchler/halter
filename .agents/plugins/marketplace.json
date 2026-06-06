@@ -8,7 +8,7 @@
       "name": "halter-rust",
       "source": {
         "source": "local",
-        "path": "./plugins/halter-rust"
+        "path": "./halter-agent-plugins/plugins/halter-rust"
       },
       "policy": {
         "installation": "AVAILABLE",

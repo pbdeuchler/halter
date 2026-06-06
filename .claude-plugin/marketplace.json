@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "halter-rust",
-      "source": "./plugins/halter-rust",
+      "source": "./halter-agent-plugins/plugins/halter-rust",
       "description": "Rust engineering guidance for Halter.",
       "version": "0.1.0",
       "author": {

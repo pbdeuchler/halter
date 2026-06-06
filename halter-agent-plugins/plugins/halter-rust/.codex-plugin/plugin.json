@@ -8,6 +8,12 @@
   },
   "skills": "./skills/",
   "license": "MIT",
+  "keywords": [
+    "rust",
+    "halter",
+    "basic-rust",
+    "workflows-rust"
+  ],
   "interface": {
     "displayName": "Halter Rust",
     "shortDescription": "Apply Halter's Rust engineering conventions.",
@@ -20,6 +26,6 @@
       "Focused implementation and verification",
       "Scripted multi-agent workflow orchestration"
     ],
-    "defaultPrompt": "Use the Halter Rust skill for this Rust change."
+    "defaultPrompt": "Use basic-rust for Halter harnesses or workflows-rust for scripted agent orchestration."
   }
 }
