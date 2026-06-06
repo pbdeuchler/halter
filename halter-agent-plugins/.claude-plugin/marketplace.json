@@ -1,0 +1,25 @@
+{
+  "name": "halter-agent-plugins",
+  "description": "Installable Halter agent plugins for Claude Code.",
+  "owner": {
+    "name": "Philip Deuchler",
+    "email": "pbdeuchler@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "halter-rust",
+      "source": "./plugins/halter-rust",
+      "description": "Rust engineering guidance for Halter.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Philip Deuchler",
+        "email": "pbdeuchler@gmail.com"
+      },
+      "category": "Development",
+      "tags": [
+        "rust",
+        "halter"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "halter-rust",
+  "version": "0.1.0",
+  "description": "Rust engineering guidance for Halter.",
+  "author": {
+    "name": "Philip Deuchler",
+    "email": "pbdeuchler@gmail.com"
+  },
+  "skills": "./skills/",
+  "license": "MIT",
+  "interface": {
+    "displayName": "Halter Rust",
+    "shortDescription": "Apply Halter's Rust engineering conventions.",
+    "longDescription": "Provides a focused Rust development workflow for Halter workspaces, including workspace orientation, API-boundary design, error handling, verification expectations, and scripted multi-agent workflow orchestration with the Halter SDK.",
+    "developerName": "Philip Deuchler",
+    "category": "Development",
+    "capabilities": [
+      "Rust workspace analysis",
+      "Halter architecture guidance",
+      "Focused implementation and verification",
+      "Scripted multi-agent workflow orchestration"
+    ],
+    "defaultPrompt": "Use the Halter Rust skill for this Rust change."
+  }
+}

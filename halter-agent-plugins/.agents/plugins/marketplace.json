@@ -1,0 +1,20 @@
+{
+  "name": "halter-agent-plugins",
+  "interface": {
+    "displayName": "Halter Agent Plugins"
+  },
+  "plugins": [
+    {
+      "name": "halter-rust",
+      "source": {
+        "source": "local",
+        "path": "./plugins/halter-rust"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Development"
+    }
+  ]
+}
