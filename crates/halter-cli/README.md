@@ -435,6 +435,13 @@ halter resources
 halter run "Describe the loaded agent environment"
 ```
 
+For OpenAI OAuth, put the token bundle under `[providers.openai.oauth]` in
+`halter.toml` instead of exporting `OPENAI_API_KEY`. OAuth route rewriting uses
+ChatGPT's Codex backend route, not the public OpenAI Platform route. This
+includes every path below `/v1/responses`, including `/v1/responses/compact`.
+OAuth requests also move system prompt material into top-level `instructions`
+and set `store` to `false`.
+
 ### 2. Use the CLI in automation
 
 ```bash

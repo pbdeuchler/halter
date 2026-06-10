@@ -84,6 +84,8 @@ impl TransportError {
 
 const RESPONSES_PATH: &str = "/v1/responses";
 const RESPONSES_COMPACT_PATH: &str = "/v1/responses/compact";
+const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const CHATGPT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 /// An event sent by the OpenAI Responses streaming API that the `async-openai`
 /// SDK does not yet model (e.g. `keepalive` heartbeat pings).
@@ -108,6 +110,12 @@ pub(crate) enum ResponsesRateLimitStrategy {
     OpenAiHeaders,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponsesEndpointMode {
+    PublicApi,
+    ChatGptCodexOAuth,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesTransportRequest {
     pub provider_label: &'static str,
@@ -120,19 +128,34 @@ pub(crate) struct ResponsesTransportRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesTransport {
     client: ReqwestClient,
-    api_key: SecretString,
+    bearer_token: SecretString,
     base_url: String,
+    endpoint_mode: ResponsesEndpointMode,
     openai_rate_limiter: OpenAiRateLimiter,
     header_overrides: HeaderOverrides,
 }
 
 impl ResponsesTransport {
     pub(crate) fn try_new(
-        api_key: impl Into<SecretString>,
+        bearer_token: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
     ) -> anyhow::Result<Self> {
-        let api_key = api_key.into();
+        Self::try_new_with_endpoint_mode(
+            bearer_token,
+            base_url,
+            header_overrides,
+            ResponsesEndpointMode::PublicApi,
+        )
+    }
+
+    pub(crate) fn try_new_with_endpoint_mode(
+        bearer_token: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        endpoint_mode: ResponsesEndpointMode,
+    ) -> anyhow::Result<Self> {
+        let bearer_token = bearer_token.into();
         let base_url = base_url.into();
         let client = ReqwestClient::builder()
             .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
@@ -140,10 +163,11 @@ impl ResponsesTransport {
             .context("failed to build responses transport client")?;
 
         Ok(Self {
-            openai_rate_limiter: OpenAiRateLimiter::new(&api_key, &base_url),
+            openai_rate_limiter: OpenAiRateLimiter::new(&bearer_token, &base_url),
             client,
-            api_key,
+            bearer_token,
             base_url,
+            endpoint_mode,
             header_overrides: HeaderOverrides::new(header_overrides)?,
         })
     }
@@ -261,7 +285,7 @@ impl ResponsesTransport {
             })?;
         let request_builder = self
             .client
-            .post(provider_url(&self.base_url, path))
+            .post(provider_url(&self.base_url, path, self.endpoint_mode))
             .headers(headers)
             .body(body_bytes);
 
@@ -306,7 +330,7 @@ impl ResponsesTransport {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if !self.header_overrides.contains("authorization") {
             let mut auth_value =
-                HeaderValue::from_str(&format!("Bearer {}", self.api_key.expose_secret()))
+                HeaderValue::from_str(&format!("Bearer {}", self.bearer_token.expose_secret()))
                     .context("failed to encode Authorization header")?;
             auth_value.set_sensitive(true);
             headers.insert(AUTHORIZATION, auth_value);
@@ -340,7 +364,37 @@ fn transport_error_to_anyhow(error: TransportError) -> anyhow::Error {
     anyhow::anyhow!("failed to execute provider request: {error}")
 }
 
-fn provider_url(base_url: &str, path: &str) -> String {
+fn provider_url(base_url: &str, path: &str, endpoint_mode: ResponsesEndpointMode) -> String {
+    match endpoint_mode {
+        ResponsesEndpointMode::PublicApi => public_provider_url(base_url, path),
+        ResponsesEndpointMode::ChatGptCodexOAuth => {
+            if is_chatgpt_codex_rewrite_path(path) {
+                // ChatGPT-issued OAuth tokens are not accepted by OpenAI's
+                // public Platform API. The ChatGPT Codex backend currently
+                // accepts Responses-shaped requests, including dedicated
+                // compaction under `/v1/responses/...`, plus Chat
+                // Completions-shaped payloads at this single private endpoint.
+                // OAuth mode therefore intentionally ignores configured
+                // base_url for that prefix. This is private ChatGPT routing,
+                // not public OpenAI Platform API behavior.
+                CHATGPT_CODEX_RESPONSES_URL.to_owned()
+            } else {
+                public_provider_url(base_url, path)
+            }
+        }
+    }
+}
+
+fn is_chatgpt_codex_rewrite_path(path: &str) -> bool {
+    path == CHAT_COMPLETIONS_PATH || is_responses_path_or_child(path)
+}
+
+fn is_responses_path_or_child(path: &str) -> bool {
+    path.strip_prefix(RESPONSES_PATH)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+}
+
+fn public_provider_url(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
 }
 
@@ -497,10 +551,11 @@ fn decode_openai_error(status: StatusCode, body: &[u8]) -> OpenAIError {
 /// (e.g. a Fireworks key sent to the default `https://openrouter.ai/api`
 /// base URL) with the misleading body `"Missing Authentication header"` —
 /// even though the request did carry an `Authorization` header. The
-/// transport always populates that header from the configured/env api key,
-/// so a 401 with this exact phrase is unambiguous: the supplied key has the
-/// wrong format for the endpoint we just talked to. Rewrite the message to
-/// say so instead of letting users chase a phantom missing-header bug.
+/// transport always populates that header from the configured bearer
+/// credential, so a 401 with this exact phrase is unambiguous: the supplied
+/// credential has the wrong format for the endpoint we just talked to. Rewrite
+/// the message to say so instead of letting users chase a phantom
+/// missing-header bug.
 fn augment_unauthorized_message(status: StatusCode, error: &mut ApiError) {
     if status != StatusCode::UNAUTHORIZED {
         return;
@@ -512,9 +567,9 @@ fn augment_unauthorized_message(status: StatusCode, error: &mut ApiError) {
         return;
     }
     error.message = "Missing Authentication header — the upstream rejected the supplied \
-         API key format despite the Authorization header being sent. Verify the key \
-         matches the configured provider (OpenRouter keys begin with `sk-or-v1-`); \
-         a key from a different provider routed to OpenRouter will surface this exact \
+         bearer credential format despite the Authorization header being sent. Verify the \
+         credential matches the configured provider (OpenRouter API keys begin with \
+         `sk-or-v1-`); a credential from a different provider routed to OpenRouter will surface this exact \
          message."
         .to_owned();
 }
@@ -530,6 +585,108 @@ mod tests {
 
     use super::*;
     use crate::openai_rate_limit_policy::estimate_openai_request_cost;
+
+    #[test]
+    fn provider_url_resolves_public_api_paths_against_base_url() {
+        let cases = [
+            (
+                "trim_trailing_slash",
+                "https://api.openai.com/",
+                RESPONSES_PATH,
+                "https://api.openai.com/v1/responses",
+            ),
+            (
+                "chat_completions",
+                "https://proxy.example.com/api",
+                CHAT_COMPLETIONS_PATH,
+                "https://proxy.example.com/api/chat/completions",
+            ),
+        ];
+
+        for (name, base_url, path, want) in cases {
+            let got = provider_url(base_url, path, ResponsesEndpointMode::PublicApi);
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn provider_url_rewrites_chatgpt_codex_oauth_paths() {
+        let cases = [
+            ("responses", RESPONSES_PATH),
+            ("responses_compact", RESPONSES_COMPACT_PATH),
+            ("responses_child", "/v1/responses/child/path"),
+            ("chat_completions", CHAT_COMPLETIONS_PATH),
+        ];
+
+        for (name, path) in cases {
+            let got = provider_url(
+                "https://api.openai.com",
+                path,
+                ResponsesEndpointMode::ChatGptCodexOAuth,
+            );
+            assert_eq!(got, CHATGPT_CODEX_RESPONSES_URL, "{name}");
+        }
+    }
+
+    #[test]
+    fn provider_url_leaves_non_responses_prefix_oauth_paths_on_base_url() {
+        let cases = [
+            (
+                "responses_prefix_without_boundary",
+                "/v1/responses-other",
+                "https://api.openai.com/v1/responses-other",
+            ),
+            (
+                "unrelated",
+                "/v1/models",
+                "https://api.openai.com/v1/models",
+            ),
+        ];
+
+        for (name, path, want) in cases {
+            let got = provider_url(
+                "https://api.openai.com/",
+                path,
+                ResponsesEndpointMode::ChatGptCodexOAuth,
+            );
+
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn request_headers_use_configured_bearer_token_unless_overridden() {
+        let cases = [
+            (
+                "default_bearer",
+                Vec::<(String, String)>::new(),
+                Some("Bearer oauth-access-token"),
+            ),
+            (
+                "override_bearer",
+                vec![(
+                    "authorization".to_owned(),
+                    "Bearer override-token".to_owned(),
+                )],
+                Some("Bearer override-token"),
+            ),
+        ];
+
+        for (name, overrides, want) in cases {
+            let transport = ResponsesTransport::try_new(
+                "oauth-access-token",
+                "https://api.openai.com",
+                &overrides,
+            )
+            .expect("transport");
+            let headers = transport.request_headers().expect("headers");
+            let got = headers
+                .get(AUTHORIZATION)
+                .map(|value| value.to_str().expect("valid auth header"));
+
+            assert_eq!(got, want, "{name}");
+        }
+    }
 
     #[tokio::test]
     async fn responses_stream_honors_openai_header_waits() {
@@ -952,9 +1109,9 @@ mod tests {
     /// for HTTP 401 when the supplied bearer token has a format it does not
     /// recognize (e.g. a Fireworks key sent to the default OpenRouter base
     /// URL). The transport always populates the Authorization header from the
-    /// resolved api key, so the upstream's phrasing is misleading. Verify the
-    /// decoded ApiError carries the augmented hint instead of the literal
-    /// upstream message.
+    /// resolved bearer credential, so the upstream's phrasing is misleading.
+    /// Verify the decoded ApiError carries the augmented hint instead of the
+    /// literal upstream message.
     #[test]
     fn decode_openai_error_rewrites_openrouter_missing_auth_header() {
         let body = json!({

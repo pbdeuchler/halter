@@ -2,7 +2,8 @@
 //!
 //! `halter-config` owns the TOML-facing configuration model and the layered
 //! loader used by the CLI and SDK. It validates static config values here,
-//! then resolves provider runtime requirements such as API keys at load time.
+//! then resolves provider runtime requirements such as API keys or OpenAI
+//! OAuth credentials at load time.
 // pattern: Functional Core
 
 mod loader;
@@ -15,8 +16,8 @@ pub use loader::{
 };
 pub use schema::{
     ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, HarnessConfig, LoopbackAllowConfig,
-    ModelConfig, ModelsConfig, NetworkPolicyConfig, PolicyConfig, PromptsConfig, ProviderConfig,
-    ProvidersConfig, ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID,
-    SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig, ToolsConfig,
-    resolve_provider_runtime_config,
+    ModelConfig, ModelsConfig, NetworkPolicyConfig, OpenAiOAuthConfig, PolicyConfig, PromptsConfig,
+    ProviderConfig, ProvidersConfig, ResolvedProviderAuth, ResolvedProviderConfig, ResourcesConfig,
+    RuntimeConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig,
+    ShellPolicyConfig, ToolsConfig, resolve_provider_runtime_config,
 };

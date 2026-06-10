@@ -104,6 +104,7 @@ fn config() -> ResponsesProviderConfig {
             include_prompt_cache_key: true,
             include_encrypted_reasoning: false,
             reasoning_summary: Some("auto"),
+            instruction_mode: crate::openai_codec::ResponsesInstructionMode::DeveloperMessage,
         },
         compact_strategy: Some(CompactStrategy::InlineResponses),
         rate_limit_strategy: None,

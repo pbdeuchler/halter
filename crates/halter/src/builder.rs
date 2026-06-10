@@ -7,15 +7,17 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use halter_config::{
-    ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, PolicyConfig, ResolvedProviderConfig,
-    SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, expand_path, load_path,
-    resolve_provider_runtime_config,
+    ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, OpenAiOAuthConfig, PolicyConfig,
+    ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID,
+    SessionBackend, SessionsConfig, expand_path, load_path, resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
     HookWarning, ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot,
 };
-use halter_providers::{AnthropicProvider, ModelRegistry, OpenAiProvider, OpenRouterProvider};
+use halter_providers::{
+    AnthropicProvider, ModelRegistry, OpenAiOAuthCredentials, OpenAiProvider, OpenRouterProvider,
+};
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
     RuntimeServices, SessionInit, SessionRuntime, TraceRecorder,
@@ -447,7 +449,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
                 existing == &resolved,
                 "provider '{name}' is used by multiple roles with divergent per-role configuration; \
                  the {role_label} role resolved to base_url '{new_base}' but an earlier role \
-                 resolved the same provider to base_url '{old_base}' (api key differences also \
+                 resolved the same provider to base_url '{old_base}' (credential differences also \
                  trigger this error). Consolidate the config or use distinct providers.",
                 name = provider_name,
                 role_label = role_label,
@@ -477,25 +479,56 @@ fn build_provider(
     );
     let provider: Arc<dyn halter_providers::Provider> = match provider.provider {
         ConfiguredProvider::Anthropic => Arc::new(AnthropicProvider::new_with_headers(
-            provider.api_key.clone(),
+            api_key_auth(provider)?,
             provider.base_url.clone(),
             &provider.headers,
             provider.temperature,
         )?),
-        ConfiguredProvider::OpenAi => Arc::new(OpenAiProvider::new_with_headers(
-            provider.api_key.clone(),
-            provider.base_url.clone(),
-            &provider.headers,
-            provider.temperature,
-        )?),
+        ConfiguredProvider::OpenAi => match &provider.auth {
+            ResolvedProviderAuth::ApiKey(api_key) => Arc::new(OpenAiProvider::new_with_headers(
+                api_key.clone(),
+                provider.base_url.clone(),
+                &provider.headers,
+                provider.temperature,
+            )?),
+            ResolvedProviderAuth::OpenAiOAuth(oauth) => {
+                Arc::new(OpenAiProvider::new_with_oauth_and_headers(
+                    openai_oauth_credentials(oauth),
+                    provider.base_url.clone(),
+                    &provider.headers,
+                    provider.temperature,
+                )?)
+            }
+        },
         ConfiguredProvider::OpenRouter => Arc::new(OpenRouterProvider::new_with_headers(
-            provider.api_key.clone(),
+            api_key_auth(provider)?,
             provider.base_url.clone(),
             &provider.headers,
             provider.temperature,
         )?),
     };
     Ok(provider)
+}
+
+fn api_key_auth(provider: &ResolvedProviderConfig) -> anyhow::Result<String> {
+    match &provider.auth {
+        ResolvedProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
+        ResolvedProviderAuth::OpenAiOAuth(_) => {
+            anyhow::bail!(
+                "provider '{}' does not support OpenAI OAuth credentials",
+                provider.provider
+            )
+        }
+    }
+}
+
+fn openai_oauth_credentials(config: &OpenAiOAuthConfig) -> OpenAiOAuthCredentials {
+    OpenAiOAuthCredentials::new(
+        config.client_id.clone(),
+        config.access_token.clone(),
+        config.id_token.clone(),
+        config.refresh_token.clone(),
+    )
 }
 
 fn resolve_selected_provider_config(
@@ -567,7 +600,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use halter_config::{ModelConfig, ProviderConfig};
+    use halter_config::{ModelConfig, OpenAiOAuthConfig, ProviderConfig};
     use halter_protocol::{PluginManifest, ReasoningEffort, SkillId};
     use tempfile::tempdir;
 
@@ -617,7 +650,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_requires_provider_api_key_when_not_configured() {
+    async fn builder_requires_provider_credentials_when_not_configured() {
         let error = resolve_selected_provider_config_with(
             &openai_config(None),
             ConfiguredProvider::OpenAi,
@@ -626,6 +659,23 @@ mod tests {
         .expect_err("provider resolution should fail");
 
         assert!(error.to_string().contains("OPENAI_API_KEY"));
+        assert!(error.to_string().contains("[providers.openai].oauth"));
+    }
+
+    #[tokio::test]
+    async fn builder_accepts_openai_oauth_without_api_key() {
+        let mut config = openai_config(None);
+        config.providers.openai = Some(ProviderConfig {
+            oauth: Some(openai_oauth_config()),
+            ..ProviderConfig::default()
+        });
+
+        HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build should succeed with OpenAI OAuth credentials");
     }
 
     #[tokio::test]
@@ -868,12 +918,19 @@ mod tests {
             tokens_per_minute: None,
         });
         config.providers.openai = Some(ProviderConfig {
-            base_url: None,
             api_key: api_key.map(ToOwned::to_owned),
-            headers: Default::default(),
-            temperature: None,
+            ..ProviderConfig::default()
         });
         config
+    }
+
+    fn openai_oauth_config() -> OpenAiOAuthConfig {
+        OpenAiOAuthConfig {
+            client_id: "client".to_owned(),
+            access_token: "access-token".to_owned(),
+            id_token: "id-token".to_owned(),
+            refresh_token: "refresh-token".to_owned(),
+        }
     }
 
     #[derive(Clone, Default)]

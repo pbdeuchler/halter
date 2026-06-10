@@ -246,8 +246,16 @@ impl fmt::Display for ConfiguredProvider {
 pub struct ProviderConfig {
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Provider API key. For OpenAI, this is mutually exclusive with `oauth`.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// OpenAI OAuth credentials. Only accepted for `[providers.openai]`.
+    /// When present, the provider uses `access_token` as the bearer token and
+    /// routes `/v1/responses`, every path below that prefix, and
+    /// `/chat/completions` through ChatGPT's Codex backend with top-level
+    /// `instructions` and `store: false`.
+    #[serde(default)]
+    pub oauth: Option<OpenAiOAuthConfig>,
     /// Optional HTTP headers applied to every request the provider emits.
     /// Names collide case-insensitively; configured entries override any
     /// default or hardcoded provider header (Authorization, x-api-key, etc.).
@@ -257,6 +265,20 @@ pub struct ProviderConfig {
     /// temperature is sent to the provider. Must be in `0.0..=2.0`.
     #[serde(default)]
     pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+/// OpenAI OAuth credential bundle supplied by the user.
+pub struct OpenAiOAuthConfig {
+    /// Public OAuth client id that issued the token bundle.
+    pub client_id: String,
+    /// Bearer token sent to OpenAI OAuth provider requests.
+    pub access_token: String,
+    /// ID token retained with the bundle for caller-managed refresh/exchange flows.
+    pub id_token: String,
+    /// Refresh token retained with the bundle for caller-managed refresh flows.
+    pub refresh_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -280,7 +302,7 @@ pub struct ModelConfig {
 pub struct ResolvedProviderConfig {
     pub provider: ConfiguredProvider,
     pub base_url: String,
-    pub api_key: String,
+    pub auth: ResolvedProviderAuth,
     /// Ordered list of user-configured headers. The runtime applies these
     /// over provider defaults using case-insensitive name matching.
     pub headers: Vec<(String, String)>,
@@ -289,10 +311,21 @@ pub struct ResolvedProviderConfig {
     pub temperature: Option<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Provider credential selected after config/env resolution.
+pub enum ResolvedProviderAuth {
+    /// Provider API key resolved from config or environment.
+    ApiKey(String),
+    /// OpenAI OAuth credentials resolved from `[providers.openai].oauth`.
+    OpenAiOAuth(OpenAiOAuthConfig),
+}
+
 /// Resolve provider runtime settings from config plus an environment lookup.
 ///
 /// Configured API keys win over environment variables. Empty strings are
-/// treated as missing so accidental whitespace does not mask a fallback.
+/// treated as missing so accidental whitespace does not mask a fallback. For
+/// OpenAI, configured OAuth credentials also win over the environment and are
+/// mutually exclusive with a configured API key.
 pub fn resolve_provider_runtime_config<F>(
     provider: ConfiguredProvider,
     configured: Option<&ProviderConfig>,
@@ -313,7 +346,21 @@ where
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let env_api_key = if configured_api_key.is_some() {
+    let configured_oauth = configured.and_then(|config| config.oauth.as_ref());
+    if configured_oauth.is_some() && provider != ConfiguredProvider::OpenAi {
+        anyhow::bail!(
+            "invalid configuration: providers.{provider}.oauth is only supported for providers.openai"
+        );
+    }
+    if configured_api_key.is_some() && configured_oauth.is_some() {
+        anyhow::bail!(
+            "invalid configuration: configure either providers.openai.api_key or providers.openai.oauth, not both"
+        );
+    }
+    if let Some(oauth) = configured_oauth {
+        validate_openai_oauth_config(&format!("providers.{provider}.oauth"), oauth)?;
+    }
+    let env_api_key = if configured_api_key.is_some() || configured_oauth.is_some() {
         None
     } else {
         lookup_env(provider.api_key_env_var())?.and_then(|value| {
@@ -321,14 +368,14 @@ where
             (!trimmed.is_empty()).then(|| trimmed.to_owned())
         })
     };
-    let api_key = configured_api_key.or(env_api_key).with_context(|| {
-        format!(
-            "missing api key for provider '{}': set [providers.{}].api_key or {}",
-            provider,
-            provider,
-            provider.api_key_env_var()
-        )
-    })?;
+    let auth = match (configured_api_key, configured_oauth) {
+        (Some(api_key), None) => ResolvedProviderAuth::ApiKey(api_key),
+        (None, Some(oauth)) => ResolvedProviderAuth::OpenAiOAuth(trimmed_openai_oauth(oauth)),
+        (None, None) => ResolvedProviderAuth::ApiKey(
+            env_api_key.with_context(|| missing_provider_credentials_message(provider))?,
+        ),
+        (Some(_), Some(_)) => unreachable!("configured api_key and oauth checked above"),
+    };
 
     let headers = configured
         .map(|config| {
@@ -345,7 +392,7 @@ where
     Ok(ResolvedProviderConfig {
         provider,
         base_url,
-        api_key,
+        auth,
         headers,
         temperature,
     })
@@ -360,6 +407,24 @@ fn validate_provider_config(name: &str, provider: &ProviderConfig) -> anyhow::Re
         &format!("providers.{name}.api_key"),
         provider.api_key.as_deref(),
     )?;
+    if provider.oauth.is_some() && name != ConfiguredProvider::OpenAi.as_str() {
+        anyhow::bail!(
+            "invalid configuration: providers.{name}.oauth is only supported for providers.openai"
+        );
+    }
+    if provider
+        .api_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && provider.oauth.is_some()
+    {
+        anyhow::bail!(
+            "invalid configuration: configure either providers.openai.api_key or providers.openai.oauth, not both"
+        );
+    }
+    if let Some(oauth) = &provider.oauth {
+        validate_openai_oauth_config(&format!("providers.{name}.oauth"), oauth)?;
+    }
     for (header_name, header_value) in &provider.headers {
         validate_required_string(&format!("providers.{name}.headers.<key>"), header_name)?;
         if !header_name
@@ -379,6 +444,42 @@ fn validate_provider_config(name: &str, provider: &ProviderConfig) -> anyhow::Re
         &format!("providers.{name}.temperature"),
         provider.temperature,
     )?;
+    Ok(())
+}
+
+fn trimmed_openai_oauth(oauth: &OpenAiOAuthConfig) -> OpenAiOAuthConfig {
+    OpenAiOAuthConfig {
+        client_id: oauth.client_id.trim().to_owned(),
+        access_token: oauth.access_token.trim().to_owned(),
+        id_token: oauth.id_token.trim().to_owned(),
+        refresh_token: oauth.refresh_token.trim().to_owned(),
+    }
+}
+
+fn missing_provider_credentials_message(provider: ConfiguredProvider) -> String {
+    if provider == ConfiguredProvider::OpenAi {
+        return format!(
+            "missing credentials for provider '{}': set [providers.{}].api_key, [providers.{}].oauth, or {}",
+            provider,
+            provider,
+            provider,
+            provider.api_key_env_var()
+        );
+    }
+
+    format!(
+        "missing api key for provider '{}': set [providers.{}].api_key or {}",
+        provider,
+        provider,
+        provider.api_key_env_var()
+    )
+}
+
+fn validate_openai_oauth_config(path: &str, oauth: &OpenAiOAuthConfig) -> anyhow::Result<()> {
+    validate_required_string(&format!("{path}.client_id"), &oauth.client_id)?;
+    validate_required_string(&format!("{path}.access_token"), &oauth.access_token)?;
+    validate_required_string(&format!("{path}.id_token"), &oauth.id_token)?;
+    validate_required_string(&format!("{path}.refresh_token"), &oauth.refresh_token)?;
     Ok(())
 }
 
@@ -744,16 +845,109 @@ mod tests {
             Some(&ProviderConfig {
                 base_url: Some("https://proxy.example.com".to_owned()),
                 api_key: Some("configured-key".to_owned()),
-                headers: IndexMap::new(),
-                temperature: None,
+                ..ProviderConfig::default()
             }),
             |_| Ok(Some("env-key".to_owned())),
         )
         .expect("resolve provider");
 
         assert_eq!(resolved.base_url, "https://proxy.example.com");
-        assert_eq!(resolved.api_key, "configured-key");
+        assert_eq!(
+            resolved.auth,
+            ResolvedProviderAuth::ApiKey("configured-key".to_owned())
+        );
         assert_eq!(resolved.temperature, None);
+    }
+
+    #[test]
+    fn provider_resolution_uses_configured_openai_oauth_before_env() {
+        let resolved = resolve_provider_runtime_config(
+            ConfiguredProvider::OpenAi,
+            Some(&ProviderConfig {
+                base_url: Some("https://proxy.example.com".to_owned()),
+                oauth: Some(OpenAiOAuthConfig {
+                    client_id: " client ".to_owned(),
+                    access_token: " access-token ".to_owned(),
+                    id_token: " id-token ".to_owned(),
+                    refresh_token: " refresh-token ".to_owned(),
+                }),
+                ..ProviderConfig::default()
+            }),
+            |_| Ok(Some("env-key".to_owned())),
+        )
+        .expect("resolve provider");
+
+        assert_eq!(resolved.base_url, "https://proxy.example.com");
+        assert_eq!(
+            resolved.auth,
+            ResolvedProviderAuth::OpenAiOAuth(OpenAiOAuthConfig {
+                client_id: "client".to_owned(),
+                access_token: "access-token".to_owned(),
+                id_token: "id-token".to_owned(),
+                refresh_token: "refresh-token".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn provider_resolution_rejects_openai_api_key_and_oauth() {
+        let error = resolve_provider_runtime_config(
+            ConfiguredProvider::OpenAi,
+            Some(&ProviderConfig {
+                api_key: Some("configured-key".to_owned()),
+                oauth: Some(openai_oauth_config()),
+                ..ProviderConfig::default()
+            }),
+            |_| Ok(None),
+        )
+        .expect_err("conflicting credentials should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("configure either providers.openai.api_key or providers.openai.oauth")
+        );
+    }
+
+    #[test]
+    fn provider_resolution_rejects_oauth_for_non_openai_provider() {
+        let error = resolve_provider_runtime_config(
+            ConfiguredProvider::OpenRouter,
+            Some(&ProviderConfig {
+                oauth: Some(openai_oauth_config()),
+                ..ProviderConfig::default()
+            }),
+            |_| Ok(None),
+        )
+        .expect_err("unsupported oauth should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("providers.openrouter.oauth is only supported for providers.openai")
+        );
+    }
+
+    #[test]
+    fn provider_resolution_rejects_empty_openai_oauth_field() {
+        let error = resolve_provider_runtime_config(
+            ConfiguredProvider::OpenAi,
+            Some(&ProviderConfig {
+                oauth: Some(OpenAiOAuthConfig {
+                    access_token: " ".to_owned(),
+                    ..openai_oauth_config()
+                }),
+                ..ProviderConfig::default()
+            }),
+            |_| Ok(Some("env-key".to_owned())),
+        )
+        .expect_err("empty OAuth access token should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("providers.openai.oauth.access_token must not be empty")
+        );
     }
 
     #[test]
@@ -761,10 +955,9 @@ mod tests {
         let resolved = resolve_provider_runtime_config(
             ConfiguredProvider::OpenRouter,
             Some(&ProviderConfig {
-                base_url: None,
                 api_key: Some("configured-key".to_owned()),
-                headers: IndexMap::new(),
                 temperature: Some(0.2),
+                ..ProviderConfig::default()
             }),
             |_| Ok(None),
         )
@@ -788,10 +981,9 @@ mod tests {
         let error = validate_provider_config(
             "openrouter",
             &ProviderConfig {
-                base_url: None,
                 api_key: Some("configured-key".to_owned()),
-                headers: IndexMap::new(),
                 temperature: Some(2.5),
+                ..ProviderConfig::default()
             },
         )
         .expect_err("validation should fail");
@@ -808,10 +1000,9 @@ mod tests {
         let error = validate_provider_config(
             "openai",
             &ProviderConfig {
-                base_url: None,
                 api_key: Some("configured-key".to_owned()),
-                headers: IndexMap::new(),
                 temperature: Some(f32::NAN),
+                ..ProviderConfig::default()
             },
         )
         .expect_err("validation should fail");
@@ -820,7 +1011,116 @@ mod tests {
     }
 
     #[test]
-    fn provider_resolution_requires_api_key_for_selected_provider() {
+    fn provider_config_accepts_openai_oauth_without_api_key() {
+        validate_provider_config(
+            "openai",
+            &ProviderConfig {
+                oauth: Some(openai_oauth_config()),
+                ..ProviderConfig::default()
+            },
+        )
+        .expect("valid oauth config should pass");
+    }
+
+    #[test]
+    fn provider_config_rejects_openai_api_key_and_oauth() {
+        let error = validate_provider_config(
+            "openai",
+            &ProviderConfig {
+                api_key: Some("configured-key".to_owned()),
+                oauth: Some(openai_oauth_config()),
+                ..ProviderConfig::default()
+            },
+        )
+        .expect_err("conflicting credentials should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("configure either providers.openai.api_key or providers.openai.oauth")
+        );
+    }
+
+    #[test]
+    fn provider_config_rejects_empty_openai_oauth_fields() {
+        let cases = [
+            (
+                "client_id",
+                OpenAiOAuthConfig {
+                    client_id: " ".to_owned(),
+                    ..openai_oauth_config()
+                },
+            ),
+            (
+                "access_token",
+                OpenAiOAuthConfig {
+                    access_token: " ".to_owned(),
+                    ..openai_oauth_config()
+                },
+            ),
+            (
+                "id_token",
+                OpenAiOAuthConfig {
+                    id_token: " ".to_owned(),
+                    ..openai_oauth_config()
+                },
+            ),
+            (
+                "refresh_token",
+                OpenAiOAuthConfig {
+                    refresh_token: " ".to_owned(),
+                    ..openai_oauth_config()
+                },
+            ),
+        ];
+
+        for (field, oauth) in cases {
+            let error = validate_provider_config(
+                "openai",
+                &ProviderConfig {
+                    oauth: Some(oauth),
+                    ..ProviderConfig::default()
+                },
+            )
+            .expect_err("empty OAuth field should fail");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("providers.openai.oauth.{field} must not be empty")),
+                "{field}: unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_config_rejects_oauth_for_non_openai_provider() {
+        let error = validate_provider_config(
+            "anthropic",
+            &ProviderConfig {
+                oauth: Some(openai_oauth_config()),
+                ..ProviderConfig::default()
+            },
+        )
+        .expect_err("unsupported oauth should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("providers.anthropic.oauth is only supported for providers.openai")
+        );
+    }
+
+    #[test]
+    fn provider_resolution_requires_api_key_or_oauth_for_openai() {
+        let error = resolve_provider_runtime_config(ConfiguredProvider::OpenAi, None, |_| Ok(None))
+            .expect_err("resolution should fail");
+
+        assert!(error.to_string().contains("[providers.openai].oauth"));
+    }
+
+    #[test]
+    fn provider_resolution_requires_api_key_for_selected_non_openai_provider() {
         let error =
             resolve_provider_runtime_config(ConfiguredProvider::OpenRouter, None, |_| Ok(None))
                 .expect_err("resolution should fail");
@@ -868,10 +1168,8 @@ mod tests {
             tokens_per_minute: None,
         });
         config.providers.openai = Some(ProviderConfig {
-            base_url: None,
             api_key: Some("test-key".to_owned()),
-            headers: IndexMap::new(),
-            temperature: None,
+            ..ProviderConfig::default()
         });
         config.sessions.sqlite_path = Some(PathBuf::from("/tmp/halter.db"));
 
@@ -969,10 +1267,8 @@ subagent_event_forwarding_cap = 42
             tokens_per_minute: None,
         });
         config.providers.openai = Some(ProviderConfig {
-            base_url: None,
             api_key: Some("test-key".to_owned()),
-            headers: IndexMap::new(),
-            temperature: None,
+            ..ProviderConfig::default()
         });
         config.runtime.traces_dir = Some(PathBuf::from(""));
 
@@ -1002,5 +1298,14 @@ port = 9090
         assert_eq!(parsed.allowed_loopback.len(), 1);
         assert_eq!(parsed.allowed_loopback[0].host, "localhost");
         assert_eq!(parsed.allowed_loopback[0].port, Some(9090));
+    }
+
+    fn openai_oauth_config() -> OpenAiOAuthConfig {
+        OpenAiOAuthConfig {
+            client_id: "client".to_owned(),
+            access_token: "access-token".to_owned(),
+            id_token: "id-token".to_owned(),
+            refresh_token: "refresh-token".to_owned(),
+        }
     }
 }

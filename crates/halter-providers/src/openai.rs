@@ -12,9 +12,48 @@ use crate::Provider;
 use crate::responses_provider::{
     CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
-use crate::responses_transport::ResponsesRateLimitStrategy;
+use crate::responses_transport::{ResponsesEndpointMode, ResponsesRateLimitStrategy};
 use crate::retry::RetryPolicy;
 use crate::secret::SecretString;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// User-supplied OpenAI OAuth credentials.
+pub struct OpenAiOAuthCredentials {
+    /// Public OAuth client id that issued the token bundle.
+    pub client_id: String,
+    /// Bearer token sent to OpenAI OAuth provider requests.
+    pub access_token: SecretString,
+    /// ID token retained with the bundle for caller-managed refresh/exchange flows.
+    pub id_token: SecretString,
+    /// Refresh token retained with the bundle for caller-managed refresh flows.
+    pub refresh_token: SecretString,
+}
+
+impl OpenAiOAuthCredentials {
+    /// Construct an OpenAI OAuth credential bundle.
+    #[must_use]
+    pub fn new(
+        client_id: impl Into<String>,
+        access_token: impl Into<SecretString>,
+        id_token: impl Into<SecretString>,
+        refresh_token: impl Into<SecretString>,
+    ) -> Self {
+        Self {
+            client_id: client_id.into(),
+            access_token: access_token.into(),
+            id_token: id_token.into(),
+            refresh_token: refresh_token.into(),
+        }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        validate_non_empty("client_id", &self.client_id)?;
+        validate_non_empty("access_token", self.access_token.expose_secret())?;
+        validate_non_empty("id_token", self.id_token.expose_secret())?;
+        validate_non_empty("refresh_token", self.refresh_token.expose_secret())?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 /// OpenAI Responses API provider.
@@ -23,7 +62,8 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// Construct an OpenAI provider with default headers and no temperature override.
+    /// Construct an OpenAI provider from an API key with default headers and
+    /// no temperature override.
     pub fn new(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
@@ -31,7 +71,7 @@ impl OpenAiProvider {
         Self::new_with_headers(api_key, base_url, &[], None)
     }
 
-    /// Construct an OpenAI provider with user-configured HTTP header
+    /// Construct an OpenAI provider from an API key with user-configured HTTP header
     /// overrides. Overrides replace any default or hardcoded header
     /// (`Authorization`, `Content-Type`) case-insensitively. When
     /// `temperature` is `Some`, it is forwarded verbatim to every request
@@ -49,6 +89,48 @@ impl OpenAiProvider {
                 base_url,
                 header_overrides,
                 temperature,
+            )?,
+        })
+    }
+
+    /// Construct an OpenAI provider from OAuth credentials with default
+    /// headers and no temperature override.
+    ///
+    /// OAuth mode routes Responses-prefix and chat completions traffic through
+    /// ChatGPT's Codex backend rather than OpenAI's public Platform API. The
+    /// rewrite applies to `/v1/responses` and every path below that prefix,
+    /// including dedicated compaction. Requests use top-level `instructions`
+    /// and `store: false`.
+    pub fn new_with_oauth(
+        credentials: OpenAiOAuthCredentials,
+        base_url: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_oauth_and_headers(credentials, base_url, &[], None)
+    }
+
+    /// Construct an OpenAI provider from OAuth credentials with
+    /// user-configured HTTP header overrides.
+    ///
+    /// OAuth mode routes Responses-prefix and chat completions traffic through
+    /// ChatGPT's Codex backend rather than OpenAI's public Platform API. The
+    /// rewrite applies to `/v1/responses` and every path below that prefix,
+    /// including dedicated compaction. Requests use top-level `instructions`
+    /// and `store: false`.
+    pub fn new_with_oauth_and_headers(
+        credentials: OpenAiOAuthCredentials,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+    ) -> anyhow::Result<Self> {
+        credentials.validate()?;
+        Ok(Self {
+            inner: ResponsesProvider::try_new_with_endpoint_mode(
+                oauth_config(),
+                credentials.access_token,
+                base_url,
+                header_overrides,
+                temperature,
+                ResponsesEndpointMode::ChatGptCodexOAuth,
             )?,
         })
     }
@@ -105,11 +187,35 @@ fn config() -> ResponsesProviderConfig {
             include_prompt_cache_key: true,
             include_encrypted_reasoning: true,
             reasoning_summary: Some("auto"),
+            instruction_mode: crate::openai_codec::ResponsesInstructionMode::DeveloperMessage,
         },
         compact_strategy: Some(CompactStrategy::DedicatedEndpoint),
         rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
         retry_policy: RetryPolicy::default(),
     }
+}
+
+fn oauth_config() -> ResponsesProviderConfig {
+    let mut config = config();
+    // ChatGPT's private Codex endpoint rejects otherwise valid Responses
+    // payloads unless `instructions` is a top-level field. Public OpenAI
+    // accepts the developer-message shape, so keep this compatibility shim
+    // scoped to OAuth routing.
+    config.request.instruction_mode =
+        crate::openai_codec::ResponsesInstructionMode::TopLevelRequired;
+    // The same private endpoint also rejects omitted/true store settings.
+    // Force explicit non-storage for OAuth traffic; this disables
+    // provider-side response-id chaining and keeps conversation state in
+    // Halter's transcript instead.
+    config.request.store = Some(false);
+    config
+}
+
+fn validate_non_empty(name: &str, value: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() {
+        anyhow::bail!("invalid OpenAI OAuth credentials: {name} must not be empty");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -263,6 +369,91 @@ mod tests {
             .filter(|line| line.to_ascii_lowercase().starts_with("content-type:"))
             .count();
         assert_eq!(content_type_lines, 1, "content-type should not duplicate");
+    }
+
+    #[test]
+    fn openai_provider_accepts_oauth_credentials() {
+        let credentials = OpenAiOAuthCredentials::new(
+            "client",
+            "oauth-access-token",
+            "id-token",
+            "refresh-token",
+        );
+        OpenAiProvider::new_with_oauth(credentials, "https://api.openai.com")
+            .expect("openai provider");
+    }
+
+    #[test]
+    fn openai_provider_oauth_config_uses_codex_instruction_and_store_shape() {
+        let config = oauth_config();
+
+        assert_eq!(config.request.store, Some(false));
+        assert_eq!(
+            config.request.instruction_mode,
+            crate::openai_codec::ResponsesInstructionMode::TopLevelRequired
+        );
+    }
+
+    #[test]
+    fn openai_provider_oauth_advertises_compaction_via_responses_prefix_rewrite() {
+        let provider = OpenAiProvider::new_with_oauth(
+            OpenAiOAuthCredentials::new(
+                "client",
+                "oauth-access-token",
+                "id-token",
+                "refresh-token",
+            ),
+            "https://api.openai.com",
+        )
+        .expect("openai provider");
+
+        let capabilities = provider.capabilities();
+
+        assert!(capabilities.supports_compaction);
+        assert_eq!(
+            capabilities.compaction_strategy,
+            Some(halter_protocol::ProviderCompactionStrategy::Dedicated)
+        );
+        let messages = vec![
+            Message::User(UserMessage::text("first")),
+            assistant_text("answer"),
+            Message::User(UserMessage::text("follow up")),
+        ];
+        assert!(provider.compaction_window(&messages).is_some());
+    }
+
+    #[test]
+    fn openai_provider_rejects_empty_oauth_credentials() {
+        let cases = [
+            (
+                "client_id",
+                OpenAiOAuthCredentials::new(" ", "access-token", "id-token", "refresh-token"),
+            ),
+            (
+                "access_token",
+                OpenAiOAuthCredentials::new("client", " ", "id-token", "refresh-token"),
+            ),
+            (
+                "id_token",
+                OpenAiOAuthCredentials::new("client", "access-token", " ", "refresh-token"),
+            ),
+            (
+                "refresh_token",
+                OpenAiOAuthCredentials::new("client", "access-token", "id-token", " "),
+            ),
+        ];
+
+        for (field, credentials) in cases {
+            let error = OpenAiProvider::new_with_oauth(credentials, "https://api.openai.com")
+                .expect_err("empty OAuth field should fail");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{field} must not be empty")),
+                "{field}: unexpected error: {error}"
+            );
+        }
     }
 
     async fn spawn_header_capture_server(captured: Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {

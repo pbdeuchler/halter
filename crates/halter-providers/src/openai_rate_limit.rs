@@ -63,11 +63,11 @@ pub(crate) struct OpenAiRateLimitPermit {
 
 impl OpenAiRateLimiter {
     #[must_use]
-    pub(crate) fn new(api_key: &SecretString, base_url: &str) -> Self {
+    pub(crate) fn new(credential: &SecretString, base_url: &str) -> Self {
         Self {
             scope: OpenAiRateLimitScope {
                 base_url: base_url.trim_end_matches('/').to_owned(),
-                credential_fingerprint: fingerprint_api_key(api_key.expose_secret()),
+                credential_fingerprint: fingerprint_credential(credential.expose_secret()),
             },
             registry: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -311,9 +311,9 @@ fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
     header_string(headers, name)?.parse::<u64>().ok()
 }
 
-fn fingerprint_api_key(api_key: &str) -> String {
+fn fingerprint_credential(credential: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(api_key.as_bytes());
+    hasher.update(credential.as_bytes());
     hex::encode(hasher.finalize())
 }
 

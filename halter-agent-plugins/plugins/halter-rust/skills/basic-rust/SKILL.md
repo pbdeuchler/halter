@@ -113,14 +113,25 @@ allowed_hosts = []
 backend = "memory"
 ```
 
-Credentials are resolved for every selected model role. Configured API keys win; otherwise Halter reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`. Halter does not parse `.env` files.
+Credentials are resolved for every selected model role. Configured API keys
+win; otherwise Halter reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or
+`OPENROUTER_API_KEY`. OpenAI can use `[providers.openai].oauth` instead of
+`api_key`; the OAuth bundle must include `client_id`, `access_token`,
+`id_token`, and `refresh_token`, and Halter sends `access_token` as the bearer
+token. OAuth route rewriting sends `/v1/responses`, every path below that
+prefix including `/v1/responses/compact`, and `/chat/completions` to
+`https://chatgpt.com/backend-api/codex/responses`;
+`base_url` is ignored for those paths. OAuth requests send the assembled system
+prompt as top-level `instructions` instead of a developer/system input item,
+and set `store` to `false`. OpenAI `api_key` and `oauth` are mutually
+exclusive. Halter does not parse `.env` files.
 
 ## Config details that matter
 
 - `models.default` is required. `models.small` and `models.subagent` fall back to `default` when omitted.
 - `reasoning` accepts `low`, `medium`, `high`, and `xhigh`.
 - `tokens_per_minute` defaults to `500_000`; use it for proactive rate limiting.
-- `providers.<name>.base_url`, `api_key`, `headers`, and `temperature` are provider-level, not role-level.
+- `providers.<name>.base_url`, `api_key`, `headers`, and `temperature` are provider-level, not role-level. OpenAI also accepts provider-level `oauth`.
 - Environment overrides include `HALTER_TOOLS_ENABLED`, `HALTER_SKILL_ROOTS`, `HALTER_PLUGIN_ROOTS`, `HALTER_POLICY_SHELL_ALLOW`, `HALTER_POLICY_SHELL_ENABLED`, `HALTER_POLICY_NETWORK_ENABLED`, `HALTER_POLICY_ALLOWED_HOSTS`, and `HALTER_SESSION_BACKEND`.
 - Resource-root paths expand leading `~/` only. `$VAR`, `${VAR}`, `~user`, and shell escapes are not expanded.
 - Explicit `tools.enabled` is an allowlist. An empty list registers all compiled built-ins.
@@ -190,6 +201,22 @@ async fn build() -> anyhow::Result<Halter> {
     };
 
     Halter::from_config(config, ResourceSnapshot::empty()).await
+}
+```
+
+For OpenAI OAuth programmatic config, set `ProviderConfig::oauth` instead of `api_key`:
+
+```rust
+use halter_config::{OpenAiOAuthConfig, ProviderConfig};
+
+ProviderConfig {
+    oauth: Some(OpenAiOAuthConfig {
+        client_id,
+        access_token,
+        id_token,
+        refresh_token,
+    }),
+    ..ProviderConfig::default()
 }
 ```
 
@@ -377,7 +404,7 @@ Run the narrowest meaningful command first. Broaden to the workspace when a chan
 ## Common failure modes
 
 - Missing resource snapshot: use `Halter::from_config_file`, `Halter::from_config(config, snapshot)`, or builder resources.
-- Missing API key: set the provider-specific env var or `[providers.<name>].api_key`.
+- Missing provider credentials: set the provider-specific env var or `[providers.<name>].api_key`. For OpenAI, `[providers.openai].oauth` is also valid.
 - Feature-gated tool unavailable: enable the Cargo feature and include the tool in `tools.enabled`.
 - Shell command denied: add the program to `policy.shell.allow` or change the workflow.
 - Path denied: make the root exist and include it in policy. Parent traversal is rejected.

@@ -39,7 +39,8 @@ This crate exports two major groups of APIs.
 ### Schema types
 
 - `HarnessConfig`
-- `ProvidersConfig`, `ProviderConfig`, `ConfiguredProvider`, `ResolvedProviderConfig`
+- `ProvidersConfig`, `ProviderConfig`, `OpenAiOAuthConfig`, `ConfiguredProvider`
+- `ResolvedProviderConfig`, `ResolvedProviderAuth`
 - `ModelsConfig`, `ModelConfig`
 - `ResourcesConfig`, `SearchRoots`
 - `PromptsConfig`
@@ -101,6 +102,16 @@ Or inline in config:
 api_key = "sk-..."
 ```
 
+OpenAI also accepts OAuth credentials instead of an API key:
+
+```toml
+[providers.openai.oauth]
+client_id = "..."
+access_token = "..."
+id_token = "..."
+refresh_token = "..."
+```
+
 ---
 
 ## Schema walkthrough
@@ -132,6 +143,13 @@ Schema shape:
 base_url = "https://api.openai.com"
 api_key = "sk-..."
 
+# Instead of api_key, OpenAI can use OAuth credentials.
+[providers.openai.oauth]
+client_id = "..."
+access_token = "..."
+id_token = "..."
+refresh_token = "..."
+
 [providers.anthropic]
 base_url = "https://api.anthropic.com"
 api_key = "..."
@@ -162,10 +180,21 @@ non-empty. Validation rejects malformed entries at load time.
 1. `base_url`
    - use configured `base_url` if present and non-empty
    - otherwise fall back to the provider default
-2. `api_key`
+2. credentials
    - prefer configured `[providers.<name>].api_key`
+   - for OpenAI only, configured `[providers.openai].oauth` is accepted instead of `api_key`
    - otherwise look up the provider-specific environment variable
    - fail if neither is available
+
+OpenAI `api_key` and `oauth` are mutually exclusive. OAuth config must include
+`client_id`, `access_token`, `id_token`, and `refresh_token`; the OpenAI
+provider sends `access_token` as the bearer token. OAuth traffic for
+`/v1/responses`, every path below that prefix such as
+`/v1/responses/compact`, and `/chat/completions` rewrites to
+`https://chatgpt.com/backend-api/codex/responses`, so `base_url` is ignored for
+those paths. OAuth requests send the assembled system prompt as top-level
+`instructions`, omit the developer/system input item, and set `store` to
+`false`.
 
 Environment variables used:
 
@@ -654,7 +683,9 @@ allow = ["git", "rg", "ls"]
 timeout_secs = 15
 ```
 
-Remember: that config requires both `OPENAI_API_KEY` and `OPENROUTER_API_KEY` unless they are embedded directly in `[providers.*]`.
+Remember: that config requires OpenAI credentials and OpenRouter credentials.
+OpenAI can use `OPENAI_API_KEY` or `[providers.openai].oauth`; OpenRouter uses
+`OPENROUTER_API_KEY` or `[providers.openrouter].api_key`.
 
 ---
 
@@ -664,9 +695,11 @@ Remember: that config requires both `OPENAI_API_KEY` and `OPENROUTER_API_KEY` un
 
 You loaded a config with no default model.
 
-### Missing provider API key
+### Missing provider credentials
 
-The chosen provider was selected by a model role, but neither config nor environment supplied its API key.
+The chosen provider was selected by a model role, but neither config nor
+environment supplied credentials. For OpenAI, set `[providers.openai].api_key`,
+`[providers.openai].oauth`, or `OPENAI_API_KEY`.
 
 ### Invalid SQLite config
 
@@ -678,7 +711,8 @@ You set `sessions.sqlite_path` without enabling the `sqlite` feature or without 
 
 ### Empty strings where values are required
 
-Provider base URLs, API keys, and model names are trimmed and validated.
+Provider base URLs, API keys, OpenAI OAuth fields, and model names are trimmed
+and validated.
 
 ---
 

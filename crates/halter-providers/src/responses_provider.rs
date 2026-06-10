@@ -15,11 +15,12 @@ use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::openai_codec::{self, ResponsesRequestOptions};
+use crate::openai_codec::{self, ResponsesInstructionMode, ResponsesRequestOptions};
 use crate::openai_error::classify;
 use crate::openai_rate_limit_policy::estimate_openai_request_cost;
 use crate::responses_transport::{
-    ResponsesRateLimitStrategy, ResponsesTransport, ResponsesTransportRequest, TransportError,
+    ResponsesEndpointMode, ResponsesRateLimitStrategy, ResponsesTransport,
+    ResponsesTransportRequest, TransportError,
 };
 use crate::retry::{RetryGate, RetryPolicy};
 use crate::secret::SecretString;
@@ -36,6 +37,7 @@ pub(crate) struct ResponsesProviderRequestConfig {
     pub include_prompt_cache_key: bool,
     pub include_encrypted_reasoning: bool,
     pub reasoning_summary: Option<&'static str>,
+    pub instruction_mode: ResponsesInstructionMode,
 }
 
 #[derive(Debug, Clone)]
@@ -60,14 +62,34 @@ pub(crate) struct ResponsesProvider {
 impl ResponsesProvider {
     pub(crate) fn try_new(
         config: ResponsesProviderConfig,
-        api_key: impl Into<SecretString>,
+        bearer_token: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             config,
-            transport: ResponsesTransport::try_new(api_key, base_url, header_overrides)?,
+            transport: ResponsesTransport::try_new(bearer_token, base_url, header_overrides)?,
+            temperature,
+        })
+    }
+
+    pub(crate) fn try_new_with_endpoint_mode(
+        config: ResponsesProviderConfig,
+        bearer_token: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+        endpoint_mode: ResponsesEndpointMode,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            config,
+            transport: ResponsesTransport::try_new_with_endpoint_mode(
+                bearer_token,
+                base_url,
+                header_overrides,
+                endpoint_mode,
+            )?,
             temperature,
         })
     }
@@ -124,6 +146,7 @@ impl ResponsesProvider {
                     .then_some(request.prompt.prefix_cache_key.as_str()),
                 include_encrypted_reasoning: self.config.request.include_encrypted_reasoning,
                 reasoning_summary: self.config.request.reasoning_summary,
+                instruction_mode: self.config.request.instruction_mode,
                 temperature: self.temperature,
             },
         )?;
@@ -550,6 +573,7 @@ mod tests {
                     include_prompt_cache_key: false,
                     include_encrypted_reasoning: false,
                     reasoning_summary: None,
+                    instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 },
                 compact_strategy: None,
                 rate_limit_strategy: None,
@@ -759,6 +783,7 @@ mod tests {
                     include_prompt_cache_key: false,
                     include_encrypted_reasoning: false,
                     reasoning_summary: None,
+                    instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 },
                 compact_strategy: None,
                 rate_limit_strategy: None,

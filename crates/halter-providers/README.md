@@ -24,7 +24,7 @@ Use this crate when you need to:
 
 If you only run the CLI, you still care about this crate because provider choice affects:
 
-- which API key you need
+- which credential source you need
 - whether streaming is supported
 - whether compaction is supported
 - tool-call replay semantics
@@ -49,6 +49,7 @@ Core exports include:
 - `ApiKind`
 - provider implementations:
   - `OpenAiProvider`
+  - `OpenAiOAuthCredentials`
   - `AnthropicProvider`
   - `OpenRouterProvider`
   - `FakeProvider`
@@ -153,7 +154,7 @@ use halter_providers::{ModelRegistry, OpenAiProvider};
 let mut registry = ModelRegistry::new();
 registry.register_provider(
     "openai".into(),
-    std::sync::Arc::new(OpenAiProvider::new("sk-...", None)?),
+    std::sync::Arc::new(OpenAiProvider::new("sk-...", "https://api.openai.com")?),
 )?;
 
 // then register model definitions and set logical roles
@@ -180,17 +181,33 @@ Typical usage:
 ```rust
 use halter_providers::OpenAiProvider;
 
-let provider = OpenAiProvider::new(std::env::var("OPENAI_API_KEY")?, None)?;
-```
-
-If you need a custom endpoint:
-
-```rust
 let provider = OpenAiProvider::new(
     std::env::var("OPENAI_API_KEY")?,
-    Some("https://api.openai.com".into()),
+    "https://api.openai.com",
 )?;
 ```
+
+OAuth usage:
+
+```rust
+use halter_providers::{OpenAiOAuthCredentials, OpenAiProvider};
+
+let credentials = OpenAiOAuthCredentials::new(
+    client_id,
+    access_token,
+    id_token,
+    refresh_token,
+);
+let provider = OpenAiProvider::new_with_oauth(credentials, "https://api.openai.com")?;
+```
+
+OAuth mode sends `access_token` as bearer auth, but Responses traffic does not
+use the public OpenAI Platform route. The transport rewrites `/v1/responses`,
+every path below that prefix such as `/v1/responses/compact`, and
+`/chat/completions` to `https://chatgpt.com/backend-api/codex/responses`;
+`base_url` is ignored for those paths. OAuth mode also sends the assembled
+system prompt as top-level `instructions` instead of a developer/system input
+item, and forces `store: false`.
 
 ---
 
@@ -264,8 +281,10 @@ If you switch a session to Anthropic, parts of your assumptions may need to chan
 
 ## HTTP header overrides
 
-All three built-in providers expose a `new_with_headers(api_key, base_url, &[(name, value)])`
-constructor. The supplied overrides are applied per request with insert
+All three built-in providers expose a
+`new_with_headers(api_key, base_url, &[(name, value)], temperature)`
+constructor. OpenAI also exposes `new_with_oauth_and_headers(...)` for OAuth
+credentials. The supplied overrides are applied per request with insert
 semantics: entries replace any default or hardcoded header (`Authorization`,
 `x-api-key`, `anthropic-version`, `Content-Type`) case-insensitively, and any
 unrelated header names are forwarded as-is.
@@ -280,6 +299,7 @@ let provider = OpenAiProvider::new_with_headers(
         ("Authorization".into(), "Bearer org-specific-token".into()),
         ("X-Trace-Id".into(), "halter-dev".into()),
     ],
+    None,
 )?;
 ```
 
@@ -358,7 +378,10 @@ fn build_registry() -> anyhow::Result<ModelRegistry> {
 
     registry.register_provider(
         "openai".into(),
-        Arc::new(OpenAiProvider::new(std::env::var("OPENAI_API_KEY")?, None)?),
+        Arc::new(OpenAiProvider::new(
+            std::env::var("OPENAI_API_KEY")?,
+            "https://api.openai.com",
+        )?),
     )?;
 
     registry.set_default_model(ModelDefinition {

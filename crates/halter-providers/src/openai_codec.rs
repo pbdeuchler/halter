@@ -33,6 +33,12 @@ const RESPONSES_ITEM_ID_MAX_LEN: usize = crate::codec_common::PROVIDER_ID_MAX_LE
 pub(crate) const COMPACTION_OPEN_TAG: &str = "<compaction>\n";
 pub(crate) const COMPACTION_CLOSE_TAG: &str = "\n</compaction>";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponsesInstructionMode {
+    DeveloperMessage,
+    TopLevelRequired,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponsesRequestOptions<'a> {
     pub stream: bool,
@@ -40,6 +46,7 @@ pub(crate) struct ResponsesRequestOptions<'a> {
     pub prompt_cache_key: Option<&'a str>,
     pub include_encrypted_reasoning: bool,
     pub reasoning_summary: Option<&'a str>,
+    pub instruction_mode: ResponsesInstructionMode,
     /// Sampling temperature forwarded to the Responses API when configured.
     pub temperature: Option<f32>,
 }
@@ -57,6 +64,19 @@ pub(crate) fn encode_responses_request(
         "model".to_owned(),
         Value::String(request.model.model.clone()),
     );
+
+    let system_text = collect_system_text(request);
+    if options.instruction_mode == ResponsesInstructionMode::TopLevelRequired {
+        let instructions = system_text.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to encode openai responses request: top-level instructions are required"
+            )
+        })?;
+        body.insert(
+            "instructions".to_owned(),
+            Value::String(instructions.to_owned()),
+        );
+    }
 
     // When chaining via previous_response_id, only send new messages.
     // The server retains the prior conversation state.
@@ -79,7 +99,11 @@ pub(crate) fn encode_responses_request(
         validate_responses_input_item_ids(&input)?;
         body.insert("input".to_owned(), Value::Array(input));
     } else {
-        let input = encode_responses_input(request)?;
+        let developer_message = (options.instruction_mode
+            == ResponsesInstructionMode::DeveloperMessage)
+            .then_some(system_text.as_deref())
+            .flatten();
+        let input = encode_responses_input(request, developer_message)?;
         validate_responses_input_item_ids(&input)?;
         body.insert("input".to_owned(), Value::Array(input));
     }
@@ -980,9 +1004,12 @@ pub(crate) fn decode_chat_response(
     Ok(events)
 }
 
-fn encode_responses_input(request: &ProviderRequest) -> anyhow::Result<Vec<Value>> {
+fn encode_responses_input(
+    request: &ProviderRequest,
+    developer_message: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
     let mut input = Vec::new();
-    if let Some(system) = collect_system_text(request) {
+    if let Some(system) = developer_message {
         input.push(encode_responses_developer_message(&system));
     }
     input.extend(request.compacted_prefix.clone());
@@ -1674,6 +1701,7 @@ mod tests {
                 prompt_cache_key: Some(request.prompt.prefix_cache_key.as_str()),
                 include_encrypted_reasoning: true,
                 reasoning_summary: Some("auto"),
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: Some(0.5),
             },
         )
@@ -1686,6 +1714,7 @@ mod tests {
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(body.get("instructions").is_none());
         assert!(
             body["input"]
                 .as_array()
@@ -1700,11 +1729,105 @@ mod tests {
                 && item["status"] == "completed"
         }));
         assert!(
+            body["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .any(|item| { item["type"] == "message" && item["role"] == "developer" })
+        );
+        assert!(
             body["tools"]
                 .as_array()
                 .expect("tools")
                 .iter()
                 .any(|tool| tool["name"] == "fs_read")
+        );
+    }
+
+    #[test]
+    fn openai_responses_request_top_level_instruction_mode_moves_system_out_of_input() {
+        let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        let body = encode_responses_request(
+            &request,
+            ResponsesRequestOptions {
+                stream: true,
+                store: Some(false),
+                prompt_cache_key: None,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::TopLevelRequired,
+                temperature: None,
+            },
+        )
+        .expect("encode request");
+        let input = body["input"].as_array().expect("input");
+
+        assert_eq!(body["instructions"], "follow plan");
+        assert_eq!(body["store"], false);
+        assert!(
+            !input
+                .iter()
+                .any(|item| item["type"] == "message" && item["role"] == "developer"),
+            "OAuth-compatible instruction mode must not also send a developer message"
+        );
+        assert!(input.iter().any(|item| item["role"] == "user"));
+    }
+
+    #[test]
+    fn openai_responses_request_top_level_instruction_mode_keeps_instructions_when_chained() {
+        let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        request.previous_response_id = Some("resp_previous".to_owned());
+        request.new_messages_start = request.messages.len() - 1;
+
+        let body = encode_responses_request(
+            &request,
+            ResponsesRequestOptions {
+                stream: true,
+                store: Some(false),
+                prompt_cache_key: None,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::TopLevelRequired,
+                temperature: None,
+            },
+        )
+        .expect("encode chained request");
+        let input = body["input"].as_array().expect("input");
+
+        assert_eq!(body["previous_response_id"], "resp_previous");
+        assert_eq!(body["instructions"], "follow plan");
+        assert_eq!(body["store"], false);
+        assert!(
+            !input
+                .iter()
+                .any(|item| item["type"] == "message" && item["role"] == "developer"),
+            "chained OAuth-compatible requests still use top-level instructions"
+        );
+    }
+
+    #[test]
+    fn openai_responses_request_top_level_instruction_mode_requires_system_text() {
+        let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        request.prompt.rendered_prefix.clear();
+
+        let error = encode_responses_request(
+            &request,
+            ResponsesRequestOptions {
+                stream: true,
+                store: None,
+                prompt_cache_key: None,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::TopLevelRequired,
+                temperature: None,
+            },
+        )
+        .expect_err("top-level instructions should require system text");
+
+        assert!(
+            error
+                .to_string()
+                .contains("top-level instructions are required")
         );
     }
 
@@ -1724,6 +1847,7 @@ mod tests {
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
                 reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
             },
         )
@@ -1752,6 +1876,7 @@ mod tests {
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
                 reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
             },
         )
@@ -1771,6 +1896,7 @@ mod tests {
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
                 reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
             },
         )
@@ -1930,6 +2056,7 @@ mod tests {
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
                 reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
             },
         )

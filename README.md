@@ -285,7 +285,7 @@ It also handles:
 > [!NOTE]
 > `.toml` config file usage is a thin serialization veneer over the programmatic config. For full customization programmatic configuration should be used, and probably preferred in headless, automated, or dynamic environments.
 
-#### API keys and overrides
+#### Credentials and overrides
 
 When using config files, halter resolves the effective config first, then resolves provider credentials.
 
@@ -295,11 +295,24 @@ Config value hierarchy:
 2. Layered config files, when using `load_layered`: user config, then project config, then the explicit config path. Later files replace earlier values, except skill and plugin root arrays append and dedupe.
 3. Supported `HALTER_*` environment overrides, such as `HALTER_TOOLS_ENABLED` or `HALTER_POLICY_SHELL_ALLOW`. These are applied after file loading, so they win over file values.
 
-API key hierarchy:
+Provider credential hierarchy:
 
 1. `[providers.<name>].api_key` in the effective config wins when it is present and non-empty.
-2. If no explicit API key is configured, halter reads the provider-specific process environment variable: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`.
-3. If neither source is available for a selected provider, config loading fails.
+2. For OpenAI only, `[providers.openai].oauth` may be configured instead of `api_key`. It must include `client_id`, `access_token`, `id_token`, and `refresh_token`; the provider sends `access_token` as the bearer token. OAuth traffic for `/v1/responses`, every path below that prefix, and `/chat/completions` rewrites to `https://chatgpt.com/backend-api/codex/responses`, so `base_url` is ignored for those paths. OAuth requests send the assembled system prompt as top-level `instructions`, omit the developer/system input item, and set `store` to `false`.
+3. If no explicit credential is configured, halter reads the provider-specific process environment variable: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`.
+4. If no credential source is available for a selected provider, config loading fails.
+
+OpenAI `api_key` and `oauth` config are mutually exclusive. If both are present in `[providers.openai]`, validation fails.
+
+OAuth config uses this shape:
+
+```toml
+[providers.openai.oauth]
+client_id = "..."
+access_token = "..."
+id_token = "..."
+refresh_token = "..."
+```
 
 Halter reads process environment variables. It does not parse `.env` files directly; if you use a `.env` file, load it into the process environment before starting the CLI or SDK process.
 
@@ -569,6 +582,22 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+```
+
+To use OpenAI OAuth in programmatic config, set `oauth` instead of `api_key`:
+
+```rust
+use halter_config::{OpenAiOAuthConfig, ProviderConfig};
+
+ProviderConfig {
+    oauth: Some(OpenAiOAuthConfig {
+        client_id,
+        access_token,
+        id_token,
+        refresh_token,
+    }),
+    ..ProviderConfig::default()
 }
 ```
 

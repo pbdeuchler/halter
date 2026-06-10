@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use anthropic::AnthropicProvider;
 pub use fake::FakeProvider;
-pub use openai::OpenAiProvider;
+pub use openai::{OpenAiOAuthCredentials, OpenAiProvider};
 pub use openrouter::OpenRouterProvider;
 pub use registry::ModelRegistry;
 pub use secret::SecretString;
