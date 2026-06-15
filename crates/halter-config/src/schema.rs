@@ -73,14 +73,7 @@ impl HarnessConfig {
         self.providers.validate()?;
         self.sessions.validate()?;
 
-        let model = self.default_model()?;
-        validate_model_config("models.default", model)?;
-        if let Some(model) = self.small_model() {
-            validate_model_config("models.small", model)?;
-        }
-        if let Some(model) = self.subagent_model() {
-            validate_model_config("models.subagent", model)?;
-        }
+        self.models.validate()?;
 
         if self.policy.max_read_bytes == 0 {
             anyhow::bail!("invalid configuration: max_read_bytes must be greater than zero");
@@ -92,24 +85,74 @@ impl HarnessConfig {
         Ok(())
     }
 
-    /// Required default model configuration.
-    pub fn default_model(&self) -> anyhow::Result<&ModelConfig> {
+    /// Required default model slot.
+    pub fn default_slot(&self) -> anyhow::Result<&ModelSlot> {
         self.models
             .default
             .as_ref()
             .context("invalid configuration: [models.default] is required")
     }
 
-    /// Optional subagent model override.
+    /// Optional subagent model slot override.
     #[must_use]
-    pub fn subagent_model(&self) -> Option<&ModelConfig> {
+    pub fn subagent_slot(&self) -> Option<&ModelSlot> {
         self.models.subagent.as_ref()
+    }
+
+    /// Shared fusion definition referenced by `"fusion"` model slots.
+    #[must_use]
+    pub fn fusion(&self) -> Option<&FusionConfig> {
+        self.models.fusion.as_ref()
+    }
+
+    /// Representative default leaf model (the inline model, or the fusion
+    /// default when the default slot references `[models.fusion]`).
+    pub fn default_model(&self) -> anyhow::Result<&ModelConfig> {
+        self.default_slot()?.primary(self.fusion())
+    }
+
+    /// Representative subagent leaf model, if a subagent slot is configured.
+    pub fn subagent_model(&self) -> Option<&ModelConfig> {
+        self.subagent_slot()
+            .and_then(|slot| slot.primary(self.fusion()).ok())
     }
 
     /// Optional small-task model override.
     #[must_use]
     pub fn small_model(&self) -> Option<&ModelConfig> {
         self.models.small.as_ref()
+    }
+
+    /// Distinct provider families referenced across all model slots, expanding
+    /// fusion slots into their leaf models. Order is deterministic and
+    /// deduplicated.
+    #[must_use]
+    pub fn referenced_providers(&self) -> Vec<ConfiguredProvider> {
+        let mut providers = Vec::new();
+        let mut push = |provider: ConfiguredProvider| {
+            if !providers.contains(&provider) {
+                providers.push(provider);
+            }
+        };
+        for slot in [self.models.default.as_ref(), self.models.subagent.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            match slot {
+                ModelSlot::Inline(model) => push(model.provider),
+                ModelSlot::Reference(ModelSlotRef::Fusion) => {
+                    if let Some(fusion) = self.fusion() {
+                        for model in fusion.models() {
+                            push(model.provider);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(small) = self.small_model() {
+            push(small.provider);
+        }
+        providers
     }
 
     /// Provider config for a known provider family.
@@ -162,11 +205,98 @@ impl ProvidersConfig {
 /// Model slots used by the runtime.
 pub struct ModelsConfig {
     #[serde(default)]
-    pub default: Option<ModelConfig>,
+    pub default: Option<ModelSlot>,
     #[serde(default)]
     pub small: Option<ModelConfig>,
     #[serde(default)]
-    pub subagent: Option<ModelConfig>,
+    pub subagent: Option<ModelSlot>,
+    /// Shared definition referenced when a slot is set to `"fusion"`.
+    #[serde(default)]
+    pub fusion: Option<FusionConfig>,
+}
+
+impl ModelsConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        let default = self
+            .default
+            .as_ref()
+            .context("invalid configuration: [models.default] is required")?;
+        validate_model_slot("models.default", default, self.fusion.as_ref())?;
+        if let Some(subagent) = &self.subagent {
+            validate_model_slot("models.subagent", subagent, self.fusion.as_ref())?;
+        }
+        if let Some(small) = &self.small {
+            validate_model_config("models.small", small)?;
+        }
+        if let Some(fusion) = &self.fusion {
+            validate_fusion_config("models.fusion", fusion)?;
+        }
+        Ok(())
+    }
+}
+
+/// A model slot: either an inline model or a reference to `[models.fusion]`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ModelSlot {
+    /// Reference to the shared `[models.fusion]` definition via the bare
+    /// string `"fusion"`.
+    Reference(ModelSlotRef),
+    /// Inline model configuration (the historical form).
+    Inline(ModelConfig),
+}
+
+impl ModelSlot {
+    /// Whether this slot resolves through `[models.fusion]`.
+    #[must_use]
+    pub fn is_fusion(&self) -> bool {
+        matches!(self, Self::Reference(ModelSlotRef::Fusion))
+    }
+
+    /// Representative leaf model for the slot: the inline model, or the fusion
+    /// default model when the slot references `[models.fusion]`.
+    pub fn primary<'a>(
+        &'a self,
+        fusion: Option<&'a FusionConfig>,
+    ) -> anyhow::Result<&'a ModelConfig> {
+        match self {
+            Self::Inline(model) => Ok(model),
+            Self::Reference(ModelSlotRef::Fusion) => fusion.map(|fusion| &fusion.default).context(
+                "invalid configuration: a model slot is set to \"fusion\" but [models.fusion] is not defined",
+            ),
+        }
+    }
+}
+
+/// Symbolic references usable in a model slot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSlotRef {
+    /// Resolve the slot through the shared `[models.fusion]` definition.
+    Fusion,
+}
+
+/// Fusion (model-judge) definition: a default model, a synthesis/judge model,
+/// and the panel of models whose responses are judged.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FusionConfig {
+    /// Model that produces the final, user-visible response from the synthesis.
+    pub default: ModelConfig,
+    /// Model that ranks the panel responses and writes the synthesis message.
+    pub synthesis: ModelConfig,
+    /// Panel models the user message is multiplexed to.
+    #[serde(default)]
+    pub panelists: Vec<ModelConfig>,
+}
+
+impl FusionConfig {
+    /// Iterate every leaf model referenced by this fusion definition.
+    pub fn models(&self) -> impl Iterator<Item = &ModelConfig> {
+        std::iter::once(&self.default)
+            .chain(std::iter::once(&self.synthesis))
+            .chain(self.panelists.iter())
+    }
 }
 
 #[derive(
@@ -490,6 +620,36 @@ fn validate_optional_temperature(path: &str, value: Option<f32>) -> anyhow::Resu
     };
     if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
         anyhow::bail!("invalid configuration: {path} must be a finite value in 0.0..=2.0");
+    }
+    Ok(())
+}
+
+fn validate_model_slot(
+    path: &str,
+    slot: &ModelSlot,
+    fusion: Option<&FusionConfig>,
+) -> anyhow::Result<()> {
+    match slot {
+        ModelSlot::Inline(model) => validate_model_config(path, model),
+        ModelSlot::Reference(ModelSlotRef::Fusion) => {
+            if fusion.is_none() {
+                anyhow::bail!(
+                    "invalid configuration: {path} is set to \"fusion\" but [models.fusion] is not defined"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_fusion_config(path: &str, fusion: &FusionConfig) -> anyhow::Result<()> {
+    validate_model_config(&format!("{path}.default"), &fusion.default)?;
+    validate_model_config(&format!("{path}.synthesis"), &fusion.synthesis)?;
+    if fusion.panelists.is_empty() {
+        anyhow::bail!("invalid configuration: {path}.panelists must not be empty");
+    }
+    for (index, panelist) in fusion.panelists.iter().enumerate() {
+        validate_model_config(&format!("{path}.panelists[{index}]"), panelist)?;
     }
     Ok(())
 }
@@ -847,6 +1007,150 @@ mod tests {
             error
                 .to_string()
                 .contains("invalid configuration: [models.default] is required")
+        );
+    }
+
+    #[test]
+    fn inline_model_slot_round_trips_through_toml() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+"#,
+        )
+        .expect("parse config");
+
+        assert!(matches!(parsed.models.default, Some(ModelSlot::Inline(_))));
+        assert_eq!(parsed.default_model().expect("default model").model, "gpt-5");
+        parsed.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn fusion_model_slot_round_trips_through_toml() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models]
+default = "fusion"
+subagent = "fusion"
+
+[models.fusion.default]
+provider = "anthropic"
+model = "claude-default"
+
+[models.fusion.synthesis]
+provider = "openai"
+model = "judge-5"
+
+[[models.fusion.panelists]]
+provider = "openai"
+model = "panel-a"
+
+[[models.fusion.panelists]]
+provider = "openrouter"
+model = "panel-b"
+
+[providers.openai]
+api_key = "openai-key"
+
+[providers.anthropic]
+api_key = "anthropic-key"
+
+[providers.openrouter]
+api_key = "openrouter-key"
+"#,
+        )
+        .expect("parse config");
+
+        let default = parsed.default_slot().expect("default slot");
+        assert!(default.is_fusion());
+        assert!(parsed.subagent_slot().is_some_and(ModelSlot::is_fusion));
+
+        let fusion = parsed.fusion().expect("fusion config");
+        assert_eq!(fusion.default.model, "claude-default");
+        assert_eq!(fusion.synthesis.model, "judge-5");
+        assert_eq!(fusion.panelists.len(), 2);
+
+        // Representative leaf model is the fusion default.
+        assert_eq!(
+            parsed.default_model().expect("default model").model,
+            "claude-default"
+        );
+        // Every leaf family is surfaced for credential resolution.
+        assert_eq!(
+            parsed.referenced_providers(),
+            vec![
+                ConfiguredProvider::Anthropic,
+                ConfiguredProvider::OpenAi,
+                ConfiguredProvider::OpenRouter,
+            ]
+        );
+
+        parsed.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn fusion_reference_requires_fusion_block() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models]
+default = "fusion"
+
+[providers.openai]
+api_key = "test-key"
+"#,
+        )
+        .expect("parse config");
+
+        let error = parsed.validate().expect_err("missing fusion block should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("models.default is set to \"fusion\" but [models.fusion] is not defined"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn fusion_requires_non_empty_panelists() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models]
+default = "fusion"
+
+[models.fusion.default]
+provider = "openai"
+model = "gpt-5"
+
+[models.fusion.synthesis]
+provider = "openai"
+model = "judge-5"
+
+[providers.openai]
+api_key = "test-key"
+"#,
+        )
+        .expect("parse config");
+
+        let error = parsed
+            .validate()
+            .expect_err("empty panelists should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("models.fusion.panelists must not be empty"),
+            "unexpected error: {error}"
         );
     }
 
@@ -1209,14 +1513,14 @@ mod tests {
     #[test]
     fn sqlite_path_requires_supported_sqlite_backend() {
         let mut config = HarnessConfig::default();
-        config.models.default = Some(ModelConfig {
+        config.models.default = Some(ModelSlot::Inline(ModelConfig {
             provider: ConfiguredProvider::OpenAi,
             model: "gpt-5".to_owned(),
             max_input_tokens: None,
             max_output_tokens: None,
             reasoning: None,
             tokens_per_minute: None,
-        });
+        }));
         config.providers.openai = Some(ProviderConfig {
             api_key: Some("test-key".to_owned()),
             ..ProviderConfig::default()
@@ -1308,14 +1612,14 @@ subagent_event_forwarding_cap = 42
     #[test]
     fn runtime_traces_dir_rejects_empty_path() {
         let mut config = HarnessConfig::default();
-        config.models.default = Some(ModelConfig {
+        config.models.default = Some(ModelSlot::Inline(ModelConfig {
             provider: ConfiguredProvider::OpenAi,
             model: "gpt-5".to_owned(),
             max_input_tokens: None,
             max_output_tokens: None,
             reasoning: None,
             tokens_per_minute: None,
-        });
+        }));
         config.providers.openai = Some(ProviderConfig {
             api_key: Some("test-key".to_owned()),
             ..ProviderConfig::default()
