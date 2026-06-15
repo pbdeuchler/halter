@@ -246,7 +246,7 @@ reasoning = "medium"
 
 - `models.default` is required
 - `reasoning` is optional
-- `tokens_per_minute` defaults to `500_000`
+- `tokens_per_minute` defaults to `500_000` and must be positive when set
 - `max_input_tokens` / `max_output_tokens` must be positive when set
 - the provider choice also determines the provider kind and API kind used elsewhere in the workspace
 

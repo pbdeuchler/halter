@@ -294,6 +294,7 @@ pub struct ModelConfig {
     #[serde(default)]
     pub reasoning: Option<ReasoningEffort>,
     #[serde(default = "default_tokens_per_minute")]
+    #[schemars(range(min = 1))]
     pub tokens_per_minute: Option<u64>,
 }
 
@@ -500,6 +501,10 @@ fn validate_model_config(path: &str, model: &ModelConfig) -> anyhow::Result<()> 
         &format!("{path}.max_output_tokens"),
         model.max_output_tokens,
     )?;
+    validate_optional_positive_u64(
+        &format!("{path}.tokens_per_minute"),
+        model.tokens_per_minute,
+    )?;
     Ok(())
 }
 
@@ -518,6 +523,13 @@ fn validate_optional_string(path: &str, value: Option<&str>) -> anyhow::Result<(
 }
 
 fn validate_optional_positive_u32(path: &str, value: Option<u32>) -> anyhow::Result<()> {
+    if matches!(value, Some(0)) {
+        anyhow::bail!("invalid configuration: {path} must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_optional_positive_u64(path: &str, value: Option<u64>) -> anyhow::Result<()> {
     if matches!(value, Some(0)) {
         anyhow::bail!("invalid configuration: {path} must be greater than zero");
     }
@@ -836,6 +848,44 @@ mod tests {
                 .to_string()
                 .contains("invalid configuration: [models.default] is required")
         );
+    }
+
+    #[test]
+    fn model_config_validates_tokens_per_minute() {
+        let cases = [
+            ("unset", None, None),
+            ("one", Some(1), None),
+            ("default", Some(500_000), None),
+            (
+                "zero",
+                Some(0),
+                Some("models.default.tokens_per_minute must be greater than zero"),
+            ),
+        ];
+
+        for (name, tokens_per_minute, want_error) in cases {
+            let model = ModelConfig {
+                provider: ConfiguredProvider::OpenAi,
+                model: "gpt-5".to_owned(),
+                max_input_tokens: None,
+                max_output_tokens: None,
+                reasoning: None,
+                tokens_per_minute,
+            };
+
+            let result = validate_model_config("models.default", &model);
+
+            match want_error {
+                Some(want_error) => {
+                    let error = result.expect_err("validation should fail");
+                    assert!(
+                        error.to_string().contains(want_error),
+                        "{name}: unexpected error: {error}"
+                    );
+                }
+                None => result.expect("validation should pass"),
+            }
+        }
     }
 
     #[test]
