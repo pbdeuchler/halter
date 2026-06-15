@@ -1010,7 +1010,7 @@ fn encode_responses_input(
 ) -> anyhow::Result<Vec<Value>> {
     let mut input = Vec::new();
     if let Some(system) = developer_message {
-        input.push(encode_responses_developer_message(&system));
+        input.push(encode_responses_developer_message(system));
     }
     input.extend(request.compacted_prefix.clone());
 
