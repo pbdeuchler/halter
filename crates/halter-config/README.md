@@ -41,7 +41,7 @@ This crate exports two major groups of APIs.
 - `HarnessConfig`
 - `ProvidersConfig`, `ProviderConfig`, `OpenAiOAuthConfig`, `ConfiguredProvider`
 - `ResolvedProviderConfig`, `ResolvedProviderAuth`
-- `ModelsConfig`, `ModelConfig`
+- `ModelsConfig`, `ModelConfig`, `ModelSlot`, `ModelSlotRef`, `FusionConfig`
 - `ResourcesConfig`, `SearchRoots`
 - `PromptsConfig`
 - `ContextConfig`
@@ -242,9 +242,45 @@ model = "openai/gpt-5-mini"
 reasoning = "medium"
 ```
 
+### Fusion (model-judge) slots
+
+`models.default` and `models.subagent` accept either an inline model (above) or
+the string `"fusion"`, which resolves through a shared `[models.fusion]` block
+holding a `default` model, a `synthesis` (judge) model, and a non-empty array of
+`panelists`:
+
+```toml
+[models]
+default = "fusion"
+
+[models.fusion.default]
+provider = "anthropic"
+model = "claude-opus-4-8"
+
+[models.fusion.synthesis]
+provider = "openai"
+model = "gpt-5"
+
+[[models.fusion.panelists]]
+provider = "openai"
+model = "gpt-5"
+
+[[models.fusion.panelists]]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+```
+
+At runtime a fusion slot multiplexes each call to the panelists, has the
+synthesis model stack-rank and judge their responses, and hands the synthesis to
+the default model (as an out-of-band meta message) to produce the visible reply.
+See the workspace README for the full flow and telemetry.
+
 ### Notes
 
 - `models.default` is required
+- a `"fusion"` slot requires a `[models.fusion]` block with non-empty `panelists`
+- `models.small` is always a single inline model (it does not fan out); when
+  unset it falls back to the default slot's representative leaf model
 - `reasoning` is optional
 - `tokens_per_minute` defaults to `500_000` and must be positive when set
 - `max_input_tokens` / `max_output_tokens` must be positive when set

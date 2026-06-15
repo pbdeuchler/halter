@@ -262,7 +262,8 @@ async fn main() -> anyhow::Result<()> {
 `halter-config` defines the schema for:
 
 - providers
-- model roles (`default`, `small`, `subagent`)
+- model roles (`default`, `small`, `subagent`), each optionally backed by a
+  `"fusion"` (model-judge) panel via `[models.fusion]`
 - resource roots
 - prompts
 - context compaction settings
@@ -423,6 +424,60 @@ backend = "memory"
 # subagent_event_forwarding = "all"
 # subagent_event_forwarding_cap = 100_000 # 0 = unbounded
 ```
+
+#### Model fusion (model-judge)
+
+The `models.default` and `models.subagent` slots accept either an inline model
+(the form above) or the string `"fusion"`, which references a shared
+`[models.fusion]` block. A fusion slot turns a single model call into a
+panel-judged one:
+
+1. The context and user message are multiplexed to every `panelists` model in
+   parallel (each receives the full context **and** the tool specs, so it may
+   propose tool calls).
+2. The `synthesis` model is given the panel responses and a `rank_responses`
+   tool. It first stack-ranks the panel responses (emitted as structured
+   `tracing` telemetry on the `halter::fusion` target), then writes a synthesis
+   that judges — not merges — them (strengths, weaknesses, pros, cons, overall).
+3. The synthesis is handed to the `default` model as an out-of-band **meta**
+   message (neither user nor assistant). Its response is what the caller sees;
+   the meta message is never persisted to the transcript.
+
+The panel/judge/synthesis cycle runs on every model call within a turn, so the
+default model still owns all real tool execution. Expect `N + 2` model calls per
+iteration.
+
+```toml
+[models]
+default = "fusion"
+subagent = "fusion"   # optional; subagents can fan out too
+
+[models.fusion.default]
+provider = "anthropic"
+model = "claude-opus-4-8"
+reasoning = "high"
+
+[models.fusion.synthesis]
+provider = "openai"
+model = "gpt-5"
+reasoning = "high"
+
+[[models.fusion.panelists]]
+provider = "openai"
+model = "gpt-5"
+
+[[models.fusion.panelists]]
+provider = "openrouter"
+model = "z-ai/glm-5.1"
+
+[[models.fusion.panelists]]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+```
+
+Rankings, panel responses, and the synthesis message are all logged via
+`tracing` (target `halter::fusion`); set `RUST_LOG=halter::fusion=info` to
+capture the quality telemetry.
 
 #### Programmatic Example (non-exhaustive)
 

@@ -83,8 +83,25 @@ matrix".
 - **`SkillId`** is now content-addressed off the canonical `SKILL.md`
   root; stable across reloads.
 
+### Features
+
+- **Model fusion (model-judge).** `models.default` and
+  `models.subagent` accept `"fusion"`, referencing a shared
+  `[models.fusion]` block (a default model, a synthesis/judge model, and
+  an array of panelists). `FusionProvider` multiplexes each call to the
+  panel, has the synthesis model stack-rank (via a `rank_responses`
+  tool) and judge their responses, then hands the synthesis to the
+  default model as an out-of-band meta message whose stream is returned
+  to the caller. Panel responses, the synthesis message, and the stack
+  rankings are emitted as structured `tracing` telemetry on the
+  `halter::fusion` target.
+
 ### Protocol additions
 
+- `Message::Meta` — out-of-band transcript message that is neither user
+  nor assistant authored; carried transiently to the default model by
+  the fusion provider and never persisted. Providers render it as a
+  framed user-role turn.
 - `ProviderError::Cancelled` — first-class cancellation signal at the
   provider boundary.
 - `SessionEventPayload::Lagged { dropped_events }` — emitted by
