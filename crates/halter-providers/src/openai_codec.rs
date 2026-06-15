@@ -1302,6 +1302,10 @@ fn encode_chat_messages(request: &ProviderRequest) -> anyhow::Result<Vec<Value>>
     for message in &request.messages {
         match message {
             Message::System(_) => {}
+            Message::Meta(meta) => messages.push(json!({
+                "role": "user",
+                "content": frame_meta_text(&meta.text),
+            })),
             Message::User(user) => messages.push(encode_chat_user_message(user)?),
             Message::Assistant(assistant) => {
                 let text = assistant_text(assistant);

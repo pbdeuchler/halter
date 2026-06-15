@@ -17,6 +17,7 @@ mod anthropic;
 mod anthropic_codec;
 mod codec_common;
 mod fake;
+mod fusion;
 mod header_overrides;
 mod http_client;
 mod openai;
@@ -42,6 +43,9 @@ use tokio_util::sync::CancellationToken;
 
 pub use anthropic::AnthropicProvider;
 pub use fake::FakeProvider;
+pub use fusion::{
+    FUSION_RANK_TOOL, FUSION_TRACE_TARGET, FusionMember, FusionProvider,
+};
 pub use openai::{OpenAiOAuthCredentials, OpenAiProvider};
 pub use openrouter::OpenRouterProvider;
 pub use registry::ModelRegistry;
