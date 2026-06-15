@@ -141,6 +141,7 @@ pub fn estimate_messages_tokens(messages: &[Message]) -> u64 {
 pub fn estimate_message_tokens(message: &Message) -> u64 {
     match message {
         Message::System(message) => estimate_text_tokens(&message.text),
+        Message::Meta(message) => estimate_text_tokens(&message.text),
         Message::User(message) => estimate_text_tokens(&message.plain_text()),
         Message::Assistant(message) => message
             .parts
@@ -204,7 +205,7 @@ impl TokenEstimator for CharHeuristicEstimator {
 pub fn score_message(message: &Message) -> MessageSignal {
     match message {
         Message::User(_) => MessageSignal::Anchor,
-        Message::System(_) => MessageSignal::High,
+        Message::System(_) | Message::Meta(_) => MessageSignal::High,
         Message::Assistant(message) => assistant_signal(message.parts.as_slice()),
         Message::Tool(message) => score_tool_result(message, None),
     }

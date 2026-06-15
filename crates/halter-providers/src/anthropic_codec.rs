@@ -11,7 +11,8 @@ use halter_protocol::{
 use serde_json::{Map, Value, json};
 
 use crate::codec_common::{
-    canonical_tool_name, normalized_tool_call_id, tool_name_for_provider, tool_result_text,
+    canonical_tool_name, frame_meta_text, normalized_tool_call_id, tool_name_for_provider,
+    tool_result_text,
 };
 
 const CACHE_CONTROL_EPHEMERAL: &str = "ephemeral";
@@ -391,6 +392,15 @@ fn encode_messages(request: &ProviderRequest) -> anyhow::Result<Vec<Value>> {
     for message in &request.messages {
         match message {
             Message::System(_) => {}
+            Message::Meta(meta) => {
+                flush_tool_results(&mut encoded, &mut pending_tool_results);
+                encoded.push(json!({
+                    "role": "user",
+                    "content": encode_user_parts(&[UserPart::Text {
+                        text: frame_meta_text(&meta.text),
+                    }]),
+                }));
+            }
             Message::User(user) => {
                 flush_tool_results(&mut encoded, &mut pending_tool_results);
                 encoded.push(json!({
@@ -1014,6 +1024,7 @@ fn render_compaction_messages(messages: &[Message]) -> String {
 fn render_compaction_message(message: &Message) -> String {
     match message {
         Message::System(system) => format!("system:\n{}", system.text),
+        Message::Meta(meta) => format!("meta:\n{}", meta.text),
         Message::User(user) => format!("user:\n{}", render_user_parts(&user.parts)),
         Message::Assistant(assistant) => {
             let parts = assistant

@@ -350,6 +350,29 @@ pub struct SystemMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Meta message: out-of-band guidance that is neither user nor assistant
+/// authored. Produced by the fusion provider's synthesis step and handed to the
+/// default model for a single generation; it is never persisted to the session
+/// transcript. Providers render it as a framed user-role turn on the wire.
+pub struct MetaMessage {
+    pub id: MessageId,
+    pub created_at: Timestamp,
+    pub text: SharedStr,
+}
+
+impl MetaMessage {
+    /// Build a meta message with a fresh id and the current timestamp.
+    #[must_use]
+    pub fn text(text: impl Into<SharedStr>) -> Self {
+        Self {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// User message, including text and optional media parts.
 pub struct UserMessage {
     pub id: MessageId,
@@ -456,6 +479,8 @@ pub struct ToolResultMessage {
 pub enum Message {
     /// System instructions.
     System(SystemMessage),
+    /// Out-of-band meta guidance, neither user nor assistant authored.
+    Meta(MetaMessage),
     /// User input.
     User(UserMessage),
     /// Assistant output.

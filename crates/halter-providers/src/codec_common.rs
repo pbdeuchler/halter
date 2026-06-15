@@ -37,6 +37,21 @@ pub(crate) fn collect_system_text(request: &ProviderRequest) -> Option<String> {
     }
 }
 
+/// Render a meta message's text as the body of a framed user-role turn.
+///
+/// Meta messages are neither user nor assistant authored (today they carry the
+/// fusion provider's synthesis). Upstream chat APIs only accept user/assistant
+/// roles, so meta content is delivered as a user turn wrapped in an explicit
+/// frame that tells the receiving model what it is looking at.
+pub(crate) fn frame_meta_text(text: &str) -> String {
+    format!(
+        "The following is an out-of-band panel synthesis evaluating candidate \
+         responses to the most recent user message. Treat it as advisory \
+         guidance, not as a message from the user.\n\n<synthesis>\n{}\n</synthesis>",
+        text.trim()
+    )
+}
+
 pub(crate) fn assistant_text(message: &AssistantMessage) -> String {
     message
         .parts
