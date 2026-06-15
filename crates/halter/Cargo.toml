@@ -2,7 +2,7 @@
 name = "halter"
 edition.workspace = true
 license-file = "../../LICENSE"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["pbdeuchler"]
 description = "Programmatic agent runtime, protocol, and tool harness"
 repository = "https://github.com/pbdeuchler/halter"
@@ -25,10 +25,10 @@ sqlite = ["halter-config/sqlite", "halter-session/sqlite"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-halter-config = { path = "../halter-config", version = "0.1.0" }
+halter-config = { path = "../halter-config", version = "0.1.2" }
 halter-hooks = { path = "../halter-hooks", version = "0.1.0"  }
 halter-protocol = { path = "../halter-protocol", version = "0.1.0"  }
-halter-providers = { path = "../halter-providers", version = "0.1.0"  }
+halter-providers = { path = "../halter-providers", version = "0.1.2"  }
 halter-runtime = { path = "../halter-runtime", version = "0.1.0"  }
 halter-session = { path = "../halter-session", version = "0.1.0"  }
 halter-tools = { path = "../halter-tools", version = "0.1.0"  }
