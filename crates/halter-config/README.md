@@ -41,7 +41,7 @@ This crate exports two major groups of APIs.
 - `HarnessConfig`
 - `ProvidersConfig`, `ProviderConfig`, `OpenAiOAuthConfig`, `ConfiguredProvider`
 - `ResolvedProviderConfig`, `ResolvedProviderAuth`
-- `ModelsConfig`, `ModelConfig`
+- `ModelsConfig`, `ModelConfig`, `ModelSlot`, `ModelSlotRef`, `ModelJudgeConfig`
 - `ResourcesConfig`, `SearchRoots`
 - `PromptsConfig`
 - `ContextConfig`
@@ -242,9 +242,45 @@ model = "openai/gpt-5-mini"
 reasoning = "medium"
 ```
 
+### Model-judge slots
+
+`models.default` and `models.subagent` accept either an inline model (above) or
+the string `"model_judge"`, which resolves through a shared
+`[models.model_judge]` block holding a `default` model, a `synthesis` model, and a
+non-empty `panel`:
+
+```toml
+[models]
+default = "model_judge"
+
+[models.model_judge.default]
+provider = "anthropic"
+model = "claude-opus-4-8"
+
+[models.model_judge.synthesis]
+provider = "openai"
+model = "gpt-5"
+
+[[models.model_judge.panel]]
+provider = "openai"
+model = "gpt-5"
+
+[[models.model_judge.panel]]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+```
+
+At runtime a model-judge slot multiplexes each call to the `panel`, asks the
+`synthesis` model to stack-rank and synthesize their responses, and hands the
+synthesis to the `default` model to produce the visible reply. See the
+workspace README for the full flow and telemetry.
+
 ### Notes
 
 - `models.default` is required
+- a `"model_judge"` slot requires a `[models.model_judge]` block with non-empty `panel`
+- `models.small` is always a single inline model (it does not fan out); when
+  unset it falls back to the default slot's representative leaf model
 - `reasoning` is optional
 - `tokens_per_minute` defaults to `500_000` and must be positive when set
 - `max_input_tokens` / `max_output_tokens` must be positive when set

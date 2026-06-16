@@ -199,14 +199,10 @@ fn validate_runtime_requirements_with<F>(
 where
     F: FnMut(&str) -> Option<OsString>,
 {
-    for provider in [
-        Some(config.default_model()?.provider),
-        config.small_model().map(|model| model.provider),
-        config.subagent_model().map(|model| model.provider),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    // Surface a clear error if the default slot is missing before resolving
+    // provider credentials for the referenced families.
+    config.default_slot()?;
+    for provider in config.referenced_providers() {
         resolve_provider_runtime_config(provider, config.provider_config(provider), |name| {
             let Some(raw) = lookup(name) else {
                 return Ok(None);

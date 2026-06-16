@@ -7,16 +7,18 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use halter_config::{
-    ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, OpenAiOAuthConfig, PolicyConfig,
-    ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID,
-    SessionBackend, SessionsConfig, expand_path, load_path, resolve_provider_runtime_config,
+    ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelJudgeConfig, ModelSlot,
+    ModelSlotRef, OpenAiOAuthConfig, PolicyConfig, ResolvedProviderAuth, ResolvedProviderConfig,
+    SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, expand_path, load_path,
+    resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
     HookWarning, ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot,
 };
 use halter_providers::{
-    AnthropicProvider, ModelRegistry, OpenAiOAuthCredentials, OpenAiProvider, OpenRouterProvider,
+    AnthropicProvider, ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials,
+    OpenAiProvider, OpenRouterProvider, Provider,
 };
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
@@ -383,45 +385,47 @@ fn describe_session_backend(config: &SessionsConfig) -> &'static str {
 
 fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry> {
     let mut registry = ModelRegistry::new();
-    let default_config = config.default_model()?;
-    let small_config = config.small_model().unwrap_or(default_config);
-    let subagent_config = config.subagent_model().unwrap_or(default_config);
-    let default_model = ResolvedModel {
-        role: ModelRole::default(),
-        id: ModelId::from(DEFAULT_MODEL_ID),
-        provider: ProviderName::from(default_config.provider.to_string()),
-        provider_kind: default_config.provider.provider_kind(),
-        api_kind: default_config.provider.api_kind(),
-        model: default_config.model.clone(),
-        max_input_tokens: default_config.max_input_tokens,
-        max_output_tokens: default_config.max_output_tokens,
-        reasoning: default_config.reasoning,
-        tokens_per_minute: default_config.tokens_per_minute,
+    // Each provider family is resolved and constructed at most once, then shared
+    // across every role and model-judge member that references it.
+    let mut family_providers: HashMap<ConfiguredProvider, Arc<dyn Provider>> = HashMap::new();
+
+    let default_slot = config.default_slot()?;
+    let default_model = build_slot_model(
+        config,
+        &mut registry,
+        &mut family_providers,
+        default_slot,
+        ModelRole::default_role(),
+        DEFAULT_MODEL_ID,
+        "default",
+    )?;
+
+    let subagent_slot = config.subagent_slot().unwrap_or(default_slot);
+    let subagent_model = build_slot_model(
+        config,
+        &mut registry,
+        &mut family_providers,
+        subagent_slot,
+        ModelRole::subagent(),
+        SUBAGENT_MODEL_ID,
+        "subagent",
+    )?;
+
+    // The small slot is always a single concrete model. When unset it falls
+    // back to the representative leaf of the default slot (the model-judge
+    // default model for model-judge slots) rather than fanning out.
+    let small_config = match config.small_model() {
+        Some(model) => model.clone(),
+        None => config.default_model()?.clone(),
     };
-    let small_model = ResolvedModel {
-        role: ModelRole::small(),
-        id: ModelId::from(SMALL_MODEL_ID),
-        provider: ProviderName::from(small_config.provider.to_string()),
-        provider_kind: small_config.provider.provider_kind(),
-        api_kind: small_config.provider.api_kind(),
-        model: small_config.model.clone(),
-        max_input_tokens: small_config.max_input_tokens,
-        max_output_tokens: small_config.max_output_tokens,
-        reasoning: small_config.reasoning,
-        tokens_per_minute: small_config.tokens_per_minute,
-    };
-    let subagent_model = ResolvedModel {
-        role: ModelRole::subagent(),
-        id: ModelId::from(SUBAGENT_MODEL_ID),
-        provider: ProviderName::from(subagent_config.provider.to_string()),
-        provider_kind: subagent_config.provider.provider_kind(),
-        api_kind: subagent_config.provider.api_kind(),
-        model: subagent_config.model.clone(),
-        max_input_tokens: subagent_config.max_input_tokens,
-        max_output_tokens: subagent_config.max_output_tokens,
-        reasoning: subagent_config.reasoning,
-        tokens_per_minute: subagent_config.tokens_per_minute,
-    };
+    let small_model = build_inline_model(
+        config,
+        &mut registry,
+        &mut family_providers,
+        &small_config,
+        ModelRole::small(),
+        SMALL_MODEL_ID,
+    )?;
 
     debug!(
         default_provider = %default_model.provider,
@@ -433,39 +437,170 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         "building model registry"
     );
 
-    let mut registered_providers: HashMap<String, ResolvedProviderConfig> = HashMap::new();
-    for (role_label, provider_name, configured_provider) in [
-        ("default", &default_model.provider, default_config.provider),
-        ("small", &small_model.provider, small_config.provider),
-        (
-            "subagent",
-            &subagent_model.provider,
-            subagent_config.provider,
-        ),
-    ] {
-        let resolved = resolve_selected_provider_config(config, configured_provider)?;
-        if let Some(existing) = registered_providers.get(&provider_name.0) {
-            anyhow::ensure!(
-                existing == &resolved,
-                "provider '{name}' is used by multiple roles with divergent per-role configuration; \
-                 the {role_label} role resolved to base_url '{new_base}' but an earlier role \
-                 resolved the same provider to base_url '{old_base}' (credential differences also \
-                 trigger this error). Consolidate the config or use distinct providers.",
-                name = provider_name,
-                role_label = role_label,
-                new_base = resolved.base_url,
-                old_base = existing.base_url,
-            );
-            continue;
-        }
-        registered_providers.insert(provider_name.0.clone(), resolved.clone());
-        registry.register_provider(provider_name.clone(), build_provider(&resolved)?);
-    }
     registry.set_default_model(default_model);
     registry.set_small_model(small_model);
     registry.set_subagent_model(subagent_model);
 
     Ok(registry)
+}
+
+/// Build the [`ResolvedModel`] for a model slot, registering whatever providers
+/// it needs (a single family provider for inline slots, or a synthetic
+/// model-judge provider plus its members' family providers for model-judge
+/// slots).
+fn build_slot_model(
+    config: &HarnessConfig,
+    registry: &mut ModelRegistry,
+    family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    slot: &ModelSlot,
+    role: ModelRole,
+    id: &str,
+    slot_label: &str,
+) -> anyhow::Result<ResolvedModel> {
+    match slot {
+        ModelSlot::Inline(model) => {
+            build_inline_model(config, registry, family_providers, model, role, id)
+        }
+        ModelSlot::Reference(ModelSlotRef::ModelJudge) => {
+            let model_judge = config.model_judge().with_context(|| {
+                format!(
+                    "invalid configuration: models.{slot_label} is set to \"model_judge\" but [models.model_judge] is not defined"
+                )
+            })?;
+            build_model_judge_model(
+                config,
+                registry,
+                family_providers,
+                model_judge,
+                role,
+                id,
+                slot_label,
+            )
+        }
+    }
+}
+
+fn build_inline_model(
+    config: &HarnessConfig,
+    registry: &mut ModelRegistry,
+    family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    model: &ModelConfig,
+    role: ModelRole,
+    id: &str,
+) -> anyhow::Result<ResolvedModel> {
+    ensure_family_provider(config, registry, family_providers, model.provider)?;
+    Ok(resolved_model(
+        model,
+        role,
+        ModelId::from(id),
+        ProviderName::from(model.provider.to_string()),
+    ))
+}
+
+fn build_model_judge_model(
+    config: &HarnessConfig,
+    registry: &mut ModelRegistry,
+    family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    model_judge: &ModelJudgeConfig,
+    role: ModelRole,
+    id: &str,
+    slot_label: &str,
+) -> anyhow::Result<ResolvedModel> {
+    let default_member =
+        build_model_judge_member(config, registry, family_providers, &model_judge.default)?;
+    let synthesis_member =
+        build_model_judge_member(config, registry, family_providers, &model_judge.synthesis)?;
+    let mut panel = Vec::with_capacity(model_judge.panel.len());
+    for panelist in &model_judge.panel {
+        panel.push(build_model_judge_member(
+            config,
+            registry,
+            family_providers,
+            panelist,
+        )?);
+    }
+
+    // Mirror the default leaf so capability/compaction queries (which the
+    // model-judge provider delegates to its default member) behave
+    // consistently, but route the slot through a synthetic provider name.
+    let provider_name = ProviderName::from(format!("model-judge-{slot_label}"));
+    let default_leaf = default_member.model.clone();
+    let model_judge_provider = Arc::new(ModelJudgeProvider::new(
+        default_member,
+        synthesis_member,
+        panel,
+    ));
+    registry.register_provider(provider_name.clone(), model_judge_provider);
+
+    Ok(ResolvedModel {
+        role,
+        id: ModelId::from(id),
+        provider: provider_name,
+        provider_kind: default_leaf.provider_kind,
+        api_kind: default_leaf.api_kind,
+        model: format!("model-judge:{}", default_leaf.model),
+        max_input_tokens: default_leaf.max_input_tokens,
+        max_output_tokens: default_leaf.max_output_tokens,
+        reasoning: default_leaf.reasoning,
+        tokens_per_minute: default_leaf.tokens_per_minute,
+    })
+}
+
+fn build_model_judge_member(
+    config: &HarnessConfig,
+    registry: &mut ModelRegistry,
+    family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    model: &ModelConfig,
+) -> anyhow::Result<ModelJudgeMember> {
+    let provider = ensure_family_provider(config, registry, family_providers, model.provider)?;
+    let resolved = resolved_model(
+        model,
+        ModelRole::default_role(),
+        ModelId::from(model.model.clone()),
+        ProviderName::from(model.provider.to_string()),
+    );
+    Ok(ModelJudgeMember {
+        provider,
+        model: resolved,
+    })
+}
+
+/// Resolve, construct, register, and cache the provider for a family exactly
+/// once.
+fn ensure_family_provider(
+    config: &HarnessConfig,
+    registry: &mut ModelRegistry,
+    family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    family: ConfiguredProvider,
+) -> anyhow::Result<Arc<dyn Provider>> {
+    if let Some(provider) = family_providers.get(&family) {
+        return Ok(provider.clone());
+    }
+    let resolved = resolve_selected_provider_config(config, family)?;
+    let provider = build_provider(&resolved)?;
+    registry.register_provider(ProviderName::from(family.to_string()), provider.clone());
+    family_providers.insert(family, provider.clone());
+    Ok(provider)
+}
+
+fn resolved_model(
+    model: &ModelConfig,
+    role: ModelRole,
+    id: ModelId,
+    provider: ProviderName,
+) -> ResolvedModel {
+    ResolvedModel {
+        role,
+        id,
+        provider,
+        provider_kind: model.provider.provider_kind(),
+        api_kind: model.provider.api_kind(),
+        model: model.model.clone(),
+        max_input_tokens: model.max_input_tokens,
+        max_output_tokens: model.max_output_tokens,
+        reasoning: model.reasoning,
+        tokens_per_minute: model.tokens_per_minute,
+    }
 }
 
 fn build_provider(
@@ -679,6 +814,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builder_constructs_model_judge_default_slot() {
+        let mut config = openai_config(Some("test-key"));
+        config.models.default = Some(ModelSlot::Reference(ModelSlotRef::ModelJudge));
+        let leaf = |model: &str| ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: model.to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tokens_per_minute: None,
+        };
+        config.models.model_judge = Some(ModelJudgeConfig {
+            default: leaf("gpt-default"),
+            synthesis: leaf("gpt-synthesis"),
+            panel: vec![leaf("gpt-panel-a"), leaf("gpt-panel-b")],
+        });
+
+        let halter = HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build should succeed for a model-judge default slot");
+
+        // The model-judge slot mirrors its default leaf model.
+        assert_eq!(
+            halter.config.default_model().expect("default model").model,
+            "gpt-default"
+        );
+    }
+
+    #[tokio::test]
     async fn h12_builder_accepts_shared_provider_across_roles() {
         // All three roles share ConfiguredProvider::OpenAi, which resolves to
         // the same ResolvedProviderConfig — the H12 collision check must
@@ -692,14 +859,14 @@ mod tests {
             reasoning: None,
             tokens_per_minute: None,
         });
-        config.models.subagent = Some(ModelConfig {
+        config.models.subagent = Some(ModelSlot::Inline(ModelConfig {
             provider: ConfiguredProvider::OpenAi,
             model: "gpt-5".to_owned(),
             max_input_tokens: Some(200_000),
             max_output_tokens: Some(8_192),
             reasoning: None,
             tokens_per_minute: None,
-        });
+        }));
 
         HalterBuilder::default()
             .with_config(config)
@@ -909,14 +1076,14 @@ mod tests {
 
     fn openai_config(api_key: Option<&str>) -> HarnessConfig {
         let mut config = HarnessConfig::default();
-        config.models.default = Some(ModelConfig {
+        config.models.default = Some(ModelSlot::Inline(ModelConfig {
             provider: ConfiguredProvider::OpenAi,
             model: "gpt-5".to_owned(),
             max_input_tokens: Some(200_000),
             max_output_tokens: Some(8_192),
             reasoning: Some(ReasoningEffort::Medium),
             tokens_per_minute: None,
-        });
+        }));
         config.providers.openai = Some(ProviderConfig {
             api_key: api_key.map(ToOwned::to_owned),
             ..ProviderConfig::default()

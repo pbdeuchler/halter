@@ -83,6 +83,17 @@ matrix".
 - **`SkillId`** is now content-addressed off the canonical `SKILL.md`
   root; stable across reloads.
 
+### Features
+
+- **Model judge.** `models.default` and `models.subagent` accept
+  `"model_judge"`, referencing a shared `[models.model_judge]` block
+  with a `default` model, a `synthesis` model, and a `panel`.
+  `ModelJudgeProvider` multiplexes each call to the panel, asks the synthesis
+  model to stack-rank responses via `rank_responses`, then gives the
+  synthesis output to the default model as internal guidance. Panel
+  responses, the synthesis message, and rankings are emitted as
+  structured `tracing` telemetry on the `halter::model_judge` target.
+
 ### Protocol additions
 
 - `ProviderError::Cancelled` — first-class cancellation signal at the
