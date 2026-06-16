@@ -185,7 +185,6 @@ fn render_message(message: &Message) -> String {
     // attacker-controlled body that embeds a delimiter.
     let (role, body) = match message {
         Message::System(message) => ("system", message.text.clone()),
-        Message::Meta(message) => ("meta", message.text.clone()),
         Message::User(message) => ("user", message.plain_text()),
         Message::Assistant(message) => {
             let body = message

@@ -262,8 +262,8 @@ async fn main() -> anyhow::Result<()> {
 `halter-config` defines the schema for:
 
 - providers
-- model roles (`default`, `small`, `subagent`), each optionally backed by a
-  `"fusion"` (model-judge) panel via `[models.fusion]`
+- model roles (`default`, `small`, `subagent`), with `default` and `subagent`
+  optionally backed by a `"model_judge"` panel via `[models.model_judge]`
 - resource roots
 - prompts
 - context compaction settings
@@ -425,59 +425,59 @@ backend = "memory"
 # subagent_event_forwarding_cap = 100_000 # 0 = unbounded
 ```
 
-#### Model fusion (model-judge)
+#### Model Judge
 
 The `models.default` and `models.subagent` slots accept either an inline model
-(the form above) or the string `"fusion"`, which references a shared
-`[models.fusion]` block. A fusion slot turns a single model call into a
-panel-judged one:
+(the form above) or the string `"model_judge"`, which references a shared
+`[models.model_judge]` block. A model-judge slot turns a single model call into
+a panel-judged one:
 
-1. The context and user message are multiplexed to every `panelists` model in
+1. The context and user message are multiplexed to every model in `panel` in
    parallel (each receives the full context **and** the tool specs, so it may
    propose tool calls).
-2. The `synthesis` model is given the panel responses and a `rank_responses`
-   tool. It first stack-ranks the panel responses (emitted as structured
-   `tracing` telemetry on the `halter::fusion` target), then writes a synthesis
-   that judges — not merges — them (strengths, weaknesses, pros, cons, overall).
-3. The synthesis is handed to the `default` model as an out-of-band **meta**
-   message (neither user nor assistant). Its response is what the caller sees;
-   the meta message is never persisted to the transcript.
+2. The `synthesis` model is given the panel responses and a `rank_responses` tool.
+   It first stack-ranks the panel responses (emitted as structured `tracing`
+   telemetry on the `halter::model_judge` target), then writes a synthesis that
+   judges, not merges, them (strengths, weaknesses, pros, cons, overall).
+3. The synthesis is handed to the `default` model as internal guidance for the
+   same provider call. The default model owns the visible answer and all real
+   tool execution; the guidance is not persisted to the transcript.
 
-The panel/judge/synthesis cycle runs on every model call within a turn, so the
+The panel/synthesis/default cycle runs on every model call within a turn, so the
 default model still owns all real tool execution. Expect `N + 2` model calls per
 iteration.
 
 ```toml
 [models]
-default = "fusion"
-subagent = "fusion"   # optional; subagents can fan out too
+default = "model_judge"
+subagent = "model_judge"   # optional; subagents can fan out too
 
-[models.fusion.default]
+[models.model_judge.default]
 provider = "anthropic"
 model = "claude-opus-4-8"
 reasoning = "high"
 
-[models.fusion.synthesis]
+[models.model_judge.synthesis]
 provider = "openai"
 model = "gpt-5"
 reasoning = "high"
 
-[[models.fusion.panelists]]
+[[models.model_judge.panel]]
 provider = "openai"
 model = "gpt-5"
 
-[[models.fusion.panelists]]
+[[models.model_judge.panel]]
 provider = "openrouter"
 model = "z-ai/glm-5.1"
 
-[[models.fusion.panelists]]
+[[models.model_judge.panel]]
 provider = "anthropic"
 model = "claude-sonnet-4-6"
 ```
 
 Rankings, panel responses, and the synthesis message are all logged via
-`tracing` (target `halter::fusion`); set `RUST_LOG=halter::fusion=info` to
-capture the quality telemetry.
+`tracing` (target `halter::model_judge`); set
+`RUST_LOG=halter::model_judge=info` to capture the quality telemetry.
 
 #### Programmatic Example (non-exhaustive)
 

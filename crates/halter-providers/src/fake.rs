@@ -41,10 +41,7 @@ impl FakeProvider {
             .rev()
             .find_map(|message| match message {
                 Message::User(user) => Some(user.plain_text()),
-                Message::System(_)
-                | Message::Meta(_)
-                | Message::Assistant(_)
-                | Message::Tool(_) => None,
+                Message::System(_) | Message::Assistant(_) | Message::Tool(_) => None,
             })
             .unwrap_or_else(|| "empty turn".to_owned());
 
@@ -154,7 +151,6 @@ fn render_compaction_input_item(item: &Value) -> String {
 fn render_compaction_message(message: &Message) -> String {
     match message {
         Message::System(message) => format!("system: {}", message.text),
-        Message::Meta(message) => format!("meta: {}", message.text),
         Message::User(message) => format!("user: {}", message.plain_text()),
         Message::Assistant(message) => format!(
             "assistant: {}",

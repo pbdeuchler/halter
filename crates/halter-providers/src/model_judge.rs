@@ -1,10 +1,10 @@
 // pattern: Imperative Shell
 //
-// The fusion provider multiplexes one model call across a panel of models, has
-// a synthesis/judge model stack-rank and synthesize their responses, and then
-// hands the synthesis (as an out-of-band meta message) to a default model whose
-// stream is what the caller ultimately sees. From the runtime's perspective it
-// is an ordinary `Provider`; all of the multiplexing lives here.
+// The model-judge provider multiplexes one model call across a panel of models,
+// asks a synthesis model to stack-rank and synthesize their responses, and then
+// hands that synthesis to a default model whose stream is what the caller sees.
+// From the runtime's perspective it is an ordinary `Provider`; all multiplexing
+// stays inside this provider.
 
 use std::sync::Arc;
 
@@ -12,10 +12,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
 use halter_protocol::{
-    AssistantMessage, AssistantPart, BlockId, CompactionWindow, Message, MessageId, MetaMessage,
+    AssistantMessage, AssistantPart, BlockId, CompactionWindow, Message, MessageId,
     ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
-    ProviderRequest, ReplayMeta, ResolvedModel, StopReason, StreamEvent, ToolCall, ToolCapabilities,
-    ToolConcurrency, ToolName, ToolResult, ToolResultMessage, ToolSpec, UserMessage,
+    ProviderRequest, ReplayMeta, ResolvedModel, StopReason, StreamEvent, ToolCall,
+    ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolResultMessage, ToolSpec,
+    UserMessage,
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -23,18 +24,18 @@ use tracing::{info, warn};
 
 use crate::Provider;
 
-/// Tracing target shared by every fusion telemetry event.
-pub const FUSION_TRACE_TARGET: &str = "halter::fusion";
+/// Tracing target shared by every model-judge telemetry event.
+pub const MODEL_JUDGE_TRACE_TARGET: &str = "halter::model_judge";
 /// Name of the synthesis-only tool used to submit panel stack rankings.
-pub const FUSION_RANK_TOOL: &str = "rank_responses";
+pub const MODEL_JUDGE_RANK_TOOL: &str = "rank_responses";
 
 /// Maximum synthesis round trips (ranking call + synthesis text) before the
-/// fusion provider stops looping and uses whatever text it has.
+/// model-judge provider stops looping and uses whatever text it has.
 const MAX_SYNTHESIS_ROUNDS: usize = 3;
 
 /// One participating model plus its adapter.
 #[derive(Clone)]
-pub struct FusionMember {
+pub struct ModelJudgeMember {
     pub provider: Arc<dyn Provider>,
     pub model: ResolvedModel,
 }
@@ -42,26 +43,30 @@ pub struct FusionMember {
 /// A model abstraction that judges and synthesizes a panel of responses before
 /// answering through its default model.
 #[derive(Clone)]
-pub struct FusionProvider {
-    default: FusionMember,
-    synthesis: FusionMember,
-    panelists: Vec<FusionMember>,
+pub struct ModelJudgeProvider {
+    default: ModelJudgeMember,
+    synthesis: ModelJudgeMember,
+    panel: Vec<ModelJudgeMember>,
 }
 
-impl FusionProvider {
-    /// Build a fusion provider from its three roles.
+impl ModelJudgeProvider {
+    /// Build a model-judge provider from its three roles.
     #[must_use]
-    pub fn new(default: FusionMember, synthesis: FusionMember, panelists: Vec<FusionMember>) -> Self {
+    pub fn new(
+        default: ModelJudgeMember,
+        synthesis: ModelJudgeMember,
+        panel: Vec<ModelJudgeMember>,
+    ) -> Self {
         Self {
             default,
             synthesis,
-            panelists,
+            panel,
         }
     }
 }
 
 #[async_trait]
-impl Provider for FusionProvider {
+impl Provider for ModelJudgeProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         // The user-visible stream comes from the default member, so mirror its
         // capabilities (tool support, compaction strategy, token limits, ...).
@@ -81,8 +86,8 @@ impl Provider for FusionProvider {
 
         if candidates.is_empty() {
             warn!(
-                target: FUSION_TRACE_TARGET,
-                "fusion produced no panel responses; falling back to the default model alone"
+                target: MODEL_JUDGE_TRACE_TARGET,
+                "model-judge produced no panel responses; falling back to the default model alone"
             );
             return self.run_default(&request, None, cancel).await;
         }
@@ -91,9 +96,9 @@ impl Provider for FusionProvider {
             Ok(synthesis) => self.run_default(&request, Some(synthesis), cancel).await,
             Err(error) => {
                 warn!(
-                    target: FUSION_TRACE_TARGET,
+                    target: MODEL_JUDGE_TRACE_TARGET,
                     %error,
-                    "fusion synthesis failed; falling back to the default model alone"
+                    "model-judge synthesis failed; falling back to the default model alone"
                 );
                 self.run_default(&request, None, cancel).await
             }
@@ -119,14 +124,14 @@ struct Candidate {
     body: String,
 }
 
-impl FusionProvider {
+impl ModelJudgeProvider {
     async fn run_panels(
         &self,
         request: &ProviderRequest,
         cancel: &CancellationToken,
     ) -> Vec<Candidate> {
-        let ids = candidate_ids(&self.panelists);
-        let futures = self.panelists.iter().enumerate().map(|(index, panelist)| {
+        let ids = candidate_ids(&self.panel);
+        let futures = self.panel.iter().enumerate().map(|(index, panelist)| {
             let inner = inner_request(
                 request,
                 panelist.model.clone(),
@@ -150,29 +155,29 @@ impl FusionProvider {
         let mut candidates = Vec::new();
         for (index, collected) in results {
             let id = ids[index].clone();
-            let model = self.panelists[index].model.model.clone();
+            let model = self.panel[index].model.model.clone();
             match collected {
                 Ok(message) => {
                     let body = render_candidate_body(&message);
                     info!(
-                        target: FUSION_TRACE_TARGET,
+                        target: MODEL_JUDGE_TRACE_TARGET,
                         event = "panel_response",
                         candidate_id = %id,
                         model = %model,
                         tool_calls = message.tool_calls.len(),
                         response = %body,
-                        "fusion panel response"
+                        "model-judge panel response"
                     );
                     candidates.push(Candidate { id, model, body });
                 }
                 Err(error) => {
                     warn!(
-                        target: FUSION_TRACE_TARGET,
+                        target: MODEL_JUDGE_TRACE_TARGET,
                         event = "panel_error",
                         candidate_id = %id,
                         model = %model,
                         %error,
-                        "fusion panel model failed"
+                        "model-judge panel model failed"
                     );
                 }
             }
@@ -201,15 +206,19 @@ impl FusionProvider {
                 messages.clone(),
                 vec![rank_tool.clone()],
             );
-            let events = self.synthesis.provider.stream(inner, cancel.child_token()).await?;
+            let events = self
+                .synthesis
+                .provider
+                .stream(inner, cancel.child_token())
+                .await?;
             let collected = collect_message(events)
                 .await
-                .map_err(|error| anyhow::anyhow!("fusion synthesis stream failed: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("model-judge synthesis stream failed: {error}"))?;
 
             let rank_call = collected
                 .tool_calls
                 .iter()
-                .find(|call| call.name.0 == FUSION_RANK_TOOL)
+                .find(|call| call.name.0 == MODEL_JUDGE_RANK_TOOL)
                 .cloned();
 
             if let Some(call) = &rank_call
@@ -222,10 +231,10 @@ impl FusionProvider {
             let synthesis = collected.text.trim();
             if !synthesis.is_empty() {
                 info!(
-                    target: FUSION_TRACE_TARGET,
+                    target: MODEL_JUDGE_TRACE_TARGET,
                     event = "synthesis",
                     synthesis = %synthesis,
-                    "fusion synthesis message"
+                    "model-judge synthesis message"
                 );
                 return Ok(synthesis.to_owned());
             }
@@ -233,7 +242,9 @@ impl FusionProvider {
             // No synthesis text yet. If the model ranked, acknowledge the tool
             // call and let it continue; otherwise there is nothing to wait for.
             let Some(call) = rank_call else {
-                anyhow::bail!("fusion synthesis produced neither a ranking nor synthesis text");
+                anyhow::bail!(
+                    "model-judge synthesis produced neither a ranking nor synthesis text"
+                );
             };
             messages.push(Message::Assistant(assistant_with_tool_call(
                 &collected.text,
@@ -250,7 +261,7 @@ impl FusionProvider {
             }));
         }
 
-        anyhow::bail!("fusion synthesis did not produce synthesis text within the round limit")
+        anyhow::bail!("model-judge synthesis did not produce synthesis text within the round limit")
     }
 
     async fn run_default(
@@ -261,7 +272,7 @@ impl FusionProvider {
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
         let mut messages = request.messages.clone();
         if let Some(synthesis) = synthesis {
-            messages.push(Message::Meta(MetaMessage::text(synthesis)));
+            messages.push(Message::User(synthesis_guidance_message(&synthesis)));
         }
         // The default member streams to the user, so preserve provider-native
         // state (response chaining, compacted prefix) from the original request.
@@ -386,13 +397,13 @@ fn assistant_with_tool_call(text: &str, call: ToolCall) -> AssistantMessage {
 /// Compute stable, unique candidate ids from the panelist models. Duplicate
 /// model names are disambiguated with a positional suffix so rankings remain
 /// unambiguous.
-fn candidate_ids(panelists: &[FusionMember]) -> Vec<String> {
-    panelists
+fn candidate_ids(panel: &[ModelJudgeMember]) -> Vec<String> {
+    panel
         .iter()
         .enumerate()
         .map(|(index, panelist)| {
             let name = &panelist.model.model;
-            let duplicate = panelists
+            let duplicate = panel
                 .iter()
                 .enumerate()
                 .any(|(other, candidate)| other != index && candidate.model.model == *name);
@@ -432,7 +443,7 @@ fn synthesis_instructions(candidates: &[Candidate]) -> String {
          candidate from best (rank 1) to worst, keyed by the candidate's `model_id`.\n\n\
          Then write a synthesis that does NOT merge the candidates but JUDGES them: cover each \
          candidate's strengths, weaknesses, pros, and cons, and finish with an overall synthesis \
-         of the best available guidance. Do not address the user directly — your synthesis is \
+         of the best available guidance. Do not address the user directly; your synthesis is \
          advisory context for another model.\n\nCandidates:\n",
     );
     for candidate in candidates {
@@ -444,9 +455,19 @@ fn synthesis_instructions(candidates: &[Candidate]) -> String {
     prompt
 }
 
+fn synthesis_guidance_message(synthesis: &str) -> UserMessage {
+    UserMessage::text(format!(
+        "The following model-judge synthesis evaluates candidate responses to \
+         the most recent user message. Treat it as advisory context for your \
+         answer, not as a new request from the user.\n\n\
+         <model_judge_synthesis>\n{}\n</model_judge_synthesis>",
+        synthesis.trim()
+    ))
+}
+
 fn rank_tool_spec() -> ToolSpec {
     ToolSpec {
-        name: ToolName::from(FUSION_RANK_TOOL),
+        name: ToolName::from(MODEL_JUDGE_RANK_TOOL),
         description: "Submit a stack ranking of the candidate panel responses for quality \
              telemetry. Provide every candidate's model_id together with its rank, where rank 1 \
              is the best response."
@@ -477,30 +498,30 @@ fn rank_tool_spec() -> ToolSpec {
 fn record_rankings(arguments: &Value) {
     let Some(rankings) = arguments.get("rankings").and_then(Value::as_array) else {
         warn!(
-            target: FUSION_TRACE_TARGET,
+            target: MODEL_JUDGE_TRACE_TARGET,
             event = "ranking_invalid",
             arguments = %arguments,
-            "fusion ranking call had no rankings array"
+            "model-judge ranking call had no rankings array"
         );
         return;
     };
 
     info!(
-        target: FUSION_TRACE_TARGET,
+        target: MODEL_JUDGE_TRACE_TARGET,
         event = "ranking",
         rankings = %arguments,
         count = rankings.len(),
-        "fusion stack ranking"
+        "model-judge stack ranking"
     );
     for entry in rankings {
         let model_id = entry.get("model_id").and_then(Value::as_str).unwrap_or("");
         let rank = entry.get("rank").and_then(Value::as_i64).unwrap_or(0);
         info!(
-            target: FUSION_TRACE_TARGET,
+            target: MODEL_JUDGE_TRACE_TARGET,
             event = "ranking_entry",
             model_id = %model_id,
             rank,
-            "fusion ranking entry"
+            "model-judge ranking entry"
         );
     }
 }
@@ -537,10 +558,7 @@ mod tests {
             request: ProviderRequest,
             _cancel: CancellationToken,
         ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
-            self.requests
-                .lock()
-                .expect("record request")
-                .push(request);
+            self.requests.lock().expect("record request").push(request);
 
             let message_id = MessageId::new();
             let mut events = vec![Ok(StreamEvent::MessageStart {
@@ -599,7 +617,7 @@ mod tests {
         model: &str,
         text: Option<&str>,
         tool: Option<(&str, Value)>,
-    ) -> (FusionMember, Arc<Mutex<Vec<ProviderRequest>>>) {
+    ) -> (ModelJudgeMember, Arc<Mutex<Vec<ProviderRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(RecordingProvider {
             requests: requests.clone(),
@@ -607,7 +625,7 @@ mod tests {
             tool: tool.map(|(name, arguments)| (name.to_owned(), arguments)),
         });
         (
-            FusionMember {
+            ModelJudgeMember {
                 provider,
                 model: resolved(model),
             },
@@ -619,7 +637,7 @@ mod tests {
         ProviderRequest {
             session_id: Default::default(),
             turn_id: halter_protocol::TurnId::new(),
-            model: resolved("fusion"),
+            model: resolved("model_judge"),
             prompt: AssembledPrompt {
                 segments: Vec::new(),
                 transcript: Vec::new(),
@@ -653,7 +671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fusion_judges_panels_and_streams_default_with_meta() {
+    async fn model_judge_judges_panel_and_streams_default_with_synthesis() {
         let (panel_a, panel_a_reqs) = member("panel-a", Some("answer A"), None);
         let (panel_b, panel_b_reqs) = member("panel-b", Some("answer B"), None);
         let rankings = json!({
@@ -662,15 +680,18 @@ mod tests {
                 { "model_id": "panel-b", "rank": 2 }
             ]
         });
-        let (synthesis, synthesis_reqs) =
-            member("judge", Some("A is stronger than B"), Some((FUSION_RANK_TOOL, rankings)));
-        let (default, default_reqs) = member("final", Some("final answer"), None);
+        let (synthesis, synthesis_reqs) = member(
+            "synthesis",
+            Some("A is stronger than B"),
+            Some((MODEL_JUDGE_RANK_TOOL, rankings)),
+        );
+        let (default, default_reqs) = member("default", Some("final answer"), None);
 
-        let fusion = FusionProvider::new(default, synthesis, vec![panel_a, panel_b]);
-        let events = fusion
+        let model_judge = ModelJudgeProvider::new(default, synthesis, vec![panel_a, panel_b]);
+        let events = model_judge
             .stream(sample_request(), CancellationToken::new())
             .await
-            .expect("fusion stream");
+            .expect("model_judge stream");
         let output = collect_text(events).await;
 
         // The user sees the default member's stream.
@@ -694,50 +715,49 @@ mod tests {
             .expect("synthesis user message");
         assert!(synthesis_user.contains("answer A"));
         assert!(synthesis_user.contains("answer B"));
-        assert!(synthesis_user.contains(FUSION_RANK_TOOL));
-        // Synthesis is offered only the ranking tool.
+        assert!(synthesis_user.contains(MODEL_JUDGE_RANK_TOOL));
+        // The synthesis model is offered only the ranking tool.
         assert_eq!(synthesis_reqs[0].tools.len(), 1);
-        assert_eq!(synthesis_reqs[0].tools[0].name.0, FUSION_RANK_TOOL);
+        assert_eq!(synthesis_reqs[0].tools[0].name.0, MODEL_JUDGE_RANK_TOOL);
 
-        // The default member received the synthesis as a meta message.
+        // The default member receives the synthesis as internal guidance, not
+        // as a protocol-level transcript variant.
         let default_reqs = default_reqs.lock().unwrap();
         assert_eq!(default_reqs.len(), 1);
-        let meta = default_reqs[0]
+        let guidance = default_reqs[0]
             .messages
             .iter()
+            .skip(1)
             .find_map(|message| match message {
-                Message::Meta(meta) => Some(meta.text.clone()),
+                Message::User(user) => Some(user.plain_text()),
                 _ => None,
             })
-            .expect("meta message present");
-        assert!(meta.contains("A is stronger than B"));
+            .expect("guidance user message");
+        assert!(guidance.contains("model-judge synthesis"));
+        assert!(guidance.contains("A is stronger than B"));
     }
 
     #[tokio::test]
-    async fn fusion_falls_back_to_default_when_panels_fail() {
+    async fn model_judge_falls_back_to_default_when_panel_fails() {
         // A synthesis member that never produces text would error, but with no
         // panels there is nothing to judge, so we fall straight through.
-        let (synthesis, synthesis_reqs) = member("judge", Some("unused"), None);
-        let (default, default_reqs) = member("final", Some("fallback answer"), None);
+        let (synthesis, synthesis_reqs) = member("synthesis", Some("unused"), None);
+        let (default, default_reqs) = member("default", Some("fallback answer"), None);
 
-        let fusion = FusionProvider::new(default, synthesis, Vec::new());
-        let events = fusion
+        let model_judge = ModelJudgeProvider::new(default, synthesis, Vec::new());
+        let events = model_judge
             .stream(sample_request(), CancellationToken::new())
             .await
-            .expect("fusion stream");
+            .expect("model_judge stream");
         let output = collect_text(events).await;
 
         assert_eq!(output, "fallback answer");
-        // Synthesis is skipped entirely when there are no panel responses.
+        // The synthesis model is skipped entirely when there are no panel responses.
         assert_eq!(synthesis_reqs.lock().unwrap().len(), 0);
-        // The default request carries no meta message in the fallback path.
+        // The default request carries only the original user message in the
+        // fallback path.
         let default_reqs = default_reqs.lock().unwrap();
         assert_eq!(default_reqs.len(), 1);
-        assert!(
-            !default_reqs[0]
-                .messages
-                .iter()
-                .any(|message| matches!(message, Message::Meta(_)))
-        );
+        assert_eq!(default_reqs[0].messages.len(), 1);
     }
 }

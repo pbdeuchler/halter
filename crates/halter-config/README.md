@@ -41,7 +41,7 @@ This crate exports two major groups of APIs.
 - `HarnessConfig`
 - `ProvidersConfig`, `ProviderConfig`, `OpenAiOAuthConfig`, `ConfiguredProvider`
 - `ResolvedProviderConfig`, `ResolvedProviderAuth`
-- `ModelsConfig`, `ModelConfig`, `ModelSlot`, `ModelSlotRef`, `FusionConfig`
+- `ModelsConfig`, `ModelConfig`, `ModelSlot`, `ModelSlotRef`, `ModelJudgeConfig`
 - `ResourcesConfig`, `SearchRoots`
 - `PromptsConfig`
 - `ContextConfig`
@@ -242,43 +242,43 @@ model = "openai/gpt-5-mini"
 reasoning = "medium"
 ```
 
-### Fusion (model-judge) slots
+### Model-judge slots
 
 `models.default` and `models.subagent` accept either an inline model (above) or
-the string `"fusion"`, which resolves through a shared `[models.fusion]` block
-holding a `default` model, a `synthesis` (judge) model, and a non-empty array of
-`panelists`:
+the string `"model_judge"`, which resolves through a shared
+`[models.model_judge]` block holding a `default` model, a `synthesis` model, and a
+non-empty `panel`:
 
 ```toml
 [models]
-default = "fusion"
+default = "model_judge"
 
-[models.fusion.default]
+[models.model_judge.default]
 provider = "anthropic"
 model = "claude-opus-4-8"
 
-[models.fusion.synthesis]
+[models.model_judge.synthesis]
 provider = "openai"
 model = "gpt-5"
 
-[[models.fusion.panelists]]
+[[models.model_judge.panel]]
 provider = "openai"
 model = "gpt-5"
 
-[[models.fusion.panelists]]
+[[models.model_judge.panel]]
 provider = "anthropic"
 model = "claude-sonnet-4-6"
 ```
 
-At runtime a fusion slot multiplexes each call to the panelists, has the
-synthesis model stack-rank and judge their responses, and hands the synthesis to
-the default model (as an out-of-band meta message) to produce the visible reply.
-See the workspace README for the full flow and telemetry.
+At runtime a model-judge slot multiplexes each call to the `panel`, asks the
+`synthesis` model to stack-rank and synthesize their responses, and hands the
+synthesis to the `default` model to produce the visible reply. See the
+workspace README for the full flow and telemetry.
 
 ### Notes
 
 - `models.default` is required
-- a `"fusion"` slot requires a `[models.fusion]` block with non-empty `panelists`
+- a `"model_judge"` slot requires a `[models.model_judge]` block with non-empty `panel`
 - `models.small` is always a single inline model (it does not fan out); when
   unset it falls back to the default slot's representative leaf model
 - `reasoning` is optional

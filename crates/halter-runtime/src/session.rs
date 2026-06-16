@@ -4191,7 +4191,7 @@ mod tests {
                 .rev()
                 .find_map(|message| match message {
                     Message::User(user) => Some(user.plain_text()),
-                    Message::System(_) | Message::Meta(_) | Message::Assistant(_) | Message::Tool(_) => None,
+                    Message::System(_) | Message::Assistant(_) | Message::Tool(_) => None,
                 })
                 .unwrap_or_default();
             let reply = if latest_user_text.starts_with("HOOK_PROMPT ") {
@@ -4304,7 +4304,7 @@ mod tests {
             .rev()
             .find_map(|message| match message {
                 Message::User(user) => Some(user.plain_text()),
-                Message::System(_) | Message::Meta(_) | Message::Assistant(_) | Message::Tool(_) => None,
+                Message::System(_) | Message::Assistant(_) | Message::Tool(_) => None,
             })
             .unwrap_or_default()
     }
@@ -4318,7 +4318,7 @@ mod tests {
                     .map(ToOwned::to_owned),
                 ToolResult::Empty | ToolResult::Text { .. } => None,
             },
-            Message::System(_) | Message::Meta(_) | Message::User(_) | Message::Assistant(_) => None,
+            Message::System(_) | Message::User(_) | Message::Assistant(_) => None,
         })
     }
 

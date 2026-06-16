@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use halter_config::{
-    ConfiguredProvider, DEFAULT_MODEL_ID, FusionConfig, HarnessConfig, ModelConfig, ModelSlot,
+    ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelJudgeConfig, ModelSlot,
     ModelSlotRef, OpenAiOAuthConfig, PolicyConfig, ResolvedProviderAuth, ResolvedProviderConfig,
     SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, expand_path, load_path,
     resolve_provider_runtime_config,
@@ -17,7 +17,7 @@ use halter_protocol::{
     HookWarning, ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot,
 };
 use halter_providers::{
-    AnthropicProvider, FusionMember, FusionProvider, ModelRegistry, OpenAiOAuthCredentials,
+    AnthropicProvider, ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials,
     OpenAiProvider, OpenRouterProvider, Provider,
 };
 use halter_runtime::{
@@ -386,7 +386,7 @@ fn describe_session_backend(config: &SessionsConfig) -> &'static str {
 fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry> {
     let mut registry = ModelRegistry::new();
     // Each provider family is resolved and constructed at most once, then shared
-    // across every role and fusion member that references it.
+    // across every role and model-judge member that references it.
     let mut family_providers: HashMap<ConfiguredProvider, Arc<dyn Provider>> = HashMap::new();
 
     let default_slot = config.default_slot()?;
@@ -412,8 +412,8 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
     )?;
 
     // The small slot is always a single concrete model. When unset it falls
-    // back to the representative leaf of the default slot (the fusion default
-    // model for fusion slots) rather than fanning out.
+    // back to the representative leaf of the default slot (the model-judge
+    // default model for model-judge slots) rather than fanning out.
     let small_config = match config.small_model() {
         Some(model) => model.clone(),
         None => config.default_model()?.clone(),
@@ -445,8 +445,9 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
 }
 
 /// Build the [`ResolvedModel`] for a model slot, registering whatever providers
-/// it needs (a single family provider for inline slots, or a synthetic fusion
-/// provider plus its members' family providers for fusion slots).
+/// it needs (a single family provider for inline slots, or a synthetic
+/// model-judge provider plus its members' family providers for model-judge
+/// slots).
 fn build_slot_model(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
@@ -460,17 +461,17 @@ fn build_slot_model(
         ModelSlot::Inline(model) => {
             build_inline_model(config, registry, family_providers, model, role, id)
         }
-        ModelSlot::Reference(ModelSlotRef::Fusion) => {
-            let fusion = config.fusion().with_context(|| {
+        ModelSlot::Reference(ModelSlotRef::ModelJudge) => {
+            let model_judge = config.model_judge().with_context(|| {
                 format!(
-                    "invalid configuration: models.{slot_label} is set to \"fusion\" but [models.fusion] is not defined"
+                    "invalid configuration: models.{slot_label} is set to \"model_judge\" but [models.model_judge] is not defined"
                 )
             })?;
-            build_fusion_model(
+            build_model_judge_model(
                 config,
                 registry,
                 family_providers,
-                fusion,
+                model_judge,
                 role,
                 id,
                 slot_label,
@@ -496,22 +497,22 @@ fn build_inline_model(
     ))
 }
 
-fn build_fusion_model(
+fn build_model_judge_model(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
     family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
-    fusion: &FusionConfig,
+    model_judge: &ModelJudgeConfig,
     role: ModelRole,
     id: &str,
     slot_label: &str,
 ) -> anyhow::Result<ResolvedModel> {
     let default_member =
-        build_fusion_member(config, registry, family_providers, &fusion.default)?;
+        build_model_judge_member(config, registry, family_providers, &model_judge.default)?;
     let synthesis_member =
-        build_fusion_member(config, registry, family_providers, &fusion.synthesis)?;
-    let mut panelists = Vec::with_capacity(fusion.panelists.len());
-    for panelist in &fusion.panelists {
-        panelists.push(build_fusion_member(
+        build_model_judge_member(config, registry, family_providers, &model_judge.synthesis)?;
+    let mut panel = Vec::with_capacity(model_judge.panel.len());
+    for panelist in &model_judge.panel {
+        panel.push(build_model_judge_member(
             config,
             registry,
             family_providers,
@@ -519,17 +520,17 @@ fn build_fusion_model(
         )?);
     }
 
-    // Mirror the fusion default leaf so capability/compaction queries (which the
-    // fusion provider delegates to its default member) behave consistently, but
-    // route the slot through a synthetic provider name.
-    let provider_name = ProviderName::from(format!("fusion-{slot_label}"));
+    // Mirror the default leaf so capability/compaction queries (which the
+    // model-judge provider delegates to its default member) behave
+    // consistently, but route the slot through a synthetic provider name.
+    let provider_name = ProviderName::from(format!("model-judge-{slot_label}"));
     let default_leaf = default_member.model.clone();
-    let fusion_provider = Arc::new(FusionProvider::new(
+    let model_judge_provider = Arc::new(ModelJudgeProvider::new(
         default_member,
         synthesis_member,
-        panelists,
+        panel,
     ));
-    registry.register_provider(provider_name.clone(), fusion_provider);
+    registry.register_provider(provider_name.clone(), model_judge_provider);
 
     Ok(ResolvedModel {
         role,
@@ -537,7 +538,7 @@ fn build_fusion_model(
         provider: provider_name,
         provider_kind: default_leaf.provider_kind,
         api_kind: default_leaf.api_kind,
-        model: format!("fusion:{}", default_leaf.model),
+        model: format!("model-judge:{}", default_leaf.model),
         max_input_tokens: default_leaf.max_input_tokens,
         max_output_tokens: default_leaf.max_output_tokens,
         reasoning: default_leaf.reasoning,
@@ -545,12 +546,12 @@ fn build_fusion_model(
     })
 }
 
-fn build_fusion_member(
+fn build_model_judge_member(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
     family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
     model: &ModelConfig,
-) -> anyhow::Result<FusionMember> {
+) -> anyhow::Result<ModelJudgeMember> {
     let provider = ensure_family_provider(config, registry, family_providers, model.provider)?;
     let resolved = resolved_model(
         model,
@@ -558,7 +559,7 @@ fn build_fusion_member(
         ModelId::from(model.model.clone()),
         ProviderName::from(model.provider.to_string()),
     );
-    Ok(FusionMember {
+    Ok(ModelJudgeMember {
         provider,
         model: resolved,
     })
@@ -813,9 +814,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_constructs_fusion_default_slot() {
+    async fn builder_constructs_model_judge_default_slot() {
         let mut config = openai_config(Some("test-key"));
-        config.models.default = Some(ModelSlot::Reference(ModelSlotRef::Fusion));
+        config.models.default = Some(ModelSlot::Reference(ModelSlotRef::ModelJudge));
         let leaf = |model: &str| ModelConfig {
             provider: ConfiguredProvider::OpenAi,
             model: model.to_owned(),
@@ -824,10 +825,10 @@ mod tests {
             reasoning: None,
             tokens_per_minute: None,
         };
-        config.models.fusion = Some(FusionConfig {
+        config.models.model_judge = Some(ModelJudgeConfig {
             default: leaf("gpt-default"),
-            synthesis: leaf("gpt-judge"),
-            panelists: vec![leaf("gpt-panel-a"), leaf("gpt-panel-b")],
+            synthesis: leaf("gpt-synthesis"),
+            panel: vec![leaf("gpt-panel-a"), leaf("gpt-panel-b")],
         });
 
         let halter = HalterBuilder::default()
@@ -835,9 +836,9 @@ mod tests {
             .with_resource_snapshot(ResourceSnapshot::empty())
             .build()
             .await
-            .expect("build should succeed for a fusion default slot");
+            .expect("build should succeed for a model-judge default slot");
 
-        // The fusion default slot mirrors its fusion default leaf model.
+        // The model-judge slot mirrors its default leaf model.
         assert_eq!(
             halter.config.default_model().expect("default model").model,
             "gpt-default"

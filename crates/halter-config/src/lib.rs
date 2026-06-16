@@ -15,8 +15,8 @@ pub use loader::{
     generate_starter_config, load_layered, load_path, schema_as_json_value,
 };
 pub use schema::{
-    ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, FusionConfig, HarnessConfig,
-    LoopbackAllowConfig, ModelConfig, ModelSlot, ModelSlotRef, ModelsConfig, NetworkPolicyConfig,
+    ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, HarnessConfig, LoopbackAllowConfig,
+    ModelConfig, ModelJudgeConfig, ModelSlot, ModelSlotRef, ModelsConfig, NetworkPolicyConfig,
     OpenAiOAuthConfig, PolicyConfig, PromptsConfig, ProviderConfig, ProvidersConfig,
     ResolvedProviderAuth, ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID,
     SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig, ToolsConfig,

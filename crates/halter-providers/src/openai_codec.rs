@@ -17,8 +17,8 @@ use tracing::warn;
 
 use crate::codec_common::{
     assistant_text, bounded_provider_id, bounded_provider_id_with_prefix, canonical_tool_name,
-    collect_system_text, data_url, document_filename, frame_meta_text, has_user_media,
-    tool_name_for_provider, tool_result_text, user_text,
+    collect_system_text, data_url, document_filename, has_user_media, tool_name_for_provider,
+    tool_result_text, user_text,
 };
 
 // Alias the consolidated PROVIDER_ID_MAX_LEN from codec_common (finding L14).
@@ -225,7 +225,6 @@ fn encode_responses_compact_input(
     for message in &request.messages {
         match message {
             Message::System(_) => {}
-            Message::Meta(meta) => input.push(encode_responses_meta_message(meta)),
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
                 if let Some(message) = encode_responses_assistant_message(assistant) {
@@ -1018,7 +1017,6 @@ fn encode_responses_input(
     for message in &request.messages {
         match message {
             Message::System(_) => {}
-            Message::Meta(meta) => input.push(encode_responses_meta_message(meta)),
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
                 if let Some(message) = encode_responses_assistant_message(assistant) {
@@ -1047,7 +1045,6 @@ fn encode_responses_input_slice(
     for message in messages {
         match message {
             Message::System(_) => {}
-            Message::Meta(meta) => input.push(encode_responses_meta_message(meta)),
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
                 if let Some(message) = encode_responses_assistant_message(assistant) {
@@ -1063,17 +1060,6 @@ fn encode_responses_input_slice(
         }
     }
     Ok(input)
-}
-
-fn encode_responses_meta_message(meta: &halter_protocol::MetaMessage) -> Value {
-    json!({
-        "type": "message",
-        "role": "user",
-        "content": [json!({
-            "type": "input_text",
-            "text": frame_meta_text(&meta.text),
-        })],
-    })
 }
 
 fn encode_responses_developer_message(text: &str) -> Value {
@@ -1302,10 +1288,6 @@ fn encode_chat_messages(request: &ProviderRequest) -> anyhow::Result<Vec<Value>>
     for message in &request.messages {
         match message {
             Message::System(_) => {}
-            Message::Meta(meta) => messages.push(json!({
-                "role": "user",
-                "content": frame_meta_text(&meta.text),
-            })),
             Message::User(user) => messages.push(encode_chat_user_message(user)?),
             Message::Assistant(assistant) => {
                 let text = assistant_text(assistant);
