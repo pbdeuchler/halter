@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 pub const IMPLEMENTATION_PLAN_PATH: &str = ".halter/software-factory/implementation-plan.md";
+pub const CHECKPOINT_PATH: &str = ".halter/software-factory/checkpoint.json";
 pub const RECENT_OPEN_ISSUE_LIMIT: usize = 100;
 pub const PROJECT_GUIDANCE_FILENAMES: [&str; 3] = ["CLAUDE.md", "AGENTS.md", "SOUL.md"];
 pub const PROJECT_GUIDANCE_MAX_BYTES: u64 = 1_048_576;

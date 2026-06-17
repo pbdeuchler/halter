@@ -33,13 +33,14 @@ use tokio::{process::Command, sync::RwLock};
 use tracing::{info, warn};
 
 use crate::core::{
-    CandidateSet, CodeReview, IMPLEMENTATION_PLAN_PATH, IssueComment, IssueDoc, JudgeSelection,
-    ModelSpec, MonitorAction, PROJECT_GUIDANCE_FILENAMES, PROJECT_GUIDANCE_MAX_BYTES,
-    ProjectGuidanceDoc, PullRequestDraft, RECENT_OPEN_ISSUE_LIMIT, RepoSlug, branch_name,
-    candidate_set_for_issue, dirty_status_excluding, ensure_requested_issue_selection,
-    format_project_system_prompt, is_maintainer_author_association, issue_corpus, issue_index,
-    monitor_action, parse_github_remote_url, parse_issue_number_input, parse_json_response,
-    selected_issue_numbers, validate_issue_number, validate_recent_issue_limit,
+    CHECKPOINT_PATH, CandidateSet, CodeReview, IMPLEMENTATION_PLAN_PATH, IssueComment, IssueDoc,
+    JudgeSelection, ModelSpec, MonitorAction, PROJECT_GUIDANCE_FILENAMES,
+    PROJECT_GUIDANCE_MAX_BYTES, ProjectGuidanceDoc, PullRequestDraft, RECENT_OPEN_ISSUE_LIMIT,
+    RepoSlug, branch_name, candidate_set_for_issue, dirty_status_excluding,
+    ensure_requested_issue_selection, format_project_system_prompt,
+    is_maintainer_author_association, issue_corpus, issue_index, monitor_action,
+    parse_github_remote_url, parse_issue_number_input, parse_json_response, selected_issue_numbers,
+    validate_issue_number, validate_recent_issue_limit,
 };
 
 #[derive(Debug, Parser)]
@@ -71,6 +72,17 @@ struct Cli {
         help = "Include the generated implementation plan file in commits"
     )]
     commit_impl_plan: bool,
+    #[arg(
+        long,
+        conflicts_with = "reset_checkpoint",
+        help = "Resume from the factory checkpoint file for this worktree"
+    )]
+    resume: bool,
+    #[arg(
+        long,
+        help = "Delete any existing factory checkpoint before starting a fresh run"
+    )]
+    reset_checkpoint: bool,
     #[arg(long, help = "Work on one specific open GitHub issue number")]
     issue: Option<u64>,
     #[arg(
@@ -107,6 +119,151 @@ struct Cli {
     pr_model: String,
 }
 
+const CHECKPOINT_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FactoryCheckpoint {
+    version: u8,
+    repo: String,
+    base_branch: String,
+    requested_issue: Option<u64>,
+    commit_impl_plan: bool,
+    issues: Option<Vec<IssueDoc>>,
+    candidates: Option<CandidateSet>,
+    selection: Option<JudgeSelection>,
+    implementation_plan: Option<String>,
+    branch: Option<String>,
+    base_ref: Option<String>,
+    implemented: bool,
+    reviewed: bool,
+    committed: bool,
+    commit_sha: Option<String>,
+    pushed: bool,
+    pr_draft: Option<PullRequestDraft>,
+    pr: Option<CheckpointPullRequest>,
+    completed: bool,
+}
+
+impl FactoryCheckpoint {
+    fn new(
+        repo: &RepoSlug,
+        base_branch: &str,
+        requested_issue: Option<u64>,
+        commit_impl_plan: bool,
+    ) -> Self {
+        Self {
+            version: CHECKPOINT_VERSION,
+            repo: repo.to_string(),
+            base_branch: base_branch.to_owned(),
+            requested_issue,
+            commit_impl_plan,
+            issues: None,
+            candidates: None,
+            selection: None,
+            implementation_plan: None,
+            branch: None,
+            base_ref: None,
+            implemented: false,
+            reviewed: false,
+            committed: false,
+            commit_sha: None,
+            pushed: false,
+            pr_draft: None,
+            pr: None,
+            completed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CheckpointPullRequest {
+    number: u64,
+    html_url: String,
+}
+
+impl From<&GitHubPullRequest> for CheckpointPullRequest {
+    fn from(pr: &GitHubPullRequest) -> Self {
+        Self {
+            number: pr.number,
+            html_url: pr.html_url.clone(),
+        }
+    }
+}
+
+fn validate_checkpoint_for_run(
+    checkpoint: &FactoryCheckpoint,
+    repo: &RepoSlug,
+    base_branch: &str,
+    requested_issue: Option<u64>,
+    commit_impl_plan: bool,
+) -> Result<(), String> {
+    if checkpoint.version != CHECKPOINT_VERSION {
+        return Err(format!(
+            "checkpoint version {} is not supported by this binary version {}",
+            checkpoint.version, CHECKPOINT_VERSION
+        ));
+    }
+    if checkpoint.repo != repo.to_string() {
+        return Err(format!(
+            "checkpoint repo {} does not match current repo {repo}",
+            checkpoint.repo
+        ));
+    }
+    if checkpoint.base_branch != base_branch {
+        return Err(format!(
+            "checkpoint base branch {} does not match current base branch {base_branch}",
+            checkpoint.base_branch
+        ));
+    }
+    if checkpoint.requested_issue != requested_issue {
+        return Err(format!(
+            "checkpoint requested issue {:?} does not match current requested issue {:?}",
+            checkpoint.requested_issue, requested_issue
+        ));
+    }
+    if checkpoint.commit_impl_plan != commit_impl_plan {
+        return Err(format!(
+            "checkpoint commit_impl_plan={} does not match current commit_impl_plan={commit_impl_plan}",
+            checkpoint.commit_impl_plan
+        ));
+    }
+    validate_checkpoint_stage_state(checkpoint)
+}
+
+fn validate_checkpoint_stage_state(checkpoint: &FactoryCheckpoint) -> Result<(), String> {
+    if checkpoint.selection.is_some() && checkpoint.candidates.is_none() {
+        return Err("checkpoint has a judge selection but no candidate set".to_owned());
+    }
+    if checkpoint.implementation_plan.is_some() && checkpoint.selection.is_none() {
+        return Err("checkpoint has an implementation plan but no judge selection".to_owned());
+    }
+    if checkpoint.branch.is_some() && checkpoint.selection.is_none() {
+        return Err("checkpoint has a branch but no judge selection".to_owned());
+    }
+    if checkpoint.implemented && checkpoint.branch.is_none() {
+        return Err("checkpoint marks implementation complete but has no branch".to_owned());
+    }
+    if checkpoint.reviewed && !checkpoint.implemented {
+        return Err("checkpoint marks review complete before implementation".to_owned());
+    }
+    if checkpoint.committed && !checkpoint.reviewed {
+        return Err("checkpoint marks commit complete before review".to_owned());
+    }
+    if checkpoint.pushed && !checkpoint.committed {
+        return Err("checkpoint marks push complete before commit".to_owned());
+    }
+    if checkpoint.pr_draft.is_some() && !checkpoint.pushed {
+        return Err("checkpoint has a PR draft before push".to_owned());
+    }
+    if checkpoint.pr.is_some() && checkpoint.pr_draft.is_none() {
+        return Err("checkpoint has a PR before PR draft".to_owned());
+    }
+    if checkpoint.completed && checkpoint.pr.is_none() {
+        return Err("checkpoint marks run complete before PR creation".to_owned());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -127,15 +284,40 @@ async fn main() -> anyhow::Result<()> {
     let github = GitHubClient::from_local_credentials(&worktree).await?;
     let repo_info = github.fetch_repo(&repo).await?;
     let base_branch = cli.base.clone().unwrap_or(repo_info.default_branch);
+    let checkpoint_path = worktree.join(CHECKPOINT_PATH);
+    let mut checkpoint = initialize_checkpoint(
+        &checkpoint_path,
+        cli.resume,
+        cli.reset_checkpoint,
+        &repo,
+        &base_branch,
+        requested_issue,
+        cli.commit_impl_plan,
+    )
+    .await?;
 
-    let issues = if let Some(number) = requested_issue {
-        info!(repo = %repo, issue = number, "fetching requested open issue");
-        vec![github.fetch_open_issue(&repo, number).await?]
+    let issues = if let Some(issues) = checkpoint.issues.clone() {
+        info!(
+            count = issues.len(),
+            "using issue corpus from factory checkpoint"
+        );
+        issues
     } else {
-        info!(repo = %repo, limit = RECENT_OPEN_ISSUE_LIMIT, "fetching recent open issues");
-        github
-            .fetch_recent_open_issues(&repo, RECENT_OPEN_ISSUE_LIMIT)
-            .await?
+        let issues = if let Some(number) = requested_issue {
+            info!(repo = %repo, issue = number, "fetching requested open issue");
+            vec![github.fetch_open_issue(&repo, number).await?]
+        } else {
+            info!(repo = %repo, limit = RECENT_OPEN_ISSUE_LIMIT, "fetching recent open issues");
+            github
+                .fetch_recent_open_issues(&repo, RECENT_OPEN_ISSUE_LIMIT)
+                .await?
+        };
+        if issues.is_empty() {
+            bail!("failed to select work: {repo} has no open non-PR issues");
+        }
+        checkpoint.issues = Some(issues.clone());
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+        issues
     };
     if issues.is_empty() {
         bail!("failed to select work: {repo} has no open non-PR issues");
@@ -194,33 +376,63 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let candidates = if let Some(number) = requested_issue {
-        let issue = issues
-            .iter()
-            .find(|issue| issue.number == number)
-            .with_context(|| format!("failed to find requested issue #{number} after fetch"))?;
-        candidate_set_for_issue(issue)
+    let candidates = if let Some(candidates) = checkpoint.candidates.clone() {
+        info!("using issue candidates from factory checkpoint");
+        candidates
     } else {
-        propose_issue_candidates(
-            &glm,
+        let candidates = if let Some(number) = requested_issue {
+            let issue = issues
+                .iter()
+                .find(|issue| issue.number == number)
+                .with_context(|| format!("failed to find requested issue #{number} after fetch"))?;
+            candidate_set_for_issue(issue)
+        } else {
+            propose_issue_candidates(
+                &glm,
+                &worktree,
+                &repo,
+                &corpus,
+                project_system_prompt.as_deref(),
+            )
+            .await?
+        };
+        checkpoint.candidates = Some(candidates.clone());
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+        candidates
+    };
+    let selection = if let Some(selection) = checkpoint.selection.clone() {
+        info!("using judge selection from factory checkpoint");
+        selection
+    } else {
+        let selection = judge_issue_plan(
+            &judge,
             &worktree,
             &repo,
-            &corpus,
+            &index,
+            &candidates,
+            IMPLEMENTATION_PLAN_PATH,
             project_system_prompt.as_deref(),
         )
-        .await?
+        .await?;
+        checkpoint.selection = Some(selection.clone());
+        let implementation_plan = read_implementation_plan(&implementation_plan_path).await?;
+        checkpoint.implementation_plan = Some(implementation_plan);
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+        selection
     };
-    let selection = judge_issue_plan(
-        &judge,
-        &worktree,
-        &repo,
-        &index,
-        &candidates,
-        IMPLEMENTATION_PLAN_PATH,
-        project_system_prompt.as_deref(),
-    )
-    .await?;
-    let implementation_plan = read_implementation_plan(&implementation_plan_path).await?;
+    let implementation_plan =
+        if let Some(implementation_plan) = checkpoint.implementation_plan.clone() {
+            if implementation_plan.trim().is_empty() {
+                bail!("factory checkpoint implementation plan is empty");
+            }
+            restore_implementation_plan(&implementation_plan_path, &implementation_plan).await?;
+            implementation_plan
+        } else {
+            let implementation_plan = read_implementation_plan(&implementation_plan_path).await?;
+            checkpoint.implementation_plan = Some(implementation_plan.clone());
+            write_checkpoint(&checkpoint_path, &checkpoint).await?;
+            implementation_plan
+        };
     let issue_numbers = selected_issue_numbers(&selection);
     if issue_numbers.is_empty() {
         bail!("failed to select work: judge did not return issue numbers");
@@ -228,66 +440,123 @@ async fn main() -> anyhow::Result<()> {
     ensure_requested_issue_selection(&selection, requested_issue).map_err(anyhow::Error::msg)?;
     ensure_selected_issues_are_open(&issues, &issue_numbers)?;
 
-    prepare_branch(
-        &worktree,
-        &base_branch,
-        cli.branch.as_deref(),
-        cli.allow_dirty,
-        &repo,
-        &selection,
-        Some(IMPLEMENTATION_PLAN_PATH),
-    )
-    .await?;
-    let current_branch = current_branch(&worktree).await?;
-    let base_ref = format!("origin/{base_branch}");
-
-    implement_plan(
-        &implementer,
-        &worktree,
-        &repo,
-        &selection,
-        &implementation_plan,
-        &issues,
-        project_system_prompt.as_deref(),
-    )
-    .await?;
-    run_review_loop(
-        &implementer,
-        &reviewer,
-        &worktree,
-        &base_ref,
-        &implementation_plan,
-        cli.max_review_iterations,
-        project_system_prompt.as_deref(),
-    )
-    .await?;
-
-    if !branch_has_diff(&worktree, &base_ref).await? {
-        bail!("failed to create PR: implementation produced no diff against {base_ref}");
-    }
-    commit_if_dirty(
-        &worktree,
-        &format!("Implement {}", selection.title),
-        (!cli.commit_impl_plan).then_some(IMPLEMENTATION_PLAN_PATH),
-    )
-    .await?;
-    run_cmd(&worktree, "git", &["push", "-u", "origin", &current_branch]).await?;
-
-    let final_diff = branch_diff(&worktree, &base_ref).await?;
-    let pr_draft = draft_pr(
-        &pr_writer,
-        &worktree,
-        &repo,
-        &selection,
-        &implementation_plan,
-        &issue_numbers,
-        &final_diff,
-        project_system_prompt.as_deref(),
-    )
-    .await?;
-    let pr = github
-        .create_pull_request(&repo, &current_branch, &base_branch, &pr_draft)
+    let (current_branch, base_ref) = if let Some(branch) = checkpoint.branch.clone() {
+        info!(branch = %branch, "checking out checkpoint branch");
+        checkout_branch(&worktree, &branch).await?;
+        let base_ref = checkpoint
+            .base_ref
+            .clone()
+            .unwrap_or_else(|| format!("origin/{base_branch}"));
+        (branch, base_ref)
+    } else {
+        let branch = prepare_branch(
+            &worktree,
+            &base_branch,
+            cli.branch.as_deref(),
+            cli.allow_dirty,
+            &repo,
+            &selection,
+            Some(IMPLEMENTATION_PLAN_PATH),
+        )
         .await?;
+        let base_ref = format!("origin/{base_branch}");
+        checkpoint.branch = Some(branch.clone());
+        checkpoint.base_ref = Some(base_ref.clone());
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+        (branch, base_ref)
+    };
+
+    if checkpoint.implemented {
+        info!("skipping implementation; factory checkpoint marks it complete");
+    } else {
+        implement_plan(
+            &implementer,
+            &worktree,
+            &repo,
+            &selection,
+            &implementation_plan,
+            &issues,
+            project_system_prompt.as_deref(),
+        )
+        .await?;
+        checkpoint.implemented = true;
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+    }
+
+    if checkpoint.reviewed {
+        info!("skipping review loop; factory checkpoint marks it complete");
+    } else {
+        run_review_loop(
+            &implementer,
+            &reviewer,
+            &worktree,
+            &base_ref,
+            &implementation_plan,
+            cli.max_review_iterations,
+            project_system_prompt.as_deref(),
+        )
+        .await?;
+        checkpoint.reviewed = true;
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+    }
+
+    if !checkpoint.committed {
+        if !branch_has_diff(&worktree, &base_ref).await? {
+            bail!("failed to create PR: implementation produced no diff against {base_ref}");
+        }
+        commit_if_dirty(
+            &worktree,
+            &format!("Implement {}", selection.title),
+            (!cli.commit_impl_plan).then_some(IMPLEMENTATION_PLAN_PATH),
+        )
+        .await?;
+        checkpoint.committed = true;
+        checkpoint.commit_sha = Some(current_commit(&worktree).await?);
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+    } else {
+        info!("skipping commit; factory checkpoint marks it complete");
+    }
+
+    if checkpoint.pushed {
+        info!("skipping push; factory checkpoint marks it complete");
+    } else {
+        run_cmd(&worktree, "git", &["push", "-u", "origin", &current_branch]).await?;
+        checkpoint.pushed = true;
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+    }
+
+    let pr_draft = if let Some(pr_draft) = checkpoint.pr_draft.clone() {
+        info!("using PR draft from factory checkpoint");
+        pr_draft
+    } else {
+        let final_diff = branch_diff(&worktree, &base_ref).await?;
+        let pr_draft = draft_pr(
+            &pr_writer,
+            &worktree,
+            &repo,
+            &selection,
+            &implementation_plan,
+            &issue_numbers,
+            &final_diff,
+            project_system_prompt.as_deref(),
+        )
+        .await?;
+        checkpoint.pr_draft = Some(pr_draft.clone());
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+        pr_draft
+    };
+    let pr = if let Some(pr) = checkpoint.pr.clone() {
+        info!(pr_number = pr.number, url = %pr.html_url, "using PR from factory checkpoint");
+        pr
+    } else {
+        let pr = github
+            .create_pull_request(&repo, &current_branch, &base_branch, &pr_draft)
+            .await?;
+        let pr = CheckpointPullRequest::from(&pr);
+        checkpoint.pr = Some(pr.clone());
+        write_checkpoint(&checkpoint_path, &checkpoint).await?;
+        pr
+    };
 
     println!("created PR: {}", pr.html_url);
 
@@ -311,6 +580,8 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     }
+    checkpoint.completed = true;
+    write_checkpoint(&checkpoint_path, &checkpoint).await?;
 
     shutdown_all([&glm, &judge, &implementer, &reviewer, &pr_writer]).await;
     Ok(())
@@ -320,6 +591,124 @@ async fn canonicalize_existing(path: impl AsRef<Path>) -> anyhow::Result<PathBuf
     tokio::fs::canonicalize(path.as_ref())
         .await
         .with_context(|| format!("failed to canonicalize {}", path.as_ref().display()))
+}
+
+async fn initialize_checkpoint(
+    path: &Path,
+    resume: bool,
+    reset: bool,
+    repo: &RepoSlug,
+    base_branch: &str,
+    requested_issue: Option<u64>,
+    commit_impl_plan: bool,
+) -> anyhow::Result<FactoryCheckpoint> {
+    if reset {
+        remove_checkpoint_if_exists(path).await?;
+    }
+
+    if resume {
+        let checkpoint = read_checkpoint(path).await?;
+        validate_checkpoint_for_run(
+            &checkpoint,
+            repo,
+            base_branch,
+            requested_issue,
+            commit_impl_plan,
+        )
+        .map_err(anyhow::Error::msg)?;
+        info!(path = %path.display(), "loaded factory checkpoint");
+        return Ok(checkpoint);
+    }
+
+    if checkpoint_exists(path).await? {
+        bail!(
+            "factory checkpoint already exists at {}; pass --resume to continue it or --reset-checkpoint to start over",
+            path.display()
+        );
+    }
+
+    let checkpoint = FactoryCheckpoint::new(repo, base_branch, requested_issue, commit_impl_plan);
+    write_checkpoint(path, &checkpoint).await?;
+    Ok(checkpoint)
+}
+
+async fn checkpoint_exists(path: &Path) -> anyhow::Result<bool> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => bail!(
+            "factory checkpoint path exists but is not a regular file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect factory checkpoint {}", path.display())),
+    }
+}
+
+async fn read_checkpoint(path: &Path) -> anyhow::Result<FactoryCheckpoint> {
+    let raw = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("failed to read factory checkpoint {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse factory checkpoint {}", path.display()))
+}
+
+async fn write_checkpoint(path: &Path, checkpoint: &FactoryCheckpoint) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("checkpoint path {} has no parent", path.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed to create checkpoint directory {}", parent.display()))?;
+
+    let tmp = path.with_extension("json.tmp");
+    let data =
+        serde_json::to_vec_pretty(checkpoint).context("failed to serialize factory checkpoint")?;
+    tokio::fs::write(&tmp, data)
+        .await
+        .with_context(|| format!("failed to write temporary checkpoint {}", tmp.display()))?;
+    match tokio::fs::rename(&tmp, path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            tokio::fs::remove_file(path).await.with_context(|| {
+                format!("failed to replace factory checkpoint {}", path.display())
+            })?;
+            tokio::fs::rename(&tmp, path).await.with_context(|| {
+                format!("failed to install factory checkpoint {}", path.display())
+            })?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to install factory checkpoint {}", path.display())
+            });
+        }
+    }
+    info!(path = %path.display(), "wrote factory checkpoint");
+    Ok(())
+}
+
+async fn remove_checkpoint_if_exists(path: &Path) -> anyhow::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {
+            info!(path = %path.display(), "removed factory checkpoint");
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to remove factory checkpoint {}", path.display())),
+    }
+}
+
+async fn restore_implementation_plan(path: &Path, plan: &str) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("implementation plan path {} has no parent", path.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    tokio::fs::write(path, plan)
+        .await
+        .with_context(|| format!("failed to restore implementation plan {}", path.display()))
 }
 
 async fn read_project_system_prompt(worktree: &Path) -> anyhow::Result<Option<String>> {
@@ -665,12 +1054,19 @@ async fn shutdown_all<'a>(harnesses: impl IntoIterator<Item = &'a Halter>) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct AgentRun {
     text: String,
 }
 
 const FACTORY_TURN_USER_MESSAGE: &str =
     "Execute the appended turn-specific instructions for this software factory stage.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentTextRequirement {
+    Required,
+    Optional,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum FactorySystemPrompt {
@@ -756,8 +1152,29 @@ async fn run_coding_agent_with_system_prompt(
         prompt,
         FactorySystemPrompt::Coding,
         project_system_prompt,
+        AgentTextRequirement::Required,
     )
     .await
+}
+
+async fn run_coding_action_with_system_prompt(
+    harness: &Halter,
+    worktree: &Path,
+    label: &str,
+    prompt: impl Into<String>,
+    project_system_prompt: Option<&str>,
+) -> anyhow::Result<()> {
+    run_agent_with_prompt_kind(
+        harness,
+        worktree,
+        label,
+        prompt,
+        FactorySystemPrompt::Coding,
+        project_system_prompt,
+        AgentTextRequirement::Optional,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn run_agent_with_system_prompt(
@@ -774,6 +1191,7 @@ async fn run_agent_with_system_prompt(
         prompt,
         FactorySystemPrompt::General,
         project_system_prompt,
+        AgentTextRequirement::Required,
     )
     .await
 }
@@ -785,6 +1203,7 @@ async fn run_agent_with_prompt_kind(
     prompt: impl Into<String>,
     system_prompt: FactorySystemPrompt,
     project_system_prompt: Option<&str>,
+    text_requirement: AgentTextRequirement,
 ) -> anyhow::Result<AgentRun> {
     info!(stage = label, "starting agent turn");
     let turn_instructions = prompt.into();
@@ -837,17 +1256,43 @@ async fn run_agent_with_prompt_kind(
     }
 
     session.shutdown(label).await?;
-    let text = latest_text
-        .filter(|text| !text.trim().is_empty())
-        .or_else(|| (!delta_text.trim().is_empty()).then_some(delta_text))
-        .with_context(|| format!("agent stage {label} produced no assistant text"))?;
+    let run = agent_run_from_text(label, latest_text, delta_text, text_requirement)?;
+    if text_requirement == AgentTextRequirement::Optional && run.text.is_empty() {
+        info!(
+            stage = label,
+            "agent turn produced no assistant text; continuing because text is optional"
+        );
+    }
     info!(
         stage = label,
         input_tokens = usage.input_tokens,
         output_tokens = usage.output_tokens,
         "completed agent turn"
     );
-    Ok(AgentRun { text })
+    Ok(run)
+}
+
+fn agent_run_from_text(
+    label: &str,
+    latest_text: Option<String>,
+    delta_text: String,
+    text_requirement: AgentTextRequirement,
+) -> anyhow::Result<AgentRun> {
+    if let Some(text) = latest_text
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| (!delta_text.trim().is_empty()).then_some(delta_text))
+    {
+        return Ok(AgentRun { text });
+    }
+
+    match text_requirement {
+        AgentTextRequirement::Required => {
+            bail!("agent stage {label} produced no assistant text");
+        }
+        AgentTextRequirement::Optional => Ok(AgentRun {
+            text: String::new(),
+        }),
+    }
 }
 
 async fn propose_issue_candidates(
@@ -980,7 +1425,7 @@ async fn prepare_branch(
     repo: &RepoSlug,
     selection: &JudgeSelection,
     excluded_dirty_path: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     if !allow_dirty && git_is_dirty(worktree, excluded_dirty_path).await? {
         bail!("failed to prepare branch: worktree is dirty; commit/stash or pass --allow-dirty");
     }
@@ -994,7 +1439,7 @@ async fn prepare_branch(
     });
     let base_ref = format!("origin/{base_branch}");
     run_cmd(worktree, "git", &["checkout", "-b", &branch, &base_ref]).await?;
-    Ok(())
+    Ok(branch)
 }
 
 async fn implement_plan(
@@ -1026,7 +1471,7 @@ IMPLEMENTATION PLAN:
 "#,
     );
     let prompt = format!("{prompt}{implementation_plan}\n");
-    run_coding_agent_with_system_prompt(
+    run_coding_action_with_system_prompt(
         implementer,
         worktree,
         "kimi implementation",
@@ -1128,7 +1573,7 @@ REVIEW RESULT:
 {review_json}
 "#
         );
-        run_coding_agent_with_system_prompt(
+        run_coding_action_with_system_prompt(
             implementer,
             worktree,
             "kimi review repair",
@@ -1406,7 +1851,7 @@ FEEDBACK:
 {feedback}
 "#
     );
-    run_coding_agent_with_system_prompt(
+    run_coding_action_with_system_prompt(
         implementer,
         worktree,
         "kimi pr feedback",
@@ -1434,6 +1879,25 @@ async fn git_is_dirty(worktree: &Path, excluded_path: Option<&str>) -> anyhow::R
 
 async fn current_branch(worktree: &Path) -> anyhow::Result<String> {
     Ok(run_cmd(worktree, "git", &["branch", "--show-current"])
+        .await?
+        .trim()
+        .to_owned())
+}
+
+async fn checkout_branch(worktree: &Path, branch: &str) -> anyhow::Result<()> {
+    if branch.trim().is_empty() {
+        bail!("failed to resume branch: checkpoint branch is empty");
+    }
+    let current = current_branch(worktree).await?;
+    if current == branch {
+        return Ok(());
+    }
+    run_cmd(worktree, "git", &["checkout", branch]).await?;
+    Ok(())
+}
+
+async fn current_commit(worktree: &Path) -> anyhow::Result<String> {
+    Ok(run_cmd(worktree, "git", &["rev-parse", "HEAD"])
         .await?
         .trim()
         .to_owned())
@@ -2004,6 +2468,336 @@ mod tests {
                 .to_string()
                 .contains("turn-specific instructions are empty")
         );
+    }
+
+    #[test]
+    fn agent_run_from_text_covers_required_and_optional_outputs() {
+        struct Case {
+            name: &'static str,
+            latest_text: Option<&'static str>,
+            delta_text: &'static str,
+            requirement: AgentTextRequirement,
+            expected_text: Option<&'static str>,
+            expected_error: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                name: "required latest assistant text",
+                latest_text: Some("final message"),
+                delta_text: "partial delta",
+                requirement: AgentTextRequirement::Required,
+                expected_text: Some("final message"),
+                expected_error: None,
+            },
+            Case {
+                name: "required delta fallback",
+                latest_text: None,
+                delta_text: "streamed message",
+                requirement: AgentTextRequirement::Required,
+                expected_text: Some("streamed message"),
+                expected_error: None,
+            },
+            Case {
+                name: "required ignores blank latest and uses delta",
+                latest_text: Some(" \n"),
+                delta_text: "streamed message",
+                requirement: AgentTextRequirement::Required,
+                expected_text: Some("streamed message"),
+                expected_error: None,
+            },
+            Case {
+                name: "required empty output fails",
+                latest_text: None,
+                delta_text: " \n",
+                requirement: AgentTextRequirement::Required,
+                expected_text: None,
+                expected_error: Some("produced no assistant text"),
+            },
+            Case {
+                name: "optional empty output succeeds",
+                latest_text: None,
+                delta_text: " \n",
+                requirement: AgentTextRequirement::Optional,
+                expected_text: Some(""),
+                expected_error: None,
+            },
+        ];
+
+        for case in cases {
+            let result = agent_run_from_text(
+                "test stage",
+                case.latest_text.map(ToOwned::to_owned),
+                case.delta_text.to_owned(),
+                case.requirement,
+            );
+
+            match (case.expected_text, case.expected_error, result) {
+                (Some(expected), None, Ok(run)) => {
+                    assert_eq!(run.text, expected, "{}", case.name);
+                }
+                (None, Some(expected), Err(error)) => {
+                    assert!(
+                        error.to_string().contains(expected),
+                        "{}: {error}",
+                        case.name
+                    );
+                }
+                (_, _, other) => panic!("{}: unexpected result {other:?}", case.name),
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_validation_covers_context_and_stage_errors() {
+        let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        let valid = FactoryCheckpoint::new(&repo, "main", Some(7), false);
+        validate_checkpoint_for_run(&valid, &repo, "main", Some(7), false)
+            .expect("valid checkpoint");
+        let mut completed = valid.clone();
+        completed.candidates = Some(sample_candidates());
+        completed.selection = Some(sample_selection());
+        completed.implementation_plan = Some("plan".to_owned());
+        completed.branch = Some("factory/test".to_owned());
+        completed.base_ref = Some("origin/main".to_owned());
+        completed.implemented = true;
+        completed.reviewed = true;
+        completed.committed = true;
+        completed.commit_sha = Some("abc123".to_owned());
+        completed.pushed = true;
+        completed.pr_draft = Some(sample_pr_draft());
+        completed.pr = Some(sample_checkpoint_pr());
+        completed.completed = true;
+        validate_checkpoint_for_run(&completed, &repo, "main", Some(7), false)
+            .expect("completed checkpoint");
+
+        let mut wrong_version = valid.clone();
+        wrong_version.version = CHECKPOINT_VERSION + 1;
+        assert!(
+            validate_checkpoint_for_run(&wrong_version, &repo, "main", Some(7), false)
+                .expect_err("wrong version")
+                .contains("version")
+        );
+
+        let wrong_repo = FactoryCheckpoint {
+            repo: "other/repo".to_owned(),
+            ..valid.clone()
+        };
+        assert!(
+            validate_checkpoint_for_run(&wrong_repo, &repo, "main", Some(7), false)
+                .expect_err("wrong repo")
+                .contains("repo")
+        );
+
+        assert!(
+            validate_checkpoint_for_run(&valid, &repo, "release", Some(7), false)
+                .expect_err("wrong base")
+                .contains("base branch")
+        );
+        assert!(
+            validate_checkpoint_for_run(&valid, &repo, "main", Some(8), false)
+                .expect_err("wrong issue")
+                .contains("requested issue")
+        );
+        assert!(
+            validate_checkpoint_for_run(&valid, &repo, "main", Some(7), true)
+                .expect_err("wrong commit_impl_plan")
+                .contains("commit_impl_plan")
+        );
+
+        struct Case {
+            name: &'static str,
+            mutate: Box<dyn Fn(&mut FactoryCheckpoint)>,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "selection without candidates",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.selection = Some(sample_selection());
+                }),
+                expected: "selection",
+            },
+            Case {
+                name: "plan without selection",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.implementation_plan = Some("plan".to_owned());
+                }),
+                expected: "implementation plan",
+            },
+            Case {
+                name: "branch without selection",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.branch = Some("factory/test".to_owned());
+                }),
+                expected: "branch",
+            },
+            Case {
+                name: "implemented without branch",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.implemented = true;
+                }),
+                expected: "implementation",
+            },
+            Case {
+                name: "reviewed before implemented",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.reviewed = true;
+                }),
+                expected: "review",
+            },
+            Case {
+                name: "committed before reviewed",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.committed = true;
+                }),
+                expected: "commit",
+            },
+            Case {
+                name: "pushed before committed",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.pushed = true;
+                }),
+                expected: "push",
+            },
+            Case {
+                name: "draft before push",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.pr_draft = Some(sample_pr_draft());
+                }),
+                expected: "PR draft",
+            },
+            Case {
+                name: "pr before draft",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.pr = Some(sample_checkpoint_pr());
+                }),
+                expected: "PR",
+            },
+            Case {
+                name: "completed before pr",
+                mutate: Box::new(|checkpoint| {
+                    checkpoint.completed = true;
+                }),
+                expected: "complete",
+            },
+        ];
+
+        for case in cases {
+            let mut checkpoint = valid.clone();
+            (case.mutate)(&mut checkpoint);
+            let error = validate_checkpoint_stage_state(&checkpoint).expect_err(case.name);
+            assert!(
+                error.contains(case.expected),
+                "{}: expected {error:?} to contain {:?}",
+                case.name,
+                case.expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_file_io_covers_write_read_remove_and_missing() {
+        let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        let checkpoint = FactoryCheckpoint::new(&repo, "main", Some(7), false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".halter/software-factory/checkpoint.json");
+
+        assert!(!checkpoint_exists(&path).await.expect("exists check"));
+        remove_checkpoint_if_exists(&path)
+            .await
+            .expect("remove missing");
+
+        write_checkpoint(&path, &checkpoint)
+            .await
+            .expect("write checkpoint");
+        assert!(checkpoint_exists(&path).await.expect("exists check"));
+
+        let loaded = read_checkpoint(&path).await.expect("read checkpoint");
+        assert_eq!(loaded, checkpoint);
+
+        remove_checkpoint_if_exists(&path)
+            .await
+            .expect("remove checkpoint");
+        assert!(!checkpoint_exists(&path).await.expect("exists check"));
+        let error = read_checkpoint(&path)
+            .await
+            .expect_err("missing checkpoint should fail");
+        assert!(error.to_string().contains("failed to read"));
+
+        tokio::fs::create_dir_all(&path)
+            .await
+            .expect("create directory at checkpoint path");
+        let error = checkpoint_exists(&path)
+            .await
+            .expect_err("directory checkpoint path should fail");
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[tokio::test]
+    async fn initialize_checkpoint_covers_fresh_resume_existing_and_reset() {
+        let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".halter/software-factory/checkpoint.json");
+
+        let fresh = initialize_checkpoint(&path, false, false, &repo, "main", None, false)
+            .await
+            .expect("fresh checkpoint");
+        assert_eq!(fresh, FactoryCheckpoint::new(&repo, "main", None, false));
+
+        let existing_error = initialize_checkpoint(&path, false, false, &repo, "main", None, false)
+            .await
+            .expect_err("existing checkpoint should block fresh run");
+        assert!(existing_error.to_string().contains("--resume"));
+
+        let resumed = initialize_checkpoint(&path, true, false, &repo, "main", None, false)
+            .await
+            .expect("resume checkpoint");
+        assert_eq!(resumed, fresh);
+
+        let reset = initialize_checkpoint(&path, false, true, &repo, "main", Some(9), true)
+            .await
+            .expect("reset checkpoint");
+        assert_eq!(reset, FactoryCheckpoint::new(&repo, "main", Some(9), true));
+
+        let mismatch = initialize_checkpoint(&path, true, false, &repo, "main", None, true)
+            .await
+            .expect_err("resume should validate requested issue");
+        assert!(mismatch.to_string().contains("requested issue"));
+    }
+
+    fn sample_candidates() -> CandidateSet {
+        CandidateSet {
+            candidates: vec![crate::core::IssueCandidate {
+                title: "Fix issue".to_owned(),
+                issue_numbers: vec![7],
+                rationale: "selected".to_owned(),
+                maintainer_input_risk: "low".to_owned(),
+            }],
+        }
+    }
+
+    fn sample_selection() -> JudgeSelection {
+        JudgeSelection {
+            title: "Fix issue".to_owned(),
+            issue_numbers: vec![7],
+            notes: "notes".to_owned(),
+        }
+    }
+
+    fn sample_pr_draft() -> PullRequestDraft {
+        PullRequestDraft {
+            title: "Fix issue".to_owned(),
+            body: "Body".to_owned(),
+        }
+    }
+
+    fn sample_checkpoint_pr() -> CheckpointPullRequest {
+        CheckpointPullRequest {
+            number: 42,
+            html_url: "https://github.com/pbdeuchler/halter/pull/42".to_owned(),
+        }
     }
 
     #[test]

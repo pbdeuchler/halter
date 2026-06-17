@@ -5,3 +5,4 @@ traces/
 Cargo.lock
 examples/*example.toml
 examples/*-test.md
+.halter/
