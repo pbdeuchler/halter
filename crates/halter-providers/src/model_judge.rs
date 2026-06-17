@@ -32,6 +32,8 @@ pub const MODEL_JUDGE_RANK_TOOL: &str = "rank_responses";
 /// Maximum synthesis round trips (ranking call + synthesis text) before the
 /// model-judge provider stops looping and uses whatever text it has.
 const MAX_SYNTHESIS_ROUNDS: usize = 3;
+const EMPTY_SYNTHESIS_ERROR: &str =
+    "model-judge synthesis produced neither a ranking nor synthesis text";
 
 /// One participating model plus its adapter.
 #[derive(Clone)]
@@ -110,7 +112,15 @@ impl Provider for ModelJudgeProvider {
         request: ProviderCompactionRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<ProviderCompactionResponse> {
-        self.default.provider.compact(request, cancel).await
+        let inner = ProviderCompactionRequest {
+            session_id: request.session_id,
+            model: self.default.model.clone(),
+            compacted_prefix: request.compacted_prefix,
+            messages: request.messages,
+            tools: request.tools,
+            instructions: request.instructions,
+        };
+        self.default.provider.compact(inner, cancel).await
     }
 }
 
@@ -199,7 +209,7 @@ impl ModelJudgeProvider {
         let rank_tool = rank_tool_spec();
         let mut recorded = false;
 
-        for _ in 0..MAX_SYNTHESIS_ROUNDS {
+        for round in 0..MAX_SYNTHESIS_ROUNDS {
             let inner = inner_request(
                 request,
                 self.synthesis.model.clone(),
@@ -240,11 +250,22 @@ impl ModelJudgeProvider {
             }
 
             // No synthesis text yet. If the model ranked, acknowledge the tool
-            // call and let it continue; otherwise there is nothing to wait for.
+            // call and let it continue. If it produced neither a ranking nor
+            // text, retry with an explicit correction before falling back.
             let Some(call) = rank_call else {
-                anyhow::bail!(
-                    "model-judge synthesis produced neither a ranking nor synthesis text"
+                if round + 1 >= MAX_SYNTHESIS_ROUNDS {
+                    anyhow::bail!("{EMPTY_SYNTHESIS_ERROR} after {MAX_SYNTHESIS_ROUNDS} attempts");
+                }
+                warn!(
+                    target: MODEL_JUDGE_TRACE_TARGET,
+                    event = "synthesis_retry",
+                    attempt = round + 1,
+                    max_rounds = MAX_SYNTHESIS_ROUNDS,
+                    rank_recorded = recorded,
+                    "{EMPTY_SYNTHESIS_ERROR}; retrying synthesis model"
                 );
+                messages.push(Message::User(synthesis_retry_message(recorded)));
+                continue;
             };
             messages.push(Message::Assistant(assistant_with_tool_call(
                 &collected.text,
@@ -439,12 +460,17 @@ fn synthesis_instructions(candidates: &[Candidate]) -> String {
     prompt.push_str(
         "You are a synthesis judge. Below are candidate responses to the most recent user \
          message, each produced by a different model.\n\n\
-         First, call the `rank_responses` tool exactly once with a stack ranking of every \
-         candidate from best (rank 1) to worst, keyed by the candidate's `model_id`.\n\n\
-         Then write a synthesis that does NOT merge the candidates but JUDGES them: cover each \
-         candidate's strengths, weaknesses, pros, and cons, and finish with an overall synthesis \
-         of the best available guidance. Do not address the user directly; your synthesis is \
-         advisory context for another model.\n\nCandidates:\n",
+         Workflow:\n\
+         1. In your first response, call the `rank_responses` tool exactly once with a stack \
+         ranking of every candidate from best (rank 1) to worst, keyed by the candidate's \
+         `model_id`.\n\
+         2. After the tool result is returned, write a synthesis that does NOT merge the \
+         candidates but JUDGES them: cover each candidate's strengths, weaknesses, pros, and cons, \
+         and finish with an overall synthesis of the best available guidance.\n\n\
+         Valid outputs are only a `rank_responses` tool call or non-empty synthesis text. Never \
+         return an empty assistant message. If you are uncertain, make a best-effort ranking and \
+         concise synthesis. Do not address the user directly; your synthesis is advisory context \
+         for another model.\n\nCandidates:\n",
     );
     for candidate in candidates {
         prompt.push_str(&format!(
@@ -453,6 +479,19 @@ fn synthesis_instructions(candidates: &[Candidate]) -> String {
         ));
     }
     prompt
+}
+
+fn synthesis_retry_message(rank_recorded: bool) -> UserMessage {
+    let next_action = if rank_recorded {
+        "The ranking has already been recorded. Write the synthesis text now."
+    } else {
+        "Call `rank_responses` exactly once with every candidate, then continue to synthesis text."
+    };
+    UserMessage::text(format!(
+        "Your previous model-judge synthesis response was invalid because it contained neither a \
+         `rank_responses` tool call nor synthesis text.\n\n{next_action}\n\nDo not return an \
+         empty message. If uncertain, make a best-effort ranking and concise synthesis."
+    ))
 }
 
 fn synthesis_guidance_message(synthesis: &str) -> UserMessage {
@@ -528,7 +567,7 @@ fn record_rankings(arguments: &Value) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::VecDeque, sync::Mutex};
 
     use chrono::Utc;
     use futures::stream;
@@ -547,6 +586,17 @@ mod tests {
         tool: Option<(String, Value)>,
     }
 
+    #[derive(Clone)]
+    struct ScriptedResponse {
+        text: Option<String>,
+        tool: Option<(String, Value)>,
+    }
+
+    struct SequencedRecordingProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        responses: Mutex<VecDeque<ScriptedResponse>>,
+    }
+
     #[async_trait]
     impl Provider for RecordingProvider {
         fn capabilities(&self) -> ProviderCapabilities {
@@ -560,41 +610,108 @@ mod tests {
         ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
             self.requests.lock().expect("record request").push(request);
 
-            let message_id = MessageId::new();
-            let mut events = vec![Ok(StreamEvent::MessageStart {
-                id: message_id.clone(),
-            })];
-
-            if let Some((name, arguments)) = &self.tool {
-                let block = BlockId::new();
-                events.push(Ok(StreamEvent::ToolCallStart {
-                    id: block.clone(),
-                    tool_call_id: ToolCallId::new(),
-                    name: ToolName::from(name.clone()),
-                }));
-                events.push(Ok(StreamEvent::ToolArgsDelta {
-                    id: block.clone(),
-                    delta: arguments.to_string(),
-                }));
-                events.push(Ok(StreamEvent::ToolCallEnd { id: block }));
-            }
-
-            if let Some(text) = &self.text {
-                let block = BlockId::new();
-                events.push(Ok(StreamEvent::TextStart { id: block.clone() }));
-                events.push(Ok(StreamEvent::TextDelta {
-                    id: block.clone(),
-                    delta: text.clone(),
-                }));
-                events.push(Ok(StreamEvent::TextEnd { id: block }));
-            }
-
-            events.push(Ok(StreamEvent::MessageEnd {
-                id: message_id,
-                stop_reason: StopReason::EndTurn,
-                response_id: None,
-            }));
+            let events = scripted_events(ScriptedResponse {
+                text: self.text.clone(),
+                tool: self.tool.clone(),
+            });
             Ok(stream::iter(events).boxed())
+        }
+    }
+
+    #[async_trait]
+    impl Provider for SequencedRecordingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            self.requests.lock().expect("record request").push(request);
+            let response = self
+                .responses
+                .lock()
+                .expect("scripted responses")
+                .pop_front()
+                .expect("scripted provider response");
+            Ok(stream::iter(scripted_events(response)).boxed())
+        }
+    }
+
+    fn scripted_events(response: ScriptedResponse) -> Vec<Result<StreamEvent, ProviderError>> {
+        let message_id = MessageId::new();
+        let mut events = vec![Ok(StreamEvent::MessageStart {
+            id: message_id.clone(),
+        })];
+
+        if let Some((name, arguments)) = response.tool {
+            let block = BlockId::new();
+            events.push(Ok(StreamEvent::ToolCallStart {
+                id: block.clone(),
+                tool_call_id: ToolCallId::new(),
+                name: ToolName::from(name),
+            }));
+            events.push(Ok(StreamEvent::ToolArgsDelta {
+                id: block.clone(),
+                delta: arguments.to_string(),
+            }));
+            events.push(Ok(StreamEvent::ToolCallEnd { id: block }));
+        }
+
+        if let Some(text) = response.text {
+            let block = BlockId::new();
+            events.push(Ok(StreamEvent::TextStart { id: block.clone() }));
+            events.push(Ok(StreamEvent::TextDelta {
+                id: block.clone(),
+                delta: text,
+            }));
+            events.push(Ok(StreamEvent::TextEnd { id: block }));
+        }
+
+        events.push(Ok(StreamEvent::MessageEnd {
+            id: message_id,
+            stop_reason: StopReason::EndTurn,
+            response_id: None,
+        }));
+        events
+    }
+
+    struct CompactRecordingProvider {
+        requests: Arc<Mutex<Vec<ProviderCompactionRequest>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CompactRecordingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_compaction: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            anyhow::bail!("stream should not be called by this test provider")
+        }
+
+        async fn compact(
+            &self,
+            request: ProviderCompactionRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<ProviderCompactionResponse> {
+            self.requests
+                .lock()
+                .expect("record compaction request")
+                .push(request);
+            Ok(ProviderCompactionResponse {
+                output: Vec::new(),
+                usage: halter_protocol::Usage::default(),
+            })
         }
     }
 
@@ -623,6 +740,24 @@ mod tests {
             requests: requests.clone(),
             text: text.map(ToOwned::to_owned),
             tool: tool.map(|(name, arguments)| (name.to_owned(), arguments)),
+        });
+        (
+            ModelJudgeMember {
+                provider,
+                model: resolved(model),
+            },
+            requests,
+        )
+    }
+
+    fn sequenced_member(
+        model: &str,
+        responses: Vec<ScriptedResponse>,
+    ) -> (ModelJudgeMember, Arc<Mutex<Vec<ProviderRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(SequencedRecordingProvider {
+            requests: requests.clone(),
+            responses: Mutex::new(VecDeque::from(responses)),
         });
         (
             ModelJudgeMember {
@@ -738,6 +873,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_judge_retries_empty_synthesis_response() {
+        let (panel, _) = member("panel-a", Some("answer A"), None);
+        let rankings = json!({
+            "rankings": [
+                { "model_id": "panel-a", "rank": 1 }
+            ]
+        });
+        let (synthesis, synthesis_reqs) = sequenced_member(
+            "synthesis",
+            vec![
+                ScriptedResponse {
+                    text: None,
+                    tool: None,
+                },
+                ScriptedResponse {
+                    text: Some("A is the best available answer".to_owned()),
+                    tool: Some((MODEL_JUDGE_RANK_TOOL.to_owned(), rankings)),
+                },
+            ],
+        );
+        let (default, default_reqs) = member("default", Some("final answer"), None);
+
+        let model_judge = ModelJudgeProvider::new(default, synthesis, vec![panel]);
+        let events = model_judge
+            .stream(sample_request(), CancellationToken::new())
+            .await
+            .expect("model_judge stream");
+        let output = collect_text(events).await;
+
+        assert_eq!(output, "final answer");
+
+        let synthesis_reqs = synthesis_reqs.lock().unwrap();
+        assert_eq!(synthesis_reqs.len(), 2);
+        let initial_prompt = synthesis_reqs[0]
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User(user) => Some(user.plain_text()),
+                _ => None,
+            })
+            .expect("initial synthesis prompt");
+        assert!(initial_prompt.contains("Never return an empty assistant message"));
+
+        let retry_prompt = synthesis_reqs[1]
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User(user) => Some(user.plain_text()),
+                _ => None,
+            })
+            .expect("retry synthesis prompt");
+        assert!(retry_prompt.contains("previous model-judge synthesis response was invalid"));
+
+        let default_reqs = default_reqs.lock().unwrap();
+        let guidance = default_reqs[0]
+            .messages
+            .iter()
+            .skip(1)
+            .find_map(|message| match message {
+                Message::User(user) => Some(user.plain_text()),
+                _ => None,
+            })
+            .expect("guidance user message");
+        assert!(guidance.contains("A is the best available answer"));
+    }
+
+    #[tokio::test]
     async fn model_judge_falls_back_to_default_when_panel_fails() {
         // A synthesis member that never produces text would error, but with no
         // panels there is nothing to judge, so we fall straight through.
@@ -759,5 +963,40 @@ mod tests {
         let default_reqs = default_reqs.lock().unwrap();
         assert_eq!(default_reqs.len(), 1);
         assert_eq!(default_reqs[0].messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn model_judge_compaction_uses_default_member_model() {
+        let compact_reqs = Arc::new(Mutex::new(Vec::new()));
+        let default = ModelJudgeMember {
+            provider: Arc::new(CompactRecordingProvider {
+                requests: compact_reqs.clone(),
+            }),
+            model: resolved("gpt-5.5"),
+        };
+        let (synthesis, _) = member("synthesis", Some("unused"), None);
+        let model_judge = ModelJudgeProvider::new(default, synthesis, Vec::new());
+
+        let mut synthetic = resolved("model-judge:gpt-5.5");
+        synthetic.provider = ProviderName::from("model-judge-default");
+        let request = ProviderCompactionRequest {
+            session_id: Default::default(),
+            model: synthetic,
+            compacted_prefix: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            instructions: "compact".to_owned(),
+        };
+
+        model_judge
+            .compact(request, CancellationToken::new())
+            .await
+            .expect("model-judge compaction");
+
+        let compact_reqs = compact_reqs.lock().expect("compaction requests");
+        assert_eq!(compact_reqs.len(), 1);
+        assert_eq!(compact_reqs[0].model.provider.0, "fake");
+        assert_eq!(compact_reqs[0].model.model, "gpt-5.5");
+        assert!(!compact_reqs[0].model.model.starts_with("model-judge:"));
     }
 }

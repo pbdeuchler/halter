@@ -3,5 +3,5 @@ target/
 .secrets
 traces/
 Cargo.lock
-examples/halter.example.toml
+examples/*example.toml
 examples/*-test.md

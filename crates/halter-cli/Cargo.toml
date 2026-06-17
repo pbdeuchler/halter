@@ -9,10 +9,6 @@ edition.workspace = true
 name = "halter"
 path = "src/main.rs"
 
-[[bin]]
-name = "halter-cli"
-path = "src/main.rs"
-
 [features]
 advanced-tools = ["halter/advanced-tools"]
 ast-tools = ["halter/ast-tools"]

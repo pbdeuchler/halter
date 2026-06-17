@@ -7,6 +7,7 @@ use serde_json::Value;
 
 const RATE_LIMIT_CODE: &str = "rate_limit_exceeded";
 const RETRY_AFTER_PREFIX: &str = "Please try again in ";
+const INFERRED_CAPACITY_BACKOFF_MS: u64 = 750;
 /// Sentinel substring OpenRouter uses to wrap upstream-provider failures
 /// (`{"error": {"message": "Provider returned error", "metadata": {...}}}`).
 /// These are typically transient — the upstream model rate-limited, timed
@@ -57,13 +58,22 @@ pub(crate) fn classify(error: &OpenAIError) -> Retryability {
         OpenAIError::JSONDeserialize(_, content) => parse_openai_stream_error(content)
             .as_ref()
             .map(classify_api_error)
-            .unwrap_or(Retryability::Fatal),
+            .unwrap_or_else(|| {
+                capacity_backoff_hint(content)
+                    .map(|backoff_hint| Retryability::Retryable {
+                        backoff_hint: Some(backoff_hint),
+                    })
+                    .unwrap_or(Retryability::Fatal)
+            }),
         // Network-layer faults and SSE framing errors are inherently
         // retryable — they are the connection failing, not the API rejecting
         // the request.
-        OpenAIError::Reqwest(_) | OpenAIError::StreamError(_) => {
-            Retryability::Retryable { backoff_hint: None }
-        }
+        OpenAIError::Reqwest(error) => Retryability::Retryable {
+            backoff_hint: capacity_backoff_hint(&error.to_string()),
+        },
+        OpenAIError::StreamError(error) => Retryability::Retryable {
+            backoff_hint: capacity_backoff_hint(&error.to_string()),
+        },
         OpenAIError::FileSaveError(_)
         | OpenAIError::FileReadError(_)
         | OpenAIError::InvalidArgument(_) => Retryability::Fatal,
@@ -74,6 +84,10 @@ fn classify_api_error(api: &ApiError) -> Retryability {
     if openai_api_error_is_rate_limit(api) {
         Retryability::Retryable {
             backoff_hint: openai_api_error_retry_after(api),
+        }
+    } else if let Some(backoff_hint) = api_capacity_backoff_hint(api) {
+        Retryability::Retryable {
+            backoff_hint: Some(backoff_hint),
         }
     } else if matches!(
         api.code.as_deref(),
@@ -110,6 +124,18 @@ pub(crate) fn openai_api_error_retry_after(error: &ApiError) -> Option<Duration>
     openai_api_error_is_rate_limit(error)
         .then(|| parse_openai_retry_after_message(&error.message))
         .flatten()
+}
+
+fn capacity_backoff_hint(message: &str) -> Option<Duration> {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("overloaded") || lower.contains("capacity"))
+        .then_some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS))
+}
+
+fn api_capacity_backoff_hint(error: &ApiError) -> Option<Duration> {
+    capacity_backoff_hint(&error.message)
+        .or_else(|| error.r#type.as_deref().and_then(capacity_backoff_hint))
+        .or_else(|| error.code.as_deref().and_then(capacity_backoff_hint))
 }
 
 pub(crate) fn parse_openai_retry_after_message(message: &str) -> Option<Duration> {
@@ -264,6 +290,26 @@ mod tests {
     }
 
     #[test]
+    fn classify_marks_capacity_signals_retryable_with_small_hint() {
+        let cases = [
+            (None, None, "upstream provider is overloaded"),
+            (None, None, "The selected model is currently at CAPACITY."),
+            (Some("server_overloaded"), None, "temporarily unavailable"),
+        ];
+
+        for (code, kind, message) in cases {
+            let err = OpenAIError::ApiError(api_error(code, kind, message));
+            assert_eq!(
+                classify(&err),
+                Retryability::Retryable {
+                    backoff_hint: Some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS)),
+                },
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn classify_marks_stream_and_reqwest_failures_retryable() {
         let stream_err = OpenAIError::StreamError(Box::new(StreamError::EventStream(
             "connection reset".to_owned(),
@@ -271,6 +317,19 @@ mod tests {
         assert_eq!(
             classify(&stream_err),
             Retryability::Retryable { backoff_hint: None }
+        );
+    }
+
+    #[test]
+    fn classify_marks_stream_capacity_failure_retryable_with_small_hint() {
+        let stream_err = OpenAIError::StreamError(Box::new(StreamError::EventStream(
+            "provider overloaded".to_owned(),
+        )));
+        assert_eq!(
+            classify(&stream_err),
+            Retryability::Retryable {
+                backoff_hint: Some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS)),
+            }
         );
     }
 
@@ -386,6 +445,28 @@ mod tests {
         assert_eq!(
             classify(&err),
             Retryability::Retryable { backoff_hint: None }
+        );
+    }
+
+    #[test]
+    fn classifies_openrouter_upstream_capacity_wrapper_with_small_hint() {
+        let body = json!({
+            "error": {
+                "code": 400,
+                "message": "Provider returned error",
+                "metadata": {
+                    "provider_name": "Upstream",
+                    "raw": "model is at capacity"
+                }
+            }
+        });
+        let api_error = parse_openai_http_error(body.to_string().as_bytes()).expect("api error");
+        let err = OpenAIError::ApiError(api_error);
+        assert_eq!(
+            classify(&err),
+            Retryability::Retryable {
+                backoff_hint: Some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS)),
+            }
         );
     }
 

@@ -538,7 +538,7 @@ fn build_model_judge_model(
         provider: provider_name,
         provider_kind: default_leaf.provider_kind,
         api_kind: default_leaf.api_kind,
-        model: format!("model-judge:{}", default_leaf.model),
+        model: default_leaf.model,
         max_input_tokens: default_leaf.max_input_tokens,
         max_output_tokens: default_leaf.max_output_tokens,
         reasoning: default_leaf.reasoning,
@@ -830,6 +830,12 @@ mod tests {
             synthesis: leaf("gpt-synthesis"),
             panel: vec![leaf("gpt-panel-a"), leaf("gpt-panel-b")],
         });
+
+        let registry = build_model_registry(&config).expect("model registry");
+        let default_model = registry.default_model().expect("default model");
+        assert_eq!(default_model.provider.0, "model-judge-default");
+        assert_eq!(default_model.model, "gpt-default");
+        assert!(!default_model.model.starts_with("model-judge:"));
 
         let halter = HalterBuilder::default()
             .with_config(config)

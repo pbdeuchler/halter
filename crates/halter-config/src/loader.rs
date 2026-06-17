@@ -485,18 +485,18 @@ max_read_bytes = 99
     }
 
     #[test]
-    fn example_config_is_parseable() {
-        let parsed = parse_toml(include_str!("../../../examples/halter.example.toml"))
-            .expect("parse example config");
-        let config: HarnessConfig = parsed.try_into().expect("decode example config");
-        config.validate().expect("example config should validate");
+    fn fixture_config_is_parseable() {
+        let parsed = parse_toml(include_str!("../tests/fixtures/halter.toml"))
+            .expect("parse fixture config");
+        let config: HarnessConfig = parsed.try_into().expect("decode fixture config");
+        config.validate().expect("fixture config should validate");
         validate_runtime_requirements_with(&config, |name| {
             Some(OsString::from(match name {
                 "OPENAI_API_KEY" | "OPENROUTER_API_KEY" => "test-key",
                 _ => unreachable!("unexpected env var: {name}"),
             }))
         })
-        .expect("example config runtime requirements should validate");
+        .expect("fixture config runtime requirements should validate");
     }
 
     #[test]
