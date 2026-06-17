@@ -291,8 +291,8 @@ pub fn parse_json_response<T: DeserializeOwned>(raw: &str) -> Result<T, String> 
 }
 
 pub fn json_slice(raw: &str) -> Option<&str> {
-    let start = raw.find(|ch| ch == '{' || ch == '[')?;
-    let end = raw.rfind(|ch| ch == '}' || ch == ']')?;
+    let start = raw.find(['{', '['])?;
+    let end = raw.rfind(['}', ']'])?;
     (end >= start).then_some(raw[start..=end].trim())
 }
 

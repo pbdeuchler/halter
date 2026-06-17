@@ -201,7 +201,14 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to find requested issue #{number} after fetch"))?;
         candidate_set_for_issue(issue)
     } else {
-        propose_issue_candidates(&glm, &worktree, &repo, &corpus).await?
+        propose_issue_candidates(
+            &glm,
+            &worktree,
+            &repo,
+            &corpus,
+            project_system_prompt.as_deref(),
+        )
+        .await?
     };
     let selection = judge_issue_plan(
         &judge,
@@ -275,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
         &implementation_plan,
         &issue_numbers,
         &final_diff,
+        project_system_prompt.as_deref(),
     )
     .await?;
     let pr = github
@@ -661,18 +669,41 @@ struct AgentRun {
     text: String,
 }
 
-fn session_init_with_project_guidance(
+const FACTORY_TURN_USER_MESSAGE: &str =
+    "Execute the appended turn-specific instructions for this software factory stage.";
+
+#[derive(Debug, Clone, Copy)]
+enum FactorySystemPrompt {
+    General,
+    Coding,
+}
+
+impl FactorySystemPrompt {
+    fn segment(self) -> PromptSegment {
+        match self {
+            Self::General => prompts::default_system_prompt_segment(),
+            Self::Coding => prompts::coding_agent_prompt_segment(),
+        }
+    }
+}
+
+fn session_init_with_appended_context(
     worktree: &Path,
+    system_prompt: FactorySystemPrompt,
+    turn_instructions: &str,
     project_system_prompt: Option<&str>,
-) -> SessionInit {
+) -> anyhow::Result<SessionInit> {
     let mut init = SessionInit {
         working_dir: worktree.to_path_buf(),
+        system_prompt_seed: vec![system_prompt.segment()],
         ..SessionInit::default()
     };
     if let Some(segment) = project_guidance_prompt_segment(project_system_prompt) {
         init.system_prompt_seed.push(segment);
     }
-    init
+    init.system_prompt_seed
+        .push(turn_instructions_prompt_segment(turn_instructions)?);
+    Ok(init)
 }
 
 fn project_guidance_prompt_segment(project_system_prompt: Option<&str>) -> Option<PromptSegment> {
@@ -680,14 +711,29 @@ fn project_guidance_prompt_segment(project_system_prompt: Option<&str>) -> Optio
     if text.is_empty() {
         return None;
     }
-    Some(PromptSegment {
+    Some(append_prompt_segment(text))
+}
+
+fn turn_instructions_prompt_segment(turn_instructions: &str) -> anyhow::Result<PromptSegment> {
+    let turn_instructions = turn_instructions.trim();
+    if turn_instructions.is_empty() {
+        bail!("failed to start agent turn: turn-specific instructions are empty");
+    }
+    Ok(append_prompt_segment(&format!(
+        "# Turn-Specific Instructions\n\n{turn_instructions}"
+    )))
+}
+
+fn append_prompt_segment(text: &str) -> PromptSegment {
+    let text = text.trim().to_owned();
+    PromptSegment {
         id: PromptSegmentId::new(),
-        text: text.to_owned(),
-        volatility: Volatility::SessionStable,
-        cache_scope: CacheScope::PrefixCacheable,
-        content_hash: hash_prompt_text(text),
-        kind: PromptSegmentKind::System,
-    })
+        content_hash: hash_prompt_text(&text),
+        text,
+        volatility: Volatility::TurnDynamic,
+        cache_scope: CacheScope::Dynamic,
+        kind: PromptSegmentKind::Append,
+    }
 }
 
 fn hash_prompt_text(text: &str) -> String {
@@ -696,13 +742,22 @@ fn hash_prompt_text(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-async fn run_agent(
+async fn run_coding_agent_with_system_prompt(
     harness: &Halter,
     worktree: &Path,
     label: &str,
     prompt: impl Into<String>,
+    project_system_prompt: Option<&str>,
 ) -> anyhow::Result<AgentRun> {
-    run_agent_with_system_prompt(harness, worktree, label, prompt, None).await
+    run_agent_with_prompt_kind(
+        harness,
+        worktree,
+        label,
+        prompt,
+        FactorySystemPrompt::Coding,
+        project_system_prompt,
+    )
+    .await
 }
 
 async fn run_agent_with_system_prompt(
@@ -712,14 +767,38 @@ async fn run_agent_with_system_prompt(
     prompt: impl Into<String>,
     project_system_prompt: Option<&str>,
 ) -> anyhow::Result<AgentRun> {
+    run_agent_with_prompt_kind(
+        harness,
+        worktree,
+        label,
+        prompt,
+        FactorySystemPrompt::General,
+        project_system_prompt,
+    )
+    .await
+}
+
+async fn run_agent_with_prompt_kind(
+    harness: &Halter,
+    worktree: &Path,
+    label: &str,
+    prompt: impl Into<String>,
+    system_prompt: FactorySystemPrompt,
+    project_system_prompt: Option<&str>,
+) -> anyhow::Result<AgentRun> {
     info!(stage = label, "starting agent turn");
+    let turn_instructions = prompt.into();
     let session = harness
-        .new_session(session_init_with_project_guidance(
+        .new_session(session_init_with_appended_context(
             worktree,
+            system_prompt,
+            &turn_instructions,
             project_system_prompt,
-        ))
+        )?)
         .await?;
-    let mut events = session.submit_turn(Turn::user(prompt.into())).await?;
+    let mut events = session
+        .submit_turn(Turn::user(FACTORY_TURN_USER_MESSAGE))
+        .await?;
     let mut latest_text = None;
     let mut delta_text = String::new();
     let mut usage = Usage::default();
@@ -776,6 +855,7 @@ async fn propose_issue_candidates(
     worktree: &Path,
     repo: &RepoSlug,
     corpus: &str,
+    project_system_prompt: Option<&str>,
 ) -> anyhow::Result<CandidateSet> {
     let prompt = format!(
         r#"You are triaging open GitHub issues for {repo}.
@@ -804,9 +884,15 @@ ISSUE CORPUS:
 {corpus}
 "#
     );
-    let raw = run_agent(glm, worktree, "glm issue grouping", prompt)
-        .await?
-        .text;
+    let raw = run_agent_with_system_prompt(
+        glm,
+        worktree,
+        "glm issue grouping",
+        prompt,
+        project_system_prompt,
+    )
+    .await?
+    .text;
     let candidates: CandidateSet = parse_json_response(&raw).map_err(anyhow::Error::msg)?;
     if candidates.candidates.is_empty() {
         bail!("GLM did not return any candidate issue groups");
@@ -940,7 +1026,7 @@ IMPLEMENTATION PLAN:
 "#,
     );
     let prompt = format!("{prompt}{implementation_plan}\n");
-    run_agent_with_system_prompt(
+    run_coding_agent_with_system_prompt(
         implementer,
         worktree,
         "kimi implementation",
@@ -1042,7 +1128,7 @@ REVIEW RESULT:
 {review_json}
 "#
         );
-        run_agent_with_system_prompt(
+        run_coding_agent_with_system_prompt(
             implementer,
             worktree,
             "kimi review repair",
@@ -1088,7 +1174,7 @@ BRANCH DIFF:
 {diff}
 "#
     );
-    let raw = run_agent_with_system_prompt(
+    let raw = run_coding_agent_with_system_prompt(
         reviewer,
         worktree,
         "gpt code review",
@@ -1108,6 +1194,7 @@ async fn draft_pr(
     implementation_plan: &str,
     issue_numbers: &[u64],
     diff: &str,
+    project_system_prompt: Option<&str>,
 ) -> anyhow::Result<PullRequestDraft> {
     let closing_lines = issue_numbers
         .iter()
@@ -1141,9 +1228,15 @@ FINAL BRANCH DIFF:
 "#,
         serde_json::to_string_pretty(selection)?
     );
-    let raw = run_agent(pr_writer, worktree, "gemma pr draft", prompt)
-        .await?
-        .text;
+    let raw = run_agent_with_system_prompt(
+        pr_writer,
+        worktree,
+        "gemma pr draft",
+        prompt,
+        project_system_prompt,
+    )
+    .await?
+    .text;
     parse_json_response(&raw).map_err(anyhow::Error::msg)
 }
 
@@ -1313,7 +1406,7 @@ FEEDBACK:
 {feedback}
 "#
     );
-    run_agent_with_system_prompt(
+    run_coding_agent_with_system_prompt(
         implementer,
         worktree,
         "kimi pr feedback",
@@ -1869,6 +1962,17 @@ mod tests {
     }
 
     #[test]
+    fn factory_system_prompt_segments_use_built_in_defaults() {
+        let general = FactorySystemPrompt::General.segment();
+        assert_eq!(general.text, prompts::default_system_prompt());
+        assert_eq!(general.kind, PromptSegmentKind::System);
+
+        let coding = FactorySystemPrompt::Coding.segment();
+        assert_eq!(coding.text, prompts::default_coding_agent_prompt());
+        assert_eq!(coding.kind, PromptSegmentKind::System);
+    }
+
+    #[test]
     fn project_guidance_prompt_segment_covers_empty_and_non_empty_inputs() {
         assert!(project_guidance_prompt_segment(None).is_none());
         assert!(project_guidance_prompt_segment(Some(" \n")).is_none());
@@ -1877,21 +1981,69 @@ mod tests {
             project_guidance_prompt_segment(Some("Follow project rules.")).expect("segment");
 
         assert_eq!(segment.text, "Follow project rules.");
-        assert_eq!(segment.kind, PromptSegmentKind::System);
-        assert_eq!(segment.volatility, Volatility::SessionStable);
-        assert_eq!(segment.cache_scope, CacheScope::PrefixCacheable);
+        assert_eq!(segment.kind, PromptSegmentKind::Append);
+        assert_eq!(segment.volatility, Volatility::TurnDynamic);
+        assert_eq!(segment.cache_scope, CacheScope::Dynamic);
         assert_eq!(segment.content_hash.len(), 64);
     }
 
     #[test]
-    fn session_init_with_project_guidance_appends_system_prompt_seed() {
-        let init = session_init_with_project_guidance(Path::new("/tmp/project"), Some("rules"));
+    fn turn_instructions_prompt_segment_covers_non_empty_and_empty_inputs() {
+        let segment =
+            turn_instructions_prompt_segment("  Run the focused tests.  ").expect("segment");
+
+        assert_eq!(segment.kind, PromptSegmentKind::Append);
+        assert_eq!(segment.volatility, Volatility::TurnDynamic);
+        assert_eq!(segment.cache_scope, CacheScope::Dynamic);
+        assert!(segment.text.contains("# Turn-Specific Instructions"));
+        assert!(segment.text.contains("Run the focused tests."));
+
+        let error = turn_instructions_prompt_segment(" \n").expect_err("empty should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("turn-specific instructions are empty")
+        );
+    }
+
+    #[test]
+    fn session_init_with_appended_context_uses_coding_prompt_and_append_segments() {
+        let init = session_init_with_appended_context(
+            Path::new("/tmp/project"),
+            FactorySystemPrompt::Coding,
+            "do the work",
+            Some("rules"),
+        )
+        .expect("session init");
 
         assert_eq!(init.working_dir, PathBuf::from("/tmp/project"));
-        assert!(init.system_prompt_seed.len() >= 2);
-        let last = init.system_prompt_seed.last().expect("last system segment");
-        assert_eq!(last.text, "rules");
-        assert_eq!(last.kind, PromptSegmentKind::System);
+        assert_eq!(init.system_prompt_seed.len(), 3);
+        assert_eq!(
+            init.system_prompt_seed[0].text,
+            prompts::default_coding_agent_prompt()
+        );
+        assert_eq!(init.system_prompt_seed[0].kind, PromptSegmentKind::System);
+        assert_eq!(init.system_prompt_seed[1].text, "rules");
+        assert_eq!(init.system_prompt_seed[1].kind, PromptSegmentKind::Append);
+        assert!(init.system_prompt_seed[2].text.contains("do the work"));
+        assert_eq!(init.system_prompt_seed[2].kind, PromptSegmentKind::Append);
+    }
+
+    #[test]
+    fn session_init_with_appended_context_rejects_empty_turn_instructions() {
+        let error = session_init_with_appended_context(
+            Path::new("/tmp/project"),
+            FactorySystemPrompt::General,
+            " \n",
+            None,
+        )
+        .expect_err("empty turn instructions should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("turn-specific instructions are empty")
+        );
     }
 
     #[tokio::test]

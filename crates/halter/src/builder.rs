@@ -14,7 +14,7 @@ use halter_config::{
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
-    HookWarning, ModelId, ModelRole, ProviderName, PromptSegmentKind, ResolvedModel,
+    HookWarning, ModelId, ModelRole, PromptSegmentKind, ProviderName, ResolvedModel,
     ResourceSnapshot,
 };
 use halter_providers::{
@@ -366,7 +366,9 @@ fn configured_system_prompt(prompts: &PromptsConfig) -> Option<String> {
     }
     match prompts.preset {
         SystemPromptPreset::General => None,
-        SystemPromptPreset::Coding => Some(halter_runtime::default_coding_agent_prompt().to_owned()),
+        SystemPromptPreset::Coding => {
+            Some(halter_runtime::default_coding_agent_prompt().to_owned())
+        }
     }
 }
 
@@ -1263,7 +1265,10 @@ mod tests {
             system_prompt: None,
         };
         let init = apply_prompt_config(&prompts, SessionInit::default());
-        assert_eq!(seed_text(&init), halter_runtime::default_coding_agent_prompt());
+        assert_eq!(
+            seed_text(&init),
+            halter_runtime::default_coding_agent_prompt()
+        );
     }
 
     #[test]
