@@ -843,7 +843,10 @@ mod tests {
         let (mut read, mut write) = connect.into_split();
         write.write_all(b"G").await.expect("write one byte");
 
-        let result = server.await.expect("server task");
+        let result = tokio::time::timeout(CALLBACK_READ_DEADLINE + Duration::from_secs(2), server)
+            .await
+            .expect("server should hit read deadline")
+            .expect("server task");
         let error = result.expect_err("slow client should time out");
         assert!(error.to_string().contains("OAuth callback read timed out"));
 
@@ -863,22 +866,17 @@ mod tests {
             handle_callback_connection(stream, state).await
         });
 
-        // Connect and immediately close the write side, so the server sees zero bytes.
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
-        stream.shutdown().await.expect("shutdown write");
-        // Keep the read half around briefly so the kernel has time to deliver EOF.
-        let _ = stream.try_read(&mut [0u8; 1]);
-        drop(stream);
+        // Connect and send nothing while keeping the socket open, so the server must enforce the
+        // read deadline instead of observing EOF.
+        let stream = TcpStream::connect(addr).await.expect("connect");
 
-        let result = server.await.expect("server task");
-        let error = result.expect_err("empty connection should time out or fail");
-        assert!(
-            error.to_string().contains("OAuth callback read timed out")
-                || error
-                    .to_string()
-                    .contains("OAuth callback connection closed before headers were complete"),
-            "unexpected error: {error}"
-        );
+        let result = tokio::time::timeout(CALLBACK_READ_DEADLINE + Duration::from_secs(2), server)
+            .await
+            .expect("server should hit read deadline")
+            .expect("server task");
+        let error = result.expect_err("idle client should time out");
+        assert!(error.to_string().contains("OAuth callback read timed out"));
+        drop(stream);
     }
 
     #[tokio::test]
