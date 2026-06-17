@@ -99,6 +99,8 @@ struct ApiKeyExchangeResponse {
 }
 
 const MAX_CALLBACK_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_STRAY_CALLBACK_REQUESTS: usize = 16;
+const CALLBACK_READ_DEADLINE: Duration = Duration::from_secs(5);
 
 pub(crate) async fn run(command: OpenAiOAuthCommand, output: &mut dyn Write) -> anyhow::Result<()> {
     validate_command(&command)?;
@@ -199,15 +201,10 @@ fn generate_pkce() -> PkceCodes {
 }
 
 fn generate_url_token() -> String {
-    let mut bytes = Vec::with_capacity(64);
-    for uuid in [
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-    ] {
-        bytes.extend_from_slice(uuid.as_bytes());
-    }
+    let mut bytes = [0u8; 32];
+    let (left, right) = bytes.split_at_mut(16);
+    left.copy_from_slice(Uuid::new_v4().as_bytes());
+    right.copy_from_slice(Uuid::new_v4().as_bytes());
     base64_url_no_pad(bytes)
 }
 
@@ -287,14 +284,23 @@ async fn await_callback(
     timeout: Duration,
 ) -> anyhow::Result<String> {
     tokio::time::timeout(timeout, async {
+        let mut stray_count: usize = 0;
         loop {
             let (stream, peer_addr) = listener
                 .accept()
                 .await
                 .context("failed to accept OAuth callback connection")?;
             debug!(%peer_addr, "accepted OAuth callback connection");
-            if let Some(code) = handle_callback_connection(stream, expected_state).await? {
-                return Ok(code);
+            match handle_callback_connection(stream, expected_state).await? {
+                Some(code) => return Ok(code),
+                None => {
+                    stray_count += 1;
+                    if stray_count >= MAX_STRAY_CALLBACK_REQUESTS {
+                        anyhow::bail!(
+                            "OAuth callback listener closed after {MAX_STRAY_CALLBACK_REQUESTS} stray requests without receiving the expected callback"
+                        );
+                    }
+                }
             }
         }
     })
@@ -353,9 +359,9 @@ async fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let mut request = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
-        let n = stream
-            .read(&mut chunk)
+        let n = tokio::time::timeout(CALLBACK_READ_DEADLINE, stream.read(&mut chunk))
             .await
+            .context("OAuth callback read timed out")?
             .context("failed to read OAuth callback request")?;
         if n == 0 {
             anyhow::bail!("OAuth callback connection closed before headers were complete");
@@ -611,12 +617,13 @@ mod tests {
     fn generated_url_token_is_pkce_compatible() {
         let token = generate_url_token();
 
-        assert!(token.len() >= 43);
+        assert_eq!(token.len(), 43);
         assert!(
             token
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
         );
+        assert_ne!(generate_url_token(), token, "tokens should be unique");
     }
 
     #[tokio::test]
@@ -712,6 +719,166 @@ mod tests {
 
         assert_eq!(code, None);
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn await_callback_returns_code_after_strays_and_then_shuts_down_on_cap() {
+        let listener = TcpListener::bind(callback_addr(0)).await.expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let state = "expected-state";
+        let expected_code = "expected-code";
+
+        let server = tokio::spawn(await_callback(listener, state, Duration::from_secs(60)));
+
+        // Max allowed strays should be tolerated before the real callback.
+        for _ in 0..MAX_STRAY_CALLBACK_REQUESTS - 1 {
+            let response =
+                send_callback_request(addr, "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await;
+            assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+        }
+
+        let callback_response = send_callback_request(
+            addr,
+            &format!(
+                "GET /auth/callback?code={expected_code}&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            ),
+        )
+        .await;
+        let code = server.await.expect("server task").expect("callback result");
+
+        assert_eq!(code, expected_code);
+        assert!(callback_response.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[tokio::test]
+    async fn await_callback_errors_after_stray_request_cap_exceeded() {
+        let listener = TcpListener::bind(callback_addr(0)).await.expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let state = "expected-state";
+
+        let server = tokio::spawn(await_callback(listener, state, Duration::from_secs(60)));
+
+        // Send ignored paths until the budget is exhausted. The last connection attempt may be
+        // refused because the listener is dropped as soon as the cap is exceeded.
+        let mut accepted_count = 0;
+        let mut refused_count = 0;
+        for i in 0..=MAX_STRAY_CALLBACK_REQUESTS {
+            match TcpStream::connect(addr).await {
+                Ok(mut stream) => {
+                    stream
+                        .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .await
+                        .expect("write request");
+                    stream.shutdown().await.expect("shutdown write");
+                    let mut response = Vec::new();
+                    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                        stream.read_to_end(&mut response).await.ok();
+                    })
+                    .await;
+                    let response = String::from_utf8(response).expect("utf8 response");
+                    if i < MAX_STRAY_CALLBACK_REQUESTS {
+                        assert!(
+                            response.starts_with("HTTP/1.1 404 Not Found"),
+                            "stray {i} should be ignored"
+                        );
+                    }
+                    accepted_count += 1;
+                }
+                Err(_) => {
+                    refused_count += 1;
+                }
+            }
+        }
+        assert!(
+            accepted_count >= MAX_STRAY_CALLBACK_REQUESTS,
+            "at least {MAX_STRAY_CALLBACK_REQUESTS} strays should be accepted before the listener closes (accepted {accepted_count}, refused {refused_count})"
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("server task should finish promptly after cap exceeded")
+            .expect("server join");
+        let error = result.expect_err("exceeded stray cap should error");
+        assert!(
+            error
+                .to_string()
+                .contains("OAuth callback listener closed after")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&MAX_STRAY_CALLBACK_REQUESTS.to_string())
+        );
+
+        // The listener should no longer accept new connections once the server task finished.
+        let start = tokio::time::Instant::now();
+        let mut listener_closed = false;
+        while start.elapsed() < Duration::from_millis(500) {
+            if TcpStream::connect(addr).await.is_err() {
+                listener_closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            listener_closed,
+            "listener should be closed after stray cap exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_http_request_times_out_on_slow_loris_client() {
+        let listener = TcpListener::bind(callback_addr(0)).await.expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let state = "state";
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_callback_connection(stream, state).await
+        });
+
+        // Connect and send only a partial request; do not close the write side.
+        let connect = TcpStream::connect(addr).await.expect("connect");
+        let (mut read, mut write) = connect.into_split();
+        write.write_all(b"G").await.expect("write one byte");
+
+        let result = server.await.expect("server task");
+        let error = result.expect_err("slow client should time out");
+        assert!(error.to_string().contains("OAuth callback read timed out"));
+
+        // Cleanup the idle client connection so the test file descriptor is released promptly.
+        drop(write);
+        let _ = read.read_to_end(&mut Vec::new()).await;
+    }
+
+    #[tokio::test]
+    async fn read_http_request_times_out_on_empty_connection() {
+        let listener = TcpListener::bind(callback_addr(0)).await.expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let state = "state";
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_callback_connection(stream, state).await
+        });
+
+        // Connect and immediately close the write side, so the server sees zero bytes.
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.shutdown().await.expect("shutdown write");
+        // Keep the read half around briefly so the kernel has time to deliver EOF.
+        let _ = stream.try_read(&mut [0u8; 1]);
+        drop(stream);
+
+        let result = server.await.expect("server task");
+        let error = result.expect_err("empty connection should time out or fail");
+        assert!(
+            error.to_string().contains("OAuth callback read timed out")
+                || error
+                    .to_string()
+                    .contains("OAuth callback connection closed before headers were complete"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -898,17 +1065,29 @@ mod tests {
     }
 
     async fn send_callback_request(addr: SocketAddr, request: &str) -> String {
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let connect = TcpStream::connect(addr).await;
+        let mut stream = match connect {
+            Ok(stream) => stream,
+            // Caller may intentionally probe after the listener has been dropped; surface the error.
+            Err(error) => panic!("connect: {error}"),
+        };
         stream
             .write_all(request.as_bytes())
             .await
             .expect("write request");
         stream.shutdown().await.expect("shutdown write");
         let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("read response");
+        // Guard against a server that never closes the connection with a small read timeout.
+        let read_result = tokio::time::timeout(Duration::from_secs(3), async {
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read response");
+        })
+        .await;
+        if read_result.is_err() {
+            // The server may have dropped the listener; return what we have (possibly empty).
+        }
         String::from_utf8(response).expect("utf8 response")
     }
 
