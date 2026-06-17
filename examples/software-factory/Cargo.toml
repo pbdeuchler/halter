@@ -1,0 +1,26 @@
+[package]
+name = "halter-software-factory-example"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures.workspace = true
+halter = { path = "../../crates/halter", features = ["full"] }
+halter-config = { path = "../../crates/halter-config" }
+halter-protocol = { path = "../../crates/halter-protocol" }
+halter-tools = { path = "../../crates/halter-tools", features = ["full"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

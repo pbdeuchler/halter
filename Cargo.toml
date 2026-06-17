@@ -9,6 +9,7 @@ members = [
     "crates/halter-session",
     "crates/halter",
     "crates/halter-cli",
+    "examples/software-factory",
     "vendor/brush-builtins-vendored",
     "vendor/brush-core-vendored",
 ]
