@@ -25,7 +25,12 @@ impl Tool for GlobTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("glob"),
-            description: "Expand a glob pattern relative to the working directory".to_owned(),
+            description: "Find files by glob pattern (e.g. `**/*.rs`, `src/**/*.ts`) relative \
+                to the working directory, honoring .gitignore. Results are sorted by path; set \
+                `sort_by_mtime` to order by most-recently-modified instead. Filter with \
+                `file_type` (file/dir/symlink). For open-ended searches that need several \
+                glob/grep rounds, delegate to a subagent instead."
+                .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -33,7 +33,13 @@ impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("read"),
-            description: format!("Read up to {MAX_READ_LIMIT} UTF-8 lines from disk"),
+            description: format!(
+                "Read a UTF-8 text file, up to {MAX_READ_LIMIT} lines per call. `path` may \
+                 be absolute or relative to the working directory. Page through larger files \
+                 with `offset` (1-based start line) and `limit`; the response includes \
+                 `total_lines`, so a returned count below it means the file continues past \
+                 the window. Returns the raw file text plus its sha256."
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -18,7 +18,12 @@ impl Tool for WriteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("write"),
-            description: "Write a UTF-8 file to disk".to_owned(),
+            description: "Write a UTF-8 file to disk, overwriting any existing file at `path` \
+                with an atomic write. Prefer `edit` for changing an existing file — it only \
+                touches the matched region. Use `write` for new files or full rewrites. Don't \
+                create files that aren't needed, and don't add README or `*.md` docs unless \
+                asked."
+                .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

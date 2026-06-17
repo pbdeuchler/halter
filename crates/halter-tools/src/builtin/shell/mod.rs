@@ -25,7 +25,10 @@ impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("shell"),
-            description: "Run a command in a persistent shell session".to_owned(),
+            description: "Run a command in a persistent shell session: the working directory, \
+                environment, and shell state carry over between calls. Commands are subject to \
+                the configured allowlist and timeout."
+                .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

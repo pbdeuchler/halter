@@ -717,10 +717,29 @@ pub struct SearchRoots {
     pub roots: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+/// Which built-in system prompt a session starts from when no explicit
+/// `system_prompt` override is set.
+pub enum SystemPromptPreset {
+    /// The general-purpose agent prompt (the default).
+    #[default]
+    General,
+    /// The batteries-included coding-agent prompt — a quick on-ramp for SDK
+    /// users who want a working coding agent.
+    Coding,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 /// Prompt-related config.
 pub struct PromptsConfig {
+    /// Which built-in system prompt to start from. Ignored when
+    /// `system_prompt` is set.
+    #[serde(default)]
+    pub preset: SystemPromptPreset,
+    /// Full override of the session system prompt. Wins over `preset`. When
+    /// unset, the built-in prompt named by `preset` is used.
     #[serde(default)]
     pub system_prompt: Option<String>,
 }

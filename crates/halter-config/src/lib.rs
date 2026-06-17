@@ -19,6 +19,7 @@ pub use schema::{
     ModelConfig, ModelJudgeConfig, ModelSlot, ModelSlotRef, ModelsConfig, NetworkPolicyConfig,
     OpenAiOAuthConfig, PolicyConfig, PromptsConfig, ProviderConfig, ProvidersConfig,
     ResolvedProviderAuth, ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID,
-    SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig, ToolsConfig,
+    SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig,
+    SystemPromptPreset, ToolsConfig,
     resolve_provider_runtime_config,
 };

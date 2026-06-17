@@ -27,7 +27,12 @@ impl Tool for GrepTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("grep"),
-            description: "Search file contents with regex filters and optional context".to_owned(),
+            description: "Search file contents with regular expressions (ripgrep syntax). \
+                Narrow the file set with `glob` (e.g. `*.rs`) or `type` (e.g. `rust`). \
+                `output_mode` is `content` (matching lines, the default), `count`, or \
+                `files_with_matches`. Escape literal braces in patterns (e.g. \
+                `interface\\{\\}`); set `multiline` for patterns that span lines."
+                .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

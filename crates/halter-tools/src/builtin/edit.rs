@@ -20,7 +20,13 @@ impl Tool for EditTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("edit"),
-            description: "Replace an exact string in a UTF-8 file using an atomic write".to_owned(),
+            description: "Replace an exact string in a UTF-8 file with an atomic write. \
+                `old_string` must match the file's raw text exactly, including whitespace, \
+                and be unique — keep it minimal, just enough context to be unique. If it is \
+                not unique the edit fails: add surrounding context, or set `replace_all` to \
+                change every occurrence (handy for renames). Pass `expected_sha256` (from \
+                `read`) to fail fast if the file changed underneath you."
+                .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

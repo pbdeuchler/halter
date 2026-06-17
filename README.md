@@ -244,6 +244,38 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### Default prompts and the built-in coding agent
+
+halter ships three built-in prompts, all available to SDK users:
+
+- a **general-purpose system prompt** (the default for every session),
+- a **batteries-included coding-agent prompt** — a quick on-ramp for a working coding agent, and
+- the **conversation-compaction** instructions used by the default context manager.
+
+The two system prompts are assembled from a shared behavioral core plus a small role-specific intro, so common guidance (acting autonomously in headless runs, preferring the provided tools, honesty, safety) is defined in exactly one place.
+
+Read or compose them through the `halter::prompts` module, and seed a session with one via `SessionInit::with_system_prompt`:
+
+```rust
+use halter::prelude::*;
+use halter::prompts;
+
+// Spin up a coding agent in one line:
+let session = harness
+    .new_session(SessionInit::default().with_system_prompt(prompts::default_coding_agent_prompt()))
+    .await?;
+```
+
+Or select a built-in from config — `prompts.preset` picks the built-in prompt, and `prompts.system_prompt` overrides it entirely:
+
+```toml
+[prompts]
+preset = "coding"            # "general" (default) | "coding"
+# system_prompt = "..."      # full override; wins over preset
+```
+
+System-prompt precedence, most specific first: an explicit per-session prompt (`SessionInit::with_system_prompt`) > `prompts.system_prompt` > `prompts.preset` > the built-in general-purpose default.
+
 ---
 
 ## Crates
@@ -265,7 +297,7 @@ async fn main() -> anyhow::Result<()> {
 - model roles (`default`, `small`, `subagent`), with `default` and `subagent`
   optionally backed by a `"model_judge"` panel via `[models.model_judge]`
 - resource roots
-- prompts
+- prompts (a built-in `preset` plus a full `system_prompt` override)
 - context compaction settings
 - tool enablement
 - policy
@@ -366,6 +398,9 @@ reasoning = "low"
 provider = "openai"
 model = "gpt-5-mini"
 reasoning = "medium"
+
+[prompts]
+preset = "general"   # "general" (default) | "coding"; system_prompt overrides either
 
 [resources.skills]
 roots = ["./.agent/skills"]
@@ -551,6 +586,7 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
         },
         prompts: PromptsConfig {
             system_prompt: Some(SYSTEM_PROMPT.to_owned()),
+            ..PromptsConfig::default()
         },
         context: ContextConfig {
             compaction_threshold: 200_000,

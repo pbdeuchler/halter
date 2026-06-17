@@ -1,5 +1,7 @@
 // pattern: Functional Core
 
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
 use halter_protocol::{
     AssembledPrompt, CacheBreakpoints, CacheScope, ContentHash, ContextPlan, Message,
@@ -9,7 +11,17 @@ use sha2::{Digest, Sha256};
 
 use crate::compaction::stable_json;
 
-const DEFAULT_SYSTEM_PROMPT_MARKDOWN: &str = include_str!("../prompts/default-system.md");
+const AGENT_CORE_MARKDOWN: &str = include_str!("../prompts/agent-core.md");
+const SYSTEM_PROMPT_INTRO_MARKDOWN: &str = include_str!("../prompts/system-prompt-intro.md");
+const CODING_AGENT_INTRO_MARKDOWN: &str = include_str!("../prompts/coding-agent-intro.md");
+const DEFAULT_COMPACTION_PROMPT_MARKDOWN: &str = include_str!("../prompts/default-compaction.md");
+
+// Both system prompts are assembled from a shared behavioral core plus a
+// role-specific intro, so common guidance lives in one place (agent-core.md).
+static DEFAULT_SYSTEM_PROMPT: LazyLock<String> =
+    LazyLock::new(|| compose_prompt(&[SYSTEM_PROMPT_INTRO_MARKDOWN, AGENT_CORE_MARKDOWN]));
+static DEFAULT_CODING_AGENT_PROMPT: LazyLock<String> =
+    LazyLock::new(|| compose_prompt(&[CODING_AGENT_INTRO_MARKDOWN, AGENT_CORE_MARKDOWN]));
 
 #[async_trait]
 /// Turns a [`ContextPlan`] into provider-ready prompt material.
@@ -22,22 +34,65 @@ pub trait PromptAssembler: Send + Sync {
 /// Default prompt assembler used by the runtime.
 pub struct DefaultPromptAssembler;
 
-#[must_use]
-pub(crate) fn default_system_prompt_text() -> &'static str {
-    DEFAULT_SYSTEM_PROMPT_MARKDOWN.trim()
+/// Join prompt fragments into one document: each fragment is trimmed, empty
+/// ones are dropped, and the rest are separated by a blank line.
+fn compose_prompt(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
+/// The built-in general-purpose system prompt text (role intro + shared core).
 #[must_use]
-pub(crate) fn default_system_prompt_segment() -> PromptSegment {
-    let text = default_system_prompt_text().to_owned();
+pub fn default_system_prompt() -> &'static str {
+    DEFAULT_SYSTEM_PROMPT.as_str()
+}
+
+/// The built-in, batteries-included coding-agent system prompt text (coding
+/// intro + shared core). Drop it into a session (see
+/// [`coding_agent_prompt_segment`] or `SessionInit::with_system_prompt`) to get
+/// a working coding agent quickly.
+#[must_use]
+pub fn default_coding_agent_prompt() -> &'static str {
+    DEFAULT_CODING_AGENT_PROMPT.as_str()
+}
+
+/// The built-in conversation-compaction instructions used by the default
+/// context manager.
+#[must_use]
+pub fn default_compaction_prompt() -> &'static str {
+    DEFAULT_COMPACTION_PROMPT_MARKDOWN.trim()
+}
+
+/// Build a [`PromptSegment`] holding an arbitrary system prompt. Use this to
+/// install a custom or built-in system prompt as the session's seed.
+#[must_use]
+pub fn system_prompt_segment(text: &str) -> PromptSegment {
+    let text = text.to_owned();
+    let content_hash = hash_prompt_text(&text);
     PromptSegment {
         id: PromptSegmentId::new(),
-        text: text.clone(),
+        text,
         volatility: Volatility::Static,
         cache_scope: CacheScope::PrefixCacheable,
-        content_hash: hash_prompt_text(&text),
+        content_hash,
         kind: PromptSegmentKind::System,
     }
+}
+
+/// The default general-purpose system prompt as a [`PromptSegment`].
+#[must_use]
+pub fn default_system_prompt_segment() -> PromptSegment {
+    system_prompt_segment(default_system_prompt())
+}
+
+/// The batteries-included coding-agent system prompt as a [`PromptSegment`].
+#[must_use]
+pub fn coding_agent_prompt_segment() -> PromptSegment {
+    system_prompt_segment(default_coding_agent_prompt())
 }
 
 /// Build a single skill segment from a SkillDef. Skill segments live
@@ -234,10 +289,56 @@ mod tests {
     fn default_system_prompt_segment_loads_embedded_markdown() {
         let segment = default_system_prompt_segment();
 
-        assert_eq!(segment.text, default_system_prompt_text());
+        assert_eq!(segment.text, default_system_prompt());
         assert!(!segment.text.is_empty());
         assert_eq!(segment.volatility, Volatility::Static);
         assert_eq!(segment.cache_scope, CacheScope::PrefixCacheable);
+    }
+
+    #[test]
+    fn built_in_prompts_are_nonempty_and_distinct() {
+        assert!(!default_system_prompt().is_empty());
+        assert!(!default_coding_agent_prompt().is_empty());
+        assert!(!default_compaction_prompt().is_empty());
+        assert_ne!(default_system_prompt(), default_coding_agent_prompt());
+    }
+
+    #[test]
+    fn assembled_prompts_share_core_but_keep_distinct_layers() {
+        // Both system prompts include the shared behavioral core...
+        assert!(default_system_prompt().contains("## Honesty"));
+        assert!(default_coding_agent_prompt().contains("## Honesty"));
+        // ...but only the coding prompt carries the coding-specific layer.
+        assert!(default_coding_agent_prompt().contains("## Verifying"));
+        assert!(!default_system_prompt().contains("## Verifying"));
+    }
+
+    #[test]
+    fn compose_prompt_trims_drops_empties_and_joins_with_blank_line() {
+        assert_eq!(compose_prompt(&["  a  ", "", "  b "]), "a\n\nb");
+        assert_eq!(compose_prompt(&["only"]), "only");
+        assert_eq!(compose_prompt(&["", "   "]), "");
+    }
+
+    #[test]
+    fn coding_agent_segment_matches_prompt_text() {
+        let segment = coding_agent_prompt_segment();
+        assert_eq!(segment.text, default_coding_agent_prompt());
+        assert_eq!(segment.kind, PromptSegmentKind::System);
+        assert_eq!(segment.cache_scope, CacheScope::PrefixCacheable);
+    }
+
+    #[test]
+    fn system_prompt_segment_uses_given_text_and_hashes_it() {
+        let same = system_prompt_segment("custom prompt");
+        assert_eq!(same.text, "custom prompt");
+        assert_eq!(same.kind, PromptSegmentKind::System);
+        // Distinct text yields a distinct content hash.
+        let other = system_prompt_segment("different prompt");
+        assert_ne!(same.content_hash, other.content_hash);
+        // Equal text yields an equal content hash (cache stability).
+        let twin = system_prompt_segment("custom prompt");
+        assert_eq!(same.content_hash, twin.content_hash);
     }
 
     #[tokio::test]

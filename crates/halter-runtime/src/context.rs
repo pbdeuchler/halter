@@ -34,8 +34,6 @@ fn skill_prompt_segments(snapshot: &ResourceSnapshot) -> Vec<PromptSegment> {
         .collect()
 }
 
-const DEFAULT_COMPACTION_PROMPT_MARKDOWN: &str = include_str!("../prompts/default-compaction.md");
-
 #[derive(Debug, Clone)]
 /// Result of a compaction pass before it is applied to session state.
 pub struct CompactionOutcome {
@@ -475,7 +473,7 @@ pub fn resolve_response_chain(
 }
 
 fn compaction_instructions(custom_instructions: Option<&str>) -> String {
-    let base = DEFAULT_COMPACTION_PROMPT_MARKDOWN.trim();
+    let base = crate::prompt::default_compaction_prompt();
     if let Some(custom_instructions) =
         custom_instructions.filter(|instructions| !instructions.trim().is_empty())
     {
@@ -608,7 +606,7 @@ mod tests {
     fn compaction_instructions_ignore_blank_custom_text() {
         assert_eq!(
             compaction_instructions(Some("   ")),
-            DEFAULT_COMPACTION_PROMPT_MARKDOWN.trim()
+            crate::prompt::default_compaction_prompt()
         );
     }
 }

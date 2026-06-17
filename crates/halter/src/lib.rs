@@ -52,12 +52,27 @@ pub mod session {
     pub use halter_session::SqliteSessionStore;
 }
 
+/// Built-in default prompts and helpers for installing them.
+///
+/// Read or compose the defaults, then seed a session with one via
+/// [`prelude::SessionInit::with_system_prompt`] or `[prompts]` config. For a
+/// batteries-included coding agent, use [`prompts::default_coding_agent_prompt`]
+/// (or set `prompts.preset = "coding"` in config).
+pub mod prompts {
+    pub use halter_config::SystemPromptPreset;
+    pub use halter_runtime::{
+        coding_agent_prompt_segment, default_coding_agent_prompt, default_compaction_prompt,
+        default_system_prompt, default_system_prompt_segment, system_prompt_segment,
+    };
+}
+
 pub mod prelude {
-    pub use halter_config::HarnessConfig;
+    pub use halter_config::{HarnessConfig, PromptsConfig, SystemPromptPreset};
     pub use halter_protocol::{
         Message, ResourceSnapshot, SessionEvent, SessionEventPayload, SessionId, Turn,
     };
     pub use halter_runtime::{HalterSession, SessionInit, SessionRuntime, SubagentEventForwarding};
 
+    pub use crate::prompts;
     pub use crate::{Halter, HalterBuilder, PluginLoader, ResourceCompiler, SkillLoader};
 }

@@ -8,13 +8,14 @@ use std::sync::Arc;
 use anyhow::Context;
 use halter_config::{
     ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelJudgeConfig, ModelSlot,
-    ModelSlotRef, OpenAiOAuthConfig, PolicyConfig, ResolvedProviderAuth, ResolvedProviderConfig,
-    SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, expand_path, load_path,
-    resolve_provider_runtime_config,
+    ModelSlotRef, OpenAiOAuthConfig, PolicyConfig, PromptsConfig, ResolvedProviderAuth,
+    ResolvedProviderConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig,
+    SystemPromptPreset, expand_path, load_path, resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
-    HookWarning, ModelId, ModelRole, ProviderName, ResolvedModel, ResourceSnapshot,
+    HookWarning, ModelId, ModelRole, ProviderName, PromptSegmentKind, ResolvedModel,
+    ResourceSnapshot,
 };
 use halter_providers::{
     AnthropicProvider, ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials,
@@ -307,7 +308,14 @@ impl Halter {
     }
 
     /// Create a new session.
+    ///
+    /// The session's system prompt is resolved from `[prompts]` config unless
+    /// the caller installed an explicit one on `init` (see
+    /// [`SessionInit::with_system_prompt`]). Precedence, most specific first:
+    /// an explicit per-session prompt > `prompts.system_prompt` >
+    /// `prompts.preset` > the built-in general-purpose default.
     pub async fn new_session(&self, init: SessionInit) -> anyhow::Result<HalterSession> {
+        let init = apply_prompt_config(&self.config.prompts, init);
         self.runtime.new_session(init).await
     }
 
@@ -342,6 +350,40 @@ impl Halter {
     pub async fn shutdown(&self, drain: std::time::Duration) -> halter_runtime::ShutdownReport {
         self.runtime.shutdown(drain).await
     }
+}
+
+/// Resolve the system prompt selected by `[prompts]` config, or `None` when
+/// config selects the built-in general default (so the seed needs no change).
+/// An explicit `system_prompt` override wins over `preset`.
+fn configured_system_prompt(prompts: &PromptsConfig) -> Option<String> {
+    if let Some(custom) = prompts
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(custom.to_owned());
+    }
+    match prompts.preset {
+        SystemPromptPreset::General => None,
+        SystemPromptPreset::Coding => Some(halter_runtime::default_coding_agent_prompt().to_owned()),
+    }
+}
+
+/// Apply `[prompts]` config to a session seed. Config only replaces the
+/// built-in general default that `SessionInit::default()` installs; a
+/// caller-supplied system prompt is left untouched so explicit init wins.
+fn apply_prompt_config(prompts: &PromptsConfig, mut init: SessionInit) -> SessionInit {
+    let Some(configured) = configured_system_prompt(prompts) else {
+        return init;
+    };
+    let default_text = halter_runtime::default_system_prompt();
+    for segment in &mut init.system_prompt_seed {
+        if segment.kind == PromptSegmentKind::System && segment.text == default_text {
+            *segment = halter_runtime::system_prompt_segment(&configured);
+        }
+    }
+    init
 }
 
 #[cfg(feature = "sqlite")]
@@ -1164,5 +1206,82 @@ mod tests {
         async fn list_sessions(&self) -> anyhow::Result<Vec<halter_protocol::SessionBlueprint>> {
             self.inner.list_sessions().await
         }
+    }
+
+    fn seed_text(init: &SessionInit) -> &str {
+        init.system_prompt_seed
+            .first()
+            .map(|segment| segment.text.as_str())
+            .expect("seed has at least one segment")
+    }
+
+    #[test]
+    fn configured_system_prompt_general_preset_is_noop() {
+        let prompts = PromptsConfig::default();
+        assert_eq!(prompts.preset, SystemPromptPreset::General);
+        assert_eq!(configured_system_prompt(&prompts), None);
+    }
+
+    #[test]
+    fn configured_system_prompt_coding_preset_selects_coding_prompt() {
+        let prompts = PromptsConfig {
+            preset: SystemPromptPreset::Coding,
+            system_prompt: None,
+        };
+        assert_eq!(
+            configured_system_prompt(&prompts).as_deref(),
+            Some(halter_runtime::default_coding_agent_prompt())
+        );
+    }
+
+    #[test]
+    fn configured_system_prompt_override_wins_over_preset() {
+        let prompts = PromptsConfig {
+            preset: SystemPromptPreset::Coding,
+            system_prompt: Some("custom override".to_owned()),
+        };
+        assert_eq!(
+            configured_system_prompt(&prompts).as_deref(),
+            Some("custom override")
+        );
+    }
+
+    #[test]
+    fn configured_system_prompt_blank_override_falls_back_to_preset() {
+        // A whitespace-only override is ignored; the preset is used instead.
+        let prompts = PromptsConfig {
+            preset: SystemPromptPreset::General,
+            system_prompt: Some("   ".to_owned()),
+        };
+        assert_eq!(configured_system_prompt(&prompts), None);
+    }
+
+    #[test]
+    fn apply_prompt_config_swaps_default_seed_for_coding_preset() {
+        let prompts = PromptsConfig {
+            preset: SystemPromptPreset::Coding,
+            system_prompt: None,
+        };
+        let init = apply_prompt_config(&prompts, SessionInit::default());
+        assert_eq!(seed_text(&init), halter_runtime::default_coding_agent_prompt());
+    }
+
+    #[test]
+    fn apply_prompt_config_general_preset_leaves_default_seed() {
+        let prompts = PromptsConfig::default();
+        let init = apply_prompt_config(&prompts, SessionInit::default());
+        assert_eq!(seed_text(&init), halter_runtime::default_system_prompt());
+    }
+
+    #[test]
+    fn apply_prompt_config_respects_explicit_session_prompt() {
+        // An explicit per-session prompt is never overridden by config.
+        let prompts = PromptsConfig {
+            preset: SystemPromptPreset::Coding,
+            system_prompt: Some("config wins?".to_owned()),
+        };
+        let init = SessionInit::default().with_system_prompt("explicit session prompt");
+        let init = apply_prompt_config(&prompts, init);
+        assert_eq!(seed_text(&init), "explicit session prompt");
     }
 }

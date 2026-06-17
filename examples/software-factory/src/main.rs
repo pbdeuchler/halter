@@ -1226,6 +1226,7 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
                 ctx.selection,
                 ctx.implementation_plan,
                 &comments,
+                ctx.project_system_prompt,
             )
             .await?;
             apply_feedback(
@@ -1258,6 +1259,7 @@ async fn refine_plsfix_comments(
     selection: &JudgeSelection,
     implementation_plan: &str,
     comments: &str,
+    project_system_prompt: Option<&str>,
 ) -> anyhow::Result<String> {
     let prompt = format!(
         r#"A maintainer left /plsfix comments on the PR. Convert them into a precise implementation instruction for the coding agent.
@@ -1275,9 +1277,15 @@ IMPLEMENTATION PLAN:
 "#,
         serde_json::to_string_pretty(selection)?
     );
-    Ok(run_agent(glm, worktree, "glm plsfix refinement", prompt)
-        .await?
-        .text)
+    Ok(run_agent_with_system_prompt(
+        glm,
+        worktree,
+        "glm plsfix refinement",
+        prompt,
+        project_system_prompt,
+    )
+    .await?
+    .text)
 }
 
 async fn apply_feedback(

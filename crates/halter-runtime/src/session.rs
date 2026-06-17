@@ -189,6 +189,22 @@ impl SessionInit {
         self.subagent_event_forwarding = Some(mode);
         self
     }
+
+    /// Seed the session with the given system prompt, replacing the default.
+    ///
+    /// Pass a built-in prompt (e.g. [`crate::default_coding_agent_prompt`]) or
+    /// any custom text:
+    ///
+    /// ```
+    /// use halter_runtime::{SessionInit, default_coding_agent_prompt};
+    ///
+    /// let init = SessionInit::default().with_system_prompt(default_coding_agent_prompt());
+    /// ```
+    #[must_use]
+    pub fn with_system_prompt(mut self, prompt: impl AsRef<str>) -> Self {
+        self.system_prompt_seed = vec![crate::prompt::system_prompt_segment(prompt.as_ref())];
+        self
+    }
 }
 
 /// Drop-time hook eviction guard. Held inside an `Arc` on the session
@@ -2435,7 +2451,7 @@ mod tests {
         assert_eq!(init.system_prompt_seed.len(), 1);
         assert_eq!(
             init.system_prompt_seed[0].text,
-            crate::prompt::default_system_prompt_text()
+            crate::prompt::default_system_prompt()
         );
     }
 
