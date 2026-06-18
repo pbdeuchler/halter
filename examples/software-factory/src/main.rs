@@ -3,6 +3,8 @@
 mod core;
 
 use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1068,6 +1070,90 @@ enum AgentTextRequirement {
     Optional,
 }
 
+const CODING_STAGE_RETRY_POLICY: AgentStageRetryPolicy = AgentStageRetryPolicy {
+    max_attempts: 3,
+    base_backoff: Duration::from_secs(5),
+    max_backoff: Duration::from_secs(30),
+};
+const INFERRED_AGENT_STAGE_CAPACITY_BACKOFF: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentStageRetryPolicy {
+    max_attempts: u32,
+    base_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl AgentStageRetryPolicy {
+    fn delay_after_failure(self, failed_attempt: u32, error: &str) -> Option<Duration> {
+        if failed_attempt >= self.max_attempts {
+            return None;
+        }
+        let delay = inferred_agent_stage_backoff_hint(error)
+            .unwrap_or_else(|| exponential_agent_stage_backoff(self, failed_attempt));
+        Some(delay.min(self.max_backoff))
+    }
+}
+
+fn exponential_agent_stage_backoff(policy: AgentStageRetryPolicy, failed_attempt: u32) -> Duration {
+    let exponent = failed_attempt.saturating_sub(1).min(31);
+    let multiplier = 1u128 << exponent;
+    let millis = policy
+        .base_backoff
+        .as_millis()
+        .saturating_mul(multiplier)
+        .min(policy.max_backoff.as_millis())
+        .min(u128::from(u64::MAX));
+    Duration::from_millis(millis as u64)
+}
+
+fn inferred_agent_stage_backoff_hint(error: &str) -> Option<Duration> {
+    let lower = error.to_ascii_lowercase();
+    (lower.contains("overloaded")
+        || lower.contains("capacity")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests"))
+    .then_some(INFERRED_AGENT_STAGE_CAPACITY_BACKOFF)
+}
+
+fn agent_stage_failure_is_retryable(retryable: bool, cancelled: bool, error: &str) -> bool {
+    !cancelled && (retryable || inferred_agent_stage_backoff_hint(error).is_some())
+}
+
+#[derive(Debug)]
+struct AgentStageTurnFailure {
+    label: String,
+    error: String,
+    retryable: bool,
+    cancelled: bool,
+}
+
+impl AgentStageTurnFailure {
+    fn should_retry(&self) -> bool {
+        agent_stage_failure_is_retryable(self.retryable, self.cancelled, &self.error)
+    }
+}
+
+impl fmt::Display for AgentStageTurnFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "agent stage {} failed: {}",
+            self.label, self.error
+        )
+    }
+}
+
+impl StdError for AgentStageTurnFailure {}
+
+fn agent_stage_error_is_retryable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AgentStageTurnFailure>().map_or_else(
+        || inferred_agent_stage_backoff_hint(&error.to_string()).is_some(),
+        AgentStageTurnFailure::should_retry,
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum FactorySystemPrompt {
     General,
@@ -1164,7 +1250,7 @@ async fn run_coding_action_with_system_prompt(
     prompt: impl Into<String>,
     project_system_prompt: Option<&str>,
 ) -> anyhow::Result<()> {
-    run_agent_with_prompt_kind(
+    run_agent_with_prompt_kind_with_retry(
         harness,
         worktree,
         label,
@@ -1172,6 +1258,7 @@ async fn run_coding_action_with_system_prompt(
         FactorySystemPrompt::Coding,
         project_system_prompt,
         AgentTextRequirement::Optional,
+        CODING_STAGE_RETRY_POLICY,
     )
     .await?;
     Ok(())
@@ -1194,6 +1281,60 @@ async fn run_agent_with_system_prompt(
         AgentTextRequirement::Required,
     )
     .await
+}
+
+async fn run_agent_with_prompt_kind_with_retry(
+    harness: &Halter,
+    worktree: &Path,
+    label: &str,
+    prompt: impl Into<String>,
+    system_prompt: FactorySystemPrompt,
+    project_system_prompt: Option<&str>,
+    text_requirement: AgentTextRequirement,
+    retry_policy: AgentStageRetryPolicy,
+) -> anyhow::Result<AgentRun> {
+    let prompt = prompt.into();
+    let mut attempt = 1;
+
+    loop {
+        match run_agent_with_prompt_kind(
+            harness,
+            worktree,
+            label,
+            prompt.clone(),
+            system_prompt,
+            project_system_prompt,
+            text_requirement,
+        )
+        .await
+        {
+            Ok(run) => return Ok(run),
+            Err(error) if agent_stage_error_is_retryable(&error) => {
+                let message = error.to_string();
+                let Some(delay) = retry_policy.delay_after_failure(attempt, &message) else {
+                    warn!(
+                        stage = label,
+                        attempt,
+                        max_attempts = retry_policy.max_attempts,
+                        error = %message,
+                        "agent stage retry budget exhausted"
+                    );
+                    return Err(error);
+                };
+                warn!(
+                    stage = label,
+                    attempt,
+                    max_attempts = retry_policy.max_attempts,
+                    retry_in_ms = delay.as_millis() as u64,
+                    error = %message,
+                    "retrying agent stage after transient failure"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn run_agent_with_prompt_kind(
@@ -1247,9 +1388,19 @@ async fn run_agent_with_prompt_kind(
                 usage = turn_usage;
                 break;
             }
-            SessionEventPayload::TurnFailed { error, .. } => {
+            SessionEventPayload::TurnFailed {
+                error,
+                cancelled,
+                retryable,
+                ..
+            } => {
                 let _ = session.shutdown("turn_failed").await;
-                bail!("agent stage {label} failed: {error}");
+                return Err(anyhow::Error::new(AgentStageTurnFailure {
+                    label: label.to_owned(),
+                    error,
+                    retryable,
+                    cancelled,
+                }));
             }
             _ => {}
         }
@@ -2546,6 +2697,142 @@ mod tests {
                 (_, _, other) => panic!("{}: unexpected result {other:?}", case.name),
             }
         }
+    }
+
+    #[test]
+    fn agent_stage_failure_retry_detection_covers_flags_and_transient_text() {
+        struct Case {
+            name: &'static str,
+            retryable: bool,
+            cancelled: bool,
+            error: &'static str,
+            expected: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "provider retryable flag",
+                retryable: true,
+                cancelled: false,
+                error: "provider asked for retry",
+                expected: true,
+            },
+            Case {
+                name: "cancelled provider retryable flag",
+                retryable: true,
+                cancelled: true,
+                error: "provider asked for retry",
+                expected: false,
+            },
+            Case {
+                name: "overloaded text fallback",
+                retryable: false,
+                cancelled: false,
+                error: r#"Provider returned error (Parasail: {"error":{"message":"The engine is currently overloaded. Please try again later."}})"#,
+                expected: true,
+            },
+            Case {
+                name: "rate limit text fallback",
+                retryable: false,
+                cancelled: false,
+                error: "provider returned 429 Too Many Requests",
+                expected: true,
+            },
+            Case {
+                name: "fatal validation error",
+                retryable: false,
+                cancelled: false,
+                error: "invalid request: missing required field",
+                expected: false,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                agent_stage_failure_is_retryable(case.retryable, case.cancelled, case.error),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn agent_stage_retry_policy_covers_hint_exponential_cap_and_exhaustion() {
+        struct Case {
+            name: &'static str,
+            policy: AgentStageRetryPolicy,
+            failed_attempt: u32,
+            error: &'static str,
+            expected: Option<Duration>,
+        }
+
+        let policy = AgentStageRetryPolicy {
+            max_attempts: 3,
+            base_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(250),
+        };
+        let cases = [
+            Case {
+                name: "first retry uses base backoff",
+                policy,
+                failed_attempt: 1,
+                error: "retryable provider failure",
+                expected: Some(Duration::from_millis(100)),
+            },
+            Case {
+                name: "second retry doubles backoff",
+                policy,
+                failed_attempt: 2,
+                error: "retryable provider failure",
+                expected: Some(Duration::from_millis(200)),
+            },
+            Case {
+                name: "hint is capped to max backoff",
+                policy,
+                failed_attempt: 1,
+                error: "upstream model is overloaded",
+                expected: Some(Duration::from_millis(250)),
+            },
+            Case {
+                name: "budget exhaustion returns none",
+                policy,
+                failed_attempt: 3,
+                error: "retryable provider failure",
+                expected: None,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                case.policy
+                    .delay_after_failure(case.failed_attempt, case.error),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn agent_stage_turn_failure_display_and_retry_metadata_match() {
+        let retryable = AgentStageTurnFailure {
+            label: "kimi implementation".to_owned(),
+            error: "provider overloaded".to_owned(),
+            retryable: false,
+            cancelled: false,
+        };
+        assert_eq!(
+            retryable.to_string(),
+            "agent stage kimi implementation failed: provider overloaded"
+        );
+        assert!(retryable.should_retry());
+
+        let cancelled = AgentStageTurnFailure {
+            cancelled: true,
+            ..retryable
+        };
+        assert!(!cancelled.should_retry());
     }
 
     #[test]
