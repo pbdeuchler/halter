@@ -847,7 +847,7 @@ fn default_factory_config() -> HarnessConfig {
                 synthesis: model_config(
                     ConfiguredProvider::OpenRouter,
                     "google/gemma-4-31b-it",
-                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
                 ),
                 panel: vec![
                     model_config(
@@ -855,6 +855,11 @@ fn default_factory_config() -> HarnessConfig {
                         "minimax/minimax-m3",
                         ReasoningEffort::Xhigh,
                     ),
+                    // model_config(
+                    //     ConfiguredProvider::OpenRouter,
+                    //     "nvidia/nemotron-3-ultra-550b-a55b",
+                    //     ReasoningEffort::Xhigh,
+                    // ),
                     model_config(
                         ConfiguredProvider::OpenRouter,
                         "moonshotai/kimi-k2.6",
