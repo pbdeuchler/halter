@@ -505,8 +505,8 @@ fn synthesis_instructions(candidates: &[Candidate]) -> String {
          ranking of every candidate from best (rank 1) to worst, keyed by the candidate's \
          `model_id`.\n\
          2. After the tool result is returned, write a synthesis that does NOT merge the \
-         candidates but JUDGES them: cover each candidate's strengths, weaknesses, pros, and cons, \
-         and finish with an overall synthesis of the best available guidance.\n\n\
+         candidates but JUDGES and SYNTHESIZES them: cover each candidate's strengths, weaknesses, pros, and cons, \
+         and finish with an overall synthesis of all responses that is greater than the sum of it's parts.\n\n\
          Valid outputs are only a `rank_responses` tool call or non-empty synthesis text. Never \
          return an empty assistant message. If you are uncertain, make a best-effort ranking and \
          concise synthesis. Do not address the user directly; your synthesis is advisory context \
