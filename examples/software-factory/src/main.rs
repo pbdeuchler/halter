@@ -36,13 +36,13 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use crate::core::{
     CHECKPOINT_PATH, CandidateSet, CodeReview, IMPLEMENTATION_PLAN_PATH, IssueComment, IssueDoc,
-    JudgeSelection, ModelSpec, MonitorAction, PROJECT_GUIDANCE_FILENAMES,
-    PROJECT_GUIDANCE_MAX_BYTES, ProjectGuidanceDoc, PullRequestDraft, RECENT_OPEN_ISSUE_LIMIT,
-    RepoSlug, branch_name, candidate_set_for_issue, dirty_status_excluding,
-    ensure_requested_issue_selection, format_project_system_prompt,
-    is_maintainer_author_association, issue_corpus, issue_index, monitor_action,
-    parse_github_remote_url, parse_issue_number_input, parse_json_response, selected_issue_numbers,
-    validate_issue_number, validate_recent_issue_limit,
+    JudgeSelection, ModelSpec, MonitorAction, PLANNING_CORPUS_BODY_CHARS,
+    PROJECT_GUIDANCE_FILENAMES, PROJECT_GUIDANCE_MAX_BYTES, ProjectGuidanceDoc, PullRequestDraft,
+    RECENT_OPEN_ISSUE_LIMIT, RepoSlug, branch_name, candidate_set_for_issue,
+    dirty_status_excluding, ensure_requested_issue_selection, format_project_system_prompt,
+    is_maintainer_author_association, issue_corpus, monitor_action, parse_github_remote_url,
+    parse_issue_number_input, parse_json_response, selected_issue_numbers, validate_issue_number,
+    validate_recent_issue_limit,
 };
 
 #[derive(Debug, Parser)]
@@ -387,8 +387,8 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .map(|issue| issue.number)
         .collect::<HashSet<_>>();
-    let corpus = issue_corpus(&repo, &issues);
-    let index = issue_index(&repo, &issues);
+    let corpus = issue_corpus(&repo, &issues, None);
+    let planning_corpus = issue_corpus(&repo, &issues, Some(PLANNING_CORPUS_BODY_CHARS));
     let implementation_plan_path = worktree.join(IMPLEMENTATION_PLAN_PATH);
     if let Some(parent) = implementation_plan_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -473,7 +473,7 @@ async fn main() -> anyhow::Result<()> {
             &judge,
             &worktree,
             &repo,
-            &index,
+            &planning_corpus,
             &candidates,
             IMPLEMENTATION_PLAN_PATH,
             project_system_prompt.as_deref(),
@@ -1148,6 +1148,13 @@ struct AgentRun {
 const FACTORY_TURN_USER_MESSAGE: &str =
     "Execute the appended turn-specific instructions for this software factory stage.";
 
+/// Shared closing instruction for stages whose response is parsed as JSON.
+const JSON_ONLY_OUTPUT_RULE: &str = "Return ONLY the JSON object as your final message — no markdown code fences and no surrounding prose.";
+
+/// Shared rule for coding stages that run cargo, whose builds exceed the
+/// 30-second default shell timeout when no explicit timeout is supplied.
+const CARGO_TIMEOUT_RULE: &str = "When running cargo build/test/clippy/check through the shell tool, pass an explicit timeout_ms of at least 120000; these commands routinely exceed the 30-second default.";
+
 fn json_preview(value: &Value, max_chars: usize) -> String {
     single_line_preview(&value.to_string(), max_chars)
 }
@@ -1568,7 +1575,7 @@ Read the entire issue corpus and identify up to 3 excellent groups of open issue
 
 If there are not enough good groups, choose individual open issues that are straightforward, contained, and do not need maintainer input.
 
-Return ONLY JSON with this shape:
+{JSON_ONLY_OUTPUT_RULE} Use this shape:
 {{
   "candidates": [
     {{
@@ -1604,7 +1611,7 @@ async fn judge_issue_plan(
     judge: &Halter,
     worktree: &Path,
     repo: &RepoSlug,
-    index: &str,
+    corpus: &str,
     candidates: &CandidateSet,
     implementation_plan_path: &str,
     project_system_prompt: Option<&str>,
@@ -1613,38 +1620,42 @@ async fn judge_issue_plan(
     let prompt = format!(
         r#"You are a model-judge planning group for a software factory workflow targeting {repo}.
 
-The prior model proposed candidate issue groups. Pick exactly one candidate group or individual issue. Then write a detailed implementation plan to this file:
-{implementation_plan_path}
+The full open-issue corpus is provided below (each issue body is capped at roughly 1k tokens). A prior model also proposed candidate issue groups as a first pass. You have everything you need to decide immediately. Work through these steps in order:
 
-Use the `github_issue` tool to fetch the full text for any issue you seriously consider before selecting it. The issue index below is intentionally compact and does not include issue bodies or comment text.
+1. Group alike issues. Use the corpus and the candidate proposals to cluster issues that share one root cause or cohesive code path; refine or discard the proposals as needed.
+2. Narrow the groups and individual issues down to the strongest, most contained candidates.
+3. Agree on a shortlist of at most 3 groups/issues worth working on.
+4. Select exactly one — the smallest cohesive PR you have high confidence in — and design its implementation plan.
 
 Selection rules:
 - prefer the smallest cohesive PR with high confidence
-- select only issues whose issue index state is open
+- select only issues whose corpus state is open
 - reject any candidate that needs maintainer clarification
-- treat comments returned by `github_issue` as maintainer comments; comments from non-maintainers are intentionally omitted
-- include concrete files/modules to inspect when inferable
-- include happy-path and sad-path tests expected for the implementation
-- include risks and verification commands
+- only maintainer comments are included; non-maintainer comments are intentionally omitted
+- corpus bodies are truncated, so use the `github_issue` tool to fetch the complete untruncated text of any issue before you commit to selecting it
 
-Implementation file rules:
-- write the full detailed implementation plan as markdown to {implementation_plan_path}
-- include selected issue numbers, scope, concrete steps, test plan, verification commands, and risks
-- do not write code
-- do not include the implementation plan text in the JSON response
+The implementation plan you write must:
+- be saved as markdown to {implementation_plan_path}
+- include selected issue numbers, scope, concrete files/modules to inspect, step-by-step changes, happy-path and sad-path tests, verification commands, and risks
+- not contain code
 
-Return ONLY JSON with this shape:
+Output protocol — follow in this exact order:
+1. Write the full plan to {implementation_plan_path} using the write tool.
+2. Confirm the file is non-empty.
+3. Only then, as your FINAL message, return ONLY the JSON object below — no markdown code fences, no surrounding prose, and no plan text (the plan belongs only in the file).
+
+JSON shape:
 {{
   "title": "PR-sized implementation title",
   "issue_numbers": [123],
   "notes": "judge rationale and constraints"
 }}
 
-CANDIDATES:
+CANDIDATE GROUPINGS (first-pass proposals to refine):
 {candidates_json}
 
-ISSUE INDEX:
-{index}
+OPEN ISSUE CORPUS:
+{corpus}
 "#
     );
     let raw = run_agent_with_system_prompt(
@@ -1730,6 +1741,7 @@ Rules:
 - Keep the diff scoped to the selected issues.
 - Add or update tests for happy paths and sad paths described in the plan.
 - Run the narrowest meaningful verification commands.
+- {CARGO_TIMEOUT_RULE}
 - If the plan proves impossible without maintainer input, stop and explain exactly why.
 
 SELECTED ISSUES:
@@ -1761,7 +1773,7 @@ fn selected_issue_details(selection: &JudgeSelection, issues: &[IssueDoc]) -> St
         owner: "selected".to_owned(),
         name: "issues".to_owned(),
     };
-    issue_corpus(&repo, &selected_issues)
+    issue_corpus(&repo, &selected_issues, None)
 }
 
 fn ensure_selected_issues_are_open(
@@ -1838,6 +1850,7 @@ Rules:
 - Do not create, switch, commit, push, or open branches/PRs.
 - Keep the fix scoped to the implementation plan and review findings.
 - Run focused tests or checks that cover the changed behavior.
+- {CARGO_TIMEOUT_RULE}
 - Return a concise summary and the verification commands you ran.
 
 IMPLEMENTATION PLAN:
@@ -1873,8 +1886,9 @@ Review stance:
 - Prioritize correctness bugs, regressions, missing tests, unsafe behavior, and broken edge cases.
 - Do not block on style nits unless they create real maintenance risk.
 - Mark clean=true only when there are no required fixes.
+- {CARGO_TIMEOUT_RULE}
 
-Return ONLY JSON with this shape:
+{JSON_ONLY_OUTPUT_RULE} Use this shape:
 {{
   "clean": false,
   "summary": "short review summary",
@@ -1923,7 +1937,7 @@ async fn draft_pr(
     let prompt = format!(
         r#"Create a detailed GitHub pull request for {repo}.
 
-Return ONLY JSON with this shape:
+Return ONLY the JSON object as your final message — no surrounding prose and not wrapped in a code fence (the body value itself may contain markdown). Use this shape:
 {{
   "title": "concise PR title",
   "body": "detailed PR body in markdown"
@@ -2136,6 +2150,7 @@ Rules:
 - Do not create, switch, commit, push, or open branches/PRs.
 - Keep changes scoped to the selected issues and feedback.
 - Run focused verification for the changed behavior.
+- {CARGO_TIMEOUT_RULE}
 
 IMPLEMENTATION PLAN:
 {implementation_plan}

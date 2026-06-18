@@ -13,6 +13,11 @@ pub const RECENT_OPEN_ISSUE_LIMIT: usize = 100;
 pub const PROJECT_GUIDANCE_FILENAMES: [&str; 3] = ["CLAUDE.md", "AGENTS.md", "SOUL.md"];
 pub const PROJECT_GUIDANCE_MAX_BYTES: u64 = 1_048_576;
 
+/// Per-issue body budget (in characters) for the planning corpus handed to the
+/// judge panel. Roughly 1k tokens at ~4 characters per token, which keeps the
+/// full open-issue corpus bounded even when individual issues are very long.
+pub const PLANNING_CORPUS_BODY_CHARS: usize = 4_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSlug {
     pub owner: String,
@@ -144,12 +149,17 @@ pub struct IssueDoc {
     pub comments: Vec<IssueComment>,
 }
 
-pub fn issue_corpus(repo: &RepoSlug, issues: &[IssueDoc]) -> String {
+pub fn issue_corpus(repo: &RepoSlug, issues: &[IssueDoc], body_char_cap: Option<usize>) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# Open GitHub issues for {repo}\n\nOnly maintainer comments are included.\n\n"
     ));
     for issue in issues {
+        let body = empty_as_placeholder(&issue.body);
+        let body = match body_char_cap {
+            Some(cap) => truncate_chars(body, cap),
+            None => body.to_owned(),
+        };
         out.push_str(&format!(
             "## #{}: {}\nURL: {}\nState: {}\nAuthor: {}\nLabels: {}\n\n{}\n",
             issue.number,
@@ -162,7 +172,7 @@ pub fn issue_corpus(repo: &RepoSlug, issues: &[IssueDoc]) -> String {
             } else {
                 issue.labels.join(", ")
             },
-            empty_as_placeholder(&issue.body)
+            body
         ));
         if !issue.comments.is_empty() {
             out.push_str("\nComments:\n");
@@ -176,26 +186,6 @@ pub fn issue_corpus(repo: &RepoSlug, issues: &[IssueDoc]) -> String {
             }
         }
         out.push('\n');
-    }
-    out
-}
-
-pub fn issue_index(repo: &RepoSlug, issues: &[IssueDoc]) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("# Open GitHub issue index for {repo}\n\n"));
-    for issue in issues {
-        out.push_str(&format!(
-            "- #{} [{}] {} | labels: {} | maintainer_comments: {}\n",
-            issue.number,
-            issue.state,
-            issue.title,
-            if issue.labels.is_empty() {
-                "(none)".to_owned()
-            } else {
-                issue.labels.join(", ")
-            },
-            issue.comments.len()
-        ));
     }
     out
 }
@@ -214,6 +204,14 @@ fn indent(value: &str) -> String {
         .map(|line| format!("  {line}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let truncated: String = value.chars().take(max_chars).collect();
+    format!("{truncated}\n…[truncated for planning corpus]")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -730,6 +728,7 @@ mod tests {
                 url: "https://example.test/issues/9".to_owned(),
                 comments: vec![],
             }],
+            None,
         );
 
         assert!(corpus.contains("State: closed"));
@@ -738,30 +737,27 @@ mod tests {
     }
 
     #[test]
-    fn issue_index_excludes_body_and_comment_text() {
+    fn issue_corpus_caps_long_bodies_only_when_requested() {
         let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
-        let index = issue_index(
-            &repo,
-            &[IssueDoc {
-                number: 9,
-                state: "open".to_owned(),
-                title: "old behavior".to_owned(),
-                body: "secret body details".to_owned(),
-                labels: vec!["bug".to_owned()],
-                author: "octo".to_owned(),
-                url: "https://example.test/issues/9".to_owned(),
-                comments: vec![IssueComment {
-                    author: "maintainer".to_owned(),
-                    body: "secret comment details".to_owned(),
-                    created_at: "2026-06-17T00:00:00Z".to_owned(),
-                }],
-            }],
-        );
+        let long_body = "x".repeat(50);
+        let issues = [IssueDoc {
+            number: 9,
+            state: "open".to_owned(),
+            title: "long issue".to_owned(),
+            body: long_body.clone(),
+            labels: vec!["bug".to_owned()],
+            author: "octo".to_owned(),
+            url: "https://example.test/issues/9".to_owned(),
+            comments: vec![],
+        }];
 
-        assert!(index.contains("#9 [open] old behavior"));
-        assert!(index.contains("maintainer_comments: 1"));
-        assert!(!index.contains("secret body details"));
-        assert!(!index.contains("secret comment details"));
+        let capped = issue_corpus(&repo, &issues, Some(10));
+        assert!(capped.contains("[truncated for planning corpus]"));
+        assert!(!capped.contains(&long_body));
+
+        let full = issue_corpus(&repo, &issues, None);
+        assert!(full.contains(&long_body));
+        assert!(!full.contains("[truncated for planning corpus]"));
     }
 
     #[test]
