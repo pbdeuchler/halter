@@ -5,6 +5,12 @@
 // hands that synthesis to a default model whose stream is what the caller sees.
 // From the runtime's perspective it is an ordinary `Provider`; all multiplexing
 // stays inside this provider.
+//
+// Each panelist is given the original context plus a constant framing prefix
+// (`PANEL_PREFIX`) so it answers as one advisory voice on a judged panel —
+// comparable prose rather than an executed action or raw tool call. The prefix
+// is injected only on the panel path; the synthesis judge and default member
+// start from the unmodified request, so it never leaks past the panel.
 
 use std::sync::Arc;
 
@@ -34,6 +40,28 @@ pub const MODEL_JUDGE_RANK_TOOL: &str = "rank_responses";
 const MAX_SYNTHESIS_ROUNDS: usize = 3;
 const EMPTY_SYNTHESIS_ERROR: &str =
     "model-judge synthesis produced neither a ranking nor synthesis text";
+
+/// Framing prepended as the first user message of every panel request. It tells
+/// each panelist it is one advisory voice on a judged panel so it returns
+/// comparable natural-language analysis instead of executing the task or
+/// communicating through raw tool calls. Injected only by [`panel_messages`] on
+/// the panel path — the synthesis judge and default member never see it — and
+/// always at the same position so panel prompt caches stay warm across a turn.
+const PANEL_PREFIX: &str = "You are one of several expert models on a review \
+    panel. The conversation that follows is an in-progress agent session. An \
+    independent synthesis judge will read your response alongside the other \
+    panelists', stack-rank them, and distill the best guidance for the model \
+    that actually acts next — so your job is to advise, not to execute.\n\nThink \
+    deeply about how you would approach what is being asked: your first \
+    inclination, the next one to three actions or thoughts you would commit to, \
+    why you would take them, and the decision tree branching from that first \
+    move — including the alternatives you weighed and the risks or unknowns that \
+    would change your mind.\n\nRespond in self-contained prose so the judge can \
+    compare you against the other panelists. Do not rely on tool calls to \
+    communicate; if you would use a tool, name it and describe what you would \
+    pass and why. Be specific and decisive — hedged or vague guidance is hard to \
+    rank. Do not address the user; you are producing advisory analysis, not a \
+    reply.";
 
 /// One participating model plus its adapter.
 #[derive(Clone)]
@@ -141,11 +169,12 @@ impl ModelJudgeProvider {
         cancel: &CancellationToken,
     ) -> Vec<Candidate> {
         let ids = candidate_ids(&self.panel);
+        let panel_context = panel_messages(&request.messages);
         let futures = self.panel.iter().enumerate().map(|(index, panelist)| {
             let inner = inner_request(
                 request,
                 panelist.model.clone(),
-                request.messages.clone(),
+                panel_context.clone(),
                 request.tools.clone(),
             );
             let provider = panelist.provider.clone();
@@ -395,6 +424,17 @@ fn inner_request(
         previous_response_id: None,
         new_messages_start: 0,
     }
+}
+
+/// Prepend [`PANEL_PREFIX`] as the first user message so each panelist answers
+/// as an advisory voice on a judged panel. The prefix sits right after the
+/// system block and before the (append-only) conversation, so its position is
+/// stable across a turn and panel prompt caches stay warm.
+fn panel_messages(messages: &[Message]) -> Vec<Message> {
+    let mut prefixed = Vec::with_capacity(messages.len() + 1);
+    prefixed.push(Message::User(UserMessage::text(PANEL_PREFIX)));
+    prefixed.extend(messages.iter().cloned());
+    prefixed
 }
 
 fn assistant_with_tool_call(text: &str, call: ToolCall) -> AssistantMessage {
@@ -805,6 +845,16 @@ mod tests {
         collect_message(stream).await.expect("collect").text
     }
 
+    /// True if any user message in the request contains `needle`. Used to assert
+    /// the panel framing prefix reaches panels but not the synthesis/default
+    /// members.
+    fn request_mentions(request: &ProviderRequest, needle: &str) -> bool {
+        request.messages.iter().any(|message| match message {
+            Message::User(user) => user.plain_text().contains(needle),
+            _ => false,
+        })
+    }
+
     #[tokio::test]
     async fn model_judge_judges_panel_and_streams_default_with_synthesis() {
         let (panel_a, panel_a_reqs) = member("panel-a", Some("answer A"), None);
@@ -833,12 +883,26 @@ mod tests {
         assert_eq!(output, "final answer");
 
         // Both panels were called once with the original user message.
-        assert_eq!(panel_a_reqs.lock().unwrap().len(), 1);
+        let panel_a_reqs = panel_a_reqs.lock().unwrap();
+        assert_eq!(panel_a_reqs.len(), 1);
         assert_eq!(panel_b_reqs.lock().unwrap().len(), 1);
+
+        // The panel framing is the first message, and the original user message
+        // still reaches the panelist after it.
+        let panel_first = match &panel_a_reqs[0].messages[0] {
+            Message::User(user) => user.plain_text(),
+            other => {
+                panic!("panel context should open with the framing user message, got {other:?}")
+            }
+        };
+        assert!(panel_first.contains("one of several expert models on a review panel"));
+        assert!(request_mentions(&panel_a_reqs[0], "what is the answer?"));
 
         // The synthesis member saw the candidate responses.
         let synthesis_reqs = synthesis_reqs.lock().unwrap();
         assert_eq!(synthesis_reqs.len(), 1);
+        // The panel framing prefix never leaks to the synthesis judge.
+        assert!(!request_mentions(&synthesis_reqs[0], "review panel"));
         let synthesis_user = synthesis_reqs[0]
             .messages
             .iter()
@@ -870,6 +934,8 @@ mod tests {
             .expect("guidance user message");
         assert!(guidance.contains("model-judge synthesis"));
         assert!(guidance.contains("A is stronger than B"));
+        // ...and the panel framing prefix never leaks to the default member.
+        assert!(!request_mentions(&default_reqs[0], "review panel"));
     }
 
     #[tokio::test]

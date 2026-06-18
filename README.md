@@ -468,8 +468,11 @@ The `models.default` and `models.subagent` slots accept either an inline model
 a panel-judged one:
 
 1. The context and user message are multiplexed to every model in `panel` in
-   parallel (each receives the full context **and** the tool specs, so it may
-   propose tool calls).
+   parallel (each receives the full context **and** the tool specs). A constant
+   framing prefix is prepended as the first user message so each panelist
+   answers as one advisory voice on a judged panel — comparable prose about what
+   it *would* do and why, rather than executing or replying. The prefix is added
+   only on the panel path, so it never reaches the synthesis or default model.
 2. The `synthesis` model is given the panel responses and a `rank_responses` tool.
    It first stack-ranks the panel responses (emitted as structured `tracing`
    telemetry on the `halter::model_judge` target), then writes a synthesis that
