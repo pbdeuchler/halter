@@ -1143,7 +1143,10 @@ fn base_payload(
         "hook_event_name".to_owned(),
         Value::String(event_name.canonical_name().to_owned()),
     );
-    payload.insert("halter_version".to_owned(), Value::from(1));
+    payload.insert(
+        "halter_version".to_owned(),
+        Value::from(HOOK_PROTOCOL_VERSION),
+    );
     payload.insert(
         "session_id".to_owned(),
         Value::String(sess.session_id().0.clone()),

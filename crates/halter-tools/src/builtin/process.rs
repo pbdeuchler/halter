@@ -339,7 +339,9 @@ impl Tool for ProcessTool {
                     anyhow::anyhow!("failed to execute process tool: signal is out of range")
                 })?;
                 let report = kill_tree(pid, signal);
-                let killed_count = report.iter().filter(|entry| entry.killed).count() as u64;
+                let killed_count =
+                    u64::try_from(report.iter().filter(|entry| entry.killed).count())
+                        .unwrap_or(u64::MAX);
                 let per_pid: Vec<Value> = report
                     .iter()
                     .map(|entry| {

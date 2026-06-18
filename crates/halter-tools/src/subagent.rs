@@ -400,21 +400,27 @@ mod tests {
             &self,
             _request: SendSubagentInputRequest,
         ) -> anyhow::Result<SubagentStatus> {
-            unreachable!("send_input not used in this test")
+            unreachable!(
+                "RecordingSubagentControl::send_input was called, but this test does not exercise send_input"
+            )
         }
 
         async fn wait(
             &self,
             _request: WaitSubagentRequest,
         ) -> anyhow::Result<WaitSubagentResponse> {
-            unreachable!("wait not used in this test")
+            unreachable!(
+                "RecordingSubagentControl::wait was called, but this test does not exercise wait_agent"
+            )
         }
 
         async fn close(
             &self,
             _request: CloseSubagentRequest,
         ) -> anyhow::Result<CloseSubagentResponse> {
-            unreachable!("close not used in this test")
+            unreachable!(
+                "RecordingSubagentControl::close was called, but this test does not exercise close_agent"
+            )
         }
     }
 

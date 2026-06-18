@@ -370,7 +370,6 @@ impl RuntimeSubagentControl {
         dispatch: crate::ExecutedHookDispatch,
         block_is_ignored: bool,
     ) -> anyhow::Result<Option<String>> {
-        let continuation = dispatch.merged.block_reason.clone();
         for attempt in 0..=PARENT_HOOK_DISPATCH_MAX_RETRIES {
             let Some(stored) = self
                 .inner
@@ -436,7 +435,7 @@ impl RuntimeSubagentControl {
                         }
                         self.inner.services.event_bus.publish(event);
                     }
-                    return Ok(continuation);
+                    return Ok(dispatch.merged.block_reason.clone());
                 }
                 Err(error)
                     if error.downcast_ref::<SessionCommitConflict>().is_some()
@@ -454,11 +453,9 @@ impl RuntimeSubagentControl {
         }
 
         // The loop body always either returns or `continue`s. Reaching this
-        // line would mean a future refactor accidentally let the loop fall
-        // through; surface that as an error rather than silently reporting
-        // success (H16: previous shape returned Ok(continuation) and erased
-        // the conflict).
-        let _ = continuation;
+        // line means it fell through after exhausting retries; surface that as
+        // an error rather than silently reporting success (the previous shape
+        // returned `Ok(continuation)` and erased the conflict).
         Err(anyhow::anyhow!(
             "hook dispatch exhausted {} retries due to session commit conflict",
             PARENT_HOOK_DISPATCH_MAX_RETRIES
