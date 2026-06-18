@@ -14,8 +14,8 @@ use halter_config::{
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
-    HookWarning, ModelId, ModelRole, PromptSegmentKind, ProviderName, ResolvedModel,
-    ResourceSnapshot,
+    BuiltinToolName, HookWarning, ModelId, ModelRole, PromptSegmentKind, ProviderName,
+    ResolvedModel, ResourceSnapshot,
 };
 use halter_providers::{
     AnthropicProvider, ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials,
@@ -36,6 +36,43 @@ use crate::{CompiledResources, LoadedPlugin, LoadedSkill, ResourceCompiler};
 
 #[cfg(feature = "sqlite")]
 use halter_session::SqliteSessionStore;
+
+fn validate_tool_features(enabled: &[BuiltinToolName]) -> anyhow::Result<()> {
+    for tool in enabled {
+        match tool {
+            BuiltinToolName::Pty => {
+                #[cfg(not(feature = "pty"))]
+                anyhow::bail!("tool 'pty' is not built into this binary; enable the 'pty' feature");
+            }
+            BuiltinToolName::AstGrep => {
+                #[cfg(not(feature = "ast-tools"))]
+                anyhow::bail!(
+                    "tool 'ast_grep' is not built into this binary; enable the 'ast-tools' feature"
+                );
+            }
+            BuiltinToolName::Image => {
+                #[cfg(not(feature = "image-tools"))]
+                anyhow::bail!(
+                    "tool 'image' is not built into this binary; enable the 'image-tools' feature"
+                );
+            }
+            BuiltinToolName::Browser => {
+                #[cfg(not(feature = "browser-tools"))]
+                anyhow::bail!(
+                    "tool 'browser' is not built into this binary; enable the 'browser-tools' feature"
+                );
+            }
+            BuiltinToolName::Profile => {
+                #[cfg(not(feature = "profiling"))]
+                anyhow::bail!(
+                    "tool 'profile' is not built into this binary; enable the 'profiling' feature"
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 /// Builder for assembling a [`Halter`] runtime from config, resources, tools, and stores.
@@ -187,7 +224,14 @@ impl HalterBuilder {
 
         let models = Arc::new(build_model_registry(&config)?);
         let tools = Arc::new(ToolRuntime::new());
-        register_builtin_tools(&tools, &config.tools.enabled);
+        validate_tool_features(&config.tools.enabled)?;
+        let enabled_tool_names: Vec<String> = config
+            .tools
+            .enabled
+            .iter()
+            .map(|tool| tool.as_str().to_owned())
+            .collect();
+        register_builtin_tools(&tools, &enabled_tool_names);
         for tool in custom_tools {
             tools.register(tool);
         }
@@ -235,7 +279,7 @@ impl HalterBuilder {
         register_subagent_tools(
             &services.tools,
             runtime.subagent_control(),
-            &config.tools.enabled,
+            &enabled_tool_names,
             services.resources.snapshot().as_ref(),
             &services
                 .models
@@ -1122,6 +1166,36 @@ mod tests {
             .await
             .expect("list persisted sessions");
         assert_eq!(persisted.len(), 1);
+    }
+
+    #[test]
+    fn validate_tool_features_accepts_always_available_tools() {
+        validate_tool_features(&[BuiltinToolName::Read, BuiltinToolName::Task])
+            .expect("always-available tools should pass feature validation");
+    }
+
+    #[cfg(not(feature = "browser-tools"))]
+    #[test]
+    fn validate_tool_features_rejects_unavailable_browser_tool() {
+        let error = validate_tool_features(&[BuiltinToolName::Browser])
+            .expect_err("browser tool should be rejected when feature is disabled");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("'browser'"),
+            "error should name tool: {message}"
+        );
+        assert!(
+            message.contains("browser-tools"),
+            "error should mention required feature: {message}"
+        );
+    }
+
+    #[cfg(feature = "browser-tools")]
+    #[test]
+    fn validate_tool_features_accepts_browser_tool_when_feature_enabled() {
+        validate_tool_features(&[BuiltinToolName::Browser])
+            .expect("browser tool should be accepted when feature is enabled");
     }
 
     fn openai_config(api_key: Option<&str>) -> HarnessConfig {

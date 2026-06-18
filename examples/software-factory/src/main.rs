@@ -23,9 +23,9 @@ use halter_config::{
     ResourcesConfig, RuntimeConfig, SearchRoots, SessionsConfig, ShellPolicyConfig, ToolsConfig,
 };
 use halter_protocol::{
-    AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
-    PruneSignalThreshold, ReasoningEffort, SessionEventPayload, ToolCapabilities, ToolConcurrency,
-    ToolName, ToolResult, ToolSpec, Turn, Usage, Volatility,
+    AssistantPart, BuiltinToolName, CacheScope, Message, PromptSegment, PromptSegmentId,
+    PromptSegmentKind, PruneSignalThreshold, ReasoningEffort, SessionEventPayload,
+    ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec, Turn, Usage, Volatility,
 };
 use halter_tools::{Tool, ToolContext};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -889,10 +889,7 @@ fn default_factory_config() -> HarnessConfig {
             prune_signal_threshold: PruneSignalThreshold::Low,
         },
         tools: ToolsConfig {
-            enabled: judge_example_tools()
-                .into_iter()
-                .map(ToOwned::to_owned)
-                .collect(),
+            enabled: judge_example_tools().to_vec(),
         },
         policy: PolicyConfig {
             allowed_write_roots: vec![PathBuf::from("./"), PathBuf::from("/tmp/halter")],
@@ -936,25 +933,25 @@ fn model_config(
     }
 }
 
-fn judge_example_tools() -> [&'static str; 17] {
+fn judge_example_tools() -> [BuiltinToolName; 17] {
     [
-        "read",
-        "glob",
-        "grep",
-        "profile",
-        "write",
-        "edit",
-        "shell",
-        "process",
-        "task",
-        "pty",
-        "ast_grep",
-        "image",
-        "wait_agent",
-        "spawn_agent",
-        "send_input",
-        "close_agent",
-        "browser",
+        BuiltinToolName::Read,
+        BuiltinToolName::Glob,
+        BuiltinToolName::Grep,
+        BuiltinToolName::Profile,
+        BuiltinToolName::Write,
+        BuiltinToolName::Edit,
+        BuiltinToolName::Shell,
+        BuiltinToolName::Process,
+        BuiltinToolName::Task,
+        BuiltinToolName::Pty,
+        BuiltinToolName::AstGrep,
+        BuiltinToolName::Image,
+        BuiltinToolName::WaitAgent,
+        BuiltinToolName::SpawnAgent,
+        BuiltinToolName::SendInput,
+        BuiltinToolName::CloseAgent,
+        BuiltinToolName::Browser,
     ]
 }
 
@@ -1096,14 +1093,6 @@ async fn build_judge_harness(
     info!("building model judge harness");
     let mut config = config.clone();
     add_worktree_policy(&mut config, worktree);
-    if !config
-        .tools
-        .enabled
-        .iter()
-        .any(|tool| tool == "github_issue")
-    {
-        config.tools.enabled.push("github_issue".to_owned());
-    }
     let resources = ResourceCompiler::from_config(&config).compile().await?;
     let harness = Halter::builder()
         .with_config(config)

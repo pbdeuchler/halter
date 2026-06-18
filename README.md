@@ -424,6 +424,13 @@ enabled = [
   "close_agent",
 ]
 
+# `tools.enabled` accepts only known, canonical builtin tool names. Unknown or
+# typo'd names cause a hard config-load error. An empty list (or omitted
+# `[tools]`) means "register every tool compiled into this binary".
+# Feature-gated names such as `browser`, `pty`, `ast_grep`, `image`, and
+# `profile` are valid as identities but only available when the matching Cargo
+# feature is enabled; otherwise the builder errors.
+
 [context]
 compaction_threshold = 200_000
 pre_compaction_target = 150_000
@@ -468,8 +475,11 @@ The `models.default` and `models.subagent` slots accept either an inline model
 a panel-judged one:
 
 1. The context and user message are multiplexed to every model in `panel` in
-   parallel (each receives the full context **and** the tool specs, so it may
-   propose tool calls).
+   parallel (each receives the full context **and** the tool specs). A constant
+   framing prefix is prepended as the first user message so each panelist
+   answers as one advisory voice on a judged panel — comparable prose about what
+   it *would* do and why, rather than executing or replying. The prefix is added
+   only on the panel path, so it never reaches the synthesis or default model.
 2. The `synthesis` model is given the panel responses and a `rank_responses` tool.
    It first stack-ranks the panel responses (emitted as structured `tracing`
    telemetry on the `halter::model_judge` target), then writes a synthesis that
@@ -523,7 +533,7 @@ use std::sync::Arc;
 use halter::session::InMemorySessionStore;
 use halter::{HalterBuilder, LoadedSkill};
 use halter_config::{
-    ConfiguredProvider, ContextConfig, HarnessConfig, ModelConfig, ModelsConfig,
+    BuiltinToolName, ConfiguredProvider, ContextConfig, HarnessConfig, ModelConfig, ModelsConfig,
     NetworkPolicyConfig, PolicyConfig, PromptsConfig, ProviderConfig, ProvidersConfig,
     ResourcesConfig, RuntimeConfig, SearchRoots, SessionBackend, SessionsConfig,
     ShellPolicyConfig, ToolsConfig,
@@ -595,17 +605,17 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
         },
         tools: ToolsConfig {
             enabled: vec![
-                "read".to_owned(),
-                "glob".to_owned(),
-                "grep".to_owned(),
-                "write".to_owned(),
-                "edit".to_owned(),
-                "shell".to_owned(),
-                "process".to_owned(),
-                "spawn_agent".to_owned(),
-                "send_input".to_owned(),
-                "wait_agent".to_owned(),
-                "close_agent".to_owned(),
+                BuiltinToolName::Read,
+                BuiltinToolName::Glob,
+                BuiltinToolName::Grep,
+                BuiltinToolName::Write,
+                BuiltinToolName::Edit,
+                BuiltinToolName::Shell,
+                BuiltinToolName::Process,
+                BuiltinToolName::SpawnAgent,
+                BuiltinToolName::SendInput,
+                BuiltinToolName::WaitAgent,
+                BuiltinToolName::CloseAgent,
             ],
         },
         policy: PolicyConfig {

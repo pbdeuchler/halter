@@ -358,19 +358,27 @@ prune_signal_threshold = "low"
 
 ## Tool enablement
 
-`ToolsConfig` is intentionally simple:
+`ToolsConfig` selects built-in tools by canonical name from [`BuiltinToolName`]. An
+unknown or typo'd name causes a hard config-load error. An empty `enabled`
+list registers every tool compiled into the binary.
 
 ```toml
 [tools]
 enabled = ["read", "glob", "grep", "write", "edit", "shell", "process"]
 ```
 
-Behavior:
+Valid names include the always-available built-ins:
+`read`, `write`, `edit`, `glob`, `grep`, `shell`, `process`, `task`
+and the subagent tools:
+`spawn_agent`, `send_input`, `wait_agent`, `close_agent`.
 
-- if `enabled` is empty, the runtime registers all built-in tools available in the build
-- if `enabled` is non-empty, only listed tools are registered
-
-Feature-gated tools must still be compiled in via Cargo features, even if named here.
+Feature-gated names are also recognized as valid identities, but they only
+become available when the corresponding Cargo feature is compiled in:
+`pty` (requires `pty`),
+`ast_grep` (requires `ast-tools`),
+`image` (requires `image-tools`),
+`browser` (requires `browser-tools`),
+`profile` (requires `profiling`).
 
 For the full tool catalog, see `../halter-tools/README.md`.
 

@@ -807,7 +807,11 @@ timeout_secs = 30
 
 ### Confusing config enablement with feature compilation
 
-If `pty` is not compiled in, listing it under `tools.enabled` is not enough.
+`tools.enabled` accepts only the canonical names in [`BuiltinToolName`]. Unknown
+or typo'd names cause a hard config-load error. Feature-gated names such as
+`pty`, `ast_grep`, `image`, `browser`, or `profile` are recognized as valid
+identities, but they also require the matching Cargo feature to be compiled in;
+requesting one without it produces a builder error.
 
 ### Allowlisting too little for real workflows
 

@@ -193,6 +193,119 @@ impl Default for ModelRole {
     }
 }
 
+/// Canonical identity for every built-in tool that halter knows about.
+///
+/// This enum is the single source of truth for tool names used in
+/// configuration. Serde rejects unknown variants at parse time, so an invalid
+/// entry such as `enabled = ["frobnicate"]` fails immediately with the
+/// offending name visible in the error.
+///
+/// Feature-gated variants (`Pty`, `AstGrep`, `Image`, `Browser`, `Profile`)
+/// are valid tool *identities*, but a binary must be compiled with the
+/// matching Cargo feature for them to be available at runtime. Requesting a
+/// known tool that was not compiled in is a builder error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BuiltinToolName {
+    /// Read files: `read`.
+    Read,
+    /// Write files: `write`.
+    Write,
+    /// Edit files: `edit`.
+    Edit,
+    /// Find files by glob pattern: `glob`.
+    Glob,
+    /// Search file contents: `grep`.
+    Grep,
+    /// Run shell commands: `shell`.
+    Shell,
+    /// Inspect or signal processes: `process`.
+    Process,
+    /// Manage session tasks: `task`.
+    Task,
+    /// Interactive pseudo-terminal: `pty` (requires `pty` feature).
+    Pty,
+    /// Structural search and replace: `ast_grep` (requires `ast-tools` feature).
+    AstGrep,
+    /// Image processing: `image` (requires `image-tools` feature).
+    Image,
+    /// Browser automation: `browser` (requires `browser-tools` feature).
+    Browser,
+    /// Runtime profiling: `profile` (requires `profiling` feature).
+    Profile,
+    /// Spawn a subagent: `spawn_agent`.
+    SpawnAgent,
+    /// Send input to a subagent: `send_input`.
+    SendInput,
+    /// Wait for a subagent: `wait_agent`.
+    WaitAgent,
+    /// Close a subagent: `close_agent`.
+    CloseAgent,
+}
+
+impl BuiltinToolName {
+    /// Stable, canonical snake_case name for this tool.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Edit => "edit",
+            Self::Glob => "glob",
+            Self::Grep => "grep",
+            Self::Shell => "shell",
+            Self::Process => "process",
+            Self::Task => "task",
+            Self::Pty => "pty",
+            Self::AstGrep => "ast_grep",
+            Self::Image => "image",
+            Self::Browser => "browser",
+            Self::Profile => "profile",
+            Self::SpawnAgent => "spawn_agent",
+            Self::SendInput => "send_input",
+            Self::WaitAgent => "wait_agent",
+            Self::CloseAgent => "close_agent",
+        }
+    }
+
+    /// All canonical built-in tool names.
+    #[must_use]
+    pub const fn all() -> &'static [BuiltinToolName] {
+        &[
+            Self::Read,
+            Self::Write,
+            Self::Edit,
+            Self::Glob,
+            Self::Grep,
+            Self::Shell,
+            Self::Process,
+            Self::Task,
+            Self::Pty,
+            Self::AstGrep,
+            Self::Image,
+            Self::Browser,
+            Self::Profile,
+            Self::SpawnAgent,
+            Self::SendInput,
+            Self::WaitAgent,
+            Self::CloseAgent,
+        ]
+    }
+}
+
+impl From<BuiltinToolName> for ToolName {
+    fn from(value: BuiltinToolName) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+impl fmt::Display for BuiltinToolName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for ModelRole {
     type Err = String;
 
@@ -1841,6 +1954,34 @@ mod tests {
         let encoded = serde_json::to_string(&event).expect("serialize event");
         let decoded: StreamEvent = serde_json::from_str(&encoded).expect("deserialize event");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn builtin_tool_name_roundtrips_snake_case() {
+        for original in BuiltinToolName::all() {
+            let json = serde_json::to_string(&original).expect("serialize");
+            let decoded: BuiltinToolName = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, *original);
+        }
+    }
+
+    #[test]
+    fn builtin_tool_name_deserialize_rejects_unknown_variant() {
+        let result: Result<BuiltinToolName, _> = serde_json::from_str("\"frobnicate\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builtin_tool_name_as_str_is_canonical_snake_case() {
+        assert_eq!(BuiltinToolName::AstGrep.as_str(), "ast_grep");
+        assert_eq!(BuiltinToolName::SpawnAgent.as_str(), "spawn_agent");
+        assert_eq!(BuiltinToolName::Read.as_str(), "read");
+    }
+
+    #[test]
+    fn builtin_tool_name_converts_to_tool_name() {
+        let tool_name: ToolName = BuiltinToolName::Browser.into();
+        assert_eq!(tool_name.0, "browser");
     }
 
     fn assistant_text(text: &str) -> Message {

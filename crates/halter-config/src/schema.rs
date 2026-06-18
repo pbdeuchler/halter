@@ -7,6 +7,8 @@ use anyhow::Context;
 use halter_protocol::{
     ApiKind, ProviderKind, PruneSignalThreshold, ReasoningEffort, SubagentEventForwarding,
 };
+
+pub use halter_protocol::BuiltinToolName;
 use indexmap::IndexMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -801,9 +803,17 @@ const fn default_pre_compaction_target() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 /// Built-in tool selection.
+///
+/// `enabled` accepts only the known built-in tool names defined by
+/// [`BuiltinToolName`]. An unknown or typo'd name fails config load immediately.
+/// An empty list means "register all tools available in this binary".
+///
+/// Feature-gated tools such as `browser` or `profile` are valid names, but they
+/// only become available when the binary is compiled with the matching Cargo
+/// feature; otherwise the builder will error.
 pub struct ToolsConfig {
     #[serde(default)]
-    pub enabled: Vec<String>,
+    pub enabled: Vec<BuiltinToolName>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1681,6 +1691,236 @@ port = 9090
         assert_eq!(parsed.allowed_loopback.len(), 1);
         assert_eq!(parsed.allowed_loopback[0].host, "localhost");
         assert_eq!(parsed.allowed_loopback[0].port, Some(9090));
+    }
+
+    #[test]
+    fn tools_config_accepts_valid_builtin_names() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[tools]
+enabled = ["read", "write", "glob", "grep", "shell", "process", "task"]
+"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            parsed.tools.enabled,
+            vec![
+                BuiltinToolName::Read,
+                BuiltinToolName::Write,
+                BuiltinToolName::Glob,
+                BuiltinToolName::Grep,
+                BuiltinToolName::Shell,
+                BuiltinToolName::Process,
+                BuiltinToolName::Task,
+            ]
+        );
+        parsed.validate().expect("valid tools should validate");
+    }
+
+    #[test]
+    fn tools_config_empty_enabled_defaults_to_all() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[tools]
+enabled = []
+"#,
+        )
+        .expect("parse config");
+
+        assert!(parsed.tools.enabled.is_empty());
+        parsed.validate().expect("empty tools should validate");
+    }
+
+    #[test]
+    fn tools_config_accepts_all_builtin_names() {
+        let all_names: Vec<String> = BuiltinToolName::all()
+            .iter()
+            .map(|tool| tool.as_str().to_owned())
+            .collect();
+        let toml_text = format!(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[tools]
+enabled = [{names}]
+"#,
+            names = all_names
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let parsed: HarnessConfig = toml::from_str(&toml_text).expect("parse config");
+        assert_eq!(parsed.tools.enabled, BuiltinToolName::all().to_vec());
+        parsed.validate().expect("all valid names should validate");
+    }
+
+    #[test]
+    fn tools_config_accepts_subagent_names() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[tools]
+enabled = ["spawn_agent", "send_input", "wait_agent", "close_agent"]
+"#,
+        )
+        .expect("parse config");
+
+        assert_eq!(
+            parsed.tools.enabled,
+            vec![
+                BuiltinToolName::SpawnAgent,
+                BuiltinToolName::SendInput,
+                BuiltinToolName::WaitAgent,
+                BuiltinToolName::CloseAgent,
+            ]
+        );
+    }
+
+    #[test]
+    fn tools_config_unknown_name_fails_at_parse() {
+        let error = toml::from_str::<HarnessConfig>(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[tools]
+enabled = ["read", "frobnicate"]
+"#,
+        )
+        .expect_err("unknown tool should fail parse");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("frobnicate"),
+            "error should name the offending tool: {message}"
+        );
+    }
+
+    #[test]
+    fn tools_config_typo_fails_at_parse() {
+        let error = toml::from_str::<HarnessConfig>(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[tools]
+enabled = ["reed"]
+"#,
+        )
+        .expect_err("typo should fail parse");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("reed"),
+            "error should name the offending tool: {message}"
+        );
+    }
+
+    #[test]
+    fn tools_config_mixed_valid_and_invalid_fails_at_parse() {
+        let error = toml::from_str::<HarnessConfig>(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[tools]
+enabled = ["read", "write", "nonexistent"]
+"#,
+        )
+        .expect_err("invalid tool should fail parse");
+
+        assert!(error.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn json_schema_tools_enabled_references_builtin_tool_name() {
+        let schema_text = crate::export_json_schema().expect("export schema");
+        let schema: serde_json::Value = serde_json::from_str(&schema_text).expect("parse schema");
+
+        let enabled_items = schema
+            .pointer("/definitions/ToolsConfig/properties/enabled/items")
+            .expect("tools.enabled.items in schema");
+        assert_eq!(
+            enabled_items["$ref"].as_str(),
+            Some("#/definitions/BuiltinToolName")
+        );
+
+        let one_of = schema
+            .pointer("/definitions/BuiltinToolName/oneOf")
+            .expect("BuiltinToolName oneOf in schema")
+            .as_array()
+            .expect("oneOf is array");
+
+        let enum_names: std::collections::HashSet<String> = one_of
+            .iter()
+            .map(|variant| {
+                variant["enum"][0]
+                    .as_str()
+                    .expect("each variant defines a single enum value")
+                    .to_owned()
+            })
+            .collect();
+
+        let expected: std::collections::HashSet<String> = BuiltinToolName::all()
+            .iter()
+            .map(|tool| tool.as_str().to_owned())
+            .collect();
+
+        assert_eq!(enum_names, expected);
     }
 
     fn openai_oauth_config() -> OpenAiOAuthConfig {

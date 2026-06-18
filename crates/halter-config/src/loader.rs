@@ -434,6 +434,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::BuiltinToolName;
 
     #[tokio::test]
     async fn layered_config_merges_predictably() {
@@ -586,7 +587,10 @@ api_key = "openai-key"
             vec![PathBuf::from("./skills"), PathBuf::from("./vendor/skills")]
         );
         assert_eq!(decoded.policy.shell.allow, vec!["git", "just"]);
-        assert_eq!(decoded.tools.enabled, vec!["read", "glob"]);
+        assert_eq!(
+            decoded.tools.enabled,
+            vec![BuiltinToolName::Read, BuiltinToolName::Glob]
+        );
     }
 
     #[test]
