@@ -8,11 +8,8 @@ use halter_protocol::{
 use sha2::{Digest, Sha256};
 
 /// Max byte length shared by all provider-facing identifier aliases (tool
-/// call ids, Responses item ids, etc.). Previously split into
-/// `DEFAULT_PROVIDER_ID_MAX_LEN` here and `RESPONSES_ITEM_ID_MAX_LEN` in
-/// `openai_codec.rs`; both were `64` (finding L14), so consolidate.
+/// call ids, Responses item ids, etc.). Consolidated to `64`.
 pub(crate) const PROVIDER_ID_MAX_LEN: usize = 64;
-const DEFAULT_PROVIDER_ID_MAX_LEN: usize = PROVIDER_ID_MAX_LEN;
 
 pub(crate) fn collect_system_text(request: &ProviderRequest) -> Option<String> {
     let mut sections = Vec::new();
@@ -122,7 +119,7 @@ pub(crate) fn tool_result_text(result: &ToolResult, error: &Option<ToolError>) -
 }
 
 pub(crate) fn normalized_tool_call_id(call_id: &ToolCallId) -> String {
-    bounded_provider_id_with_prefix("", &call_id.0, DEFAULT_PROVIDER_ID_MAX_LEN, "tool")
+    bounded_provider_id_with_prefix("", &call_id.0, PROVIDER_ID_MAX_LEN, "tool")
 }
 
 pub(crate) fn bounded_provider_id(value: &str, max_len: usize, empty_prefix: &str) -> String {

@@ -47,7 +47,6 @@ CREATE TABLE events (
 // Compile-time guarantee that MIGRATIONS is sorted by strictly increasing
 // version. run_migrations skips any entry whose version is <= the current
 // schema version, so an unsorted table would silently drop migrations.
-// (finding L15)
 const _: () = {
     let mut i = 1;
     while i < MIGRATIONS.len() {
@@ -609,7 +608,7 @@ fn unix_timestamp_seconds() -> Result<i64> {
 ///    developer who exports `XDG_DATA_HOME` globally on Windows will see the
 ///    XDG path used instead of `%LOCALAPPDATA%`. This is intentional —
 ///    cross-platform dotfile/portable-install workflows benefit from a
-///    single consistent override. (finding M27)
+///    single consistent override.
 /// 2. Platform fallback:
 ///    - Windows: `%LOCALAPPDATA%/halter/sessions.db`
 ///    - Unix:    `$HOME/.local/share/halter/sessions.db`

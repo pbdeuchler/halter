@@ -92,7 +92,7 @@ impl TaskList {
             }
         }
         TaskSummary {
-            total: self.items.len() as u64,
+            total: u64::try_from(self.items.len()).unwrap_or(u64::MAX),
             pending,
             completed,
         }

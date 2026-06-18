@@ -61,7 +61,8 @@ pub trait Provider: Send + Sync {
     /// Return the provider-specific compaction window for a transcript.
     ///
     /// Providers that do not support compaction return `None`.
-    fn compaction_window(&self, _messages: &[Message]) -> Option<CompactionWindow> {
+    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
+        let _ = messages;
         None
     }
 
