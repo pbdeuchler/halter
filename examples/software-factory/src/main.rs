@@ -3,6 +3,7 @@
 mod core;
 
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{process::Command, sync::RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::core::{
     CHECKPOINT_PATH, CandidateSet, CodeReview, IMPLEMENTATION_PLAN_PATH, IssueComment, IssueDoc,
@@ -117,6 +119,37 @@ struct Cli {
         help = "Provider/model for PR title and body drafting"
     )]
     pr_model: String,
+}
+
+/// Third-party targets that become too noisy when users set `RUST_LOG=debug`.
+const NOISY_TARGET_SUPPRESSIONS: &str = "tokenize=warn,parse=warn,expansion=warn,commands=warn,\
+     pattern=warn,completion=warn,jobs=warn,unimplemented=warn,\
+     hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,rustls=warn";
+
+fn logging_filter_spec(user_directives: Option<&str>) -> String {
+    let directives = user_directives
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("info");
+    format!("{directives},{NOISY_TARGET_SUPPRESSIONS}")
+}
+
+fn logging_filter_from_spec(spec: &str) -> anyhow::Result<EnvFilter> {
+    EnvFilter::try_new(spec).context("invalid RUST_LOG filter")
+}
+
+fn init_logging() -> anyhow::Result<()> {
+    let user_directives = match env::var(EnvFilter::DEFAULT_ENV) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => bail!("invalid utf-8 in RUST_LOG"),
+    };
+    let filter = logging_filter_from_spec(&logging_filter_spec(user_directives.as_deref()))?;
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_target(true).compact())
+        .try_init()
+        .context("failed to initialize logging")
 }
 
 const CHECKPOINT_VERSION: u8 = 1;
@@ -266,14 +299,28 @@ fn validate_checkpoint_stage_state(checkpoint: &FactoryCheckpoint) -> Result<(),
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
+    init_logging()?;
+
     let requested_issue = cli
         .issue
         .map(validate_issue_number)
         .transpose()
         .map_err(anyhow::Error::msg)?;
+    info!(
+        remote = %cli.remote,
+        base = ?cli.base,
+        branch = ?cli.branch,
+        monitor = cli.monitor,
+        allow_dirty = cli.allow_dirty,
+        commit_impl_plan = cli.commit_impl_plan,
+        resume = cli.resume,
+        reset_checkpoint = cli.reset_checkpoint,
+        requested_issue = ?requested_issue,
+        max_review_iterations = cli.max_review_iterations,
+        poll_seconds = cli.poll_seconds,
+        "starting software factory run"
+    );
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     let worktree = git_worktree_root(&cwd).await?;
     let project_system_prompt = read_project_system_prompt(&worktree).await?;
@@ -284,6 +331,18 @@ async fn main() -> anyhow::Result<()> {
     let github = GitHubClient::from_local_credentials(&worktree).await?;
     let repo_info = github.fetch_repo(&repo).await?;
     let base_branch = cli.base.clone().unwrap_or(repo_info.default_branch);
+    info!(
+        cwd = %cwd.display(),
+        worktree = %worktree.display(),
+        repo = %repo,
+        base_branch = %base_branch,
+        "resolved repository context"
+    );
+    if let Some(prompt) = project_system_prompt.as_deref() {
+        info!(bytes = prompt.len(), "loaded project guidance");
+    } else {
+        info!("no project guidance files found");
+    }
     let checkpoint_path = worktree.join(CHECKPOINT_PATH);
     let mut checkpoint = initialize_checkpoint(
         &checkpoint_path,
@@ -322,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
     if issues.is_empty() {
         bail!("failed to select work: {repo} has no open non-PR issues");
     }
+    info!(issue_count = issues.len(), "loaded issue corpus");
     let issue_cache = issue_cache_from_docs(&issues);
     let allowed_issue_numbers = issues
         .iter()
@@ -338,6 +398,7 @@ async fn main() -> anyhow::Result<()> {
 
     let glm = build_model_harness(
         &base_config,
+        "issue grouping and feedback refinement",
         ModelSpec::parse(&cli.glm_model).map_err(anyhow::Error::msg)?,
         ReasoningEffort::Xhigh,
         &worktree,
@@ -356,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let implementer = build_model_harness(
         &base_config,
+        "implementation",
         ModelSpec::parse(&cli.implementer_model).map_err(anyhow::Error::msg)?,
         ReasoningEffort::Xhigh,
         &worktree,
@@ -363,6 +425,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let reviewer = build_model_harness(
         &base_config,
+        "code review",
         ModelSpec::parse(&cli.reviewer_model).map_err(anyhow::Error::msg)?,
         ReasoningEffort::Xhigh,
         &worktree,
@@ -370,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let pr_writer = build_model_harness(
         &base_config,
+        "pr drafting",
         ModelSpec::parse(&cli.pr_model).map_err(anyhow::Error::msg)?,
         ReasoningEffort::Medium,
         &worktree,
@@ -385,6 +449,7 @@ async fn main() -> anyhow::Result<()> {
                 .iter()
                 .find(|issue| issue.number == number)
                 .with_context(|| format!("failed to find requested issue #{number} after fetch"))?;
+            info!(issue = number, "using requested issue as the candidate set");
             candidate_set_for_issue(issue)
         } else {
             propose_issue_candidates(
@@ -465,6 +530,7 @@ async fn main() -> anyhow::Result<()> {
         write_checkpoint(&checkpoint_path, &checkpoint).await?;
         (branch, base_ref)
     };
+    info!(branch = %current_branch, base_ref = %base_ref, "prepared branch");
 
     if checkpoint.implemented {
         info!("skipping implementation; factory checkpoint marks it complete");
@@ -498,13 +564,14 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         checkpoint.reviewed = true;
         write_checkpoint(&checkpoint_path, &checkpoint).await?;
+        info!("implementation review loop completed");
     }
 
     if !checkpoint.committed {
         if !branch_has_diff(&worktree, &base_ref).await? {
             bail!("failed to create PR: implementation produced no diff against {base_ref}");
         }
-        commit_if_dirty(
+        let committed = commit_if_dirty(
             &worktree,
             &format!("Implement {}", selection.title),
             (!cli.commit_impl_plan).then_some(IMPLEMENTATION_PLAN_PATH),
@@ -513,6 +580,7 @@ async fn main() -> anyhow::Result<()> {
         checkpoint.committed = true;
         checkpoint.commit_sha = Some(current_commit(&worktree).await?);
         write_checkpoint(&checkpoint_path, &checkpoint).await?;
+        info!(committed, "commit step completed");
     } else {
         info!("skipping commit; factory checkpoint marks it complete");
     }
@@ -555,6 +623,7 @@ async fn main() -> anyhow::Result<()> {
         let pr = CheckpointPullRequest::from(&pr);
         checkpoint.pr = Some(pr.clone());
         write_checkpoint(&checkpoint_path, &checkpoint).await?;
+        info!(pr_number = pr.number, url = %pr.html_url, "created pull request");
         pr
     };
 
@@ -583,7 +652,9 @@ async fn main() -> anyhow::Result<()> {
     checkpoint.completed = true;
     write_checkpoint(&checkpoint_path, &checkpoint).await?;
 
+    info!("shutting down harnesses");
     shutdown_all([&glm, &judge, &implementer, &reviewer, &pr_writer]).await;
+    info!("software factory run complete");
     Ok(())
 }
 
@@ -945,9 +1016,11 @@ impl GitHubIssueTool {
             bail!("failed to fetch issue #{number}: issue is outside the current issue corpus");
         }
         if let Some(issue) = self.cache.read().await.get(&number).cloned() {
+            info!(issue = number, "github_issue tool cache hit");
             return Ok((issue, "cache"));
         }
 
+        info!(issue = number, repo = %self.repo, "github_issue tool fetching issue");
         let issue = self.github.fetch_open_issue(&self.repo, number).await?;
         self.cache.write().await.insert(number, issue.clone());
         Ok((issue, "github"))
@@ -1013,6 +1086,7 @@ async fn build_judge_harness(
     worktree: &Path,
     issue_tool: Arc<dyn Tool>,
 ) -> anyhow::Result<Halter> {
+    info!("building model judge harness");
     let mut config = config.clone();
     add_worktree_policy(&mut config, worktree);
     if !config
@@ -1024,20 +1098,30 @@ async fn build_judge_harness(
         config.tools.enabled.push("github_issue".to_owned());
     }
     let resources = ResourceCompiler::from_config(&config).compile().await?;
-    Halter::builder()
+    let harness = Halter::builder()
         .with_config(config)
         .with_compiled_resources(resources)
         .with_tool(issue_tool)
         .build()
-        .await
+        .await?;
+    info!("built model judge harness");
+    Ok(harness)
 }
 
 async fn build_model_harness(
     config: &HarnessConfig,
+    role: &str,
     model: ModelSpec,
     reasoning: ReasoningEffort,
     worktree: &Path,
 ) -> anyhow::Result<Halter> {
+    info!(
+        role,
+        provider = ?model.provider,
+        model = %model.model,
+        reasoning = ?reasoning,
+        "building model harness"
+    );
     let mut config = config.clone();
     add_worktree_policy(&mut config, worktree);
     let model = model.into_model_config(reasoning, Some(230_000), Some(16_384));
@@ -1045,7 +1129,9 @@ async fn build_model_harness(
     config.models.small = Some(model.clone());
     config.models.subagent = Some(ModelSlot::Inline(model));
     let resources = ResourceCompiler::from_config(&config).compile().await?;
-    Halter::from_compiled_resources(config, resources).await
+    let harness = Halter::from_compiled_resources(config, resources).await?;
+    info!(role, "built model harness");
+    Ok(harness)
 }
 
 async fn shutdown_all<'a>(harnesses: impl IntoIterator<Item = &'a Halter>) {
@@ -1061,6 +1147,43 @@ struct AgentRun {
 
 const FACTORY_TURN_USER_MESSAGE: &str =
     "Execute the appended turn-specific instructions for this software factory stage.";
+
+fn json_preview(value: &Value, max_chars: usize) -> String {
+    single_line_preview(&value.to_string(), max_chars)
+}
+
+fn single_line_preview(text: &str, max_chars: usize) -> String {
+    let normalized = text.replace('\n', "\\n").replace('\r', "\\r");
+    let mut preview = String::new();
+    let mut truncated = false;
+    for (index, ch) in normalized.chars().enumerate() {
+        if index == max_chars {
+            truncated = true;
+            break;
+        }
+        preview.push(ch);
+    }
+    if truncated {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn tool_result_kind(result: &ToolResult) -> &'static str {
+    match result {
+        ToolResult::Empty => "empty",
+        ToolResult::Text { .. } => "text",
+        ToolResult::Json { .. } => "json",
+    }
+}
+
+fn tool_result_size(result: &ToolResult) -> usize {
+    match result {
+        ToolResult::Empty => 0,
+        ToolResult::Text { text } => text.len(),
+        ToolResult::Json { value } => value.to_string().len(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentTextRequirement {
@@ -1205,8 +1328,14 @@ async fn run_agent_with_prompt_kind(
     project_system_prompt: Option<&str>,
     text_requirement: AgentTextRequirement,
 ) -> anyhow::Result<AgentRun> {
-    info!(stage = label, "starting agent turn");
     let turn_instructions = prompt.into();
+    info!(
+        stage = label,
+        system_prompt = ?system_prompt,
+        prompt_bytes = turn_instructions.len(),
+        project_guidance = project_system_prompt.is_some_and(|prompt| !prompt.trim().is_empty()),
+        "starting agent turn"
+    );
     let session = harness
         .new_session(session_init_with_appended_context(
             worktree,
@@ -1223,8 +1352,20 @@ async fn run_agent_with_prompt_kind(
     let mut usage = Usage::default();
 
     while let Some(event) = events.next().await {
-        match event?.payload {
+        let event =
+            event.with_context(|| format!("failed to read event for agent stage {label}"))?;
+        match event.payload {
+            SessionEventPayload::SessionStarted => {
+                info!(stage = label, "agent session started");
+            }
+            SessionEventPayload::Warning { message } => {
+                warn!(stage = label, warning = %message, "agent warning");
+            }
+            SessionEventPayload::TurnStarted { turn_id } => {
+                info!(stage = label, turn_id = %turn_id, "agent turn started");
+            }
             SessionEventPayload::DeltaItem { delta } => {
+                debug!(stage = label, bytes = delta.text.len(), "assistant delta");
                 delta_text.push_str(&delta.text);
             }
             SessionEventPayload::MessageItem {
@@ -1241,20 +1382,134 @@ async fn run_agent_with_prompt_kind(
                         .collect::<String>(),
                 );
             }
+            SessionEventPayload::ToolExecutionStarted { call } => {
+                info!(
+                    stage = label,
+                    tool = %call.name,
+                    call_id = %call.id,
+                    arguments = %json_preview(&call.arguments, 500),
+                    "tool started"
+                );
+            }
+            SessionEventPayload::ToolOutput {
+                call_id,
+                tool_name,
+                chunk,
+            } => {
+                debug!(
+                    stage = label,
+                    tool = %tool_name,
+                    call_id = %call_id,
+                    bytes = chunk.len(),
+                    preview = %single_line_preview(&chunk, 300),
+                    "tool output"
+                );
+            }
+            SessionEventPayload::HookStarted { run } => {
+                info!(
+                    stage = label,
+                    hook = %run.event_name,
+                    plugin = %run.plugin_id,
+                    handler = ?run.handler_type,
+                    "hook started"
+                );
+            }
+            SessionEventPayload::HookCompleted { run } => {
+                info!(
+                    stage = label,
+                    hook = %run.event_name,
+                    plugin = %run.plugin_id,
+                    status = ?run.status,
+                    duration_ms = ?run.duration_ms,
+                    entries = run.entries.len(),
+                    message = ?run.status_message,
+                    "hook completed"
+                );
+            }
+            SessionEventPayload::ToolExecutionCompleted { outcome } => {
+                let tool = outcome.call.name;
+                let call_id = outcome.call.id;
+                match outcome.result {
+                    Ok(result) => {
+                        info!(
+                            stage = label,
+                            tool = %tool,
+                            call_id = %call_id,
+                            result_kind = tool_result_kind(&result),
+                            result_bytes = tool_result_size(&result),
+                            "tool completed"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            stage = label,
+                            tool = %tool,
+                            call_id = %call_id,
+                            error = %error,
+                            "tool failed"
+                        );
+                    }
+                }
+            }
+            SessionEventPayload::ApprovalRequested { tool_name, reason } => {
+                warn!(
+                    stage = label,
+                    tool = %tool_name,
+                    reason = %reason,
+                    "tool approval requested"
+                );
+            }
+            SessionEventPayload::ContextCompacted { summary } => {
+                info!(
+                    stage = label,
+                    summary_bytes = summary.len(),
+                    "context compacted"
+                );
+            }
             SessionEventPayload::TurnCompleted {
-                usage: turn_usage, ..
+                turn_id,
+                usage: turn_usage,
             } => {
                 usage = turn_usage;
+                info!(
+                    stage = label,
+                    turn_id = %turn_id,
+                    input_tokens = usage.input_tokens,
+                    output_tokens = usage.output_tokens,
+                    cache_creation_input_tokens = usage.cache_creation_input_tokens,
+                    cache_read_input_tokens = usage.cache_read_input_tokens,
+                    "agent turn completed"
+                );
                 break;
             }
-            SessionEventPayload::TurnFailed { error, .. } => {
+            SessionEventPayload::TurnFailed {
+                turn_id,
+                error,
+                cancelled,
+                retryable,
+            } => {
+                warn!(
+                    stage = label,
+                    turn_id = %turn_id,
+                    cancelled,
+                    retryable,
+                    error = %error,
+                    "agent turn failed"
+                );
                 let _ = session.shutdown("turn_failed").await;
                 bail!("agent stage {label} failed: {error}");
+            }
+            SessionEventPayload::Lagged { dropped_events } => {
+                warn!(stage = label, dropped_events, "agent event stream lagged");
+            }
+            SessionEventPayload::SessionShutdownComplete => {
+                info!(stage = label, "agent session shutdown complete");
             }
             _ => {}
         }
     }
 
+    info!(stage = label, "shutting down agent session");
     session.shutdown(label).await?;
     let run = agent_run_from_text(label, latest_text, delta_text, text_requirement)?;
     if text_requirement == AgentTextRequirement::Optional && run.text.is_empty() {
@@ -1426,6 +1681,12 @@ async fn prepare_branch(
     selection: &JudgeSelection,
     excluded_dirty_path: Option<&str>,
 ) -> anyhow::Result<String> {
+    info!(
+        base_branch,
+        requested_branch = ?requested_branch,
+        allow_dirty,
+        "preparing factory branch"
+    );
     if !allow_dirty && git_is_dirty(worktree, excluded_dirty_path).await? {
         bail!("failed to prepare branch: worktree is dirty; commit/stash or pass --allow-dirty");
     }
@@ -1438,6 +1699,13 @@ async fn prepare_branch(
         )
     });
     let base_ref = format!("origin/{base_branch}");
+    info!(
+        branch = %branch,
+        base_ref = %base_ref,
+        title = %selection.title,
+        repo = %repo,
+        "checking out factory branch"
+    );
     run_cmd(worktree, "git", &["checkout", "-b", &branch, &base_ref]).await?;
     Ok(branch)
 }
@@ -1545,6 +1813,12 @@ async fn run_review_loop(
         if diff.trim().is_empty() {
             bail!("review loop cannot continue: branch diff is empty");
         }
+        info!(
+            iteration,
+            max_iterations,
+            diff_bytes = diff.len(),
+            "starting review iteration"
+        );
         let review =
             review_diff(reviewer, worktree, base_ref, &diff, project_system_prompt).await?;
         if review.clean && review.findings.is_empty() {
@@ -1708,12 +1982,20 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
         .github
         .initial_seen_pr_activity(ctx.repo, ctx.pr_number)
         .await?;
+    info!(
+        pr_number = ctx.pr_number,
+        seen_activity = seen.len(),
+        poll_seconds = ctx.poll_seconds,
+        "starting PR monitor"
+    );
     loop {
+        info!(pr_number = ctx.pr_number, "polling PR state");
         let pr = ctx
             .github
             .fetch_pull_request(ctx.repo, ctx.pr_number)
             .await?;
         if pr.merged.unwrap_or(false) {
+            info!(pr_number = ctx.pr_number, url = %pr.html_url, "PR merged");
             println!("PR merged: {}", pr.html_url);
             return Ok(());
         }
@@ -1730,9 +2012,20 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
             .fetch_new_pr_activity(ctx.repo, ctx.pr_number, &mut seen)
             .await?;
         if action.is_empty() {
+            info!(
+                pr_number = ctx.pr_number,
+                poll_seconds = ctx.poll_seconds,
+                "no new PR activity"
+            );
             tokio::time::sleep(Duration::from_secs(ctx.poll_seconds)).await;
             continue;
         }
+        info!(
+            pr_number = ctx.pr_number,
+            review_feedback = action.code_review_feedback.len(),
+            plsfix_comments = action.plsfix_comments.len(),
+            "new PR activity"
+        );
 
         if !action.code_review_feedback.is_empty() {
             let feedback = action.code_review_feedback.join("\n\n---\n\n");
@@ -1917,8 +2210,10 @@ async fn commit_if_dirty(
     excluded_path: Option<&str>,
 ) -> anyhow::Result<bool> {
     if !git_is_dirty(worktree, excluded_path).await? {
+        info!(message, excluded_path = ?excluded_path, "worktree is clean");
         return Ok(false);
     }
+    info!(message, excluded_path = ?excluded_path, "staging worktree changes");
     run_cmd(worktree, "git", &["add", "-A"]).await?;
     if let Some(path) = excluded_path {
         run_cmd(worktree, "git", &["reset", "--", path]).await?;
@@ -1927,27 +2222,55 @@ async fn commit_if_dirty(
         .await
         .is_ok()
     {
+        info!(message, "no staged changes to commit");
         return Ok(false);
     }
+    info!(message, "committing worktree changes");
     run_cmd(worktree, "git", &["commit", "-m", message]).await?;
     Ok(true)
 }
 
 async fn run_cmd(worktree: &Path, program: &str, args: &[&str]) -> anyhow::Result<String> {
+    let command = args.join(" ");
+    debug!(
+        cwd = %worktree.display(),
+        program,
+        args = %command,
+        "running command"
+    );
     let output = Command::new(program)
         .args(args)
         .current_dir(worktree)
         .output()
         .await
-        .with_context(|| format!("failed to run command: {program} {}", args.join(" ")))?;
+        .with_context(|| format!("failed to run command: {program} {command}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
+        warn!(
+            cwd = %worktree.display(),
+            program,
+            args = %command,
+            status = %output.status,
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            stderr = %single_line_preview(stderr.trim(), 500),
+            "command failed"
+        );
         bail!(
             "command failed: {program} {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            args.join(" ")
+            command
         );
     }
+    debug!(
+        cwd = %worktree.display(),
+        program,
+        args = %command,
+        status = %output.status,
+        stdout_bytes = output.stdout.len(),
+        stderr_bytes = output.stderr.len(),
+        "command completed"
+    );
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
@@ -1959,9 +2282,13 @@ struct GitHubClient {
 impl GitHubClient {
     async fn from_local_credentials(worktree: &Path) -> anyhow::Result<Self> {
         let token = match github_token_from_env() {
-            Some(token) => Some(token),
+            Some(token) => {
+                info!("using GitHub token from environment");
+                Some(token)
+            }
             None => github_token_from_gh_cli(worktree).await,
         };
+        let authenticated = token.is_some();
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
@@ -1986,10 +2313,12 @@ impl GitHubClient {
             .default_headers(headers)
             .build()
             .context("failed to build GitHub client")?;
+        info!(authenticated, "built GitHub client");
         Ok(Self { client })
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(&self, url: &str) -> anyhow::Result<T> {
+        debug!(method = "GET", url, "GitHub request");
         let response = self.client.get(url).send().await?;
         decode_response(response, "GET", url).await
     }
@@ -1999,11 +2328,13 @@ impl GitHubClient {
         url: &str,
         body: &B,
     ) -> anyhow::Result<T> {
+        info!(method = "POST", url, "GitHub request");
         let response = self.client.post(url).json(body).send().await?;
         decode_response(response, "POST", url).await
     }
 
     async fn fetch_repo(&self, repo: &RepoSlug) -> anyhow::Result<GitHubRepo> {
+        info!(repo = %repo, "fetching GitHub repository metadata");
         self.get(&repo.api_base()).await
     }
 
@@ -2013,6 +2344,7 @@ impl GitHubClient {
         limit: usize,
     ) -> anyhow::Result<Vec<IssueDoc>> {
         let limit = validate_recent_issue_limit(limit).map_err(anyhow::Error::msg)?;
+        info!(repo = %repo, limit, "searching recent open GitHub issues");
         let mut url = reqwest::Url::parse("https://api.github.com/search/issues")
             .context("failed to build GitHub issue search URL")?;
         url.query_pairs_mut()
@@ -2022,6 +2354,11 @@ impl GitHubClient {
             .append_pair("per_page", &limit.to_string())
             .append_pair("page", "1");
         let search: GitHubIssueSearchResponse = self.get(url.as_str()).await?;
+        info!(
+            repo = %repo,
+            search_items = search.items.len(),
+            "GitHub issue search returned"
+        );
         let mut docs = Vec::with_capacity(search.items.len());
         for issue in search
             .items
@@ -2029,13 +2366,16 @@ impl GitHubClient {
             .filter(|issue| issue.pull_request.is_none())
             .filter(|issue| issue.state == "open")
         {
+            info!(repo = %repo, issue = issue.number, "fetching issue comments");
             let comments = self.fetch_issue_comments(repo, issue.number).await?;
             docs.push(issue.into_doc(comments));
         }
+        info!(repo = %repo, issue_count = docs.len(), "loaded open issue docs");
         Ok(docs)
     }
 
     async fn fetch_open_issue(&self, repo: &RepoSlug, number: u64) -> anyhow::Result<IssueDoc> {
+        info!(repo = %repo, issue = number, "fetching open GitHub issue");
         let url = format!("{}/issues/{number}", repo.api_base());
         let issue: GitHubIssue = self.get(&url).await?;
         if issue.pull_request.is_some() {
@@ -2060,6 +2400,12 @@ impl GitHubClient {
         let mut page = 1;
         let mut comments = Vec::new();
         loop {
+            debug!(
+                repo = %repo,
+                issue = issue_number,
+                page,
+                "fetching issue comments page"
+            );
             let url = format!(
                 "{}/issues/{issue_number}/comments?per_page=100&page={page}",
                 repo.api_base()
@@ -2077,6 +2423,12 @@ impl GitHubClient {
             }
             page += 1;
         }
+        info!(
+            repo = %repo,
+            issue = issue_number,
+            maintainer_comments = comments.len(),
+            "loaded issue comments"
+        );
         Ok(comments)
     }
 
@@ -2087,6 +2439,13 @@ impl GitHubClient {
         base: &str,
         draft: &PullRequestDraft,
     ) -> anyhow::Result<GitHubPullRequest> {
+        info!(
+            repo = %repo,
+            branch,
+            base,
+            title = %draft.title,
+            "creating GitHub pull request"
+        );
         let url = format!("{}/pulls", repo.api_base());
         let request = CreatePullRequest {
             title: draft.title.clone(),
@@ -2102,6 +2461,7 @@ impl GitHubClient {
         repo: &RepoSlug,
         number: u64,
     ) -> anyhow::Result<GitHubPullRequest> {
+        debug!(repo = %repo, pr_number = number, "fetching pull request");
         self.get(&format!("{}/pulls/{number}", repo.api_base()))
             .await
     }
@@ -2124,6 +2484,7 @@ impl GitHubClient {
         pr_number: u64,
         seen: &mut HashSet<String>,
     ) -> anyhow::Result<MonitorAction> {
+        debug!(repo = %repo, pr_number, "fetching new PR activity");
         let issue_comments: Vec<GitHubIssueComment> = self
             .get_paginated(&format!("{}/issues/{pr_number}/comments", repo.api_base()))
             .await?;
@@ -2169,7 +2530,15 @@ impl GitHubClient {
             }
         }
 
-        Ok(monitor_action(review_feedback, issue_comment_bodies))
+        let action = monitor_action(review_feedback, issue_comment_bodies);
+        debug!(
+            repo = %repo,
+            pr_number,
+            review_feedback = action.code_review_feedback.len(),
+            plsfix_comments = action.plsfix_comments.len(),
+            "classified PR activity"
+        );
+        Ok(action)
     }
 
     async fn get_paginated<T: for<'de> Deserialize<'de>>(
@@ -2181,8 +2550,10 @@ impl GitHubClient {
         loop {
             let separator = if base_url.contains('?') { '&' } else { '?' };
             let url = format!("{base_url}{separator}per_page=100&page={page}");
+            debug!(url = %url, page, "fetching GitHub page");
             let batch: Vec<T> = self.get(&url).await?;
             let count = batch.len();
+            debug!(url = %url, page, count, "loaded GitHub page");
             all.extend(batch);
             if count < 100 {
                 break;
@@ -2214,6 +2585,7 @@ async fn github_token_from_gh_cli(worktree: &Path) -> Option<String> {
                 warn!("gh auth token returned an empty token; continuing without GitHub auth");
                 None
             } else {
+                info!("using GitHub token from gh auth token");
                 Some(token)
             }
         }
@@ -2244,8 +2616,16 @@ async fn decode_response<T: for<'de> Deserialize<'de>>(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
+        warn!(
+            method,
+            url,
+            status = %status,
+            body = %single_line_preview(&body, 500),
+            "GitHub API request failed"
+        );
         bail!("GitHub API request failed: {method} {url} returned {status}: {body}");
     }
+    debug!(method, url, status = %status, "GitHub response");
     response
         .json::<T>()
         .await
@@ -2366,6 +2746,148 @@ mod tests {
         assert_eq!(config.tools.enabled, judge_example_tools());
         assert_eq!(config.policy.shell.allow, judge_example_shell_allowlist());
         assert!(config.policy.network.enabled);
+    }
+
+    #[test]
+    fn logging_filter_spec_defaults_or_uses_rust_log_and_appends_suppressions() {
+        struct Case {
+            name: &'static str,
+            user_directives: Option<&'static str>,
+            expected_prefix: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "missing rust log defaults to info",
+                user_directives: None,
+                expected_prefix: "info,",
+            },
+            Case {
+                name: "blank rust log defaults to info",
+                user_directives: Some(" \n"),
+                expected_prefix: "info,",
+            },
+            Case {
+                name: "configured rust log is preserved",
+                user_directives: Some("debug,halter=trace"),
+                expected_prefix: "debug,halter=trace,",
+            },
+        ];
+
+        for case in cases {
+            let spec = logging_filter_spec(case.user_directives);
+
+            assert!(
+                spec.starts_with(case.expected_prefix),
+                "{}: {spec}",
+                case.name
+            );
+            assert!(spec.contains(NOISY_TARGET_SUPPRESSIONS), "{}", case.name);
+            logging_filter_from_spec(&spec).expect(case.name);
+        }
+    }
+
+    #[test]
+    fn logging_filter_from_spec_covers_valid_and_invalid_specs() {
+        logging_filter_from_spec("info,halter=debug").expect("valid filter");
+
+        let error =
+            logging_filter_from_spec("halter=not-a-level").expect_err("invalid level should fail");
+
+        assert!(error.to_string().contains("invalid RUST_LOG filter"));
+    }
+
+    #[test]
+    fn single_line_preview_covers_normalized_truncated_and_empty_text() {
+        struct Case {
+            name: &'static str,
+            text: &'static str,
+            max_chars: usize,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "empty",
+                text: "",
+                max_chars: 10,
+                expected: "",
+            },
+            Case {
+                name: "short unchanged",
+                text: "abc",
+                max_chars: 10,
+                expected: "abc",
+            },
+            Case {
+                name: "newlines are escaped",
+                text: "a\nb\rc",
+                max_chars: 20,
+                expected: "a\\nb\\rc",
+            },
+            Case {
+                name: "truncated at character boundary",
+                text: "abéde",
+                max_chars: 3,
+                expected: "abé...",
+            },
+            Case {
+                name: "zero limit truncates non-empty text",
+                text: "abc",
+                max_chars: 0,
+                expected: "...",
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                single_line_preview(case.text, case.max_chars),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn json_preview_serializes_before_previewing() {
+        let value = json!({
+            "message": "hello\nworld",
+            "ok": true,
+        });
+
+        let preview = json_preview(&value, 16);
+
+        assert!(preview.starts_with('{'));
+        assert!(preview.ends_with("..."));
+        assert!(!preview.contains('\n'));
+    }
+
+    #[test]
+    fn tool_result_logging_helpers_cover_each_result_kind() {
+        let json_value = json!({"a": 1});
+        let cases = [
+            (ToolResult::Empty, "empty", 0),
+            (
+                ToolResult::Text {
+                    text: "hello".to_owned(),
+                },
+                "text",
+                5,
+            ),
+            (
+                ToolResult::Json {
+                    value: json_value.clone(),
+                },
+                "json",
+                json_value.to_string().len(),
+            ),
+        ];
+
+        for (result, expected_kind, expected_size) in cases {
+            assert_eq!(tool_result_kind(&result), expected_kind);
+            assert_eq!(tool_result_size(&result), expected_size);
+        }
     }
 
     #[tokio::test]
