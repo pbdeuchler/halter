@@ -891,7 +891,9 @@ mod tests {
         // still reaches the panelist after it.
         let panel_first = match &panel_a_reqs[0].messages[0] {
             Message::User(user) => user.plain_text(),
-            other => panic!("panel context should open with the framing user message, got {other:?}"),
+            other => {
+                panic!("panel context should open with the framing user message, got {other:?}")
+            }
         };
         assert!(panel_first.contains("one of several expert models on a review panel"));
         assert!(request_mentions(&panel_a_reqs[0], "what is the answer?"));
