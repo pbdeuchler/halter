@@ -169,7 +169,7 @@ impl RuntimeSubagentControl {
             }
             if entry.running.is_some() {
                 anyhow::bail!(
-                    "failed to execute subagent request: agent '{}' is still running",
+                    "failed to execute subagent request: agent '{}' is still running; use wait_agent to wait for completion, or close_agent to stop it",
                     agent_id.0
                 );
             }
@@ -639,7 +639,7 @@ impl SubagentControl for RuntimeSubagentControl {
             })?;
             if entry.running.is_some() {
                 anyhow::bail!(
-                    "failed to execute send_input tool: agent '{}' is still running",
+                    "failed to execute send_input tool: agent '{}' is still running; use wait_agent to wait for completion, or close_agent to stop it",
                     request.target.0
                 );
             }
@@ -668,6 +668,7 @@ impl SubagentControl for RuntimeSubagentControl {
             return Ok(WaitSubagentResponse {
                 status: Some(status),
                 timed_out: false,
+                target_statuses: Vec::new(),
             });
         }
 
@@ -691,16 +692,35 @@ impl SubagentControl for RuntimeSubagentControl {
                     Ok(status) => Ok(WaitSubagentResponse {
                         status: Some(status?),
                         timed_out: false,
+                        target_statuses: Vec::new(),
                     }),
-                    Err(_) => Ok(WaitSubagentResponse {
-                        status: None,
-                        timed_out: true,
-                    }),
+                    Err(_) => {
+                        let registry = self.inner.registry.lock().await;
+                        let target_statuses = match load_target_statuses(
+                            &registry,
+                            &request.targets,
+                        ) {
+                            Ok(statuses) => statuses,
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "failed to snapshot subagent statuses after wait_agent timeout"
+                                );
+                                Vec::new()
+                            }
+                        };
+                        Ok(WaitSubagentResponse {
+                            status: None,
+                            timed_out: true,
+                            target_statuses,
+                        })
+                    }
                 }
             }
             None => Ok(WaitSubagentResponse {
                 status: Some(wait_for_status.await?),
                 timed_out: false,
+                target_statuses: Vec::new(),
             }),
         }
     }
@@ -719,12 +739,14 @@ impl SubagentControl for RuntimeSubagentControl {
                 })?;
             let previous = entry.status.clone();
             entry.generation = entry.generation.saturating_add(1);
+            let closed_running_turn = entry.running.is_some();
             if let Some(running) = entry.running.take() {
                 running.cancel.cancel();
                 running.join_handle.abort();
             }
             entry.status.state = SubagentState::Closed;
-            entry.status.error = None;
+            entry.status.error = closed_running_turn
+                .then(|| "closed by close_agent (work was cancelled)".to_owned());
             previous
         };
 
@@ -808,6 +830,8 @@ mod tests {
             .await
             .expect("wait");
 
+        assert!(!waited.timed_out);
+        assert!(waited.target_statuses.is_empty());
         let waited_status = waited.status.expect("completed status");
         assert_eq!(waited_status.state, SubagentState::Completed);
         assert_eq!(
@@ -874,6 +898,174 @@ mod tests {
             Some("child reply [subagent/model]")
         );
         assert_eq!(provider_requests.lock().expect("requests").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_returns_target_statuses() {
+        let services = test_services(Arc::new(PendingProvider));
+        let control = RuntimeSubagentControl::new(services);
+        let parent = parent_context();
+
+        let first = control
+            .spawn(
+                &parent,
+                SpawnSubagentRequest {
+                    message: "first task".to_owned(),
+                    agent_type: None,
+                    fork_context: false,
+                    model: None,
+                },
+            )
+            .await
+            .expect("spawn first");
+        let second = control
+            .spawn(
+                &parent,
+                SpawnSubagentRequest {
+                    message: "second task".to_owned(),
+                    agent_type: None,
+                    fork_context: false,
+                    model: None,
+                },
+            )
+            .await
+            .expect("spawn second");
+
+        let waited = control
+            .wait(WaitSubagentRequest {
+                targets: vec![first.agent_id.clone(), second.agent_id.clone()],
+                timeout_ms: Some(5),
+            })
+            .await
+            .expect("wait timeout");
+
+        assert!(waited.timed_out);
+        assert!(waited.status.is_none());
+        assert_eq!(waited.target_statuses.len(), 2);
+        assert!(
+            waited
+                .target_statuses
+                .iter()
+                .all(|status| status.state == SubagentState::Running),
+            "target statuses should snapshot running agents: {:?}",
+            waited.target_statuses
+        );
+
+        control
+            .close(CloseSubagentRequest {
+                target: first.agent_id,
+            })
+            .await
+            .expect("close first");
+        control
+            .close(CloseSubagentRequest {
+                target: second.agent_id,
+            })
+            .await
+            .expect("close second");
+    }
+
+    #[tokio::test]
+    async fn wait_unknown_target_errors_before_timeout() {
+        let services = test_services(Arc::new(PendingProvider));
+        let control = RuntimeSubagentControl::new(services);
+
+        let error = control
+            .wait(WaitSubagentRequest {
+                targets: vec![AgentId::from("missing-agent")],
+                timeout_ms: Some(5),
+            })
+            .await
+            .expect_err("unknown target should error");
+
+        assert!(
+            error.to_string().contains("unknown agent 'missing-agent'"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_input_running_agent_error_suggests_control_flow() {
+        let services = test_services(Arc::new(PendingProvider));
+        let control = RuntimeSubagentControl::new(services);
+        let parent = parent_context();
+        let spawned = control
+            .spawn(
+                &parent,
+                SpawnSubagentRequest {
+                    message: "running task".to_owned(),
+                    agent_type: None,
+                    fork_context: false,
+                    model: None,
+                },
+            )
+            .await
+            .expect("spawn");
+
+        let error = control
+            .send_input(SendSubagentInputRequest {
+                target: spawned.agent_id.clone(),
+                message: "follow up too soon".to_owned(),
+            })
+            .await
+            .expect_err("running send_input should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("wait_agent"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("close_agent"),
+            "unexpected error: {message}"
+        );
+
+        control
+            .close(CloseSubagentRequest {
+                target: spawned.agent_id,
+            })
+            .await
+            .expect("close");
+    }
+
+    #[tokio::test]
+    async fn close_running_agent_records_cancellation_status() {
+        let services = test_services(Arc::new(PendingProvider));
+        let control = RuntimeSubagentControl::new(services);
+        let parent = parent_context();
+        let spawned = control
+            .spawn(
+                &parent,
+                SpawnSubagentRequest {
+                    message: "running task".to_owned(),
+                    agent_type: None,
+                    fork_context: false,
+                    model: None,
+                },
+            )
+            .await
+            .expect("spawn");
+
+        let closed = control
+            .close(CloseSubagentRequest {
+                target: spawned.agent_id.clone(),
+            })
+            .await
+            .expect("close");
+        assert_eq!(closed.previous_status.state, SubagentState::Running);
+
+        let waited = control
+            .wait(WaitSubagentRequest {
+                targets: vec![spawned.agent_id],
+                timeout_ms: None,
+            })
+            .await
+            .expect("wait");
+        let status = waited.status.expect("closed status");
+        assert_eq!(status.state, SubagentState::Closed);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("closed by close_agent (work was cancelled)")
+        );
     }
 
     #[tokio::test]
@@ -980,7 +1172,25 @@ mod tests {
                 ..halter_protocol::SessionState::default()
             },
             snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            model: ModelId::from("default"),
             subagent_model: ModelId::from("subagent"),
+        }
+    }
+
+    struct PendingProvider;
+
+    #[async_trait]
+    impl Provider for PendingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            Ok(stream::pending().boxed())
         }
     }
 

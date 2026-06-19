@@ -113,7 +113,7 @@ impl HarnessConfig {
         self.default_slot()?.primary(self.model_judge())
     }
 
-    /// Representative subagent leaf model, if a subagent slot is configured.
+    /// Representative subagent leaf model, if a concrete subagent slot is configured.
     pub fn subagent_model(&self) -> Option<&ModelConfig> {
         self.subagent_slot()
             .and_then(|slot| slot.primary(self.model_judge()).ok())
@@ -149,6 +149,7 @@ impl HarnessConfig {
                         }
                     }
                 }
+                ModelSlot::Reference(ModelSlotRef::AutoResolve) => {}
             }
         }
         if let Some(small) = self.small_model() {
@@ -237,7 +238,7 @@ impl ModelsConfig {
     }
 }
 
-/// A model slot: either an inline model or a reference to `[models.model_judge]`.
+/// A model slot: either an inline model or a symbolic reference.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ModelSlot {
@@ -255,6 +256,12 @@ impl ModelSlot {
         matches!(self, Self::Reference(ModelSlotRef::ModelJudge))
     }
 
+    /// Whether this slot resolves to the parent session's active model.
+    #[must_use]
+    pub fn is_auto_resolve(&self) -> bool {
+        matches!(self, Self::Reference(ModelSlotRef::AutoResolve))
+    }
+
     /// Representative leaf model for the slot: the inline model, or the
     /// model-judge default model when the slot references `[models.model_judge]`.
     pub fn primary<'a>(
@@ -268,6 +275,9 @@ impl ModelSlot {
                 .context(
                     "invalid configuration: a model slot is set to \"model_judge\" but [models.model_judge] is not defined",
                 ),
+            Self::Reference(ModelSlotRef::AutoResolve) => anyhow::bail!(
+                "invalid configuration: \"auto_resolve\" does not have a standalone leaf model"
+            ),
         }
     }
 }
@@ -278,6 +288,8 @@ impl ModelSlot {
 pub enum ModelSlotRef {
     /// Resolve the slot through the shared `[models.model_judge]` definition.
     ModelJudge,
+    /// Resolve spawned subagents to the parent session's active model config.
+    AutoResolve,
 }
 
 /// How a model-judge slot turns one decision into a panel-judged one.
@@ -663,6 +675,14 @@ fn validate_model_slot(
             if model_judge.is_none() {
                 anyhow::bail!(
                     "invalid configuration: {path} is set to \"model_judge\" but [models.model_judge] is not defined"
+                );
+            }
+            Ok(())
+        }
+        ModelSlot::Reference(ModelSlotRef::AutoResolve) => {
+            if path != "models.subagent" {
+                anyhow::bail!(
+                    "invalid configuration: {path} is set to \"auto_resolve\" but \"auto_resolve\" is only valid for models.subagent"
                 );
             }
             Ok(())
@@ -1152,6 +1172,56 @@ api_key = "openrouter-key"
         );
 
         parsed.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn auto_resolve_subagent_slot_round_trips_through_toml() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models]
+subagent = "auto_resolve"
+
+[models.default]
+provider = "openai"
+model = "gpt-default"
+
+[providers.openai]
+api_key = "openai-key"
+"#,
+        )
+        .expect("parse config");
+
+        let subagent = parsed.subagent_slot().expect("subagent slot");
+        assert!(subagent.is_auto_resolve());
+        assert!(parsed.subagent_model().is_none());
+        assert_eq!(
+            parsed.referenced_providers(),
+            vec![ConfiguredProvider::OpenAi]
+        );
+
+        parsed.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn auto_resolve_is_rejected_for_default_slot() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models]
+default = "auto_resolve"
+"#,
+        )
+        .expect("parse config");
+
+        let error = parsed
+            .validate()
+            .expect_err("default auto_resolve should fail");
+
+        assert!(error.to_string().contains("models.default"));
+        assert!(error.to_string().contains("models.subagent"));
     }
 
     #[test]

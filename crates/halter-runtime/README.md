@@ -386,7 +386,12 @@ A parent session can delegate work while preserving:
 - model routing
 - persistence
 
-Subagent control is also coordinated with the tool layer, where tools like `spawn_agent`, `wait_agent`, `send_input`, and `close_agent` live.
+Subagent control is also coordinated with the tool layer, where tools like
+`spawn_agent`, `wait_agent`, `send_input`, and `close_agent` live.
+`send_input` is accepted only after the target child turn is terminal; use
+`wait_agent` while work is running, or `close_agent` to cancel it. A timed-out
+`wait_agent` response includes `target_statuses` so callers can see the current
+state of every requested child.
 
 ---
 
@@ -454,6 +459,9 @@ If the backing store rejects concurrent commits, the session layer may surface c
 ### Misconfigured subagent depth or model routing
 
 If tool policy and runtime session init disagree about subagent constraints, delegation may fail.
+When a parent session runs under a wrapper model such as a full-turn model judge,
+configure `models.subagent = "auto_resolve"` if children should inherit the
+parent's concrete model instead of recursively entering the wrapper again.
 
 ---
 

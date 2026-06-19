@@ -1430,6 +1430,7 @@ impl SessionHandle {
                         blueprint: blueprint.clone(),
                         state: state.clone(),
                         snapshot: snapshot.clone(),
+                        model: effective_model.clone(),
                         subagent_model: effective_subagent_model.clone(),
                     })),
                 };
@@ -1855,7 +1856,21 @@ pub(crate) async fn materialize_assistant_message(
                 let pending = tool_call_blocks.remove(&id).with_context(|| {
                     format!("failed to materialize tool call: missing block '{}'", id)
                 })?;
-                let arguments = parse_tool_call_arguments(&pending.arguments)?;
+                let arguments = match parse_tool_call_arguments(&pending.arguments) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(
+                            provider = %model.provider,
+                            model = %model.model,
+                            tool_call_id = %pending.tool_call_id,
+                            block_id = %id,
+                            raw_arguments = %pending.arguments,
+                            %error,
+                            "tool call arguments failed to parse; substituting empty object"
+                        );
+                        serde_json::json!({})
+                    }
+                };
                 parts.push(AssistantPart::ToolCall(ToolCall {
                     id: pending.tool_call_id,
                     name: pending.name,
@@ -2696,6 +2711,55 @@ mod tests {
             .collect();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, tool_call_id);
+        assert_eq!(tool_calls[0].arguments, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn materialize_handles_completed_tool_call_with_invalid_json() {
+        let model = resolved_test_model("default", "fake", "halter/fake");
+        let message_id = halter_protocol::MessageId::new();
+        let block_id = BlockId::new();
+        let tool_call_id = ToolCallId::from("call-bad-json-completed");
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> = stream::iter(vec![
+            Ok(StreamEvent::MessageStart {
+                id: message_id.clone(),
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                id: block_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                name: ToolName::from("write"),
+            }),
+            Ok(StreamEvent::ToolArgsDelta {
+                id: block_id.clone(),
+                delta: r#"{"path":"x.txt","content":"hel"#.to_owned(),
+            }),
+            Ok(StreamEvent::ToolCallEnd {
+                id: block_id.clone(),
+            }),
+            Ok(StreamEvent::MessageEnd {
+                id: message_id,
+                stop_reason: StopReason::ToolUse,
+                response_id: None,
+            }),
+        ])
+        .boxed();
+
+        let materialized = super::materialize_assistant_message(stream, &model)
+            .await
+            .expect("materialize must recover completed calls with unparsable arguments");
+        let tool_calls: Vec<_> = materialized
+            .message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                AssistantPart::ToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, tool_call_id);
+        assert_eq!(tool_calls[0].name.0, "write");
         assert_eq!(tool_calls[0].arguments, serde_json::json!({}));
     }
 

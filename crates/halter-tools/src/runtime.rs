@@ -44,6 +44,7 @@ pub struct SubagentParentContext {
     pub blueprint: SessionBlueprint,
     pub state: SessionState,
     pub snapshot: Arc<ResourceSnapshot>,
+    pub model: halter_protocol::ModelId,
     pub subagent_model: halter_protocol::ModelId,
 }
 
@@ -56,7 +57,7 @@ pub trait SubagentControl: Send + Sync {
         parent: &SubagentParentContext,
         request: SpawnSubagentRequest,
     ) -> anyhow::Result<SubagentStatus>;
-    /// Send additional input to a running subagent.
+    /// Send additional input to a subagent after its current turn is terminal.
     async fn send_input(&self, request: SendSubagentInputRequest)
     -> anyhow::Result<SubagentStatus>;
     /// Wait for subagent progress or completion.

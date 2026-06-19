@@ -12,6 +12,10 @@ use serde_json::{Value, json};
 
 use crate::{SubagentControl, Tool, ToolContext, ToolRuntime, ToolRuntimeEvent};
 
+const DEFAULT_MODEL_ALIAS: &str = "default";
+const SUBAGENT_MODEL_ALIAS: &str = "subagent";
+const AUTO_RESOLVE_MODEL_ALIAS: &str = "auto_resolve";
+
 pub fn register_subagent_tools(
     runtime: &ToolRuntime,
     control: Arc<dyn SubagentControl>,
@@ -56,6 +60,7 @@ impl SpawnAgentTool {
         available_agent_types: Vec<String>,
         available_model_ids: Vec<String>,
     ) -> Self {
+        let available_model_ids = include_parent_local_model_aliases(available_model_ids);
         Self {
             control,
             available_agent_types,
@@ -67,13 +72,13 @@ impl SpawnAgentTool {
         let model_schema = if self.available_model_ids.is_empty() {
             json!({
                 "type": "string",
-                "description": "Optional registered model id for the child session. Omit to use the configured subagent model."
+                "description": "Optional registered model id for the child session. Omit to use the configured subagent model. Built-in aliases default, subagent, and auto_resolve resolve relative to the parent session."
             })
         } else {
             json!({
                 "type": "string",
                 "enum": self.available_model_ids,
-                "description": "Optional registered model id for the child session. Omit to use the configured subagent model. Use model ids such as default, small, or subagent, not provider model names."
+                "description": "Optional registered model id for the child session. Omit to use the configured subagent model. Built-in aliases default, subagent, and auto_resolve resolve relative to the parent session; use registered model ids, not provider model names."
             })
         };
         let mut properties = serde_json::Map::from_iter([
@@ -148,7 +153,7 @@ impl Tool for SpawnAgentTool {
     fn spec(&self) -> ToolSpec {
         subagent_spec(
             "spawn_agent",
-            "Spawn a child session to work on a delegated task. Omit agent_type to use the default child session. If you set model, use a registered model id such as default, small, or subagent, not a provider model name.",
+            "Spawn a child session to work on a delegated task. Omit agent_type to use the default child session. Omit model to use the configured subagent model. If you set model, use a registered model id; default, subagent, and auto_resolve resolve relative to the parent session.",
             self.input_schema(),
             ToolConcurrency::Exclusive,
             // long_running=true: spawning a child session can involve
@@ -178,6 +183,24 @@ impl Tool for SpawnAgentTool {
     }
 }
 
+fn include_parent_local_model_aliases(mut available_model_ids: Vec<String>) -> Vec<String> {
+    if available_model_ids.is_empty() {
+        return available_model_ids;
+    }
+
+    for alias in [
+        DEFAULT_MODEL_ALIAS,
+        SUBAGENT_MODEL_ALIAS,
+        AUTO_RESOLVE_MODEL_ALIAS,
+    ] {
+        if !available_model_ids.iter().any(|model_id| model_id == alias) {
+            available_model_ids.push(alias.to_owned());
+        }
+    }
+    available_model_ids.sort();
+    available_model_ids
+}
+
 #[derive(Clone)]
 struct SendInputTool {
     control: Arc<dyn SubagentControl>,
@@ -194,7 +217,7 @@ impl Tool for SendInputTool {
     fn spec(&self) -> ToolSpec {
         subagent_spec(
             "send_input",
-            "Send a follow-up task to an existing child session",
+            "Send a follow-up task to an existing child session. Only works after the child has reached a terminal state (completed, failed, cancelled, or closed). Use wait_agent to wait for completion, or close_agent to stop a running agent.",
             json!({
                 "type": "object",
                 "properties": {
@@ -237,7 +260,7 @@ impl Tool for WaitAgentTool {
     fn spec(&self) -> ToolSpec {
         subagent_spec(
             "wait_agent",
-            "Wait for one of the target child sessions to reach a terminal state",
+            "Wait for one of the target child sessions to reach a terminal state (completed, failed, cancelled, or closed). Returns the status of the agent that finished. If timeout_ms expires before any target finishes, returns timed_out: true and target_statuses with the current state of each requested agent.",
             json!({
                 "type": "object",
                 "properties": {
@@ -283,7 +306,7 @@ impl Tool for CloseAgentTool {
     fn spec(&self) -> ToolSpec {
         subagent_spec(
             "close_agent",
-            "Close an existing child session and stop accepting follow-up input",
+            "Close an existing child session, stopping any in-progress work. Use this to cancel a running agent or clean up a finished one. The closed agent will no longer accept send_input calls.",
             json!({
                 "type": "object",
                 "properties": {
@@ -458,6 +481,7 @@ mod tests {
                 },
                 state: SessionState::default(),
                 snapshot: Arc::new(ResourceSnapshot::empty()),
+                model: ModelId::from("default"),
                 subagent_model: ModelId::from("subagent"),
             })),
         };
@@ -485,6 +509,48 @@ mod tests {
         assert_eq!(requests[0].agent_type, Some(AgentName::from("helper")));
         assert!(!requests[0].fork_context);
         assert_eq!(requests[0].model, Some(ModelId::from("default")));
+    }
+
+    #[test]
+    fn spawn_agent_model_schema_includes_parent_local_aliases() {
+        let tool = SpawnAgentTool::new(
+            Arc::new(RecordingSubagentControl::default()),
+            Vec::new(),
+            vec!["default".to_owned(), "small".to_owned()],
+        );
+
+        let spec = tool.spec();
+        let model_enum = spec.input_schema["properties"]["model"]["enum"]
+            .as_array()
+            .expect("model enum");
+        let model_values = model_enum
+            .iter()
+            .map(|value| value.as_str().expect("string enum value"))
+            .collect::<Vec<_>>();
+
+        assert!(model_values.contains(&"default"));
+        assert!(model_values.contains(&"small"));
+        assert!(model_values.contains(&"subagent"));
+        assert!(model_values.contains(&"auto_resolve"));
+    }
+
+    #[test]
+    fn subagent_tool_descriptions_explain_running_agent_control_flow() {
+        let control = Arc::new(RecordingSubagentControl::default());
+
+        let send_input = SendInputTool::new(control.clone()).spec().description;
+        assert!(send_input.contains("terminal state"));
+        assert!(send_input.contains("wait_agent"));
+        assert!(send_input.contains("close_agent"));
+
+        let wait_agent = WaitAgentTool::new(control.clone()).spec().description;
+        assert!(wait_agent.contains("target_statuses"));
+        assert!(wait_agent.contains("timed_out: true"));
+
+        let close_agent = CloseAgentTool::new(control).spec().description;
+        assert!(close_agent.contains("stopping any in-progress work"));
+        assert!(close_agent.contains("cancel"));
+        assert!(close_agent.contains("send_input"));
     }
 
     #[tokio::test]
@@ -550,6 +616,7 @@ mod tests {
                 },
                 state: SessionState::default(),
                 snapshot: Arc::new(ResourceSnapshot::empty()),
+                model: ModelId::from("default"),
                 subagent_model: ModelId::from("subagent"),
             })),
         };
@@ -607,6 +674,7 @@ mod tests {
                 },
                 state: SessionState::default(),
                 snapshot: Arc::new(ResourceSnapshot::empty()),
+                model: ModelId::from("default"),
                 subagent_model: ModelId::from("subagent"),
             })),
         };
@@ -626,7 +694,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("available model values: default, subagent")
+                .contains("available model values: auto_resolve, default, subagent")
         );
     }
 
@@ -642,7 +710,7 @@ mod tests {
         assert!(spec.input_schema["properties"].get("agent_type").is_none());
         assert_eq!(
             spec.input_schema["properties"]["model"]["enum"],
-            json!(["default", "subagent"])
+            json!(["auto_resolve", "default", "subagent"])
         );
     }
 
@@ -665,7 +733,7 @@ mod tests {
         );
         assert_eq!(
             spec.input_schema["properties"]["model"]["enum"],
-            json!(["default", "small", "subagent"])
+            json!(["auto_resolve", "default", "small", "subagent"])
         );
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -445,16 +445,27 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         "default",
     )?;
 
-    let subagent_slot = config.subagent_slot().unwrap_or(default_slot);
-    let subagent_model = build_slot_model(
-        config,
-        &mut registry,
-        &mut family_providers,
-        subagent_slot,
-        ModelRole::subagent(),
-        SUBAGENT_MODEL_ID,
-        "subagent",
-    )?;
+    let subagent_model = match config.subagent_slot() {
+        Some(ModelSlot::Reference(ModelSlotRef::AutoResolve)) => default_model.clone(),
+        Some(subagent_slot) => build_slot_model(
+            config,
+            &mut registry,
+            &mut family_providers,
+            subagent_slot,
+            ModelRole::subagent(),
+            SUBAGENT_MODEL_ID,
+            "subagent",
+        )?,
+        None => build_slot_model(
+            config,
+            &mut registry,
+            &mut family_providers,
+            default_slot,
+            ModelRole::subagent(),
+            SUBAGENT_MODEL_ID,
+            "subagent",
+        )?,
+    };
 
     // The small slot is always a single concrete model. When unset it falls
     // back to the representative leaf of the default slot (the model-judge
@@ -522,6 +533,9 @@ fn build_slot_model(
                 slot_label,
             )
         }
+        ModelSlot::Reference(ModelSlotRef::AutoResolve) => anyhow::bail!(
+            "invalid configuration: models.{slot_label} is set to \"auto_resolve\" but auto-resolve must be handled before building a concrete slot"
+        ),
     }
 }
 
@@ -864,9 +878,8 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
     // `process_tree_root` is anchored to the live halter PID at builder
     // time so process-signal checks (AC1.6 / AC1.7) can reject signals
     // aimed at PIDs that aren't descendants of this process. Other newer
-    // fields (`allowed_read_roots`, `sensitive_path_patterns`,
-    // `shell_mode`) still inherit from `PolicySettings::default()` until
-    // the surface lands in user config.
+    // fields (`sensitive_path_patterns`, `shell_mode`) still inherit from
+    // `PolicySettings::default()` until the surface lands in user config.
     let defaults = PolicySettings::default();
     let allowed_hosts = if config.network.allowed_hosts.is_empty() {
         defaults.allowed_hosts.clone()
@@ -875,6 +888,7 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
     };
     PolicySettings {
         allowed_write_roots: config.allowed_write_roots.clone(),
+        allowed_read_roots: allowed_read_roots_from_config(config, &defaults),
         max_read_bytes: config.max_read_bytes,
         shell_enabled: config.shell.enabled,
         allowed_shell_commands: config.shell.allow.clone(),
@@ -895,6 +909,19 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
         process_tree_root: Some(std::process::id() as i32),
         ..defaults
     }
+}
+
+fn allowed_read_roots_from_config(
+    config: &PolicyConfig,
+    defaults: &PolicySettings,
+) -> Vec<PathBuf> {
+    let mut roots = defaults.allowed_read_roots.clone();
+    for root in &config.allowed_write_roots {
+        if !roots.iter().any(|existing| existing == root) {
+            roots.push(root.clone());
+        }
+    }
+    roots
 }
 
 #[cfg(test)]
@@ -949,6 +976,26 @@ mod tests {
             settings.process_tree_root,
             Some(std::process::id() as i32),
             "process_tree_root should be anchored to std::process::id() at builder time"
+        );
+    }
+
+    #[test]
+    fn policy_from_config_reads_configured_write_roots() {
+        let mut config = openai_config(Some("test-key")).policy.clone();
+        let worktree = PathBuf::from("/tmp/halter-factory-worktree");
+        config.allowed_write_roots = vec![PathBuf::from("."), worktree.clone(), worktree.clone()];
+
+        let settings = policy_from_config(&config);
+
+        assert!(settings.allowed_read_roots.contains(&worktree));
+        assert_eq!(
+            settings
+                .allowed_read_roots
+                .iter()
+                .filter(|root| *root == &worktree)
+                .count(),
+            1,
+            "configured write roots should be added to read roots once"
         );
     }
 
@@ -1070,6 +1117,52 @@ mod tests {
             .build()
             .await
             .expect("build should succeed for a full-turn model-judge slot");
+    }
+
+    #[tokio::test]
+    async fn builder_auto_resolve_subagent_reuses_default_model_slot() {
+        let mut config = openai_config(Some("test-key"));
+        config.models.default = Some(ModelSlot::Reference(ModelSlotRef::ModelJudge));
+        config.models.subagent = Some(ModelSlot::Reference(ModelSlotRef::AutoResolve));
+        let leaf = |model: &str| ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: model.to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tokens_per_minute: None,
+        };
+        config.models.model_judge = Some(ModelJudgeConfig {
+            mode: ModelJudgeMode::FullTurn,
+            default: leaf("gpt-default"),
+            synthesis: leaf("gpt-synthesis"),
+            panel: vec![leaf("gpt-panel-a"), leaf("gpt-panel-b")],
+            panel_isolation: Default::default(),
+        });
+
+        let registry = build_model_registry(&config).expect("model registry");
+        let default_model = registry.default_model().expect("default model");
+        let subagent_model = registry.subagent_model().expect("subagent model");
+
+        assert_eq!(subagent_model.id, default_model.id);
+        assert!(
+            !registry
+                .model_ids()
+                .contains(&ModelId::from(SUBAGENT_MODEL_ID))
+        );
+        assert!(registry.full_turn_judge(&default_model.id).is_some());
+        assert!(
+            registry
+                .full_turn_judge(&ModelId::from(SUBAGENT_MODEL_ID))
+                .is_none()
+        );
+
+        HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build should succeed for auto-resolved subagents");
     }
 
     #[tokio::test]

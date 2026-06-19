@@ -275,10 +275,25 @@ At runtime a model-judge slot multiplexes each call to the `panel`, asks the
 synthesis to the `default` model to produce the visible reply. See the
 workspace README for the full flow and telemetry.
 
+`models.subagent` also accepts `"auto_resolve"` when spawned subagents should use
+the parent session's active model configuration instead of a separately
+configured subagent model:
+
+```toml
+[models]
+default = "model_judge"
+subagent = "auto_resolve"
+```
+
+This is useful when the default slot is a full-turn model judge: panel members
+spawn child sessions with their concrete panel model instead of recursively
+re-entering the global `model_judge` slot.
+
 ### Notes
 
 - `models.default` is required
 - a `"model_judge"` slot requires a `[models.model_judge]` block with non-empty `panel`
+- `"auto_resolve"` is valid only for `models.subagent`
 - `models.small` is always a single inline model (it does not fan out); when
   unset it falls back to the default slot's representative leaf model
 - `reasoning` is optional
@@ -402,6 +417,8 @@ allowed_hosts = []
 Defaults:
 
 - `allowed_write_roots = [".", "/tmp/halter"]`
+- runtime read roots start from `[ ".", $TMPDIR | "/tmp" ]` and also include
+  configured `allowed_write_roots`
 - `max_read_bytes = 1_048_576`
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`

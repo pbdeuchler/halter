@@ -658,10 +658,16 @@ impl SubagentStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// Response from a subagent wait operation.
+///
+/// `status` is populated when one requested subagent reaches a terminal state.
+/// `target_statuses` is populated on timeout with the current state of every
+/// requested target.
 pub struct WaitSubagentResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<SubagentStatus>,
     pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_statuses: Vec<SubagentStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

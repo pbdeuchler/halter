@@ -155,6 +155,11 @@ Defaults:
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
 
+When the high-level `halter` builder constructs policy from `PolicyConfig`, it
+also adds configured `allowed_write_roots` to the runtime read roots. This lets
+agents inspect files under any root they are allowed to modify, including
+generated worktrees.
+
 This is the main security and operability boundary for tool use.
 
 `ToolPolicy` exposes a capability-oriented surface
@@ -566,7 +571,8 @@ Bad tasks:
 
 ## `send_input`
 
-Sends follow-up input to a running child session.
+Sends follow-up input to a child session after its current turn has reached a
+terminal state.
 
 Typical input:
 
@@ -579,9 +585,12 @@ Typical input:
 
 Use this when:
 
-- the child needs correction
-- requirements changed
-- you want to tighten scope mid-flight
+- the child completed or failed and needs a follow-up turn
+- requirements changed after the child produced a result
+- you want to tighten scope after collecting the current result
+
+If the child is still running, use `wait_agent` to collect completion or
+`close_agent` to stop it.
 
 ---
 
@@ -600,11 +609,16 @@ Typical input:
 
 This is essential for orchestrated parallel work.
 
+If `timeout_ms` expires before any target reaches terminal state, the response
+has `timed_out: true`, `status: null`, and `target_statuses` containing the
+current status of each requested target.
+
 ---
 
 ## `close_agent`
 
-Stops accepting further follow-up input for a child session.
+Closes a child session. If the child is running, this cancels in-progress work;
+closed children no longer accept `send_input`.
 
 Typical input:
 

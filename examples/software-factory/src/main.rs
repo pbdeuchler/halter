@@ -949,7 +949,7 @@ fn default_factory_config() -> HarnessConfig {
         },
         models: ModelsConfig {
             default: Some(ModelSlot::Reference(ModelSlotRef::ModelJudge)),
-            subagent: Some(ModelSlot::Reference(ModelSlotRef::ModelJudge)),
+            subagent: Some(ModelSlot::Reference(ModelSlotRef::AutoResolve)),
             small: Some(model_config(
                 ConfiguredProvider::OpenAi,
                 "gpt-5.5",
@@ -3052,6 +3052,12 @@ mod tests {
         assert_eq!(config.tools.enabled, judge_example_tools());
         assert_eq!(config.policy.shell.allow, judge_example_shell_allowlist());
         assert!(config.policy.network.enabled);
+        assert!(
+            config.models.subagent.is_some_and(|slot| matches!(
+                slot,
+                ModelSlot::Reference(ModelSlotRef::AutoResolve)
+            ))
+        );
     }
 
     #[test]

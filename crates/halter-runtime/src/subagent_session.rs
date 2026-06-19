@@ -1,14 +1,18 @@
 // pattern: Functional Core
 
 use halter_protocol::{
-    AgentName, AssistantMessage, AssistantPart, CacheScope, ContentHash, Message, PromptSegment,
-    PromptSegmentId, PromptSegmentKind, SessionEvent, SessionEventPayload, SessionId, SessionState,
-    SpawnSubagentRequest, SubagentRef, Usage, Volatility,
+    AgentName, AssistantMessage, AssistantPart, CacheScope, ContentHash, Message, ModelId,
+    PromptSegment, PromptSegmentId, PromptSegmentKind, SessionEvent, SessionEventPayload,
+    SessionId, SessionState, SpawnSubagentRequest, SubagentRef, Usage, Volatility,
 };
 use halter_tools::SubagentParentContext;
 use sha2::{Digest, Sha256};
 
 use crate::SessionInit;
+
+const DEFAULT_MODEL_ALIAS: &str = "default";
+const SUBAGENT_MODEL_ALIAS: &str = "subagent";
+const AUTO_RESOLVE_MODEL_ALIAS: &str = "auto_resolve";
 
 pub fn build_subagent_session_init(
     parent: &SubagentParentContext,
@@ -29,16 +33,25 @@ pub fn build_subagent_session_init(
         working_dir: parent.blueprint.working_dir.clone(),
         system_prompt_seed,
         max_turns: parent.blueprint.max_turns,
-        default_model: Some(
-            request
-                .model
-                .clone()
-                .unwrap_or_else(|| parent.subagent_model.clone()),
-        ),
+        default_model: Some(resolve_child_default_model(parent, request.model.as_ref())),
         subagent_model: Some(parent.subagent_model.clone()),
         subagent_event_forwarding: Some(parent.blueprint.subagent_event_forwarding),
         subagent_depth: parent.blueprint.subagent_depth + 1,
     })
+}
+
+fn resolve_child_default_model(
+    parent: &SubagentParentContext,
+    requested_model: Option<&ModelId>,
+) -> ModelId {
+    match requested_model {
+        None => parent.subagent_model.clone(),
+        Some(model) if model.0 == DEFAULT_MODEL_ALIAS || model.0 == AUTO_RESOLVE_MODEL_ALIAS => {
+            parent.model.clone()
+        }
+        Some(model) if model.0 == SUBAGENT_MODEL_ALIAS => parent.subagent_model.clone(),
+        Some(model) => model.clone(),
+    }
 }
 
 pub fn build_subagent_state(
@@ -188,6 +201,7 @@ mod tests {
                 ..SessionState::default()
             },
             snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            model: "default".into(),
             subagent_model: "subagent".into(),
         };
 
@@ -232,6 +246,7 @@ mod tests {
             },
             state: SessionState::default(),
             snapshot: Arc::new(snapshot),
+            model: "default".into(),
             subagent_model: "subagent".into(),
         };
 
@@ -256,6 +271,57 @@ mod tests {
         assert_eq!(init.subagent_depth, 2);
         assert_eq!(init.system_prompt_seed.len(), 2);
         assert_eq!(init.system_prompt_seed[1].text, "specialized helper prompt");
+    }
+
+    #[test]
+    fn build_subagent_session_init_resolves_builtin_model_aliases_from_parent() {
+        let parent = SubagentParentContext {
+            blueprint: SessionBlueprint {
+                session_id: SessionId::from("parent"),
+                parent_session_id: None,
+                default_model: "global-default".into(),
+                subagent_model: "global-subagent".into(),
+                subagent_event_forwarding: SubagentEventForwarding::Off,
+                snapshot_revision: Revision::from("revision"),
+                working_dir: ".".into(),
+                system_prompt_seed: Vec::new(),
+                max_turns: None,
+                subagent_depth: 0,
+            },
+            state: SessionState::default(),
+            snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            model: "parent-active".into(),
+            subagent_model: "parent-subagent".into(),
+        };
+
+        let cases = [
+            (None, "parent-subagent"),
+            (Some("default"), "parent-active"),
+            (Some("auto_resolve"), "parent-active"),
+            (Some("subagent"), "parent-subagent"),
+            (Some("custom"), "custom"),
+        ];
+
+        for (requested, want_default_model) in cases {
+            let init = build_subagent_session_init(
+                &parent,
+                &SessionId::from("child"),
+                &SpawnSubagentRequest {
+                    message: "task".to_owned(),
+                    agent_type: None,
+                    fork_context: false,
+                    model: requested.map(ModelId::from),
+                },
+            )
+            .expect("init");
+
+            assert_eq!(
+                init.default_model,
+                Some(ModelId::from(want_default_model)),
+                "requested model {requested:?}"
+            );
+            assert_eq!(init.subagent_model, Some(ModelId::from("parent-subagent")));
+        }
     }
 
     #[test]
@@ -284,6 +350,7 @@ mod tests {
             },
             state: SessionState::default(),
             snapshot: Arc::new(snapshot),
+            model: "default".into(),
             subagent_model: "subagent".into(),
         };
 
