@@ -117,7 +117,7 @@ struct Cli {
     implementer_model: String,
     #[arg(
         long,
-        default_value = "openai/gpt-5.5",
+        default_value = "openrouter/z-ai/glm-5.2",
         help = "Provider/model for branch-diff code review"
     )]
     reviewer_model: String,
@@ -951,9 +951,9 @@ fn default_factory_config() -> HarnessConfig {
             default: Some(ModelSlot::Reference(ModelSlotRef::ModelJudge)),
             subagent: Some(ModelSlot::Reference(ModelSlotRef::AutoResolve)),
             small: Some(model_config(
-                ConfiguredProvider::OpenAi,
-                "gpt-5.5",
-                ReasoningEffort::Medium,
+                    ConfiguredProvider::OpenRouter,
+                    "z-ai/glm-5.2",
+                    ReasoningEffort::Medium,
             )),
             model_judge: Some(ModelJudgeConfig {
                 mode: ModelJudgeMode::FullTurn,
@@ -973,16 +973,16 @@ fn default_factory_config() -> HarnessConfig {
                         "minimax/minimax-m3",
                         ReasoningEffort::Xhigh,
                     ),
-                    // model_config(
-                    //     ConfiguredProvider::OpenRouter,
-                    //     "nvidia/nemotron-3-ultra-550b-a55b",
-                    //     ReasoningEffort::Xhigh,
-                    // ),
                     model_config(
                         ConfiguredProvider::OpenRouter,
-                        "moonshotai/kimi-k2.6",
+                        "nvidia/nemotron-3-ultra-550b-a55b",
                         ReasoningEffort::Xhigh,
                     ),
+                    // model_config(
+                    //     ConfiguredProvider::OpenRouter,
+                    //     "moonshotai/kimi-k2.6",
+                    //     ReasoningEffort::Xhigh,
+                    // ),
                     model_config(
                         ConfiguredProvider::OpenRouter,
                         "qwen/qwen3.6-27b",
