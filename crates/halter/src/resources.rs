@@ -50,6 +50,7 @@ pub struct LoadedAgent {
     pub id: AgentId,
     pub name: String,
     pub prompt: String,
+    pub revision: ContentHash,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +130,10 @@ impl SkillLoader {
                 continue;
             }
             collect_skills(&root, &mut visited, &mut skills)?;
+        }
+        for skill in &mut skills {
+            skill.body = render_plugin_vars(&skill.root, &skill.body);
+            skill.revision = hash_bytes(skill.body.as_bytes());
         }
         info!(skill_count = skills.len(), "loaded skills");
         Ok(skills)
@@ -322,6 +327,7 @@ fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<CompiledResou
             revision_hasher.update(hooks_file.revision.as_bytes());
         }
         for agent in &plugin.agents {
+            revision_hasher.update(agent.revision.as_bytes());
             snapshot.agents.insert(
                 AgentName::from(agent.name.clone()),
                 AgentDef {
@@ -504,6 +510,11 @@ fn load_plugin_root(root: &Path) -> anyhow::Result<Option<LoadedPlugin>> {
         }
     }
 
+    skills.iter_mut().for_each(|skill| {
+        skill.body = render_plugin_vars(root, &skill.body);
+        skill.revision = hash_bytes(skill.body.as_bytes());
+    });
+
     let mut agents = Vec::new();
     for agent_path in &manifest.agents {
         let resolved = resolve_plugin_path(root, agent_path)?;
@@ -512,6 +523,11 @@ fn load_plugin_root(root: &Path) -> anyhow::Result<Option<LoadedPlugin>> {
         } else if resolved.is_dir() {
             load_agent_dir(&resolved, &mut agents)?;
         }
+    }
+
+    for agent in &mut agents {
+        agent.prompt = render_plugin_vars(root, &agent.prompt);
+        agent.revision = hash_bytes(agent.prompt.as_bytes());
     }
 
     let hooks = load_plugin_hooks(root, &plugin_id, &manifest)?;
@@ -535,10 +551,8 @@ fn resolve_plugin_path(root: &Path, component: &str) -> anyhow::Result<PathBuf> 
     let expanded = expand_plugin_component_path(root, component);
     let uses_plugin_alias = component.contains("${CLAUDE_PLUGIN_ROOT}")
         || component.contains("${PLUGIN_ROOT}")
-        || component.contains("${HALTER_PLUGIN_ROOT}")
         || component.contains("${CLAUDE_PLUGIN_DATA}")
-        || component.contains("${PLUGIN_DATA}")
-        || component.contains("${HALTER_PLUGIN_DATA}");
+        || component.contains("${PLUGIN_DATA}");
 
     if !component.starts_with("./") && !uses_plugin_alias {
         anyhow::bail!(
@@ -657,16 +671,25 @@ fn expand_path(path: &Path) -> PathBuf {
     PathBuf::from(raw.as_ref())
 }
 
-fn expand_plugin_component_path(root: &Path, component: &str) -> String {
+/// Expand plugin template variables in `text`.
+///
+/// Supported aliases:
+/// - `${CLAUDE_PLUGIN_ROOT}` / `${PLUGIN_ROOT}` → the plugin (or skill) root.
+/// - `${CLAUDE_PLUGIN_DATA}` / `${PLUGIN_DATA}` → `<root>/.data`.
+///
+/// Unknown `${...}` tokens are left literal. For standalone skills, `root` is
+/// the skill directory itself, so `PLUGIN_DATA` resolves to `<skill_root>/.data`.
+fn render_plugin_vars(root: &Path, text: &str) -> String {
     let plugin_root = root.to_string_lossy().to_string();
     let plugin_data = root.join(".data").to_string_lossy().to_string();
-    component
-        .replace("${CLAUDE_PLUGIN_ROOT}", &plugin_root)
+    text.replace("${CLAUDE_PLUGIN_ROOT}", &plugin_root)
         .replace("${PLUGIN_ROOT}", &plugin_root)
-        .replace("${HALTER_PLUGIN_ROOT}", &plugin_root)
         .replace("${CLAUDE_PLUGIN_DATA}", &plugin_data)
         .replace("${PLUGIN_DATA}", &plugin_data)
-        .replace("${HALTER_PLUGIN_DATA}", &plugin_data)
+}
+
+fn expand_plugin_component_path(root: &Path, component: &str) -> String {
+    render_plugin_vars(root, component)
 }
 
 fn reject_parent_components(path: &Path, component: &str) -> anyhow::Result<()> {
@@ -695,6 +718,7 @@ fn load_agent_dir(root: &Path, sink: &mut Vec<LoadedAgent>) -> anyhow::Result<()
 fn load_agent_file(path: &Path) -> anyhow::Result<LoadedAgent> {
     let prompt = fs::read_to_string(path)
         .with_context(|| format!("failed to read agent prompt at {}", path.display()))?;
+    let revision = hash_bytes(prompt.as_bytes());
     Ok(LoadedAgent {
         id: AgentId::new(),
         name: path
@@ -703,6 +727,7 @@ fn load_agent_file(path: &Path) -> anyhow::Result<LoadedAgent> {
             .to_string_lossy()
             .to_string(),
         prompt,
+        revision,
     })
 }
 
@@ -1079,6 +1104,395 @@ description: says hello
                 .to_string()
                 .contains("failed to canonicalize plugin root"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn render_plugin_vars_replaces_all_four_aliases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let data = root.join(".data");
+        let input =
+            "root=${CLAUDE_PLUGIN_ROOT}|${PLUGIN_ROOT} data=${CLAUDE_PLUGIN_DATA}|${PLUGIN_DATA}";
+        let output = render_plugin_vars(&root, input);
+        let expected_root = root.to_string_lossy().to_string();
+        let expected_data = data.to_string_lossy().to_string();
+        let expected =
+            format!("root={expected_root}|{expected_root} data={expected_data}|{expected_data}");
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn render_plugin_vars_leaves_unknown_tokens_literal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let input = "token=${UNKNOWN_VAR}/foo unchanged";
+        let output = render_plugin_vars(temp.path(), input);
+        assert_eq!(output, input);
+    }
+
+    #[tokio::test]
+    async fn plugin_skill_body_renders_plugin_vars() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let skill_dir = plugin_root.join("skills/reviewer");
+        let manifest_dir = plugin_root.join(".claude-plugin");
+
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: reviewer\n---\n\nUse ${PLUGIN_ROOT}/assets/foo.md and cache at ${CLAUDE_PLUGIN_DATA}.\n",
+        )
+        .expect("write skill");
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            r#"{
+  "name": "example",
+  "version": "0.1.0",
+  "skills": ["./skills/reviewer"]
+}"#,
+        )
+        .expect("write manifest");
+
+        let mut config = HarnessConfig::default();
+        config.resources.plugins.roots = vec![temp.path().to_path_buf()];
+        let resources = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect("compile resources");
+
+        let skill = resources
+            .snapshot
+            .skills
+            .get(&SkillName::from("reviewer"))
+            .expect("reviewer skill");
+        assert!(
+            !skill.body.contains("${PLUGIN_ROOT}"),
+            "body still contains template: {}",
+            skill.body
+        );
+        assert!(
+            !skill.body.contains("${CLAUDE_PLUGIN_DATA}"),
+            "body still contains template: {}",
+            skill.body
+        );
+        assert!(
+            skill.body.contains("/plugin/.data"),
+            "body should contain plugin data dir: {}",
+            skill.body
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_skill_directory_tree_renders_plugin_vars() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let skill_dir = plugin_root.join("skills/reviewer");
+        let manifest_dir = plugin_root.join(".claude-plugin");
+
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: reviewer\n---\n\nLoad ${PLUGIN_ROOT}/assets/foo.md.\n",
+        )
+        .expect("write skill");
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            r#"{
+  "name": "example",
+  "version": "0.1.0",
+  "skills": ["./skills"]
+}"#,
+        )
+        .expect("write manifest");
+
+        let mut config = HarnessConfig::default();
+        config.resources.plugins.roots = vec![temp.path().to_path_buf()];
+        let resources = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect("compile resources");
+
+        let skill = resources
+            .snapshot
+            .skills
+            .get(&SkillName::from("reviewer"))
+            .expect("reviewer skill");
+        assert!(
+            !skill.body.contains("${PLUGIN_ROOT}"),
+            "body still contains template: {}",
+            skill.body
+        );
+        assert!(
+            skill.body.contains("/plugin/assets/foo.md"),
+            "body should resolve plugin root: {}",
+            skill.body
+        );
+        assert!(
+            !skill.body.contains("/plugin/skills/assets/foo.md"),
+            "body should not resolve to skills subdirectory: {}",
+            skill.body
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_agent_prompt_renders_plugin_vars() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let agents_dir = plugin_root.join("agents");
+        let manifest_dir = plugin_root.join(".claude-plugin");
+
+        fs::create_dir_all(&agents_dir).expect("create agents dir");
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            agents_dir.join("helper.md"),
+            "Tools are at ${PLUGIN_ROOT}/tools.",
+        )
+        .expect("write agent prompt");
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            r#"{
+  "name": "example",
+  "version": "0.1.0",
+  "agents": ["./agents"]
+}"#,
+        )
+        .expect("write manifest");
+
+        let mut config = HarnessConfig::default();
+        config.resources.plugins.roots = vec![temp.path().to_path_buf()];
+        let resources = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect("compile resources");
+
+        let agent = resources
+            .snapshot
+            .agents
+            .get(&AgentName::from("helper"))
+            .expect("helper agent");
+        assert!(
+            !agent.prompt.contains("${PLUGIN_ROOT}"),
+            "prompt still contains template: {}",
+            agent.prompt
+        );
+        assert!(
+            agent.prompt.contains("/plugin/tools"),
+            "prompt should contain plugin tools path: {}",
+            agent.prompt
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_skill_body_renders_plugin_vars() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join("skills/hello");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: hello\n---\n\nRun ${PLUGIN_ROOT}/scripts/x.sh and cache in ${PLUGIN_DATA}.\n",
+        )
+        .expect("write skill");
+
+        let mut config = HarnessConfig::default();
+        config.resources.skills.roots = vec![temp.path().join("skills")];
+        let resources = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect("compile resources");
+
+        let skill = resources
+            .snapshot
+            .skills
+            .get(&SkillName::from("hello"))
+            .expect("hello skill");
+        assert!(
+            !skill.body.contains("${PLUGIN_ROOT}"),
+            "body still contains template: {}",
+            skill.body
+        );
+        assert!(
+            skill.body.contains("/skills/hello/scripts/x.sh"),
+            "body should contain skill scripts path: {}",
+            skill.body
+        );
+        assert!(
+            skill.body.contains("/skills/hello/.data"),
+            "body should contain skill data dir: {}",
+            skill.body
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_halter_plugin_root_alias_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let manifest_dir = plugin_root.join(".agent-plugin");
+
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            r#"{
+  "name": "legacy",
+  "version": "0.1.0",
+  "skills": ["${HALTER_PLUGIN_ROOT}/skills"]
+}"#,
+        )
+        .expect("write manifest");
+
+        let mut config = HarnessConfig::default();
+        config.resources.plugins.roots = vec![temp.path().to_path_buf()];
+        let error = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect_err("compile should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("relative component paths must start with './'"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_alias_in_body_left_literal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let skill_dir = plugin_root.join("skills/legacy");
+        let manifest_dir = plugin_root.join(".claude-plugin");
+
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: legacy\n---\n\nPath ${HALTER_PLUGIN_ROOT}/foo stays literal.\n",
+        )
+        .expect("write skill");
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            r#"{
+  "name": "legacy",
+  "version": "0.1.0",
+  "skills": ["./skills/legacy"]
+}"#,
+        )
+        .expect("write manifest");
+
+        let mut config = HarnessConfig::default();
+        config.resources.plugins.roots = vec![temp.path().to_path_buf()];
+        let resources = ResourceCompiler::from_config(&config)
+            .compile()
+            .await
+            .expect("compile resources");
+
+        let skill = resources
+            .snapshot
+            .skills
+            .get(&SkillName::from("legacy"))
+            .expect("legacy skill");
+        assert!(
+            skill.body.contains("${HALTER_PLUGIN_ROOT}/foo"),
+            "body should leave removed alias literal: {}",
+            skill.body
+        );
+    }
+
+    #[tokio::test]
+    async fn rendered_alias_affects_snapshot_revision() {
+        use std::collections::HashMap;
+
+        fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+            fs::create_dir_all(dst)?;
+            for entry in fs::read_dir(src)? {
+                let entry = entry?;
+                let src_path = entry.path();
+                let dst_path = dst.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_dir_all(&src_path, &dst_path)?;
+                } else {
+                    fs::copy(&src_path, &dst_path)?;
+                }
+            }
+            Ok(())
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = temp.path().join("plugin");
+        let skill_dir = plugin_root.join("skills/rev");
+        let agents_dir = plugin_root.join("agents");
+        let manifest_dir = plugin_root.join(".claude-plugin");
+
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::create_dir_all(&agents_dir).expect("create agents dir");
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: revskill\n---\n\nUse ${PLUGIN_ROOT}/a.md.\n",
+        )
+        .expect("write skill");
+        fs::write(agents_dir.join("agent.md"), "Prompt ${PLUGIN_ROOT}/a.md.")
+            .expect("write agent prompt");
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            r#"{
+  "name": "revplugin",
+  "version": "0.1.0",
+  "skills": ["./skills/rev"],
+  "agents": ["./agents"]
+}"#,
+        )
+        .expect("write manifest");
+
+        // Two copies of the same plugin at different absolute roots. The rendered
+        // ${PLUGIN_ROOT} values differ, so the snapshot revisions must differ.
+        let parent_a = temp.path().join("parent-a");
+        let parent_b = temp.path().join("parent-b");
+        copy_dir_all(&plugin_root, &parent_a.join("plugin")).expect("copy plugin a");
+        copy_dir_all(&plugin_root, &parent_b.join("plugin")).expect("copy plugin b");
+        let root_a = parent_a.join("plugin");
+
+        let roots_a: Vec<PathBuf> = vec![parent_a.clone()];
+        let roots_b: Vec<PathBuf> = vec![parent_b.clone()];
+
+        let config = HarnessConfig::default();
+        let first = ResourceCompiler::from_config(&config)
+            .with_plugin_roots(roots_a)
+            .compile()
+            .await
+            .expect("compile first");
+        let second = ResourceCompiler::from_config(&config)
+            .with_plugin_roots(roots_b)
+            .compile()
+            .await
+            .expect("compile second");
+
+        assert_ne!(
+            first.snapshot.revision, second.snapshot.revision,
+            "different root spellings should yield different snapshot revisions"
+        );
+
+        let by_name: HashMap<_, _> = first
+            .snapshot
+            .skills
+            .iter()
+            .map(|(name, skill)| (name.clone(), skill))
+            .collect();
+        let skill_a = by_name.get(&SkillName::from("revskill")).expect("revskill");
+        let agent_a = first
+            .snapshot
+            .agents
+            .get(&AgentName::from("agent"))
+            .expect("agent");
+        assert!(
+            skill_a.body.contains(root_a.to_string_lossy().as_ref()),
+            "skill body should contain rendered root path: {}",
+            skill_a.body
+        );
+        assert!(
+            agent_a.prompt.contains(root_a.to_string_lossy().as_ref()),
+            "agent prompt should contain rendered root path: {}",
+            agent_a.prompt
         );
     }
 }
