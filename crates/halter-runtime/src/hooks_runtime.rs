@@ -1046,7 +1046,7 @@ fn build_command(
     child.current_dir(cwd);
     set_alias_envs(
         &mut child,
-        &["PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT", "HALTER_PLUGIN_ROOT"],
+        &["PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"],
         handler.plugin_root.display().to_string(),
     );
     child.env("PLUGIN_ID", handler.plugin_id.0.as_str());
@@ -1113,19 +1113,11 @@ fn expand_placeholders(value: &str, plugin_root: &Path) -> String {
         value,
         &[
             (
-                &[
-                    "${PLUGIN_ROOT}",
-                    "${CLAUDE_PLUGIN_ROOT}",
-                    "${HALTER_PLUGIN_ROOT}",
-                ],
+                &["${PLUGIN_ROOT}", "${CLAUDE_PLUGIN_ROOT}"],
                 plugin_root.as_str(),
             ),
             (
-                &[
-                    "${PLUGIN_DATA}",
-                    "${CLAUDE_PLUGIN_DATA}",
-                    "${HALTER_PLUGIN_DATA}",
-                ],
+                &["${PLUGIN_DATA}", "${CLAUDE_PLUGIN_DATA}"],
                 plugin_data.as_str(),
             ),
         ],
@@ -1426,6 +1418,27 @@ mod tests {
                 vec!["-Command".to_owned(), "echo hi".to_owned()]
             )
         );
+    }
+
+    #[test]
+    fn hook_plugin_placeholders_render_supported_aliases() {
+        let root = Path::new("/tmp/plugin");
+        let input = "${PLUGIN_ROOT}|${CLAUDE_PLUGIN_ROOT}|${PLUGIN_DATA}|${CLAUDE_PLUGIN_DATA}";
+        let expanded = expand_placeholders(input, root);
+
+        assert_eq!(
+            expanded,
+            "/tmp/plugin|/tmp/plugin|/tmp/plugin/.data|/tmp/plugin/.data"
+        );
+    }
+
+    #[test]
+    fn hook_removed_halter_plugin_placeholders_stay_literal() {
+        let root = Path::new("/tmp/plugin");
+        let input = "${HALTER_PLUGIN_ROOT}|${HALTER_PLUGIN_DATA}";
+        let expanded = expand_placeholders(input, root);
+
+        assert_eq!(expanded, input);
     }
 
     // === Phase 2 acceptance tests ===

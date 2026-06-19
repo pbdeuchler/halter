@@ -124,7 +124,7 @@ impl Tool for PtyTool {
             }),
             concurrency: ToolConcurrency::Exclusive,
             capabilities: ToolCapabilities {
-                mutating: false,
+                mutating: true,
                 requires_approval: false,
                 cancellable: false,
                 long_running: true,
@@ -477,6 +477,14 @@ mod security_tests {
             !args.iter().any(|a| a.contains('l')),
             "args must not contain `-l` / `-lc` flag (would source rc files)"
         );
+    }
+
+    #[test]
+    fn pty_tool_spec_marks_tool_as_mutating() {
+        let spec = PtyTool.spec();
+
+        assert!(spec.capabilities.mutating);
+        assert_eq!(spec.concurrency, ToolConcurrency::Exclusive);
     }
 
     #[test]
