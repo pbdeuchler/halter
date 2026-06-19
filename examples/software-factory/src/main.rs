@@ -1009,7 +1009,7 @@ fn default_factory_config() -> HarnessConfig {
                 .collect(),
         },
         policy: PolicyConfig {
-            allowed_write_roots: vec![PathBuf::from("./"), PathBuf::from("/tmp/halter")],
+            allowed_write_roots: vec![PathBuf::from("./"), PathBuf::from("/tmp/halter"), PathBuf::from("/private/tmp/halter-software-factory")],
             max_read_bytes: 1_048_576,
             max_subagent_depth: 3,
             max_concurrent_subagents: 8,
