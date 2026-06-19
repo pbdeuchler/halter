@@ -18,9 +18,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
 use halter_protocol::{
-    AssistantMessage, AssistantPart, BlockId, CompactionWindow, Message, MessageId,
-    ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
-    ProviderRequest, ReplayMeta, ResolvedModel, StopReason, StreamEvent, ToolCall,
+    AssistantMessage, AssistantPart, BlockId, CompactionWindow, Message, MessageId, ModelId,
+    PanelIsolation, ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse,
+    ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, StopReason, StreamEvent, ToolCall,
     ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolResultMessage, ToolSpec,
     UserMessage,
 };
@@ -68,6 +68,32 @@ const PANEL_PREFIX: &str = "You are one of several expert models on a review \
 pub struct ModelJudgeMember {
     pub provider: Arc<dyn Provider>,
     pub model: ResolvedModel,
+}
+
+/// Resolved description of a FullTurn model-judge, stored in the model registry
+/// and driven by the runtime. Unlike the OneShot [`ModelJudgeProvider`], a
+/// FullTurn judge has no `Provider` of its own: the default model is an ordinary
+/// registry model, and the runtime fans the user's turn out to the panel as full
+/// agentic sub-sessions before reusing [`run_panel_synthesis`] on their
+/// outcomes. This struct is pure data — it holds no behavior.
+#[derive(Clone)]
+pub struct FullTurnJudgePlan {
+    /// Model that ranks the panel outcomes and writes the synthesis message.
+    pub synthesis: ModelJudgeMember,
+    /// Panelists, each a registry model the runtime runs a full turn against.
+    pub panel: Vec<FullTurnPanelist>,
+    /// How panelist sub-sessions are sandboxed while they execute tools.
+    pub isolation: PanelIsolation,
+}
+
+/// One FullTurn panelist: a registry model id plus a stable label used as the
+/// candidate id shown to the synthesis judge and emitted as telemetry.
+#[derive(Clone)]
+pub struct FullTurnPanelist {
+    /// Registry model id the runtime starts the panel sub-session with.
+    pub model_id: ModelId,
+    /// Underlying model name, used as the candidate id and for telemetry.
+    pub label: String,
 }
 
 /// A model abstraction that judges and synthesizes a panel of responses before
@@ -122,7 +148,7 @@ impl Provider for ModelJudgeProvider {
             return self.run_default(&request, None, cancel).await;
         }
 
-        match self.run_synthesis(&request, &candidates, &cancel).await {
+        match run_panel_synthesis(&self.synthesis, &request, &candidates, &cancel).await {
             Ok(synthesis) => self.run_default(&request, Some(synthesis), cancel).await,
             Err(error) => {
                 warn!(
@@ -152,14 +178,28 @@ impl Provider for ModelJudgeProvider {
     }
 }
 
-/// A successfully collected panel response.
-struct Candidate {
+/// A successfully collected panel response. Produced by the OneShot provider
+/// from a single inference, or by the runtime from a FullTurn panel sub-session;
+/// either way it is what [`run_panel_synthesis`] judges.
+pub struct Candidate {
     /// Stable, unique identifier shown to the judge and logged as telemetry.
-    id: String,
+    pub id: String,
     /// Underlying model name, for telemetry.
-    model: String,
+    pub model: String,
     /// Rendered response body (text plus any proposed tool calls).
-    body: String,
+    pub body: String,
+}
+
+impl Candidate {
+    /// Build a candidate from its id, model name, and rendered body.
+    #[must_use]
+    pub fn new(id: impl Into<String>, model: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            model: model.into(),
+            body: body.into(),
+        }
+    }
 }
 
 impl ModelJudgeProvider {
@@ -224,96 +264,6 @@ impl ModelJudgeProvider {
         candidates
     }
 
-    async fn run_synthesis(
-        &self,
-        request: &ProviderRequest,
-        candidates: &[Candidate],
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<String> {
-        let mut messages = request.messages.clone();
-        messages.push(Message::User(UserMessage::text(synthesis_instructions(
-            candidates,
-        ))));
-
-        let rank_tool = rank_tool_spec();
-        let mut recorded = false;
-
-        for round in 0..MAX_SYNTHESIS_ROUNDS {
-            let inner = inner_request(
-                request,
-                self.synthesis.model.clone(),
-                messages.clone(),
-                vec![rank_tool.clone()],
-            );
-            let events = self
-                .synthesis
-                .provider
-                .stream(inner, cancel.child_token())
-                .await?;
-            let collected = collect_message(events)
-                .await
-                .map_err(|error| anyhow::anyhow!("model-judge synthesis stream failed: {error}"))?;
-
-            let rank_call = collected
-                .tool_calls
-                .iter()
-                .find(|call| call.name.0 == MODEL_JUDGE_RANK_TOOL)
-                .cloned();
-
-            if let Some(call) = &rank_call
-                && !recorded
-            {
-                record_rankings(&call.arguments);
-                recorded = true;
-            }
-
-            let synthesis = collected.text.trim();
-            if !synthesis.is_empty() {
-                info!(
-                    target: MODEL_JUDGE_TRACE_TARGET,
-                    event = "synthesis",
-                    synthesis = %synthesis,
-                    "model-judge synthesis message"
-                );
-                return Ok(synthesis.to_owned());
-            }
-
-            // No synthesis text yet. If the model ranked, acknowledge the tool
-            // call and let it continue. If it produced neither a ranking nor
-            // text, retry with an explicit correction before falling back.
-            let Some(call) = rank_call else {
-                if round + 1 >= MAX_SYNTHESIS_ROUNDS {
-                    anyhow::bail!("{EMPTY_SYNTHESIS_ERROR} after {MAX_SYNTHESIS_ROUNDS} attempts");
-                }
-                warn!(
-                    target: MODEL_JUDGE_TRACE_TARGET,
-                    event = "synthesis_retry",
-                    attempt = round + 1,
-                    max_rounds = MAX_SYNTHESIS_ROUNDS,
-                    rank_recorded = recorded,
-                    "{EMPTY_SYNTHESIS_ERROR}; retrying synthesis model"
-                );
-                messages.push(Message::User(synthesis_retry_message(recorded)));
-                continue;
-            };
-            messages.push(Message::Assistant(assistant_with_tool_call(
-                &collected.text,
-                call.clone(),
-            )));
-            messages.push(Message::Tool(ToolResultMessage {
-                id: MessageId::new(),
-                call_id: call.id.clone(),
-                content: ToolResult::Json {
-                    value: json!({ "status": "recorded" }),
-                },
-                error: None,
-                created_at: Utc::now(),
-            }));
-        }
-
-        anyhow::bail!("model-judge synthesis did not produce synthesis text within the round limit")
-    }
-
     async fn run_default(
         &self,
         request: &ProviderRequest,
@@ -339,6 +289,104 @@ impl ModelJudgeProvider {
         };
         self.default.provider.stream(inner, cancel).await
     }
+}
+
+/// Rank and judge a set of panel responses, returning the synthesis text.
+///
+/// Shared by both judge forms: the OneShot [`ModelJudgeProvider`] collects each
+/// [`Candidate`] from a single inference, while the runtime's FullTurn judge
+/// collects them from full panel sub-sessions. In both cases the `synthesis`
+/// member first stack-ranks the candidates (emitted as telemetry) and then
+/// writes a synthesis that judges, not merges, them. `base` supplies the
+/// conversation context and provider-call metadata; the synthesis member runs as
+/// a stateless inner call over `base`'s messages plus the candidate digest.
+pub async fn run_panel_synthesis(
+    synthesis: &ModelJudgeMember,
+    base: &ProviderRequest,
+    candidates: &[Candidate],
+    cancel: &CancellationToken,
+) -> anyhow::Result<String> {
+    let mut messages = base.messages.clone();
+    messages.push(Message::User(UserMessage::text(synthesis_instructions(
+        candidates,
+    ))));
+
+    let rank_tool = rank_tool_spec();
+    let mut recorded = false;
+
+    for round in 0..MAX_SYNTHESIS_ROUNDS {
+        let inner = inner_request(
+            base,
+            synthesis.model.clone(),
+            messages.clone(),
+            vec![rank_tool.clone()],
+        );
+        let events = synthesis
+            .provider
+            .stream(inner, cancel.child_token())
+            .await?;
+        let collected = collect_message(events)
+            .await
+            .map_err(|error| anyhow::anyhow!("model-judge synthesis stream failed: {error}"))?;
+
+        let rank_call = collected
+            .tool_calls
+            .iter()
+            .find(|call| call.name.0 == MODEL_JUDGE_RANK_TOOL)
+            .cloned();
+
+        if let Some(call) = &rank_call
+            && !recorded
+        {
+            record_rankings(&call.arguments);
+            recorded = true;
+        }
+
+        let synthesis_text = collected.text.trim();
+        if !synthesis_text.is_empty() {
+            info!(
+                target: MODEL_JUDGE_TRACE_TARGET,
+                event = "synthesis",
+                synthesis = %synthesis_text,
+                "model-judge synthesis message"
+            );
+            return Ok(synthesis_text.to_owned());
+        }
+
+        // No synthesis text yet. If the model ranked, acknowledge the tool
+        // call and let it continue. If it produced neither a ranking nor
+        // text, retry with an explicit correction before falling back.
+        let Some(call) = rank_call else {
+            if round + 1 >= MAX_SYNTHESIS_ROUNDS {
+                anyhow::bail!("{EMPTY_SYNTHESIS_ERROR} after {MAX_SYNTHESIS_ROUNDS} attempts");
+            }
+            warn!(
+                target: MODEL_JUDGE_TRACE_TARGET,
+                event = "synthesis_retry",
+                attempt = round + 1,
+                max_rounds = MAX_SYNTHESIS_ROUNDS,
+                rank_recorded = recorded,
+                "{EMPTY_SYNTHESIS_ERROR}; retrying synthesis model"
+            );
+            messages.push(Message::User(synthesis_retry_message(recorded)));
+            continue;
+        };
+        messages.push(Message::Assistant(assistant_with_tool_call(
+            &collected.text,
+            call.clone(),
+        )));
+        messages.push(Message::Tool(ToolResultMessage {
+            id: MessageId::new(),
+            call_id: call.id.clone(),
+            content: ToolResult::Json {
+                value: json!({ "status": "recorded" }),
+            },
+            error: None,
+            created_at: Utc::now(),
+        }));
+    }
+
+    anyhow::bail!("model-judge synthesis did not produce synthesis text within the round limit")
 }
 
 /// A single model response collected from a provider stream.
@@ -534,7 +582,10 @@ fn synthesis_retry_message(rank_recorded: bool) -> UserMessage {
     ))
 }
 
-fn synthesis_guidance_message(synthesis: &str) -> UserMessage {
+/// Wrap synthesis text as an advisory user message for the default model. Used
+/// by the OneShot provider on every default call and by the runtime's FullTurn
+/// judge on the opening inference step of the turn.
+pub fn synthesis_guidance_message(synthesis: &str) -> UserMessage {
     UserMessage::text(format!(
         "The following model-judge synthesis evaluates candidate responses to \
          the most recent user message. Treat it as advisory context for your \
@@ -1064,5 +1115,66 @@ mod tests {
         assert_eq!(compact_reqs[0].model.provider.0, "fake");
         assert_eq!(compact_reqs[0].model.model, "gpt-5.5");
         assert!(!compact_reqs[0].model.model.starts_with("model-judge:"));
+    }
+
+    #[tokio::test]
+    async fn run_panel_synthesis_ranks_candidates_and_returns_text() {
+        let rankings = json!({ "rankings": [{ "model_id": "panel-a", "rank": 1 }] });
+        let (synthesis, synthesis_reqs) = member(
+            "synthesis",
+            Some("A is the strongest outcome"),
+            Some((MODEL_JUDGE_RANK_TOOL, rankings)),
+        );
+        let candidates = vec![Candidate::new("panel-a", "panel-a", "panel A outcome")];
+
+        let result = run_panel_synthesis(
+            &synthesis,
+            &sample_request(),
+            &candidates,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("synthesis succeeds");
+
+        assert_eq!(result, "A is the strongest outcome");
+        let synthesis_reqs = synthesis_reqs.lock().unwrap();
+        assert_eq!(synthesis_reqs.len(), 1);
+        let judge_prompt = synthesis_reqs[0]
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User(user) => Some(user.plain_text()),
+                _ => None,
+            })
+            .expect("judge prompt");
+        assert!(judge_prompt.contains("panel A outcome"));
+        assert!(judge_prompt.contains(MODEL_JUDGE_RANK_TOOL));
+        assert_eq!(synthesis_reqs[0].tools.len(), 1);
+        assert_eq!(synthesis_reqs[0].tools[0].name.0, MODEL_JUDGE_RANK_TOOL);
+    }
+
+    #[tokio::test]
+    async fn run_panel_synthesis_errors_when_neither_ranking_nor_text() {
+        // A synthesis member that always returns an empty message exhausts the
+        // retry budget and surfaces the empty-synthesis error.
+        let (synthesis, _) = member("synthesis", None, None);
+        let candidates = vec![Candidate::new("panel-a", "panel-a", "panel A outcome")];
+
+        let error = run_panel_synthesis(
+            &synthesis,
+            &sample_request(),
+            &candidates,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("synthesis with no output should error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("neither a ranking nor synthesis text"),
+            "unexpected error: {error}"
+        );
     }
 }

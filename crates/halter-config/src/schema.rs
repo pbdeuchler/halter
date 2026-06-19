@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use halter_protocol::{
-    ApiKind, ProviderKind, PruneSignalThreshold, ReasoningEffort, SubagentEventForwarding,
+    ApiKind, PanelIsolation, ProviderKind, PruneSignalThreshold, ReasoningEffort,
+    SubagentEventForwarding,
 };
 use indexmap::IndexMap;
 use schemars::JsonSchema;
@@ -279,11 +280,31 @@ pub enum ModelSlotRef {
     ModelJudge,
 }
 
+/// How a model-judge slot turns one decision into a panel-judged one.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelJudgeMode {
+    /// Each panelist answers with a single message (one inference, no tools),
+    /// and the panel/synthesis/default cycle runs on every model call within a
+    /// turn. Cheap, fast, step-by-step second opinions. The historical default.
+    #[default]
+    OneShot,
+    /// Each panelist runs a complete agentic turn (inference + tool loop) on the
+    /// user's message once per turn, and the synthesis model judges the
+    /// *outcomes* of those turns before handing guidance to the default model,
+    /// which owns the real, user-visible execution. See [`PanelIsolation`] for
+    /// how panelist tool execution is sandboxed.
+    FullTurn,
+}
+
 /// Model-judge definition: a default model, a synthesis model, and the panel of
 /// models whose responses are judged.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelJudgeConfig {
+    /// Whether panelists answer in one shot or run full agentic turns.
+    #[serde(default)]
+    pub mode: ModelJudgeMode,
     /// Model that produces the final, user-visible response from the synthesis.
     pub default: ModelConfig,
     /// Model that ranks the panel responses and writes the synthesis message.
@@ -291,6 +312,10 @@ pub struct ModelJudgeConfig {
     /// Panel of models the user message is multiplexed to.
     #[serde(default)]
     pub panel: Vec<ModelConfig>,
+    /// How FullTurn panelist sub-sessions are sandboxed. Ignored under
+    /// [`ModelJudgeMode::OneShot`] (one-shot panelists never execute tools).
+    #[serde(default)]
+    pub panel_isolation: PanelIsolation,
 }
 
 impl ModelJudgeConfig {
@@ -1106,6 +1131,10 @@ api_key = "openrouter-key"
         assert_eq!(model_judge.default.model, "claude-default");
         assert_eq!(model_judge.synthesis.model, "synthesis-5");
         assert_eq!(model_judge.panel.len(), 2);
+        // Omitted mode/panel_isolation fall back to the backward-compatible
+        // OneShot + ReadOnly defaults.
+        assert_eq!(model_judge.mode, ModelJudgeMode::OneShot);
+        assert_eq!(model_judge.panel_isolation, PanelIsolation::ReadOnly);
 
         // Representative leaf model is the model-judge default model.
         assert_eq!(
@@ -1122,6 +1151,46 @@ api_key = "openrouter-key"
             ]
         );
 
+        parsed.validate().expect("config should validate");
+    }
+
+    #[test]
+    fn full_turn_model_judge_round_trips_through_toml() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models]
+default = "model_judge"
+
+[models.model_judge]
+mode = "full_turn"
+panel_isolation = "worktree"
+
+[models.model_judge.default]
+provider = "anthropic"
+model = "claude-default"
+
+[models.model_judge.synthesis]
+provider = "openai"
+model = "synthesis-5"
+
+[[models.model_judge.panel]]
+provider = "openai"
+model = "panel-a"
+
+[providers.openai]
+api_key = "openai-key"
+
+[providers.anthropic]
+api_key = "anthropic-key"
+"#,
+        )
+        .expect("parse config");
+
+        let model_judge = parsed.model_judge().expect("model_judge config");
+        assert_eq!(model_judge.mode, ModelJudgeMode::FullTurn);
+        assert_eq!(model_judge.panel_isolation, PanelIsolation::Worktree);
         parsed.validate().expect("config should validate");
     }
 

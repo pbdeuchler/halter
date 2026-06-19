@@ -44,7 +44,9 @@ use tokio_util::sync::CancellationToken;
 pub use anthropic::AnthropicProvider;
 pub use fake::FakeProvider;
 pub use model_judge::{
-    MODEL_JUDGE_RANK_TOOL, MODEL_JUDGE_TRACE_TARGET, ModelJudgeMember, ModelJudgeProvider,
+    Candidate, FullTurnJudgePlan, FullTurnPanelist, MODEL_JUDGE_RANK_TOOL,
+    MODEL_JUDGE_TRACE_TARGET, ModelJudgeMember, ModelJudgeProvider, run_panel_synthesis,
+    synthesis_guidance_message,
 };
 pub use openai::{OpenAiOAuthCredentials, OpenAiProvider};
 pub use openrouter::OpenRouterProvider;

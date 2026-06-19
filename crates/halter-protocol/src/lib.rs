@@ -289,6 +289,28 @@ pub enum ReasoningEffort {
     Xhigh,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+/// How a FullTurn model-judge panelist's sub-session is sandboxed while it runs
+/// a complete agentic turn. Only meaningful for FullTurn judges; OneShot
+/// panelists never execute tools.
+pub enum PanelIsolation {
+    /// Panelists share the parent working directory but get a tool set with
+    /// every mutating tool (write/edit/shell/process/task) filtered out. They
+    /// can read, search, and reason but cannot change the workspace. Safe under
+    /// concurrency; the default.
+    #[default]
+    ReadOnly,
+    /// Panelists share the parent working directory with the parent's full tool
+    /// set. Maximum fidelity, but concurrent panelists can clobber each other's
+    /// writes — the caller owns that risk.
+    SharedFull,
+    /// Each panelist runs in its own git worktree with the full tool set, so it
+    /// can mutate freely without colliding. Requires a git repository; falls
+    /// back to [`PanelIsolation::SharedFull`] (with a warning) otherwise.
+    Worktree,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 /// Token accounting reported by providers and accumulated by sessions.
 pub struct Usage {

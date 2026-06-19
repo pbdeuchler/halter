@@ -464,31 +464,63 @@ backend = "memory"
 
 The `models.default` and `models.subagent` slots accept either an inline model
 (the form above) or the string `"model_judge"`, which references a shared
-`[models.model_judge]` block. A model-judge slot turns a single model call into
-a panel-judged one:
+`[models.model_judge]` block. A model-judge slot deliberates over a panel of
+models, judges their work with a `synthesis` model, and hands the result to the
+`default` model as advisory guidance — the default model always owns the visible
+answer and all real tool execution.
+
+The `mode` field picks how deeply each panelist deliberates:
+
+**`mode = "one_shot"` (default).** Each panelist answers with a single message
+(one inference, no tools), and the whole cycle runs on **every model call within
+a turn**:
 
 1. The context and user message are multiplexed to every model in `panel` in
    parallel (each receives the full context **and** the tool specs). A constant
-   framing prefix is prepended as the first user message so each panelist
-   answers as one advisory voice on a judged panel — comparable prose about what
-   it *would* do and why, rather than executing or replying. The prefix is added
+   framing prefix is prepended as the first user message so each panelist answers
+   as one advisory voice on a judged panel — comparable prose about what it
+   *would* do and why, rather than executing or replying. The prefix is added
    only on the panel path, so it never reaches the synthesis or default model.
-2. The `synthesis` model is given the panel responses and a `rank_responses` tool.
-   It first stack-ranks the panel responses (emitted as structured `tracing`
-   telemetry on the `halter::model_judge` target), then writes a synthesis that
-   judges, not merges, them (strengths, weaknesses, pros, cons, overall).
+2. The `synthesis` model is given the panel responses and a `rank_responses`
+   tool. It first stack-ranks the responses (emitted as structured `tracing`
+   telemetry), then writes a synthesis that judges, not merges, them (strengths,
+   weaknesses, pros, cons, overall).
 3. The synthesis is handed to the `default` model as internal guidance for the
-   same provider call. The default model owns the visible answer and all real
-   tool execution; the guidance is not persisted to the transcript.
+   same provider call; the guidance is not persisted to the transcript.
 
-The panel/synthesis/default cycle runs on every model call within a turn, so the
-default model still owns all real tool execution. Expect `N + 2` model calls per
-iteration.
+Cheap and fast — a fresh second opinion at each step. Expect `N + 2` model calls
+per iteration.
+
+**`mode = "full_turn"`.** Each panelist runs a **complete agentic turn**
+(inference + tool loop to completion) on the user's message, **once per turn**.
+The `synthesis` model judges the *outcomes* of those turns (using the same
+`rank_responses` + judge flow), and the synthesis is injected as advisory
+guidance on the default model's opening inference of the turn. The default model
+then runs its own full turn, owning the real, user-visible execution. Heavier,
+but each panelist actually investigates the task rather than only describing what
+it would do. Panelists are advisory — their work is scratch exploration that
+feeds the judge, not the shipped result.
+
+`panel_isolation` controls how FullTurn panelist sub-sessions are sandboxed
+(ignored under `one_shot`):
+
+- `read_only` (default) — panelists share the working directory but get a tool
+  set with every mutating tool (`write`/`edit`/`shell`/`process`/`task`)
+  filtered out. Safe under concurrency.
+- `shared_full` — panelists share the working directory with the full tool set.
+  Maximum fidelity, but concurrent panelists can clobber each other's writes.
+- `worktree` — each panelist runs in its own git worktree with the full tool
+  set, so it can mutate freely without colliding. Requires a git repository;
+  falls back to `shared_full` (with a warning) otherwise.
 
 ```toml
 [models]
 default = "model_judge"
 subagent = "model_judge"   # optional; subagents can fan out too
+
+[models.model_judge]
+mode = "one_shot"            # "one_shot" (default) | "full_turn"
+panel_isolation = "read_only"  # full_turn only: "read_only" (default) | "shared_full" | "worktree"
 
 [models.model_judge.default]
 provider = "anthropic"
@@ -513,7 +545,7 @@ provider = "anthropic"
 model = "claude-sonnet-4-6"
 ```
 
-Rankings, panel responses, and the synthesis message are all logged via
+Rankings, panel responses/outcomes, and the synthesis message are all logged via
 `tracing` (target `halter::model_judge`); set
 `RUST_LOG=halter::model_judge=info` to capture the quality telemetry.
 

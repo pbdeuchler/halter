@@ -7,10 +7,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use halter_config::{
-    ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelJudgeConfig, ModelSlot,
-    ModelSlotRef, OpenAiOAuthConfig, PolicyConfig, PromptsConfig, ResolvedProviderAuth,
-    ResolvedProviderConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig,
-    SystemPromptPreset, expand_path, load_path, resolve_provider_runtime_config,
+    ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelJudgeConfig,
+    ModelJudgeMode, ModelSlot, ModelSlotRef, OpenAiOAuthConfig, PolicyConfig, PromptsConfig,
+    ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID,
+    SessionBackend, SessionsConfig, SystemPromptPreset, expand_path, load_path,
+    resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
@@ -18,8 +19,8 @@ use halter_protocol::{
     ResourceSnapshot,
 };
 use halter_providers::{
-    AnthropicProvider, ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials,
-    OpenAiProvider, OpenRouterProvider, Provider,
+    AnthropicProvider, FullTurnJudgePlan, FullTurnPanelist, ModelJudgeMember, ModelJudgeProvider,
+    ModelRegistry, OpenAiOAuthCredentials, OpenAiProvider, OpenRouterProvider, Provider,
 };
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
@@ -550,6 +551,44 @@ fn build_model_judge_model(
     id: &str,
     slot_label: &str,
 ) -> anyhow::Result<ResolvedModel> {
+    // The mode is encoded structurally here so the runtime never has to branch
+    // on it: OneShot registers a synthetic `Provider` the slot routes through;
+    // FullTurn leaves the slot pointing at a plain default model and records a
+    // panel plan the turn loop consults.
+    match model_judge.mode {
+        ModelJudgeMode::OneShot => build_one_shot_judge(
+            config,
+            registry,
+            family_providers,
+            model_judge,
+            role,
+            id,
+            slot_label,
+        ),
+        ModelJudgeMode::FullTurn => build_full_turn_judge(
+            config,
+            registry,
+            family_providers,
+            model_judge,
+            role,
+            id,
+            slot_label,
+        ),
+    }
+}
+
+/// OneShot judge: wrap the three roles in a [`ModelJudgeProvider`] and route the
+/// slot through a synthetic provider name. The panel/synthesis/default cycle
+/// runs inside the provider on every model call.
+fn build_one_shot_judge(
+    config: &HarnessConfig,
+    registry: &mut ModelRegistry,
+    family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    model_judge: &ModelJudgeConfig,
+    role: ModelRole,
+    id: &str,
+    slot_label: &str,
+) -> anyhow::Result<ResolvedModel> {
     let default_member =
         build_model_judge_member(config, registry, family_providers, &model_judge.default)?;
     let synthesis_member =
@@ -588,6 +627,91 @@ fn build_model_judge_model(
         reasoning: default_leaf.reasoning,
         tokens_per_minute: default_leaf.tokens_per_minute,
     })
+}
+
+/// FullTurn judge: the slot resolves to the plain default model (normal per-step
+/// inference), each panelist is registered as its own resolvable model, and a
+/// [`FullTurnJudgePlan`] is recorded so the runtime fans the user's turn out to
+/// the panel as full sub-sessions before running the default.
+fn build_full_turn_judge(
+    config: &HarnessConfig,
+    registry: &mut ModelRegistry,
+    family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    model_judge: &ModelJudgeConfig,
+    role: ModelRole,
+    id: &str,
+    slot_label: &str,
+) -> anyhow::Result<ResolvedModel> {
+    // The default model is an ordinary registry model; its per-step inference is
+    // never judged. The judging happens once per turn, in the runtime.
+    ensure_family_provider(
+        config,
+        registry,
+        family_providers,
+        model_judge.default.provider,
+    )?;
+    let slot_model = resolved_model(
+        &model_judge.default,
+        role,
+        ModelId::from(id),
+        ProviderName::from(model_judge.default.provider.to_string()),
+    );
+
+    // Synthesis is a single inner inference, identical to the OneShot path.
+    let synthesis =
+        build_model_judge_member(config, registry, family_providers, &model_judge.synthesis)?;
+
+    // Each panelist gets a unique, slot-scoped model id so the runtime can start
+    // a sub-session against it; the label is the model name (disambiguated) used
+    // as the candidate id shown to the synthesis judge.
+    let labels = panel_labels(&model_judge.panel);
+    let mut panel = Vec::with_capacity(model_judge.panel.len());
+    for (index, panelist) in model_judge.panel.iter().enumerate() {
+        ensure_family_provider(config, registry, family_providers, panelist.provider)?;
+        let model_id = ModelId::from(format!("model-judge-panel:{slot_label}:{index}"));
+        registry.register_model(resolved_model(
+            panelist,
+            ModelRole::default_role(),
+            model_id.clone(),
+            ProviderName::from(panelist.provider.to_string()),
+        ));
+        panel.push(FullTurnPanelist {
+            model_id,
+            label: labels[index].clone(),
+        });
+    }
+
+    registry.register_full_turn_judge(
+        &ModelId::from(id),
+        Arc::new(FullTurnJudgePlan {
+            synthesis,
+            panel,
+            isolation: model_judge.panel_isolation,
+        }),
+    );
+
+    Ok(slot_model)
+}
+
+/// Candidate labels for FullTurn panelists: the model name, disambiguated with a
+/// positional suffix when the same model appears more than once.
+fn panel_labels(panel: &[ModelConfig]) -> Vec<String> {
+    panel
+        .iter()
+        .enumerate()
+        .map(|(index, panelist)| {
+            let name = &panelist.model;
+            let duplicate = panel
+                .iter()
+                .enumerate()
+                .any(|(other, candidate)| other != index && candidate.model == *name);
+            if duplicate {
+                format!("{name}#{index}")
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
 }
 
 fn build_model_judge_member(
@@ -870,9 +994,11 @@ mod tests {
             tokens_per_minute: None,
         };
         config.models.model_judge = Some(ModelJudgeConfig {
+            mode: ModelJudgeMode::OneShot,
             default: leaf("gpt-default"),
             synthesis: leaf("gpt-synthesis"),
             panel: vec![leaf("gpt-panel-a"), leaf("gpt-panel-b")],
+            panel_isolation: Default::default(),
         });
 
         let registry = build_model_registry(&config).expect("model registry");
@@ -880,6 +1006,8 @@ mod tests {
         assert_eq!(default_model.provider.0, "model-judge-default");
         assert_eq!(default_model.model, "gpt-default");
         assert!(!default_model.model.starts_with("model-judge:"));
+        // OneShot routes through the synthetic provider, not a FullTurn plan.
+        assert!(registry.full_turn_judge(&default_model.id).is_none());
 
         let halter = HalterBuilder::default()
             .with_config(config)
@@ -893,6 +1021,55 @@ mod tests {
             halter.config.default_model().expect("default model").model,
             "gpt-default"
         );
+    }
+
+    #[tokio::test]
+    async fn builder_constructs_full_turn_model_judge_slot() {
+        let mut config = openai_config(Some("test-key"));
+        config.models.default = Some(ModelSlot::Reference(ModelSlotRef::ModelJudge));
+        let leaf = |model: &str| ModelConfig {
+            provider: ConfiguredProvider::OpenAi,
+            model: model.to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tokens_per_minute: None,
+        };
+        config.models.model_judge = Some(ModelJudgeConfig {
+            mode: ModelJudgeMode::FullTurn,
+            default: leaf("gpt-default"),
+            synthesis: leaf("gpt-synthesis"),
+            panel: vec![leaf("gpt-panel-a"), leaf("gpt-panel-b")],
+            panel_isolation: Default::default(),
+        });
+
+        let registry = build_model_registry(&config).expect("model registry");
+        let default_model = registry.default_model().expect("default model");
+
+        // FullTurn leaves the slot pointing at a plain default provider (no
+        // synthetic model-judge provider) and records a panel plan instead.
+        assert_eq!(default_model.provider.0, "openai");
+        assert_eq!(default_model.model, "gpt-default");
+        let plan = registry
+            .full_turn_judge(&default_model.id)
+            .expect("full-turn plan registered for the default slot");
+        assert_eq!(plan.panel.len(), 2);
+        assert_eq!(plan.panel[0].label, "gpt-panel-a");
+        assert_eq!(plan.panel[1].label, "gpt-panel-b");
+
+        // Each panelist is resolvable as its own registry model.
+        for panelist in &plan.panel {
+            registry
+                .model(&panelist.model_id)
+                .expect("panelist model resolvable");
+        }
+
+        HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build should succeed for a full-turn model-judge slot");
     }
 
     #[tokio::test]

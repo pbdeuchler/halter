@@ -1071,6 +1071,11 @@ impl SessionHandle {
             });
         }
 
+        // Captured before the user message is appended: FullTurn model-judge
+        // panels are seeded with the pre-turn context and then submit the user
+        // message as their own turn, so this avoids a duplicated user message.
+        let full_turn_pre_messages = state.messages.clone();
+
         let user_message = Message::User(turn.user_message.clone());
         state.messages.push(user_message.clone());
         self.push_event(
@@ -1141,13 +1146,50 @@ impl SessionHandle {
                 .models
                 .model(&selected_models.subagent_model)?;
             let provider = self.services.models.provider(&model.provider)?;
+
+            // FullTurn model-judge: on the opening inference of the turn, fan the
+            // user message out to the panel as full sub-sessions, synthesize their
+            // outcomes, and inject the result as advisory guidance for the default
+            // model. Non-persisted and first-step only — the default's own output
+            // carries the influence forward through the rest of the turn.
+            let mut request_messages = plan.messages.clone();
+            if provider_iterations == 1
+                && let Some(judge) = self
+                    .services
+                    .models
+                    .full_turn_judge(&selected_models.default_model)
+            {
+                let inputs = crate::model_judge::FullTurnInputs {
+                    services: self.services.clone(),
+                    blueprint: stored.blueprint.clone(),
+                    snapshot: snapshot.clone(),
+                    fork_messages: full_turn_pre_messages.clone(),
+                    judge_messages: plan.messages.clone(),
+                    prompt: prompt.clone(),
+                    session_id: self.session_id.clone(),
+                    turn_id: turn.id.clone(),
+                    user_text: turn.user_message.plain_text(),
+                };
+                if let Some(advisory) = crate::model_judge::run_full_turn_deliberation(
+                    inputs,
+                    judge,
+                    turn_cancel.child_token(),
+                )
+                .await
+                {
+                    request_messages.push(Message::User(
+                        halter_providers::synthesis_guidance_message(&advisory),
+                    ));
+                }
+            }
+
             let request = ProviderRequest {
                 session_id: self.session_id.clone(),
                 turn_id: turn.id.clone(),
                 model: model.clone(),
                 prompt,
                 compacted_prefix: plan.compacted_prefix.clone(),
-                messages: plan.messages.clone(),
+                messages: request_messages,
                 tools: plan.tool_specs.clone(),
                 previous_response_id: plan.previous_response_id.clone(),
                 new_messages_start: plan.new_messages_start,
@@ -5329,5 +5371,170 @@ mod tests {
                 value: json!({ "ok": true }),
             })
         }
+    }
+
+    /// Records every request it streams and replays a single fixed reply (or an
+    /// empty assistant message when `reply` is `None`), completing the turn in
+    /// one inference. Used to assert FullTurn model-judge guidance injection.
+    struct RecordingFakeProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        reply: Option<String>,
+    }
+
+    impl RecordingFakeProvider {
+        fn new(reply: Option<&str>) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                reply: reply.map(ToOwned::to_owned),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RecordingFakeProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            self.requests.lock().unwrap().push(request);
+            let message_id = halter_protocol::MessageId::new();
+            let mut events = vec![Ok(StreamEvent::MessageStart {
+                id: message_id.clone(),
+            })];
+            if let Some(reply) = &self.reply {
+                let block = BlockId::new();
+                events.push(Ok(StreamEvent::TextStart { id: block.clone() }));
+                events.push(Ok(StreamEvent::TextDelta {
+                    id: block.clone(),
+                    delta: reply.clone(),
+                }));
+                events.push(Ok(StreamEvent::TextEnd { id: block }));
+            }
+            events.push(Ok(StreamEvent::MessageEnd {
+                id: message_id,
+                stop_reason: StopReason::EndTurn,
+                response_id: None,
+            }));
+            Ok(stream::iter(events).boxed())
+        }
+    }
+
+    /// Build services whose `default` slot is backed by a FullTurn model judge:
+    /// the default model runs through `default_provider`, the single panelist
+    /// through `panel_provider`, and the synthesis member through
+    /// `synthesis_provider`.
+    fn full_turn_judge_services(
+        working_dir: &std::path::Path,
+        default_provider: Arc<dyn Provider>,
+        panel_provider: Arc<dyn Provider>,
+        synthesis_provider: Arc<dyn Provider>,
+    ) -> Arc<RuntimeServices> {
+        let mut services = RuntimeServices::default();
+        let mut models = ModelRegistry::new();
+        models.set_default_model(resolved_test_model("default", "fake", "halter/default"));
+        models.set_subagent_model(resolved_test_model("subagent", "fake", "halter/fake"));
+        models.set_small_model(resolved_test_model("small", "fake", "halter/fake"));
+        models.register_provider(ProviderName::from("fake"), default_provider);
+        models.register_provider(ProviderName::from("panel"), panel_provider);
+        models.register_model(resolved_test_model("panel-0", "panel", "halter/panel"));
+        let synthesis = halter_providers::ModelJudgeMember {
+            provider: synthesis_provider,
+            model: resolved_test_model("synthesis", "synthesis", "halter/synthesis"),
+        };
+        models.register_full_turn_judge(
+            &ModelId::from("default"),
+            Arc::new(halter_providers::FullTurnJudgePlan {
+                synthesis,
+                panel: vec![halter_providers::FullTurnPanelist {
+                    model_id: ModelId::from("panel-0"),
+                    label: "panel-0".to_owned(),
+                }],
+                isolation: halter_protocol::PanelIsolation::ReadOnly,
+            }),
+        );
+        services.models = Arc::new(models);
+        services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
+            allowed_write_roots: vec![working_dir.to_path_buf()],
+            ..PolicySettings::default()
+        }));
+        Arc::new(services)
+    }
+
+    fn request_carries_synthesis_guidance(requests: &[ProviderRequest]) -> bool {
+        requests.iter().any(|request| {
+            request.messages.iter().any(|message| match message {
+                Message::User(user) => user.plain_text().contains("model_judge_synthesis"),
+                _ => false,
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn full_turn_judge_injects_synthesis_guidance_on_opening_step() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let default_provider = Arc::new(RecordingFakeProvider::new(Some("default answer")));
+        let default_requests = default_provider.requests.clone();
+        let panel_provider = Arc::new(RecordingFakeProvider::new(Some("panel outcome")));
+        let synthesis_provider = Arc::new(RecordingFakeProvider::new(Some("synthesis verdict")));
+
+        let services = full_turn_judge_services(
+            temp.path(),
+            default_provider,
+            panel_provider,
+            synthesis_provider,
+        );
+        let runtime = SessionRuntime::new(services);
+        let session = new_session(&runtime, temp.path()).await;
+        session
+            .submit_turn(Turn::user("plan the work"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let requests = default_requests.lock().unwrap();
+        assert!(
+            request_carries_synthesis_guidance(&requests),
+            "default model should receive the panel synthesis as advisory guidance"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_turn_judge_falls_back_when_panels_produce_no_outcome() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let default_provider = Arc::new(RecordingFakeProvider::new(Some("default answer")));
+        let default_requests = default_provider.requests.clone();
+        // The panelist returns an empty assistant message, so there is no outcome
+        // to synthesize and deliberation must fall back to the plain default.
+        let panel_provider = Arc::new(RecordingFakeProvider::new(None));
+        let synthesis_provider = Arc::new(RecordingFakeProvider::new(Some("unused verdict")));
+
+        let services = full_turn_judge_services(
+            temp.path(),
+            default_provider,
+            panel_provider,
+            synthesis_provider,
+        );
+        let runtime = SessionRuntime::new(services);
+        let session = new_session(&runtime, temp.path()).await;
+        session
+            .submit_turn(Turn::user("plan the work"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let requests = default_requests.lock().unwrap();
+        assert!(
+            !request_carries_synthesis_guidance(&requests),
+            "with no panel outcomes the default model should run without guidance"
+        );
     }
 }

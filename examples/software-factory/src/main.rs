@@ -18,9 +18,10 @@ use clap::Parser;
 use futures::StreamExt;
 use halter::prelude::*;
 use halter_config::{
-    ConfiguredProvider, ContextConfig, HarnessConfig, ModelConfig, ModelJudgeConfig, ModelSlot,
-    ModelSlotRef, ModelsConfig, NetworkPolicyConfig, PolicyConfig, ProviderConfig, ProvidersConfig,
-    ResourcesConfig, RuntimeConfig, SearchRoots, SessionsConfig, ShellPolicyConfig, ToolsConfig,
+    ConfiguredProvider, ContextConfig, HarnessConfig, ModelConfig, ModelJudgeConfig,
+    ModelJudgeMode, ModelSlot, ModelSlotRef, ModelsConfig, NetworkPolicyConfig, PanelIsolation,
+    PolicyConfig, ProviderConfig, ProvidersConfig, ResourcesConfig, RuntimeConfig, SearchRoots,
+    SessionsConfig, ShellPolicyConfig, ToolsConfig,
 };
 use halter_protocol::{
     AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
@@ -955,6 +956,7 @@ fn default_factory_config() -> HarnessConfig {
                 ReasoningEffort::Medium,
             )),
             model_judge: Some(ModelJudgeConfig {
+                mode: ModelJudgeMode::FullTurn,
                 default: model_config(
                     ConfiguredProvider::OpenRouter,
                     "z-ai/glm-5.2",
@@ -987,6 +989,7 @@ fn default_factory_config() -> HarnessConfig {
                         ReasoningEffort::Xhigh,
                     ),
                 ],
+                panel_isolation: PanelIsolation::ReadOnly,
             }),
         },
         resources: ResourcesConfig {
@@ -1009,7 +1012,11 @@ fn default_factory_config() -> HarnessConfig {
                 .collect(),
         },
         policy: PolicyConfig {
-            allowed_write_roots: vec![PathBuf::from("./"), PathBuf::from("/tmp/halter"), PathBuf::from("/private/tmp/halter-software-factory")],
+            allowed_write_roots: vec![
+                PathBuf::from("./"),
+                PathBuf::from("/tmp/halter"),
+                PathBuf::from("/private/tmp/halter-software-factory"),
+            ],
             max_read_bytes: 1_048_576,
             max_subagent_depth: 3,
             max_concurrent_subagents: 8,
@@ -3057,7 +3064,11 @@ mod tests {
 
         assert_eq!(
             config.policy.allowed_write_roots,
-            vec![worktree.to_path_buf(), PathBuf::from("/tmp/halter")]
+            vec![
+                worktree.to_path_buf(),
+                PathBuf::from("/tmp/halter"),
+                PathBuf::from("/private/tmp/halter-software-factory"),
+            ]
         );
         assert_eq!(
             config.resources.skills.roots,

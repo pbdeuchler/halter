@@ -7,7 +7,7 @@ use anyhow::Context;
 use halter_protocol::{ModelId, ProviderName, ResolvedModel};
 use tracing::debug;
 
-use crate::Provider;
+use crate::{FullTurnJudgePlan, Provider};
 
 #[derive(Default, Clone)]
 /// Registry of resolved models and provider adapters.
@@ -18,6 +18,10 @@ pub struct ModelRegistry {
     subagent_model: Option<ResolvedModel>,
     plan_model: Option<ResolvedModel>,
     providers: HashMap<String, Arc<dyn Provider>>,
+    /// FullTurn model-judge plans keyed by the registry model id of the slot
+    /// they back. A `Some` entry tells the runtime to fan a turn out to the
+    /// panel as full sub-sessions before running this model.
+    full_turn_judges: HashMap<String, Arc<FullTurnJudgePlan>>,
 }
 
 impl ModelRegistry {
@@ -90,6 +94,14 @@ impl ModelRegistry {
             .context("failed to resolve model: plan model is not configured")
     }
 
+    /// Make a model resolvable by id without binding it to a named role. Used
+    /// for FullTurn model-judge panelists, which the runtime starts sub-sessions
+    /// against but which are not the default/small/subagent model of any slot.
+    pub fn register_model(&mut self, model: ResolvedModel) {
+        debug!(model_id = %model.id, provider = %model.provider, "registering model");
+        self.models.insert(model.id.0.clone(), model);
+    }
+
     /// Resolve a concrete model id.
     pub fn model(&self, model_id: &ModelId) -> anyhow::Result<ResolvedModel> {
         debug!(model_id = %model_id, "resolving model");
@@ -125,5 +137,21 @@ impl ModelRegistry {
             .get(&name.0)
             .cloned()
             .with_context(|| format!("failed to resolve provider: unknown provider '{}'", name.0))
+    }
+
+    /// Register a FullTurn model-judge plan for a slot's model id.
+    pub fn register_full_turn_judge(&mut self, model_id: &ModelId, plan: Arc<FullTurnJudgePlan>) {
+        debug!(
+            model_id = %model_id,
+            panel = plan.panel.len(),
+            "registering full-turn model judge"
+        );
+        self.full_turn_judges.insert(model_id.0.clone(), plan);
+    }
+
+    /// Resolve the FullTurn model-judge plan backing a model id, if any.
+    #[must_use]
+    pub fn full_turn_judge(&self, model_id: &ModelId) -> Option<Arc<FullTurnJudgePlan>> {
+        self.full_turn_judges.get(&model_id.0).cloned()
     }
 }

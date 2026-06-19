@@ -10,6 +10,7 @@ mod compaction;
 mod context;
 mod event_bus;
 mod hooks_runtime;
+mod model_judge;
 mod model_selection;
 mod prompt;
 mod session;
