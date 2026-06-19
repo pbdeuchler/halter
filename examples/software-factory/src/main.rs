@@ -1012,11 +1012,7 @@ fn default_factory_config() -> HarnessConfig {
                 .collect(),
         },
         policy: PolicyConfig {
-            allowed_write_roots: vec![
-                PathBuf::from("./"),
-                PathBuf::from("/tmp/halter"),
-                PathBuf::from("/private/tmp/halter-software-factory"),
-            ],
+            allowed_write_roots: vec![PathBuf::from("./"), PathBuf::from("/tmp/halter")],
             max_read_bytes: 1_048_576,
             max_subagent_depth: 3,
             max_concurrent_subagents: 8,
@@ -1302,7 +1298,8 @@ const JSON_ONLY_OUTPUT_RULE: &str = "Return ONLY the JSON object as your final m
 
 /// Shared rule for coding stages that run cargo, whose builds exceed the
 /// 30-second default shell timeout when no explicit timeout is supplied.
-const CARGO_TIMEOUT_RULE: &str = "When running cargo build/test/clippy/check through the shell tool, pass an explicit timeout_ms of at least 120000; these commands routinely exceed the 30-second default.";
+const CARGO_TIMEOUT_RULE: &str = "When running builds, tests, lints, or other checks through the shell tool, pass an explicit timeout_ms of at least 120000; these commands routinely exceed the 30-second default.";
+const CODE_REVIEW_MAX_TURNS: u32 = 10;
 
 fn json_preview(value: &Value, max_chars: usize) -> String {
     single_line_preview(&value.to_string(), max_chars)
@@ -1451,10 +1448,12 @@ fn session_init_with_appended_context(
     system_prompt: FactorySystemPrompt,
     turn_instructions: &str,
     project_system_prompt: Option<&str>,
+    max_turns: Option<u32>,
 ) -> anyhow::Result<SessionInit> {
     let mut init = SessionInit {
         working_dir: worktree.to_path_buf(),
         system_prompt_seed: vec![system_prompt.segment()],
+        max_turns,
         ..SessionInit::default()
     };
     if let Some(segment) = project_guidance_prompt_segment(project_system_prompt) {
@@ -1501,7 +1500,7 @@ fn hash_prompt_text(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-async fn run_coding_agent_with_system_prompt(
+async fn run_code_review_agent_with_system_prompt(
     harness: &Halter,
     worktree: &Path,
     label: &str,
@@ -1516,6 +1515,7 @@ async fn run_coding_agent_with_system_prompt(
         FactorySystemPrompt::Coding,
         project_system_prompt,
         AgentTextRequirement::Required,
+        Some(CODE_REVIEW_MAX_TURNS),
     )
     .await
 }
@@ -1556,6 +1556,7 @@ async fn run_agent_with_system_prompt(
         FactorySystemPrompt::General,
         project_system_prompt,
         AgentTextRequirement::Required,
+        None,
     )
     .await
 }
@@ -1582,6 +1583,7 @@ async fn run_agent_with_prompt_kind_with_retry(
             system_prompt,
             project_system_prompt,
             text_requirement,
+            None,
         )
         .await
         {
@@ -1622,11 +1624,13 @@ async fn run_agent_with_prompt_kind(
     system_prompt: FactorySystemPrompt,
     project_system_prompt: Option<&str>,
     text_requirement: AgentTextRequirement,
+    max_turns: Option<u32>,
 ) -> anyhow::Result<AgentRun> {
     let turn_instructions = prompt.into();
     info!(
         stage = label,
         system_prompt = ?system_prompt,
+        max_turns = ?max_turns,
         prompt_bytes = turn_instructions.len(),
         project_guidance = project_system_prompt.is_some_and(|prompt| !prompt.trim().is_empty()),
         "starting agent turn"
@@ -1637,6 +1641,7 @@ async fn run_agent_with_prompt_kind(
             system_prompt,
             &turn_instructions,
             project_system_prompt,
+            max_turns,
         )?)
         .await?;
     let mut events = session
@@ -2122,8 +2127,18 @@ async fn run_review_loop(
             diff_bytes = diff.len(),
             "starting review iteration"
         );
-        let review =
-            review_diff(reviewer, worktree, base_ref, &diff, project_system_prompt).await?;
+        let review = review_diff(
+            reviewer,
+            worktree,
+            base_ref,
+            &diff,
+            ReviewIteration {
+                current: iteration,
+                max: max_iterations,
+            },
+            project_system_prompt,
+        )
+        .await?;
         if review.clean && review.findings.is_empty() {
             info!(iteration, "review loop is clean");
             return Ok(review);
@@ -2134,22 +2149,13 @@ async fn run_review_loop(
             "review requested changes"
         );
         let review_json = serde_json::to_string_pretty(&review)?;
-        let prompt = format!(
-            r#"The code review for the current branch found issues. Fix every finding in the current worktree.
-
-Rules:
-- Do not create, switch, commit, push, or open branches/PRs.
-- Keep the fix scoped to the implementation plan and review findings.
-- Run focused tests or checks that cover the changed behavior.
-- {CARGO_TIMEOUT_RULE}
-- Return a concise summary and the verification commands you ran.
-
-IMPLEMENTATION PLAN:
-{implementation_plan}
-
-REVIEW RESULT:
-{review_json}
-"#
+        let prompt = review_repair_prompt(
+            implementation_plan,
+            &review_json,
+            ReviewIteration {
+                current: iteration,
+                max: max_iterations,
+            },
         );
         run_coding_action_with_system_prompt(
             implementer,
@@ -2168,17 +2174,56 @@ async fn review_diff(
     worktree: &Path,
     base_ref: &str,
     diff: &str,
+    iteration: ReviewIteration,
     project_system_prompt: Option<&str>,
 ) -> anyhow::Result<CodeReview> {
-    let prompt = format!(
-        r#"You are reviewing a branch diff against {base_ref}.
+    let prompt = code_review_prompt(base_ref, diff, iteration);
+    let raw = run_code_review_agent_with_system_prompt(
+        reviewer,
+        worktree,
+        "gpt code review",
+        prompt,
+        project_system_prompt,
+    )
+    .await?
+    .text;
+    parse_json_response(&raw).map_err(anyhow::Error::msg)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReviewIteration {
+    current: usize,
+    max: usize,
+}
+
+impl ReviewIteration {
+    fn is_first(self) -> bool {
+        self.current == 1
+    }
+
+    fn is_final(self) -> bool {
+        self.max > 0 && self.current == self.max
+    }
+}
+
+fn code_review_prompt(base_ref: &str, diff: &str, iteration: ReviewIteration) -> String {
+    let intro = if iteration.is_first() {
+        format!("You are reviewing a branch diff against {base_ref}.")
+    } else {
+        format!(
+            "Your previous code review has been addressed. Thoroughly re-review the branch diff against {base_ref} and ensure all findings have been addressed and there are no new ones."
+        )
+    };
+    let final_instruction = final_review_iteration_instruction(iteration, "review");
+    format!(
+        r#"{intro}
 
 Review stance:
 - Prioritize correctness bugs, regressions, missing tests, unsafe behavior, and broken edge cases.
-- Do not block on style nits unless they create real maintenance risk.
+- Include but do not block on style nits unless they create real maintenance risk.
 - Mark clean=true only when there are no required fixes.
 - {CARGO_TIMEOUT_RULE}
-
+{final_instruction}
 {JSON_ONLY_OUTPUT_RULE} Use this shape:
 {{
   "clean": false,
@@ -2197,17 +2242,43 @@ Review stance:
 BRANCH DIFF:
 {diff}
 "#
-    );
-    let raw = run_coding_agent_with_system_prompt(
-        reviewer,
-        worktree,
-        "gpt code review",
-        prompt,
-        project_system_prompt,
     )
-    .await?
-    .text;
-    parse_json_response(&raw).map_err(anyhow::Error::msg)
+}
+
+fn review_repair_prompt(
+    implementation_plan: &str,
+    review_json: &str,
+    iteration: ReviewIteration,
+) -> String {
+    let final_instruction = final_review_iteration_instruction(iteration, "implementation");
+    format!(
+        r#"The code review for the current branch found issues. Fix every finding in the current worktree.
+
+Rules:
+- Do not create, switch, commit, push, or open branches/PRs.
+- Keep the fix scoped to the implementation plan and review findings.
+- Run focused tests or checks that cover the changed behavior.
+- {CARGO_TIMEOUT_RULE}
+{final_instruction}- Return a concise summary and the verification commands you ran.
+
+IMPLEMENTATION PLAN:
+{implementation_plan}
+
+REVIEW RESULT:
+{review_json}
+"#
+    )
+}
+
+fn final_review_iteration_instruction(iteration: ReviewIteration, participant: &str) -> String {
+    if !iteration.is_final() {
+        return String::new();
+    }
+    match participant {
+        "review" => "- This is the last code review iteration. Ensure every previous finding has been addressed and no new required fixes remain. If there are repeated issues or miscommunications, think deeply and take a different review approach before returning findings.\n\n".to_owned(),
+        "implementation" => "- This is the last review-repair iteration. Ensure every finding is fully addressed. If there are repeated issues or miscommunications, think deeply and take a different implementation approach before finishing.\n".to_owned(),
+        _ => String::new(),
+    }
 }
 
 async fn draft_pr(
@@ -3070,11 +3141,7 @@ mod tests {
 
         assert_eq!(
             config.policy.allowed_write_roots,
-            vec![
-                worktree.to_path_buf(),
-                PathBuf::from("/tmp/halter"),
-                PathBuf::from("/private/tmp/halter-software-factory"),
-            ]
+            vec![worktree.to_path_buf(), PathBuf::from("/tmp/halter"),]
         );
         assert_eq!(
             config.resources.skills.roots,
@@ -4063,6 +4130,7 @@ mod tests {
             FactorySystemPrompt::Coding,
             "do the work",
             Some("rules"),
+            None,
         )
         .expect("session init");
 
@@ -4086,6 +4154,7 @@ mod tests {
             FactorySystemPrompt::General,
             " \n",
             None,
+            None,
         )
         .expect_err("empty turn instructions should fail");
 
@@ -4094,6 +4163,132 @@ mod tests {
                 .to_string()
                 .contains("turn-specific instructions are empty")
         );
+    }
+
+    #[test]
+    fn session_init_with_appended_context_applies_optional_max_turns() {
+        let init = session_init_with_appended_context(
+            Path::new("/tmp/project"),
+            FactorySystemPrompt::Coding,
+            "review the branch",
+            None,
+            Some(CODE_REVIEW_MAX_TURNS),
+        )
+        .expect("session init");
+
+        assert_eq!(init.max_turns, Some(10));
+    }
+
+    #[test]
+    fn code_review_prompt_covers_initial_follow_up_and_final_iterations() {
+        struct Case {
+            name: &'static str,
+            iteration: ReviewIteration,
+            want_initial: bool,
+            want_follow_up: bool,
+            want_final: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "initial_review",
+                iteration: ReviewIteration { current: 1, max: 5 },
+                want_initial: true,
+                want_follow_up: false,
+                want_final: false,
+            },
+            Case {
+                name: "follow_up_review",
+                iteration: ReviewIteration { current: 2, max: 5 },
+                want_initial: false,
+                want_follow_up: true,
+                want_final: false,
+            },
+            Case {
+                name: "final_review",
+                iteration: ReviewIteration { current: 5, max: 5 },
+                want_initial: false,
+                want_follow_up: true,
+                want_final: true,
+            },
+        ];
+
+        for case in cases {
+            let prompt = code_review_prompt("origin/master", "diff --git a/x b/x", case.iteration);
+
+            assert_eq!(
+                prompt.contains("You are reviewing a branch diff against origin/master."),
+                case.want_initial,
+                "{} initial prompt mismatch",
+                case.name
+            );
+            assert_eq!(
+                prompt.contains("Your previous code review has been addressed."),
+                case.want_follow_up,
+                "{} follow-up prompt mismatch",
+                case.name
+            );
+            assert_eq!(
+                prompt.contains("last code review iteration"),
+                case.want_final,
+                "{} final prompt mismatch",
+                case.name
+            );
+            assert!(prompt.contains(JSON_ONLY_OUTPUT_RULE), "{}", case.name);
+            assert!(prompt.contains("BRANCH DIFF:\ndiff --git"), "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn review_repair_prompt_covers_regular_and_final_iterations() {
+        struct Case {
+            name: &'static str,
+            iteration: ReviewIteration,
+            want_final: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "regular_repair",
+                iteration: ReviewIteration { current: 4, max: 5 },
+                want_final: false,
+            },
+            Case {
+                name: "final_repair",
+                iteration: ReviewIteration { current: 5, max: 5 },
+                want_final: true,
+            },
+        ];
+
+        for case in cases {
+            let prompt = review_repair_prompt("plan", r#"{"clean":false}"#, case.iteration);
+
+            assert!(
+                prompt.contains("IMPLEMENTATION PLAN:\nplan"),
+                "{}",
+                case.name
+            );
+            assert!(
+                prompt.contains(
+                    r#"REVIEW RESULT:
+{"clean":false}"#
+                ),
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                prompt.contains("last review-repair iteration"),
+                case.want_final,
+                "{} final repair mismatch",
+                case.name
+            );
+            assert_eq!(
+                prompt.contains("different implementation approach"),
+                case.want_final,
+                "{} final approach mismatch",
+                case.name
+            );
+        }
     }
 
     #[tokio::test]
