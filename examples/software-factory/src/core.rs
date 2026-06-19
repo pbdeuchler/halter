@@ -9,6 +9,7 @@ use serde_json::Value;
 
 pub const IMPLEMENTATION_PLAN_PATH: &str = ".halter/software-factory/implementation-plan.md";
 pub const CHECKPOINT_PATH: &str = ".halter/software-factory/checkpoint.json";
+pub const FACTORY_WORKTREE_TMP_DIR: &str = "halter-software-factory";
 pub const RECENT_OPEN_ISSUE_LIMIT: usize = 100;
 pub const PROJECT_GUIDANCE_FILENAMES: [&str; 3] = ["CLAUDE.md", "AGENTS.md", "SOUL.md"];
 pub const PROJECT_GUIDANCE_MAX_BYTES: u64 = 1_048_576;
@@ -402,6 +403,21 @@ pub fn branch_name(repo: &RepoSlug, title: &str, run_id: &str) -> String {
     format!("halter-factory/{repo}-{run_id}-{title}")
 }
 
+pub fn factory_worktree_dir_name(repo: &RepoSlug, run_id: &str) -> String {
+    let owner = non_empty_path_component(&sanitize_branch_component(&repo.owner), "owner");
+    let repo = non_empty_path_component(&sanitize_branch_component(&repo.name), "repo");
+    let run_id = non_empty_path_component(&sanitize_branch_component(run_id), "run");
+    format!("{owner}-{repo}-{run_id}")
+}
+
+fn non_empty_path_component(value: &str, fallback: &str) -> String {
+    if value.is_empty() {
+        fallback.to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
 pub fn parse_issue_number_input(input: &Value) -> Result<u64, String> {
     let number = input
         .get("number")
@@ -411,11 +427,15 @@ pub fn parse_issue_number_input(input: &Value) -> Result<u64, String> {
         .map_err(|_| "field 'number' must be a positive integer".to_owned())
 }
 
-pub fn dirty_status_excluding(status: &str, excluded_path: Option<&str>) -> bool {
+pub fn dirty_status_excluding(status: &str, excluded_paths: &[&str]) -> bool {
     status
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .any(|line| !excluded_path.is_some_and(|path| status_line_mentions_path(line, path)))
+        .any(|line| {
+            !excluded_paths
+                .iter()
+                .any(|path| status_line_mentions_path(line, path))
+        })
 }
 
 fn status_line_mentions_path(line: &str, path: &str) -> bool {
@@ -786,6 +806,21 @@ mod tests {
     }
 
     #[test]
+    fn factory_worktree_dir_name_uses_sanitized_repo_and_run_id() {
+        let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        assert_eq!(
+            factory_worktree_dir_name(&repo, "2026/06/17 12:00"),
+            "pbdeuchler-halter-2026-06-17-1200"
+        );
+
+        let repo = RepoSlug {
+            owner: "...".to_owned(),
+            name: "...".to_owned(),
+        };
+        assert_eq!(factory_worktree_dir_name(&repo, "..."), "owner-repo-run");
+    }
+
+    #[test]
     fn parse_issue_number_input_covers_success_and_error_cases() {
         let valid = serde_json::json!({ "number": 42 });
         assert_eq!(parse_issue_number_input(&valid).expect("valid number"), 42);
@@ -803,19 +838,23 @@ mod tests {
     }
 
     #[test]
-    fn dirty_status_excluding_ignores_only_the_requested_file() {
-        assert!(!dirty_status_excluding("", None));
+    fn dirty_status_excluding_ignores_requested_files() {
+        assert!(!dirty_status_excluding("", &[]));
         assert!(dirty_status_excluding(
             "?? .halter/software-factory/implementation-plan.md\n",
-            None
+            &[]
         ));
         assert!(!dirty_status_excluding(
             "?? .halter/software-factory/implementation-plan.md\n",
-            Some(IMPLEMENTATION_PLAN_PATH)
+            &[IMPLEMENTATION_PLAN_PATH]
+        ));
+        assert!(!dirty_status_excluding(
+            "?? .halter/software-factory/implementation-plan.md\n?? .halter/software-factory/checkpoint.json\n",
+            &[IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH]
         ));
         assert!(dirty_status_excluding(
             "?? .halter/software-factory/implementation-plan.md\n M src/lib.rs\n",
-            Some(IMPLEMENTATION_PLAN_PATH)
+            &[IMPLEMENTATION_PLAN_PATH]
         ));
     }
 

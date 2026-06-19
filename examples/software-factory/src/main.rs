@@ -7,7 +7,7 @@ use std::env;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,14 +37,14 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::core::{
-    CHECKPOINT_PATH, CandidateSet, CodeReview, IMPLEMENTATION_PLAN_PATH, IssueComment, IssueDoc,
-    JudgeSelection, ModelSpec, MonitorAction, PLANNING_CORPUS_BODY_CHARS,
+    CHECKPOINT_PATH, CandidateSet, CodeReview, FACTORY_WORKTREE_TMP_DIR, IMPLEMENTATION_PLAN_PATH,
+    IssueComment, IssueDoc, JudgeSelection, ModelSpec, MonitorAction, PLANNING_CORPUS_BODY_CHARS,
     PROJECT_GUIDANCE_FILENAMES, PROJECT_GUIDANCE_MAX_BYTES, ProjectGuidanceDoc, PullRequestDraft,
     RECENT_OPEN_ISSUE_LIMIT, RepoSlug, branch_name, candidate_set_for_issue,
-    dirty_status_excluding, ensure_requested_issue_selection, format_project_system_prompt,
-    is_maintainer_author_association, issue_corpus, monitor_action, parse_github_remote_url,
-    parse_issue_number_input, parse_json_response, selected_issue_numbers, validate_issue_number,
-    validate_recent_issue_limit,
+    dirty_status_excluding, ensure_requested_issue_selection, factory_worktree_dir_name,
+    format_project_system_prompt, is_maintainer_author_association, issue_corpus, monitor_action,
+    parse_github_remote_url, parse_issue_number_input, parse_json_response, selected_issue_numbers,
+    validate_issue_number, validate_recent_issue_limit,
 };
 
 #[derive(Debug, Parser)]
@@ -64,6 +64,11 @@ struct Cli {
         help = "Branch name to create; defaults to a generated factory branch"
     )]
     branch: Option<String>,
+    #[arg(
+        long,
+        help = "Create and run inside a dedicated git worktree under /tmp"
+    )]
+    worktree: bool,
     #[arg(
         long,
         help = "Poll the opened PR for reviews and /plsfix comments until it merges"
@@ -127,6 +132,7 @@ struct Cli {
 const NOISY_TARGET_SUPPRESSIONS: &str = "tokenize=warn,parse=warn,expansion=warn,commands=warn,\
      pattern=warn,completion=warn,jobs=warn,unimplemented=warn,\
      hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,rustls=warn";
+const FACTORY_LOCAL_STATE_PATHS: [&str; 2] = [IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH];
 
 fn logging_filter_spec(user_directives: Option<&str>) -> String {
     let directives = user_directives
@@ -152,6 +158,14 @@ fn init_logging() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().with_target(true).compact())
         .try_init()
         .context("failed to initialize logging")
+}
+
+fn excluded_commit_paths(commit_impl_plan: bool) -> Vec<&'static str> {
+    if commit_impl_plan {
+        vec![CHECKPOINT_PATH]
+    } else {
+        vec![IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH]
+    }
 }
 
 const CHECKPOINT_VERSION: u8 = 1;
@@ -313,6 +327,7 @@ async fn main() -> anyhow::Result<()> {
         remote = %cli.remote,
         base = ?cli.base,
         branch = ?cli.branch,
+        worktree = cli.worktree,
         monitor = cli.monitor,
         allow_dirty = cli.allow_dirty,
         commit_impl_plan = cli.commit_impl_plan,
@@ -324,18 +339,29 @@ async fn main() -> anyhow::Result<()> {
         "starting software factory run"
     );
     let cwd = std::env::current_dir().context("failed to read current directory")?;
-    let worktree = git_worktree_root(&cwd).await?;
-    let project_system_prompt = read_project_system_prompt(&worktree).await?;
-    let repo = github_repo_from_git_remote(&worktree, &cli.remote).await?;
-    let mut base_config = default_factory_config();
-    add_worktree_policy(&mut base_config, &worktree);
-
-    let github = GitHubClient::from_local_credentials(&worktree).await?;
+    let launch_worktree = git_worktree_root(&cwd).await?;
+    let repo = github_repo_from_git_remote(&launch_worktree, &cli.remote).await?;
+    let github = GitHubClient::from_local_credentials(&launch_worktree).await?;
     let repo_info = github.fetch_repo(&repo).await?;
     let base_branch = cli.base.clone().unwrap_or(repo_info.default_branch);
+    let run_id = Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let worktree = resolve_execution_worktree(
+        &launch_worktree,
+        cli.worktree,
+        cli.resume,
+        &repo,
+        &base_branch,
+        &run_id,
+    )
+    .await?;
+    let project_system_prompt = read_project_system_prompt(&worktree).await?;
+    let mut base_config = default_factory_config();
+    add_worktree_policy(&mut base_config, &worktree);
     info!(
         cwd = %cwd.display(),
+        launch_worktree = %launch_worktree.display(),
         worktree = %worktree.display(),
+        worktree_mode = cli.worktree,
         repo = %repo,
         base_branch = %base_branch,
         "resolved repository context"
@@ -523,7 +549,8 @@ async fn main() -> anyhow::Result<()> {
             cli.allow_dirty,
             &repo,
             &selection,
-            Some(IMPLEMENTATION_PLAN_PATH),
+            &FACTORY_LOCAL_STATE_PATHS,
+            &run_id,
         )
         .await?;
         let base_ref = format!("origin/{base_branch}");
@@ -533,6 +560,7 @@ async fn main() -> anyhow::Result<()> {
         (branch, base_ref)
     };
     info!(branch = %current_branch, base_ref = %base_ref, "prepared branch");
+    let commit_excluded_paths = excluded_commit_paths(cli.commit_impl_plan);
 
     if checkpoint.implemented {
         info!("skipping implementation; factory checkpoint marks it complete");
@@ -576,7 +604,7 @@ async fn main() -> anyhow::Result<()> {
         let committed = commit_if_dirty(
             &worktree,
             &format!("Implement {}", selection.title),
-            (!cli.commit_impl_plan).then_some(IMPLEMENTATION_PLAN_PATH),
+            &commit_excluded_paths,
         )
         .await?;
         checkpoint.committed = true;
@@ -645,7 +673,7 @@ async fn main() -> anyhow::Result<()> {
             selection: &selection,
             implementation_plan: &implementation_plan,
             project_system_prompt: project_system_prompt.as_deref(),
-            excluded_commit_path: (!cli.commit_impl_plan).then_some(IMPLEMENTATION_PLAN_PATH),
+            excluded_commit_paths: &commit_excluded_paths,
             max_review_iterations: cli.max_review_iterations,
             poll_seconds: cli.poll_seconds,
         })
@@ -664,6 +692,92 @@ async fn canonicalize_existing(path: impl AsRef<Path>) -> anyhow::Result<PathBuf
     tokio::fs::canonicalize(path.as_ref())
         .await
         .with_context(|| format!("failed to canonicalize {}", path.as_ref().display()))
+}
+
+async fn resolve_execution_worktree(
+    launch_worktree: &Path,
+    use_tmp_worktree: bool,
+    resume: bool,
+    repo: &RepoSlug,
+    base_branch: &str,
+    run_id: &str,
+) -> anyhow::Result<PathBuf> {
+    if !use_tmp_worktree {
+        return Ok(launch_worktree.to_path_buf());
+    }
+
+    if resume {
+        if path_is_factory_tmp_worktree(launch_worktree) {
+            info!(
+                worktree = %launch_worktree.display(),
+                "resuming existing factory git worktree"
+            );
+            return Ok(launch_worktree.to_path_buf());
+        }
+        bail!(
+            "failed to resume --worktree: cd into the existing factory worktree under {} and run --resume",
+            factory_worktree_tmp_root().display()
+        );
+    }
+
+    create_factory_worktree(launch_worktree, repo, base_branch, run_id).await
+}
+
+fn factory_worktree_tmp_root() -> PathBuf {
+    PathBuf::from("/tmp").join(FACTORY_WORKTREE_TMP_DIR)
+}
+
+fn path_is_factory_tmp_worktree(path: &Path) -> bool {
+    path.starts_with(factory_worktree_tmp_root())
+        || path.starts_with(Path::new("/private/tmp").join(FACTORY_WORKTREE_TMP_DIR))
+}
+
+async fn create_factory_worktree(
+    source_worktree: &Path,
+    repo: &RepoSlug,
+    base_branch: &str,
+    run_id: &str,
+) -> anyhow::Result<PathBuf> {
+    let parent = factory_worktree_tmp_root();
+    tokio::fs::create_dir_all(&parent).await.with_context(|| {
+        format!(
+            "failed to create factory worktree directory {}",
+            parent.display()
+        )
+    })?;
+
+    let worktree = parent.join(factory_worktree_dir_name(repo, run_id));
+    if tokio::fs::try_exists(&worktree)
+        .await
+        .with_context(|| format!("failed to inspect factory worktree {}", worktree.display()))?
+    {
+        bail!(
+            "factory git worktree path already exists: {}; use --resume from that worktree or choose a different run",
+            worktree.display()
+        );
+    }
+
+    run_cmd(source_worktree, "git", &["fetch", "origin", base_branch]).await?;
+    let worktree_arg = worktree.to_str().with_context(|| {
+        format!(
+            "factory worktree path is not valid UTF-8: {}",
+            worktree.display()
+        )
+    })?;
+    let base_ref = format!("origin/{base_branch}");
+    info!(
+        source_worktree = %source_worktree.display(),
+        worktree = %worktree.display(),
+        base_ref = %base_ref,
+        "creating factory git worktree"
+    );
+    run_cmd(
+        source_worktree,
+        "git",
+        &["worktree", "add", "--detach", worktree_arg, &base_ref],
+    )
+    .await?;
+    canonicalize_existing(&worktree).await
 }
 
 async fn initialize_checkpoint(
@@ -1075,6 +1189,7 @@ impl Tool for GitHubIssueTool {
 }
 
 fn add_worktree_policy(config: &mut HarnessConfig, worktree: &Path) {
+    absolutize_relative_roots(&mut config.policy.allowed_write_roots, worktree);
     if !config
         .policy
         .allowed_write_roots
@@ -1086,6 +1201,26 @@ fn add_worktree_policy(config: &mut HarnessConfig, worktree: &Path) {
             .allowed_write_roots
             .push(worktree.to_path_buf());
     }
+    absolutize_relative_roots(&mut config.resources.skills.roots, worktree);
+    absolutize_relative_roots(&mut config.resources.plugins.roots, worktree);
+}
+
+fn absolutize_relative_roots(roots: &mut [PathBuf], worktree: &Path) {
+    for root in roots {
+        if root.is_relative() && !path_starts_with_tilde(root) {
+            *root = if root == Path::new(".") || root == Path::new("./") {
+                worktree.to_path_buf()
+            } else {
+                worktree.join(&root)
+            };
+        }
+    }
+}
+
+fn path_starts_with_tilde(path: &Path) -> bool {
+    path.components()
+        .next()
+        .is_some_and(|component| matches!(component, Component::Normal(value) if value == "~"))
 }
 
 async fn build_judge_harness(
@@ -1842,7 +1977,8 @@ async fn prepare_branch(
     allow_dirty: bool,
     repo: &RepoSlug,
     selection: &JudgeSelection,
-    excluded_dirty_path: Option<&str>,
+    excluded_dirty_paths: &[&str],
+    run_id: &str,
 ) -> anyhow::Result<String> {
     info!(
         base_branch,
@@ -1850,17 +1986,13 @@ async fn prepare_branch(
         allow_dirty,
         "preparing factory branch"
     );
-    if !allow_dirty && git_is_dirty(worktree, excluded_dirty_path).await? {
+    if !allow_dirty && git_is_dirty(worktree, excluded_dirty_paths).await? {
         bail!("failed to prepare branch: worktree is dirty; commit/stash or pass --allow-dirty");
     }
     run_cmd(worktree, "git", &["fetch", "origin", base_branch]).await?;
-    let branch = requested_branch.map(ToOwned::to_owned).unwrap_or_else(|| {
-        branch_name(
-            repo,
-            &selection.title,
-            &Utc::now().format("%Y%m%d%H%M%S").to_string(),
-        )
-    });
+    let branch = requested_branch
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| branch_name(repo, &selection.title, run_id));
     let base_ref = format!("origin/{base_branch}");
     info!(
         branch = %branch,
@@ -2138,7 +2270,7 @@ struct MonitorContext<'a> {
     selection: &'a JudgeSelection,
     implementation_plan: &'a str,
     project_system_prompt: Option<&'a str>,
-    excluded_commit_path: Option<&'a str>,
+    excluded_commit_paths: &'a [&'a str],
     max_review_iterations: usize,
     poll_seconds: u64,
 }
@@ -2209,7 +2341,7 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
             commit_if_dirty(
                 ctx.worktree,
                 "Address PR code review feedback",
-                ctx.excluded_commit_path,
+                ctx.excluded_commit_paths,
             )
             .await?;
             run_cmd(ctx.worktree, "git", &["push", "origin", ctx.branch]).await?;
@@ -2240,7 +2372,7 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
             commit_if_dirty(
                 ctx.worktree,
                 "Address /plsfix PR feedback",
-                ctx.excluded_commit_path,
+                ctx.excluded_commit_paths,
             )
             .await?;
             run_cmd(ctx.worktree, "git", &["push", "origin", ctx.branch]).await?;
@@ -2332,9 +2464,9 @@ FEEDBACK:
     Ok(())
 }
 
-async fn git_is_dirty(worktree: &Path, excluded_path: Option<&str>) -> anyhow::Result<bool> {
+async fn git_is_dirty(worktree: &Path, excluded_paths: &[&str]) -> anyhow::Result<bool> {
     let status = run_cmd(worktree, "git", &["status", "--porcelain"]).await?;
-    Ok(dirty_status_excluding(&status, excluded_path))
+    Ok(dirty_status_excluding(&status, excluded_paths))
 }
 
 async fn current_branch(worktree: &Path) -> anyhow::Result<String> {
@@ -2374,15 +2506,15 @@ async fn branch_diff(worktree: &Path, base_ref: &str) -> anyhow::Result<String> 
 async fn commit_if_dirty(
     worktree: &Path,
     message: &str,
-    excluded_path: Option<&str>,
+    excluded_paths: &[&str],
 ) -> anyhow::Result<bool> {
-    if !git_is_dirty(worktree, excluded_path).await? {
-        info!(message, excluded_path = ?excluded_path, "worktree is clean");
+    if !git_is_dirty(worktree, excluded_paths).await? {
+        info!(message, excluded_paths = ?excluded_paths, "worktree is clean");
         return Ok(false);
     }
-    info!(message, excluded_path = ?excluded_path, "staging worktree changes");
+    info!(message, excluded_paths = ?excluded_paths, "staging worktree changes");
     run_cmd(worktree, "git", &["add", "-A"]).await?;
-    if let Some(path) = excluded_path {
+    for path in excluded_paths {
         run_cmd(worktree, "git", &["reset", "--", path]).await?;
     }
     if run_cmd(worktree, "git", &["diff", "--cached", "--quiet"])
@@ -2913,6 +3045,46 @@ mod tests {
         assert_eq!(config.tools.enabled, judge_example_tools());
         assert_eq!(config.policy.shell.allow, judge_example_shell_allowlist());
         assert!(config.policy.network.enabled);
+    }
+
+    #[test]
+    fn add_worktree_policy_absolutizes_relative_resource_roots_idempotently() {
+        let mut config = default_factory_config();
+        let worktree = Path::new("/tmp/factory-project");
+
+        add_worktree_policy(&mut config, worktree);
+        add_worktree_policy(&mut config, worktree);
+
+        assert_eq!(
+            config.policy.allowed_write_roots,
+            vec![worktree.to_path_buf(), PathBuf::from("/tmp/halter")]
+        );
+        assert_eq!(
+            config.resources.skills.roots,
+            vec![worktree.join(".agent/skills")]
+        );
+        assert_eq!(
+            config.resources.plugins.roots,
+            vec![worktree.join(".agent/plugins")]
+        );
+
+        let mut config = default_factory_config();
+        config.resources.skills.roots = vec![PathBuf::from("~/skills")];
+        add_worktree_policy(&mut config, worktree);
+
+        assert_eq!(
+            config.resources.skills.roots,
+            vec![PathBuf::from("~/skills")]
+        );
+    }
+
+    #[test]
+    fn excluded_commit_paths_cover_checkpoint_and_optional_plan() {
+        assert_eq!(excluded_commit_paths(true), vec![CHECKPOINT_PATH]);
+        assert_eq!(
+            excluded_commit_paths(false),
+            vec![IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH]
+        );
     }
 
     #[test]
@@ -3592,6 +3764,172 @@ mod tests {
         assert!(mismatch.to_string().contains("requested issue"));
     }
 
+    #[tokio::test]
+    async fn resolve_execution_worktree_covers_current_tmp_resume_and_bad_resume() {
+        let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let current =
+            resolve_execution_worktree(dir.path(), false, false, &repo, "main", "20260617")
+                .await
+                .expect("current worktree mode");
+        assert_eq!(current, dir.path());
+
+        let tmp = factory_worktree_tmp_root().join("resume-target");
+        let resumed = resolve_execution_worktree(&tmp, true, true, &repo, "main", "20260617")
+            .await
+            .expect("resume from tmp factory worktree");
+        assert_eq!(resumed, tmp);
+
+        let error = resolve_execution_worktree(dir.path(), true, true, &repo, "main", "20260617")
+            .await
+            .expect_err("resume outside tmp factory worktree should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cd into the existing factory worktree")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_factory_worktree_rejects_existing_path() {
+        let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        let run_id = unique_test_run_id("existing");
+        let path = factory_worktree_tmp_root().join(factory_worktree_dir_name(&repo, &run_id));
+        remove_dir_if_exists(&path).await;
+        tokio::fs::create_dir_all(&path)
+            .await
+            .expect("create existing path");
+
+        let error = create_factory_worktree(Path::new("/does/not/matter"), &repo, "main", &run_id)
+            .await
+            .expect_err("existing worktree path should fail");
+
+        assert!(error.to_string().contains("already exists"));
+        remove_dir_if_exists(&path).await;
+    }
+
+    #[tokio::test]
+    async fn create_factory_worktree_adds_detached_tmp_worktree() {
+        let (_dir, source) = init_git_repo_with_origin().await;
+        let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        let run_id = unique_test_run_id("create");
+        let expected_path =
+            factory_worktree_tmp_root().join(factory_worktree_dir_name(&repo, &run_id));
+        remove_dir_if_exists(&expected_path).await;
+
+        let worktree = create_factory_worktree(&source, &repo, "main", &run_id)
+            .await
+            .expect("create factory worktree");
+
+        assert!(path_is_factory_tmp_worktree(&worktree));
+        assert_eq!(
+            run_cmd(&worktree, "git", &["rev-parse", "--is-inside-work-tree"])
+                .await
+                .expect("inside worktree")
+                .trim(),
+            "true"
+        );
+        assert_eq!(
+            run_cmd(&worktree, "git", &["branch", "--show-current"])
+                .await
+                .expect("detached branch")
+                .trim(),
+            ""
+        );
+        assert!(worktree.join("README.md").exists());
+
+        remove_git_worktree(&source, &worktree).await;
+    }
+
+    #[tokio::test]
+    async fn prepare_branch_covers_generated_branch_and_dirty_rejection() {
+        let (_dir, source) = init_git_repo_with_origin().await;
+        let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        let selection = sample_selection();
+
+        let branch = prepare_branch(
+            &source,
+            "main",
+            None,
+            false,
+            &repo,
+            &selection,
+            &[],
+            "20260617",
+        )
+        .await
+        .expect("prepare generated branch");
+        assert_eq!(branch, "halter-factory/halter-20260617-fix-issue");
+        assert_eq!(
+            current_branch(&source).await.expect("current branch"),
+            branch
+        );
+
+        tokio::fs::write(source.join("dirty.txt"), "dirty\n")
+            .await
+            .expect("write dirty file");
+        let error = prepare_branch(
+            &source,
+            "main",
+            Some("factory/other"),
+            false,
+            &repo,
+            &selection,
+            &[],
+            "20260618",
+        )
+        .await
+        .expect_err("dirty worktree should fail");
+        assert!(error.to_string().contains("worktree is dirty"));
+    }
+
+    #[tokio::test]
+    async fn commit_if_dirty_excludes_multiple_factory_state_paths() {
+        let (_dir, source) = init_git_repo_with_origin().await;
+        let state_dir = source.join(".halter/software-factory");
+        tokio::fs::create_dir_all(&state_dir)
+            .await
+            .expect("create factory state dir");
+        tokio::fs::write(source.join("tracked.txt"), "tracked\n")
+            .await
+            .expect("write tracked change");
+        tokio::fs::write(source.join(IMPLEMENTATION_PLAN_PATH), "plan\n")
+            .await
+            .expect("write implementation plan");
+        tokio::fs::write(source.join(CHECKPOINT_PATH), "{}\n")
+            .await
+            .expect("write checkpoint");
+
+        let committed = commit_if_dirty(
+            &source,
+            "Commit tracked change",
+            &[IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH],
+        )
+        .await
+        .expect("commit tracked change");
+        assert!(committed);
+
+        let committed_paths = run_cmd(
+            &source,
+            "git",
+            &["show", "--name-only", "--format=", "HEAD"],
+        )
+        .await
+        .expect("show committed paths");
+        assert!(committed_paths.lines().any(|line| line == "tracked.txt"));
+        assert!(!committed_paths.contains(".halter/software-factory"));
+
+        let committed = commit_if_dirty(
+            &source,
+            "Skip local state only",
+            &[IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH],
+        )
+        .await
+        .expect("skip local state only");
+        assert!(!committed);
+    }
+
     fn sample_candidates() -> CandidateSet {
         CandidateSet {
             candidates: vec![crate::core::IssueCandidate {
@@ -3623,6 +3961,82 @@ mod tests {
             number: 42,
             html_url: "https://github.com/pbdeuchler/halter/pull/42".to_owned(),
         }
+    }
+
+    fn unique_test_run_id(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        format!("{prefix}-{}-{nanos}", std::process::id())
+    }
+
+    async fn remove_dir_if_exists(path: &Path) {
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to remove {}: {error}", path.display()),
+        }
+    }
+
+    async fn init_git_repo_with_origin() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let origin = dir.path().join("origin.git");
+        let source = dir.path().join("source");
+        let origin_arg = origin.to_str().expect("utf-8 origin path");
+        let source_arg = source.to_str().expect("utf-8 source path");
+
+        run_cmd(dir.path(), "git", &["init", "--bare", origin_arg])
+            .await
+            .expect("init bare origin");
+        run_cmd(dir.path(), "git", &["init", source_arg])
+            .await
+            .expect("init source repo");
+        run_cmd(&source, "git", &["checkout", "-b", "main"])
+            .await
+            .expect("create main branch");
+        run_cmd(
+            &source,
+            "git",
+            &["config", "user.name", "Software Factory Test"],
+        )
+        .await
+        .expect("set git user name");
+        run_cmd(
+            &source,
+            "git",
+            &["config", "user.email", "software-factory-test@example.com"],
+        )
+        .await
+        .expect("set git user email");
+        tokio::fs::write(source.join("README.md"), "hello\n")
+            .await
+            .expect("write readme");
+        run_cmd(&source, "git", &["add", "README.md"])
+            .await
+            .expect("stage readme");
+        run_cmd(&source, "git", &["commit", "-m", "Initial commit"])
+            .await
+            .expect("initial commit");
+        run_cmd(&source, "git", &["remote", "add", "origin", origin_arg])
+            .await
+            .expect("add origin");
+        run_cmd(&source, "git", &["push", "-u", "origin", "main"])
+            .await
+            .expect("push main");
+
+        (dir, source)
+    }
+
+    async fn remove_git_worktree(source: &Path, worktree: &Path) {
+        let worktree_arg = worktree.to_str().expect("utf-8 worktree path");
+        run_cmd(
+            source,
+            "git",
+            &["worktree", "remove", "--force", worktree_arg],
+        )
+        .await
+        .expect("remove git worktree");
     }
 
     #[test]

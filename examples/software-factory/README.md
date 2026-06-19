@@ -18,6 +18,8 @@ checkpoint state, and coordinates a multi-stage coding workflow.
 The command runs this workflow:
 
 1. Resolve the current git worktree and GitHub repository from a remote URL.
+   With `--worktree`, create a detached git worktree under
+   `/tmp/halter-software-factory/` and run the factory there.
 2. Read project guidance from top-level `CLAUDE.md`, `AGENTS.md`, and `SOUL.md`
    files when they exist.
 3. Fetch recent open GitHub issues, or fetch one issue when `--issue` is set.
@@ -77,6 +79,10 @@ to the target repository's `.gitignore` unless you intentionally want this state
 tracked. The `--commit-impl-plan` flag controls whether the implementation plan
 is committed; checkpoint state is meant to stay local.
 
+With `--worktree`, that local state is written in the temporary git worktree
+under `/tmp/halter-software-factory/`, leaving the launch worktree's checkout and
+`.halter/` state untouched.
+
 ## run it
 
 From the Halter workspace, this targets the Halter repository itself:
@@ -105,6 +111,12 @@ To keep watching the PR after it is opened:
 cargo run --manifest-path /path/to/halter/examples/software-factory/Cargo.toml -- --issue 123 --monitor
 ```
 
+To run the modifying stages in a dedicated git worktree under `/tmp`:
+
+```bash
+cargo run --manifest-path /path/to/halter/examples/software-factory/Cargo.toml -- --issue 123 --worktree
+```
+
 The command prints the created PR URL:
 
 ```text
@@ -121,6 +133,7 @@ Common options:
 | `--remote <REMOTE>` | Git remote used to identify the GitHub repository. Defaults to `origin`. |
 | `--base <BASE>` | Base branch for the PR. Defaults to the repository default branch from GitHub. |
 | `--branch <BRANCH>` | Branch name to create. Defaults to `halter-factory/<repo>-<timestamp>-<title>`. |
+| `--worktree` | Create a detached git worktree under `/tmp/halter-software-factory/` and run the factory there. |
 | `--monitor` | Poll the opened PR for maintainer feedback and `/plsfix` comments until it merges. |
 | `--allow-dirty` | Allow the run to start from a dirty worktree. Use this carefully. |
 | `--commit-impl-plan` | Include `.halter/software-factory/implementation-plan.md` in commits. |
@@ -172,6 +185,11 @@ inputs change, start a new run with `--reset-checkpoint`.
 
 The implementation plan is restored from the checkpoint on resume, so a resumed
 run uses the same selected scope and plan.
+
+For `--worktree` runs, resume from inside the temporary factory worktree that
+contains the checkpoint. The path is logged when the run starts. Running
+`--worktree --resume` from the original launch checkout fails because the
+temporary worktree path is not recoverable from that checkout alone.
 
 ## project guidance
 
