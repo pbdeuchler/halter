@@ -153,7 +153,7 @@ Model options use `provider/model` form, where `provider` is `openai`,
 | `--pr-model` | `openrouter/google/gemma-4-31b-it` |
 
 The model-judge panel is configured in `default_factory_config()` in
-`src/main.rs`.
+`src/config.rs`.
 
 ## state and resume
 
@@ -217,9 +217,20 @@ The code is split by side-effect boundary:
 
 - `src/core.rs` contains the functional core: parsing, formatting, selection
   validation, branch naming, dirty-status handling, and monitor classification.
-- `src/main.rs` contains the imperative shell: CLI parsing, GitHub API calls,
-  Halter harness construction, agent turns, git commands, checkpoint I/O, and PR
-  monitoring.
+- `src/main.rs` is a thin orchestrator that declares the modules and runs the
+  top-level workflow.
+- `src/cli.rs` defines the CLI with clap.
+- `src/logging.rs` sets up Rust tracing and noisy-target suppression.
+- `src/checkpoint.rs` handles factory checkpoint persistence and validation.
+- `src/worktree.rs` resolves and creates the execution git worktree.
+- `src/config.rs` builds the default harness and policy configuration.
+- `src/harness.rs` constructs Halter harnesses for judge and CLI model overrides.
+- `src/prompts.rs` holds system prompts, prompt segments, and prompt hashing.
+- `src/agent.rs` runs a single agent turn and retry logic.
+- `src/stages.rs` contains the pipeline stages from issue selection to PR monitoring.
+- `src/git.rs` wraps git commands.
+- `src/github.rs` implements the GitHub API client and `github_issue` tool.
+- `src/test_support.rs` provides shared fixtures for unit tests.
 
 The example builds separate harnesses for separate jobs:
 
