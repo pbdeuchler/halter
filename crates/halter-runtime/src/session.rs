@@ -815,11 +815,11 @@ impl SessionHandle {
         let mut state = stored.state;
         let mut events = Vec::new();
         let turn_id = TurnId::new();
-        let hook_ctx = HookInvocationContext {
-            turn_id: &turn_id,
-            model: &stored.blueprint.default_model,
-            working_dir: &stored.blueprint.working_dir,
-        };
+        let hook_ctx = HookInvocationContext::new(
+            &turn_id,
+            &stored.blueprint.default_model,
+            &stored.blueprint.working_dir,
+        );
         let fired_hook_ids = state
             .fired_hook_ids
             .iter()
@@ -857,11 +857,11 @@ impl SessionHandle {
         let expected_state = stored.state.clone();
         let mut state = stored.state;
         let turn_id = TurnId::new();
-        let hook_ctx = HookInvocationContext {
-            turn_id: &turn_id,
-            model: &stored.blueprint.default_model,
-            working_dir: &stored.blueprint.working_dir,
-        };
+        let hook_ctx = HookInvocationContext::new(
+            &turn_id,
+            &stored.blueprint.default_model,
+            &stored.blueprint.working_dir,
+        );
         let fired_hook_ids = state
             .fired_hook_ids
             .iter()
@@ -901,11 +901,11 @@ impl SessionHandle {
         let mut state = stored.state;
         let mut events = Vec::new();
         let turn_id = TurnId::new();
-        let hook_ctx = HookInvocationContext {
-            turn_id: &turn_id,
-            model: &stored.blueprint.default_model,
-            working_dir: &stored.blueprint.working_dir,
-        };
+        let hook_ctx = HookInvocationContext::new(
+            &turn_id,
+            &stored.blueprint.default_model,
+            &stored.blueprint.working_dir,
+        );
         let mut fired_hook_ids = state
             .fired_hook_ids
             .iter()
@@ -997,11 +997,8 @@ impl SessionHandle {
             .default_model
             .clone()
             .unwrap_or_else(|| stored.blueprint.default_model.clone());
-        let hook_ctx = HookInvocationContext {
-            turn_id: &turn.id,
-            model: &hook_model,
-            working_dir: &stored.blueprint.working_dir,
-        };
+        let hook_ctx =
+            HookInvocationContext::new(&turn.id, &hook_model, &stored.blueprint.working_dir);
 
         for warning in std::mem::take(&mut state.pending_warning_messages) {
             self.push_event(
@@ -1249,11 +1246,13 @@ impl SessionHandle {
                 let stop_dispatch = run_stop(
                     self,
                     &fired_hook_ids,
-                    HookInvocationContext {
-                        turn_id: &turn.id,
-                        model: &model.id,
-                        working_dir: &stored.blueprint.working_dir,
-                    },
+                    HookInvocationContext::for_provider_iteration(
+                        &turn.id,
+                        &model.id,
+                        &stored.blueprint.working_dir,
+                        provider_iterations,
+                        stored.blueprint.max_turns,
+                    ),
                     Some(&materialized.message),
                     true,
                 )
@@ -1323,6 +1322,7 @@ impl SessionHandle {
                     &selected_models.default_model,
                     &selected_models.subagent_model,
                     &turn.id,
+                    provider_iterations,
                     &mut fired_hook_ids,
                     &mut state,
                     tool_calls,
@@ -1349,6 +1349,7 @@ impl SessionHandle {
         effective_model: &ModelId,
         effective_subagent_model: &ModelId,
         turn_id: &halter_protocol::TurnId,
+        provider_iteration: u32,
         fired_hook_ids: &mut BTreeSet<String>,
         state: &mut SessionState,
         tool_calls: Vec<ToolCall>,
@@ -1366,11 +1367,13 @@ impl SessionHandle {
                 let pre_dispatch = run_pre_tool_use(
                     self,
                     fired_hook_ids,
-                    HookInvocationContext {
+                    HookInvocationContext::for_provider_iteration(
                         turn_id,
-                        model: effective_model,
-                        working_dir: &blueprint.working_dir,
-                    },
+                        effective_model,
+                        &blueprint.working_dir,
+                        provider_iteration,
+                        blueprint.max_turns,
+                    ),
                     &call,
                 )
                 .await?;
@@ -1504,11 +1507,13 @@ impl SessionHandle {
                     let post_dispatch = run_post_tool_use(
                         self,
                         fired_hook_ids,
-                        HookInvocationContext {
+                        HookInvocationContext::for_provider_iteration(
                             turn_id,
-                            model: effective_model,
-                            working_dir: &blueprint.working_dir,
-                        },
+                            effective_model,
+                            &blueprint.working_dir,
+                            provider_iteration,
+                            blueprint.max_turns,
+                        ),
                         &call,
                         &content,
                     )
@@ -1525,11 +1530,13 @@ impl SessionHandle {
                     let post_dispatch = run_post_tool_use_failure(
                         self,
                         fired_hook_ids,
-                        HookInvocationContext {
+                        HookInvocationContext::for_provider_iteration(
                             turn_id,
-                            model: effective_model,
-                            working_dir: &blueprint.working_dir,
-                        },
+                            effective_model,
+                            &blueprint.working_dir,
+                            provider_iteration,
+                            blueprint.max_turns,
+                        ),
                         &call,
                         tool_error,
                     )
@@ -2493,7 +2500,7 @@ mod tests {
         DefaultToolPolicy, PolicySettings, Tool, ToolContext, register_builtin_tools,
         register_subagent_tools,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::sync::Notify;
 
     use super::*;
@@ -3998,6 +4005,66 @@ mod tests {
             !events
                 .iter()
                 .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_iteration_hook_payload_includes_turn_budget() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(ToolLoopProvider), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        let payloads = Arc::new(Mutex::new(Vec::new()));
+        let payloads_for_hook = payloads.clone();
+        let mut registered = RegisteredHooks::default();
+        registered.register(
+            PluginId::from("internal"),
+            RegisteredHookPriority::AfterPlugins,
+            Hook::callback(HookEventName::PreToolUse, move |input| {
+                let payloads = payloads_for_hook.clone();
+                async move {
+                    payloads.lock().expect("payloads").push(input.payload);
+                    HookResponse::passthrough()
+                }
+            }),
+        );
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .registered_hooks = Arc::new(registered);
+        let runtime = SessionRuntime::new(services);
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                max_turns: Some(2),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+
+        let events = session
+            .submit_turn(Turn::user("write a note"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        );
+        let payloads = payloads.lock().expect("payloads");
+        let payload = payloads.first().expect("pre-tool hook payload");
+        assert_eq!(
+            payload.get("provider_iteration").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(payload.get("max_turns").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            payload
+                .get("provider_iterations_remaining")
+                .and_then(Value::as_u64),
+            Some(1)
         );
     }
 

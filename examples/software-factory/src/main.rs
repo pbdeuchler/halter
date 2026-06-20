@@ -8,7 +8,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -23,10 +23,11 @@ use halter_config::{
     PolicyConfig, ProviderConfig, ProvidersConfig, ResourcesConfig, RuntimeConfig, SearchRoots,
     SessionsConfig, ShellPolicyConfig, ToolsConfig,
 };
+use halter_hooks::{Hook, HookEventName, HookInput, HookResponse};
 use halter_protocol::{
-    AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
-    PruneSignalThreshold, ReasoningEffort, SessionEventPayload, ToolCapabilities, ToolConcurrency,
-    ToolName, ToolResult, ToolSpec, Turn, Usage, Volatility,
+    AssistantPart, CacheScope, Message, PluginId, PromptSegment, PromptSegmentId,
+    PromptSegmentKind, PruneSignalThreshold, ReasoningEffort, SessionEventPayload,
+    ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec, Turn, Usage, Volatility,
 };
 use halter_tools::{Tool, ToolContext};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -452,11 +453,9 @@ async fn main() -> anyhow::Result<()> {
         &worktree,
     )
     .await?;
-    let reviewer = build_model_harness(
+    let reviewer = build_reviewer_harness(
         &base_config,
-        "code review",
         ModelSpec::parse(&cli.reviewer_model).map_err(anyhow::Error::msg)?,
-        ReasoningEffort::Xhigh,
         &worktree,
     )
     .await?;
@@ -951,9 +950,9 @@ fn default_factory_config() -> HarnessConfig {
             default: Some(ModelSlot::Reference(ModelSlotRef::ModelJudge)),
             subagent: Some(ModelSlot::Reference(ModelSlotRef::AutoResolve)),
             small: Some(model_config(
-                    ConfiguredProvider::OpenRouter,
-                    "z-ai/glm-5.2",
-                    ReasoningEffort::Medium,
+                ConfiguredProvider::OpenRouter,
+                "z-ai/glm-5.2",
+                ReasoningEffort::Medium,
             )),
             model_judge: Some(ModelJudgeConfig {
                 mode: ModelJudgeMode::FullTurn,
@@ -1260,6 +1259,36 @@ async fn build_model_harness(
     reasoning: ReasoningEffort,
     worktree: &Path,
 ) -> anyhow::Result<Halter> {
+    build_model_harness_with_hook(config, role, model, reasoning, worktree, None).await
+}
+
+async fn build_reviewer_harness(
+    config: &HarnessConfig,
+    model: ModelSpec,
+    worktree: &Path,
+) -> anyhow::Result<Halter> {
+    build_model_harness_with_hook(
+        config,
+        "code review",
+        model,
+        ReasoningEffort::Xhigh,
+        worktree,
+        Some((
+            PluginId::from("software-factory-code-review-budget"),
+            code_review_turn_budget_hook(CODE_REVIEW_MAX_TURNS),
+        )),
+    )
+    .await
+}
+
+async fn build_model_harness_with_hook(
+    config: &HarnessConfig,
+    role: &str,
+    model: ModelSpec,
+    reasoning: ReasoningEffort,
+    worktree: &Path,
+    hook: Option<(PluginId, Hook)>,
+) -> anyhow::Result<Halter> {
     info!(
         role,
         provider = ?model.provider,
@@ -1274,7 +1303,13 @@ async fn build_model_harness(
     config.models.small = Some(model.clone());
     config.models.subagent = Some(ModelSlot::Inline(model));
     let resources = ResourceCompiler::from_config(&config).compile().await?;
-    let harness = Halter::from_compiled_resources(config, resources).await?;
+    let mut builder = Halter::builder()
+        .with_config(config)
+        .with_compiled_resources(resources);
+    if let Some((plugin_id, hook)) = hook {
+        builder = builder.with_plugin_hook(plugin_id, hook);
+    }
+    let harness = builder.build().await?;
     info!(role, "built model harness");
     Ok(harness)
 }
@@ -1299,7 +1334,84 @@ const JSON_ONLY_OUTPUT_RULE: &str = "Return ONLY the JSON object as your final m
 /// Shared rule for coding stages that run cargo, whose builds exceed the
 /// 30-second default shell timeout when no explicit timeout is supplied.
 const CARGO_TIMEOUT_RULE: &str = "When running builds, tests, lints, or other checks through the shell tool, pass an explicit timeout_ms of at least 120000; these commands routinely exceed the 30-second default.";
-const CODE_REVIEW_MAX_TURNS: u32 = 10;
+const CODE_REVIEW_MAX_TURNS: u32 = 50;
+
+fn code_review_turn_budget_hook(max_turns: u32) -> Hook {
+    Hook::function(HookEventName::PreToolUse, move || {
+        let alerted_remaining = Arc::new(Mutex::new(HashSet::<u32>::new()));
+        move |input| {
+            let alerted_remaining = alerted_remaining.clone();
+            async move {
+                code_review_turn_budget_hook_response(&input, max_turns, alerted_remaining.as_ref())
+            }
+        }
+    })
+    .with_status_message("checking code review turn budget")
+}
+
+fn code_review_turn_budget_hook_response(
+    input: &HookInput,
+    default_max_turns: u32,
+    alerted_remaining: &Mutex<HashSet<u32>>,
+) -> HookResponse {
+    if input.event_name != HookEventName::PreToolUse {
+        return HookResponse::passthrough();
+    }
+    let Some(remaining) = hook_u32_field(input, "provider_iterations_remaining") else {
+        return HookResponse::passthrough();
+    };
+    let max_turns = hook_u32_field(input, "max_turns").unwrap_or(default_max_turns);
+    let Some(notice) = code_review_turn_budget_notice(max_turns, remaining) else {
+        return HookResponse::passthrough();
+    };
+    let Ok(mut alerted_remaining) = alerted_remaining.lock() else {
+        return HookResponse::passthrough();
+    };
+    if !alerted_remaining.insert(remaining) {
+        return HookResponse::passthrough();
+    }
+    HookResponse::passthrough().with_additional_context(notice)
+}
+
+fn hook_u32_field(input: &HookInput, key: &str) -> Option<u32> {
+    input
+        .field(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn code_review_turn_budget_notice(max_turns: u32, remaining: u32) -> Option<String> {
+    if max_turns == 0
+        || remaining == 0
+        || remaining > max_turns
+        || !code_review_turn_budget_thresholds(max_turns).contains(&remaining)
+    {
+        return None;
+    }
+
+    if remaining == 1 {
+        return Some(format!(
+            "# Code Review Turn Budget\n\nYou have 1 code-review turn left in this session out of the {max_turns}-turn budget. This next model call is the final turn for this review attempt. Report back the final review now using the required JSON shape. The software-factory workflow may run more review-repair iterations later, so include any known future work you would ask for later in the summary or findings instead of holding it back."
+        ));
+    }
+
+    Some(format!(
+        "# Code Review Turn Budget\n\nYou have {remaining} code-review turns left in this session out of the {max_turns}-turn budget. Continue the review with that remaining budget in mind, and preserve enough time to return the required JSON review."
+    ))
+}
+
+fn code_review_turn_budget_thresholds(max_turns: u32) -> Vec<u32> {
+    if max_turns == 0 {
+        return Vec::new();
+    }
+    let mut thresholds = [max_turns / 3, max_turns / 6, 1]
+        .into_iter()
+        .filter(|remaining| *remaining > 0)
+        .collect::<Vec<_>>();
+    thresholds.sort_unstable_by(|left, right| right.cmp(left));
+    thresholds.dedup();
+    thresholds
+}
 
 fn json_preview(value: &Value, max_chars: usize) -> String {
     single_line_preview(&value.to_string(), max_chars)
@@ -4176,7 +4288,216 @@ mod tests {
         )
         .expect("session init");
 
-        assert_eq!(init.max_turns, Some(10));
+        assert_eq!(init.max_turns, Some(CODE_REVIEW_MAX_TURNS));
+    }
+
+    #[test]
+    fn code_review_turn_budget_thresholds_cover_fractional_small_and_zero_budgets() {
+        struct Case {
+            name: &'static str,
+            max_turns: u32,
+            expected: Vec<u32>,
+        }
+
+        let cases = [
+            Case {
+                name: "current_review_budget",
+                max_turns: 50,
+                expected: vec![16, 8, 1],
+            },
+            Case {
+                name: "dedupes_one_turn_thresholds",
+                max_turns: 10,
+                expected: vec![3, 1],
+            },
+            Case {
+                name: "small_budget",
+                max_turns: 2,
+                expected: vec![1],
+            },
+            Case {
+                name: "zero_budget",
+                max_turns: 0,
+                expected: vec![],
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                code_review_turn_budget_thresholds(case.max_turns),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn code_review_turn_budget_notice_covers_thresholds_and_passthroughs() {
+        struct Case {
+            name: &'static str,
+            max_turns: u32,
+            remaining: u32,
+            want_contains: Option<&'static str>,
+            want_final: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "one_third_remaining",
+                max_turns: 50,
+                remaining: 16,
+                want_contains: Some("16 code-review turns left"),
+                want_final: false,
+            },
+            Case {
+                name: "one_sixth_remaining",
+                max_turns: 50,
+                remaining: 8,
+                want_contains: Some("8 code-review turns left"),
+                want_final: false,
+            },
+            Case {
+                name: "final_turn",
+                max_turns: 50,
+                remaining: 1,
+                want_contains: Some("final review now"),
+                want_final: true,
+            },
+            Case {
+                name: "non_threshold",
+                max_turns: 50,
+                remaining: 7,
+                want_contains: None,
+                want_final: false,
+            },
+            Case {
+                name: "zero_remaining",
+                max_turns: 50,
+                remaining: 0,
+                want_contains: None,
+                want_final: false,
+            },
+            Case {
+                name: "remaining_above_budget",
+                max_turns: 50,
+                remaining: 51,
+                want_contains: None,
+                want_final: false,
+            },
+        ];
+
+        for case in cases {
+            let notice = code_review_turn_budget_notice(case.max_turns, case.remaining);
+            match case.want_contains {
+                Some(needle) => {
+                    let notice = notice.expect(case.name);
+                    assert!(notice.contains(needle), "{}: {notice}", case.name);
+                    assert_eq!(
+                        notice.contains("future work"),
+                        case.want_final,
+                        "{} final wording mismatch",
+                        case.name
+                    );
+                }
+                None => assert!(notice.is_none(), "{}", case.name),
+            }
+        }
+    }
+
+    #[test]
+    fn code_review_turn_budget_hook_response_covers_emit_duplicate_and_passthrough() {
+        fn hook_context(response: HookResponse) -> Option<String> {
+            response
+                .into_output()
+                .hook_specific_output
+                .and_then(|output| output.additional_context)
+        }
+
+        let input = |event_name, payload| HookInput {
+            event_name,
+            matcher_value: None,
+            payload,
+        };
+        let alerted_remaining = Mutex::new(HashSet::new());
+        let first = code_review_turn_budget_hook_response(
+            &input(
+                HookEventName::PreToolUse,
+                json!({
+                    "max_turns": 50,
+                    "provider_iterations_remaining": 16,
+                }),
+            ),
+            50,
+            &alerted_remaining,
+        );
+        assert!(
+            hook_context(first)
+                .as_deref()
+                .is_some_and(|context| context.contains("16 code-review turns left"))
+        );
+
+        let duplicate = code_review_turn_budget_hook_response(
+            &input(
+                HookEventName::PreToolUse,
+                json!({
+                    "max_turns": 50,
+                    "provider_iterations_remaining": 16,
+                }),
+            ),
+            50,
+            &alerted_remaining,
+        );
+        assert!(hook_context(duplicate).is_none());
+
+        let missing_max_uses_default = code_review_turn_budget_hook_response(
+            &input(
+                HookEventName::PreToolUse,
+                json!({
+                    "provider_iterations_remaining": 8,
+                }),
+            ),
+            50,
+            &Mutex::new(HashSet::new()),
+        );
+        assert!(
+            hook_context(missing_max_uses_default)
+                .as_deref()
+                .is_some_and(|context| context.contains("8 code-review turns left"))
+        );
+
+        let non_threshold = code_review_turn_budget_hook_response(
+            &input(
+                HookEventName::PreToolUse,
+                json!({
+                    "max_turns": 50,
+                    "provider_iterations_remaining": 7,
+                }),
+            ),
+            50,
+            &Mutex::new(HashSet::new()),
+        );
+        assert!(hook_context(non_threshold).is_none());
+
+        let missing_remaining = code_review_turn_budget_hook_response(
+            &input(HookEventName::PreToolUse, json!({"max_turns": 50})),
+            50,
+            &Mutex::new(HashSet::new()),
+        );
+        assert!(hook_context(missing_remaining).is_none());
+
+        let wrong_event = code_review_turn_budget_hook_response(
+            &input(
+                HookEventName::Stop,
+                json!({
+                    "max_turns": 50,
+                    "provider_iterations_remaining": 8,
+                }),
+            ),
+            50,
+            &Mutex::new(HashSet::new()),
+        );
+        assert!(hook_context(wrong_event).is_none());
     }
 
     #[test]

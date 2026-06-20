@@ -12,6 +12,7 @@ clap.workspace = true
 futures.workspace = true
 halter = { path = "../../crates/halter", features = ["full"] }
 halter-config = { path = "../../crates/halter-config" }
+halter-hooks = { path = "../../crates/halter-hooks" }
 halter-protocol = { path = "../../crates/halter-protocol" }
 halter-tools = { path = "../../crates/halter-tools", features = ["full"] }
 reqwest.workspace = true

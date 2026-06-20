@@ -81,6 +81,36 @@ pub struct HookInvocationContext<'a> {
     pub turn_id: &'a TurnId,
     pub model: &'a ModelId,
     pub working_dir: &'a Path,
+    pub provider_iteration: Option<u32>,
+    pub max_turns: Option<u32>,
+}
+
+impl<'a> HookInvocationContext<'a> {
+    pub fn new(turn_id: &'a TurnId, model: &'a ModelId, working_dir: &'a Path) -> Self {
+        Self {
+            turn_id,
+            model,
+            working_dir,
+            provider_iteration: None,
+            max_turns: None,
+        }
+    }
+
+    pub fn for_provider_iteration(
+        turn_id: &'a TurnId,
+        model: &'a ModelId,
+        working_dir: &'a Path,
+        provider_iteration: u32,
+        max_turns: Option<u32>,
+    ) -> Self {
+        Self {
+            turn_id,
+            model,
+            working_dir,
+            provider_iteration: Some(provider_iteration),
+            max_turns,
+        }
+    }
 }
 
 /// Completed hook dispatch, including preview and final run summaries.
@@ -1153,6 +1183,21 @@ fn base_payload(
         "permission_mode".to_owned(),
         Value::String("default".to_owned()),
     );
+    if let Some(provider_iteration) = ctx.provider_iteration {
+        payload.insert(
+            "provider_iteration".to_owned(),
+            Value::from(provider_iteration),
+        );
+        if let Some(max_turns) = ctx.max_turns {
+            payload.insert("max_turns".to_owned(), Value::from(max_turns));
+            payload.insert(
+                "provider_iterations_remaining".to_owned(),
+                Value::from(max_turns.saturating_sub(provider_iteration)),
+            );
+        }
+    } else if let Some(max_turns) = ctx.max_turns {
+        payload.insert("max_turns".to_owned(), Value::from(max_turns));
+    }
     if let Some(path) = sess.services().sessions.transcript_path(sess.session_id()) {
         payload.insert(
             "transcript_path".to_owned(),

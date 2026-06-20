@@ -490,11 +490,11 @@ impl RuntimeSubagentControl {
         let dispatch = run_subagent_start(
             &session,
             &fired_hook_ids,
-            HookInvocationContext {
-                turn_id: &turn_id,
-                model: &stored.blueprint.default_model,
-                working_dir: &stored.blueprint.working_dir,
-            },
+            HookInvocationContext::new(
+                &turn_id,
+                &stored.blueprint.default_model,
+                &stored.blueprint.working_dir,
+            ),
             &status.agent_id,
             status
                 .agent_type
@@ -541,11 +541,11 @@ impl RuntimeSubagentControl {
         let dispatch = run_subagent_stop(
             &session,
             &fired_hook_ids,
-            HookInvocationContext {
-                turn_id: &turn_id,
-                model: &stored.blueprint.default_model,
-                working_dir: &stored.blueprint.working_dir,
-            },
+            HookInvocationContext::new(
+                &turn_id,
+                &stored.blueprint.default_model,
+                &stored.blueprint.working_dir,
+            ),
             agent_id,
             agent_type.map_or("default", |agent_type| agent_type.0.as_str()),
             transcript_path.as_deref(),
