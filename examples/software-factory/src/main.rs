@@ -1299,7 +1299,7 @@ const JSON_ONLY_OUTPUT_RULE: &str = "Return ONLY the JSON object as your final m
 /// Shared rule for coding stages that run cargo, whose builds exceed the
 /// 30-second default shell timeout when no explicit timeout is supplied.
 const CARGO_TIMEOUT_RULE: &str = "When running builds, tests, lints, or other checks through the shell tool, pass an explicit timeout_ms of at least 120000; these commands routinely exceed the 30-second default.";
-const CODE_REVIEW_MAX_TURNS: u32 = 10;
+const CODE_REVIEW_MAX_TURNS: u32 = 100;
 
 fn json_preview(value: &Value, max_chars: usize) -> String {
     single_line_preview(&value.to_string(), max_chars)
