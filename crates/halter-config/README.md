@@ -406,7 +406,7 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find"]
+allow = ["git", "cargo", "rg", "ls", "find", "true", "cd"]
 timeout_secs = 30
 
 [policy.network]
@@ -423,7 +423,7 @@ Defaults:
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
 - shell enabled by default
-- shell allowlist defaults to `git`, `cargo`, `rg`, `ls`, `find`
+- shell allowlist defaults to `git`, `cargo`, `rg`, `ls`, `find`, `true`, `cd`
 - network disabled by default
 
 Validation rules include:
@@ -702,7 +702,7 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "python"]
+allow = ["git", "cargo", "rg", "ls", "find", "true", "cd", "python"]
 timeout_secs = 30
 
 [sessions]

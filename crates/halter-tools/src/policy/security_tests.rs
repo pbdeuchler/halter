@@ -249,6 +249,18 @@ async fn shell_allowlist_rejects_unlisted_programs() {
     );
 }
 
+#[tokio::test]
+async fn default_shell_allowlist_accepts_true_and_cd() {
+    let policy = DefaultToolPolicy::new(PolicySettings::default());
+
+    for command in ["true", "cd ."] {
+        policy
+            .check_shell_command_strict(command, ShellMode::Strict)
+            .await
+            .expect("default allowlist should accept command");
+    }
+}
+
 // ------------- AC1.12: loopback IP denied unless allowlisted
 
 #[tokio::test]

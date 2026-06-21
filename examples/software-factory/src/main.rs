@@ -951,9 +951,9 @@ fn default_factory_config() -> HarnessConfig {
             default: Some(ModelSlot::Reference(ModelSlotRef::ModelJudge)),
             subagent: Some(ModelSlot::Reference(ModelSlotRef::AutoResolve)),
             small: Some(model_config(
-                    ConfiguredProvider::OpenRouter,
-                    "z-ai/glm-5.2",
-                    ReasoningEffort::Medium,
+                ConfiguredProvider::OpenRouter,
+                "z-ai/glm-5.2",
+                ReasoningEffort::Medium,
             )),
             model_judge: Some(ModelJudgeConfig {
                 mode: ModelJudgeMode::FullTurn,
@@ -1075,10 +1075,10 @@ fn judge_example_tools() -> [&'static str; 17] {
     ]
 }
 
-fn judge_example_shell_allowlist() -> [&'static str; 17] {
+fn judge_example_shell_allowlist() -> [&'static str; 19] {
     [
-        "git", "cargo", "rg", "ls", "find", "python", "python3", "pwd", "echo", "date", "gh",
-        "which", "sort", "nl", "sed", "wc", "head",
+        "git", "cargo", "rg", "ls", "find", "true", "cd", "python", "python3", "pwd", "echo",
+        "date", "gh", "which", "sort", "nl", "sed", "wc", "head",
     ]
 }
 
@@ -2117,21 +2117,14 @@ async fn run_review_loop(
     project_system_prompt: Option<&str>,
 ) -> anyhow::Result<CodeReview> {
     for iteration in 1..=max_iterations {
-        let diff = branch_diff(worktree, base_ref).await?;
-        if diff.trim().is_empty() {
+        if !branch_has_diff(worktree, base_ref).await? {
             bail!("review loop cannot continue: branch diff is empty");
         }
-        info!(
-            iteration,
-            max_iterations,
-            diff_bytes = diff.len(),
-            "starting review iteration"
-        );
+        info!(iteration, max_iterations, "starting review iteration");
         let review = review_diff(
             reviewer,
             worktree,
             base_ref,
-            &diff,
             ReviewIteration {
                 current: iteration,
                 max: max_iterations,
@@ -2173,11 +2166,10 @@ async fn review_diff(
     reviewer: &Halter,
     worktree: &Path,
     base_ref: &str,
-    diff: &str,
     iteration: ReviewIteration,
     project_system_prompt: Option<&str>,
 ) -> anyhow::Result<CodeReview> {
-    let prompt = code_review_prompt(base_ref, diff, iteration);
+    let prompt = code_review_prompt(base_ref, iteration);
     let raw = run_code_review_agent_with_system_prompt(
         reviewer,
         worktree,
@@ -2206,12 +2198,12 @@ impl ReviewIteration {
     }
 }
 
-fn code_review_prompt(base_ref: &str, diff: &str, iteration: ReviewIteration) -> String {
+fn code_review_prompt(base_ref: &str, iteration: ReviewIteration) -> String {
     let intro = if iteration.is_first() {
-        format!("You are reviewing a branch diff against {base_ref}.")
+        format!("You are reviewing the current branch against {base_ref}.")
     } else {
         format!(
-            "Your previous code review has been addressed. Thoroughly re-review the branch diff against {base_ref} and ensure all findings have been addressed and there are no new ones."
+            "Your previous code review has been addressed. Thoroughly re-review the current branch against {base_ref} and ensure all findings have been addressed and there are no new ones."
         )
     };
     let final_instruction = final_review_iteration_instruction(iteration, "review");
@@ -2222,6 +2214,7 @@ Review stance:
 - Prioritize correctness bugs, regressions, missing tests, unsafe behavior, and broken edge cases.
 - Include but do not block on style nits unless they create real maintenance risk.
 - Mark clean=true only when there are no required fixes.
+- Inspect the branch diff yourself from the current worktree. Start with `git diff --find-renames {base_ref}`, then read changed files and run focused checks when needed.
 - {CARGO_TIMEOUT_RULE}
 {final_instruction}
 {JSON_ONLY_OUTPUT_RULE} Use this shape:
@@ -2238,9 +2231,6 @@ Review stance:
     }}
   ]
 }}
-
-BRANCH DIFF:
-{diff}
 "#
     )
 }
@@ -2574,7 +2564,39 @@ async fn current_commit(worktree: &Path) -> anyhow::Result<String> {
 }
 
 async fn branch_has_diff(worktree: &Path, base_ref: &str) -> anyhow::Result<bool> {
-    Ok(!branch_diff(worktree, base_ref).await?.trim().is_empty())
+    let args = ["diff", "--quiet", "--find-renames", base_ref];
+    let command = args.join(" ");
+    debug!(
+        cwd = %worktree.display(),
+        program = "git",
+        args = %command,
+        "running command"
+    );
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(worktree)
+        .output()
+        .await
+        .with_context(|| format!("failed to run command: git {command}"))?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            warn!(
+                cwd = %worktree.display(),
+                program = "git",
+                args = %command,
+                status = %output.status,
+                stdout_bytes = output.stdout.len(),
+                stderr_bytes = output.stderr.len(),
+                stderr = %single_line_preview(stderr.trim(), 500),
+                "command failed"
+            );
+            bail!("command failed: git {command}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        }
+    }
 }
 
 async fn branch_diff(worktree: &Path, base_ref: &str) -> anyhow::Result<String> {
@@ -4014,6 +4036,35 @@ mod tests {
         assert!(!committed);
     }
 
+    #[tokio::test]
+    async fn branch_has_diff_covers_clean_changed_and_invalid_base_ref() {
+        let (_dir, source) = init_git_repo_with_origin().await;
+
+        assert!(
+            !branch_has_diff(&source, "origin/main")
+                .await
+                .expect("clean branch diff check")
+        );
+
+        tokio::fs::write(source.join("README.md"), "hello\nchanged\n")
+            .await
+            .expect("write tracked change");
+
+        assert!(
+            branch_has_diff(&source, "origin/main")
+                .await
+                .expect("changed branch diff check")
+        );
+
+        let error = branch_has_diff(&source, "missing/ref")
+            .await
+            .expect_err("invalid base ref should fail");
+        assert!(
+            error.to_string().contains("command failed: git diff"),
+            "unexpected error: {error}"
+        );
+    }
+
     fn sample_candidates() -> CandidateSet {
         CandidateSet {
             candidates: vec![crate::core::IssueCandidate {
@@ -4167,16 +4218,17 @@ mod tests {
 
     #[test]
     fn session_init_with_appended_context_applies_optional_max_turns() {
+        let max_turns = 10;
         let init = session_init_with_appended_context(
             Path::new("/tmp/project"),
             FactorySystemPrompt::Coding,
             "review the branch",
             None,
-            Some(CODE_REVIEW_MAX_TURNS),
+            Some(max_turns),
         )
         .expect("session init");
 
-        assert_eq!(init.max_turns, Some(10));
+        assert_eq!(init.max_turns, Some(max_turns));
     }
 
     #[test]
@@ -4214,10 +4266,10 @@ mod tests {
         ];
 
         for case in cases {
-            let prompt = code_review_prompt("origin/master", "diff --git a/x b/x", case.iteration);
+            let prompt = code_review_prompt("origin/master", case.iteration);
 
             assert_eq!(
-                prompt.contains("You are reviewing a branch diff against origin/master."),
+                prompt.contains("You are reviewing the current branch against origin/master."),
                 case.want_initial,
                 "{} initial prompt mismatch",
                 case.name
@@ -4235,7 +4287,13 @@ mod tests {
                 case.name
             );
             assert!(prompt.contains(JSON_ONLY_OUTPUT_RULE), "{}", case.name);
-            assert!(prompt.contains("BRANCH DIFF:\ndiff --git"), "{}", case.name);
+            assert!(
+                prompt.contains("git diff --find-renames origin/master"),
+                "{}",
+                case.name
+            );
+            assert!(!prompt.contains("BRANCH DIFF:"), "{}", case.name);
+            assert!(!prompt.contains("diff --git"), "{}", case.name);
         }
     }
 

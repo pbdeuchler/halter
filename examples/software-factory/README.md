@@ -30,8 +30,9 @@ The command runs this workflow:
    `.halter/software-factory/implementation-plan.md`.
 7. Create a branch from the base branch.
 8. Run an implementation agent.
-9. Run a reviewer agent against the branch diff and ask the implementation agent
-   to repair findings until the review is clean or the iteration limit is hit.
+9. Run a reviewer agent that inspects the branch changes and ask the
+   implementation agent to repair findings until the review is clean or the
+   iteration limit is hit.
 10. Commit, push, draft a PR body, and open the PR.
 11. With `--monitor`, poll the PR for maintainer review feedback and maintainer
     `/plsfix` comments, apply requested fixes, commit, and push again until the
@@ -226,7 +227,7 @@ The example builds separate harnesses for separate jobs:
 - GLM: issue grouping and `/plsfix` refinement.
 - Model judge: issue selection and implementation planning.
 - Implementer: code changes and repair work.
-- Reviewer: branch-diff review.
+- Reviewer: branch review.
 - PR writer: PR title and body drafting.
 
 The judge harness registers a custom `github_issue` tool. The tool lets the

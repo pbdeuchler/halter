@@ -441,7 +441,7 @@ allowed_hosts = []
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "python", "pwd", "cwd", "echo"]
+allow = ["git", "cargo", "rg", "ls", "find", "true", "cd", "python", "pwd", "cwd", "echo"]
 timeout_secs = 30
 
 [sessions]
