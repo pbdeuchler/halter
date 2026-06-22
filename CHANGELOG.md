@@ -55,6 +55,11 @@ matrix".
 
 ### API changes
 
+- **`MergeConflict.field`.** `MergeConflict.field` is now a typed
+  `ConflictField` enum (`UpdatedInput`, `UpdatedOutput`) instead of a
+  `&'static str`; the rendered form in `hooks.merge_conflict` tracing
+  output is unchanged. `ConflictField` and `MergeConflict` are now
+  re-exported from `halter_hooks`.
 - **`SessionHandle` / `SessionInner`.** `HalterSession` no longer
   derives `Clone + Drop` over shared state. `SessionHandle` is the
   public cheap-clonable surface; `SessionInner` holds the owned graph.
