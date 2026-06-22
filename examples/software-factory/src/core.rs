@@ -15,7 +15,7 @@ pub const PROJECT_GUIDANCE_FILENAMES: [&str; 3] = ["CLAUDE.md", "AGENTS.md", "SO
 pub const PROJECT_GUIDANCE_MAX_BYTES: u64 = 1_048_576;
 
 /// Per-issue body budget (in characters) for the planning corpus handed to the
-/// judge panel. Roughly 1k tokens at ~4 characters per token, which keeps the
+/// planning panel. Roughly 1k tokens at ~4 characters per token, which keeps the
 /// full open-issue corpus bounded even when individual issues are very long.
 pub const PLANNING_CORPUS_BODY_CHARS: usize = 4_000;
 
@@ -216,21 +216,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct IssueCandidate {
-    pub title: String,
-    pub issue_numbers: Vec<u64>,
-    pub rationale: String,
-    #[serde(default)]
-    pub maintainer_input_risk: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CandidateSet {
-    pub candidates: Vec<IssueCandidate>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JudgeSelection {
+pub struct IssueSelection {
     pub title: String,
     pub issue_numbers: Vec<u64>,
     #[serde(default)]
@@ -267,6 +253,12 @@ pub struct ProjectGuidanceDoc {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelResponse {
+    pub id: String,
+    pub text: String,
+}
+
 pub fn format_project_system_prompt(docs: &[ProjectGuidanceDoc]) -> Option<String> {
     let non_empty_docs = docs
         .iter()
@@ -296,11 +288,43 @@ pub fn json_slice(raw: &str) -> Option<&str> {
     (end >= start).then_some(raw[start..=end].trim())
 }
 
-pub fn selected_issue_numbers(selection: &JudgeSelection) -> Vec<u64> {
+pub fn selected_issue_numbers(selection: &IssueSelection) -> Vec<u64> {
     let mut numbers = selection.issue_numbers.clone();
     numbers.sort_unstable();
     numbers.dedup();
     numbers
+}
+
+pub fn ensure_panel_responses(stage: &str, responses: &[PanelResponse]) -> Result<(), String> {
+    if responses.is_empty() {
+        return Err(format!("{stage} produced no usable panel responses"));
+    }
+    for response in responses {
+        if response.id.trim().is_empty() {
+            return Err(format!(
+                "{stage} produced a panel response with an empty id"
+            ));
+        }
+        if response.text.trim().is_empty() {
+            return Err(format!(
+                "{stage} produced an empty response for panel {}",
+                response.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn render_panel_responses(responses: &[PanelResponse]) -> String {
+    let mut out = String::new();
+    for response in responses {
+        out.push_str(&format!(
+            "\n--- model_id: {} ---\n{}\n",
+            response.id,
+            response.text.trim()
+        ));
+    }
+    out
 }
 
 pub fn validate_issue_number(number: u64) -> Result<u64, String> {
@@ -317,21 +341,8 @@ pub fn validate_recent_issue_limit(limit: usize) -> Result<usize, String> {
     Ok(limit)
 }
 
-pub fn candidate_set_for_issue(issue: &IssueDoc) -> CandidateSet {
-    CandidateSet {
-        candidates: vec![IssueCandidate {
-            title: format!("Issue #{}: {}", issue.number, issue.title),
-            issue_numbers: vec![issue.number],
-            rationale: format!("The user explicitly requested issue #{}.", issue.number),
-            maintainer_input_risk:
-                "Judge must reject this issue if its text indicates maintainer input is needed."
-                    .to_owned(),
-        }],
-    }
-}
-
 pub fn ensure_requested_issue_selection(
-    selection: &JudgeSelection,
+    selection: &IssueSelection,
     requested_issue: Option<u64>,
 ) -> Result<(), String> {
     let Some(requested_issue) = requested_issue else {
@@ -347,7 +358,7 @@ pub fn ensure_requested_issue_selection(
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "judge selected {selected} but --issue requested #{requested_issue}"
+        "issue selection chose {selected} but --issue requested #{requested_issue}"
     ))
 }
 
@@ -504,15 +515,15 @@ mod tests {
 
     #[test]
     fn model_spec_parse_preserves_openrouter_model_slashes() {
-        let spec = ModelSpec::parse("openrouter/moonshotai/kimi-k2.7-code").expect("valid model");
+        let spec = ModelSpec::parse("openrouter/vendor/family-model").expect("valid model");
         assert_eq!(spec.provider, ConfiguredProvider::OpenRouter);
-        assert_eq!(spec.model, "moonshotai/kimi-k2.7-code");
+        assert_eq!(spec.model, "vendor/family-model");
 
-        let openai = ModelSpec::parse("openai/gpt-5.5").expect("valid openai model");
+        let openai = ModelSpec::parse("openai/default-model").expect("valid openai model");
         assert_eq!(openai.provider, ConfiguredProvider::OpenAi);
-        assert_eq!(openai.model, "gpt-5.5");
+        assert_eq!(openai.model, "default-model");
 
-        for raw in ["", "gpt-5.5", "bogus/model", "openai/"] {
+        for raw in ["", "default-model", "bogus/model", "openai/"] {
             assert!(
                 ModelSpec::parse(raw).is_err(),
                 "{raw:?} should not parse as a model spec"
@@ -607,13 +618,67 @@ mod tests {
 
     #[test]
     fn selected_issue_numbers_are_sorted_and_deduped() {
-        let selection = JudgeSelection {
+        let selection = IssueSelection {
             title: "fix things".to_owned(),
             issue_numbers: vec![42, 7, 42],
             notes: String::new(),
         };
 
         assert_eq!(selected_issue_numbers(&selection), vec![7, 42]);
+    }
+
+    #[test]
+    fn panel_response_validation_covers_success_and_error_cases() {
+        let responses = vec![PanelResponse {
+            id: "panel-1".to_owned(),
+            text: "select issue #7".to_owned(),
+        }];
+        ensure_panel_responses("issue selection", &responses).expect("valid responses");
+
+        let cases = [
+            ("empty list", Vec::new(), "no usable panel responses"),
+            (
+                "empty id",
+                vec![PanelResponse {
+                    id: " ".to_owned(),
+                    text: "plan".to_owned(),
+                }],
+                "empty id",
+            ),
+            (
+                "empty text",
+                vec![PanelResponse {
+                    id: "panel-1".to_owned(),
+                    text: " \n".to_owned(),
+                }],
+                "empty response",
+            ),
+        ];
+
+        for (name, responses, expected) in cases {
+            let error =
+                ensure_panel_responses("implementation planning", &responses).expect_err(name);
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn render_panel_responses_uses_generic_panel_ids() {
+        let rendered = render_panel_responses(&[
+            PanelResponse {
+                id: "panel-1".to_owned(),
+                text: "  first selection  ".to_owned(),
+            },
+            PanelResponse {
+                id: "panel-2".to_owned(),
+                text: "second selection".to_owned(),
+            },
+        ]);
+
+        assert!(rendered.contains("--- model_id: panel-1 ---"));
+        assert!(rendered.contains("first selection"));
+        assert!(!rendered.contains("  first selection  "));
+        assert!(rendered.contains("--- model_id: panel-2 ---"));
     }
 
     #[test]
@@ -675,33 +740,8 @@ mod tests {
     }
 
     #[test]
-    fn candidate_set_for_issue_builds_single_forced_candidate() {
-        let issue = IssueDoc {
-            number: 13,
-            state: "open".to_owned(),
-            title: "make logs quieter".to_owned(),
-            body: "too much output".to_owned(),
-            labels: vec!["bug".to_owned()],
-            author: "octo".to_owned(),
-            url: "https://example.test/issues/13".to_owned(),
-            comments: vec![],
-        };
-
-        let candidates = candidate_set_for_issue(&issue);
-
-        assert_eq!(candidates.candidates.len(), 1);
-        assert_eq!(candidates.candidates[0].issue_numbers, vec![13]);
-        assert!(candidates.candidates[0].title.contains("#13"));
-        assert!(
-            candidates.candidates[0]
-                .rationale
-                .contains("explicitly requested")
-        );
-    }
-
-    #[test]
     fn requested_issue_selection_guard_allows_exact_match_only() {
-        let matching = JudgeSelection {
+        let matching = IssueSelection {
             title: "fix requested issue".to_owned(),
             issue_numbers: vec![7, 7],
             notes: String::new(),
@@ -710,17 +750,17 @@ mod tests {
         assert!(ensure_requested_issue_selection(&matching, Some(7)).is_ok());
 
         for selection in [
-            JudgeSelection {
+            IssueSelection {
                 title: "wrong".to_owned(),
                 issue_numbers: vec![8],
                 notes: String::new(),
             },
-            JudgeSelection {
+            IssueSelection {
                 title: "extra".to_owned(),
                 issue_numbers: vec![7, 8],
                 notes: String::new(),
             },
-            JudgeSelection {
+            IssueSelection {
                 title: "empty".to_owned(),
                 issue_numbers: vec![],
                 notes: String::new(),

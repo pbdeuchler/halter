@@ -15,13 +15,12 @@ use anyhow::{Context, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use clap::Parser;
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use halter::prelude::*;
 use halter_config::{
-    ConfiguredProvider, ContextConfig, HarnessConfig, ModelConfig, ModelJudgeConfig,
-    ModelJudgeMode, ModelSlot, ModelSlotRef, ModelsConfig, NetworkPolicyConfig, PanelIsolation,
-    PolicyConfig, ProviderConfig, ProvidersConfig, ResourcesConfig, RuntimeConfig, SearchRoots,
-    SessionsConfig, ShellPolicyConfig, ToolsConfig,
+    ContextConfig, HarnessConfig, ModelConfig, ModelSlot, ModelSlotRef, ModelsConfig,
+    NetworkPolicyConfig, PolicyConfig, ProviderConfig, ProvidersConfig, ResourcesConfig,
+    RuntimeConfig, SearchRoots, SessionsConfig, ShellPolicyConfig, ToolsConfig,
 };
 use halter_protocol::{
     AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
@@ -38,14 +37,14 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::core::{
-    CHECKPOINT_PATH, CandidateSet, CodeReview, FACTORY_WORKTREE_TMP_DIR, IMPLEMENTATION_PLAN_PATH,
-    IssueComment, IssueDoc, JudgeSelection, ModelSpec, MonitorAction, PLANNING_CORPUS_BODY_CHARS,
-    PROJECT_GUIDANCE_FILENAMES, PROJECT_GUIDANCE_MAX_BYTES, ProjectGuidanceDoc, PullRequestDraft,
-    RECENT_OPEN_ISSUE_LIMIT, RepoSlug, branch_name, candidate_set_for_issue,
-    dirty_status_excluding, ensure_requested_issue_selection, factory_worktree_dir_name,
+    CHECKPOINT_PATH, CodeReview, FACTORY_WORKTREE_TMP_DIR, IMPLEMENTATION_PLAN_PATH, IssueComment,
+    IssueDoc, IssueSelection, ModelSpec, MonitorAction, PLANNING_CORPUS_BODY_CHARS,
+    PROJECT_GUIDANCE_FILENAMES, PROJECT_GUIDANCE_MAX_BYTES, PanelResponse, ProjectGuidanceDoc,
+    PullRequestDraft, RECENT_OPEN_ISSUE_LIMIT, RepoSlug, branch_name, dirty_status_excluding,
+    ensure_panel_responses, ensure_requested_issue_selection, factory_worktree_dir_name,
     format_project_system_prompt, is_maintainer_author_association, issue_corpus, monitor_action,
-    parse_github_remote_url, parse_issue_number_input, parse_json_response, selected_issue_numbers,
-    validate_issue_number, validate_recent_issue_limit,
+    parse_github_remote_url, parse_issue_number_input, parse_json_response, render_panel_responses,
+    selected_issue_numbers, validate_issue_number, validate_recent_issue_limit,
 };
 
 #[derive(Debug, Parser)]
@@ -98,35 +97,35 @@ struct Cli {
     #[arg(
         long,
         default_value_t = 5,
-        help = "Maximum Kimi/GPT review-repair iterations"
+        help = "Maximum implementation/review repair iterations"
     )]
     max_review_iterations: usize,
     #[arg(long, default_value_t = 60, help = "Seconds between PR monitor polls")]
     poll_seconds: u64,
     #[arg(
         long,
-        default_value = "openrouter/z-ai/glm-5.2",
-        help = "Provider/model for issue grouping and /plsfix refinement"
+        default_value = DEFAULT_MODEL_SPEC,
+        help = "Provider/model for the default decision and feedback-refinement session"
     )]
-    glm_model: String,
+    default_model: String,
     #[arg(
         long,
-        default_value = "openrouter/moonshotai/kimi-k2.7-code",
+        default_value = DEFAULT_IMPLEMENTATION_MODEL_SPEC,
         help = "Provider/model for implementation"
     )]
-    implementer_model: String,
+    implementation_model: String,
     #[arg(
         long,
-        default_value = "openrouter/z-ai/glm-5.2",
+        default_value = DEFAULT_REVIEW_MODEL_SPEC,
         help = "Provider/model for branch-diff code review"
     )]
-    reviewer_model: String,
+    review_model: String,
     #[arg(
         long,
-        default_value = "openrouter/google/gemma-4-31b-it",
+        default_value = DEFAULT_PULL_REQUEST_MODEL_SPEC,
         help = "Provider/model for PR title and body drafting"
     )]
-    pr_model: String,
+    pull_request_model: String,
 }
 
 /// Third-party targets that become too noisy when users set `RUST_LOG=debug`.
@@ -134,6 +133,20 @@ const NOISY_TARGET_SUPPRESSIONS: &str = "tokenize=warn,parse=warn,expansion=warn
      pattern=warn,completion=warn,jobs=warn,unimplemented=warn,\
      hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,rustls=warn";
 const FACTORY_LOCAL_STATE_PATHS: [&str; 2] = [IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH];
+const DEFAULT_MODEL_SPEC: &str = "openrouter/z-ai/glm-5.2";
+const DEFAULT_IMPLEMENTATION_MODEL_SPEC: &str = "openrouter/moonshotai/kimi-k2.7-code";
+const DEFAULT_REVIEW_MODEL_SPEC: &str = DEFAULT_MODEL_SPEC;
+const DEFAULT_PULL_REQUEST_MODEL_SPEC: &str = "openrouter/google/gemma-4-31b-it";
+const PANEL_MODEL_SPECS: [&str; 3] = [
+    "openrouter/minimax/minimax-m3",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
+    "openrouter/qwen/qwen3.6-27b",
+];
+const DEFAULT_SESSION_COMPACTION_THRESHOLD: u64 = 300_000;
+const DEFAULT_SESSION_PRE_COMPACTION_TARGET: u64 = 200_000;
+const FACTORY_AGENT_MAX_INPUT_TOKENS: u32 = 230_000;
+const FACTORY_AGENT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+const RANK_RESPONSES_TOOL: &str = "rank_responses";
 
 fn logging_filter_spec(user_directives: Option<&str>) -> String {
     let directives = user_directives
@@ -179,8 +192,7 @@ struct FactoryCheckpoint {
     requested_issue: Option<u64>,
     commit_impl_plan: bool,
     issues: Option<Vec<IssueDoc>>,
-    candidates: Option<CandidateSet>,
-    selection: Option<JudgeSelection>,
+    selection: Option<IssueSelection>,
     implementation_plan: Option<String>,
     branch: Option<String>,
     base_ref: Option<String>,
@@ -208,7 +220,6 @@ impl FactoryCheckpoint {
             requested_issue,
             commit_impl_plan,
             issues: None,
-            candidates: None,
             selection: None,
             implementation_plan: None,
             branch: None,
@@ -281,14 +292,11 @@ fn validate_checkpoint_for_run(
 }
 
 fn validate_checkpoint_stage_state(checkpoint: &FactoryCheckpoint) -> Result<(), String> {
-    if checkpoint.selection.is_some() && checkpoint.candidates.is_none() {
-        return Err("checkpoint has a judge selection but no candidate set".to_owned());
-    }
     if checkpoint.implementation_plan.is_some() && checkpoint.selection.is_none() {
-        return Err("checkpoint has an implementation plan but no judge selection".to_owned());
+        return Err("checkpoint has an implementation plan but no issue selection".to_owned());
     }
     if checkpoint.branch.is_some() && checkpoint.selection.is_none() {
-        return Err("checkpoint has a branch but no judge selection".to_owned());
+        return Err("checkpoint has a branch but no issue selection".to_owned());
     }
     if checkpoint.implemented && checkpoint.branch.is_none() {
         return Err("checkpoint marks implementation complete but has no branch".to_owned());
@@ -416,7 +424,6 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .map(|issue| issue.number)
         .collect::<HashSet<_>>();
-    let corpus = issue_corpus(&repo, &issues, None);
     let planning_corpus = issue_corpus(&repo, &issues, Some(PLANNING_CORPUS_BODY_CHARS));
     let implementation_plan_path = worktree.join(IMPLEMENTATION_PLAN_PATH);
     if let Some(parent) = implementation_plan_path.parent() {
@@ -425,29 +432,32 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let glm = build_model_harness(
+    let issue_tool: Arc<dyn Tool> = Arc::new(GitHubIssueTool::new(
+        github.clone(),
+        repo.clone(),
+        issue_cache.clone(),
+        allowed_issue_numbers,
+    ));
+    let rank_tool: Arc<dyn Tool> = Arc::new(RankResponsesTool);
+    let default_harness = build_default_harness(
         &base_config,
-        "issue grouping and feedback refinement",
-        ModelSpec::parse(&cli.glm_model).map_err(anyhow::Error::msg)?,
-        ReasoningEffort::Xhigh,
         &worktree,
+        ModelSpec::parse(&cli.default_model).map_err(anyhow::Error::msg)?,
+        issue_tool.clone(),
+        rank_tool,
     )
     .await?;
-    let judge = build_judge_harness(
-        &base_config,
+    let default_session = create_default_session(
+        &default_harness,
         &worktree,
-        Arc::new(GitHubIssueTool::new(
-            github.clone(),
-            repo.clone(),
-            issue_cache.clone(),
-            allowed_issue_numbers,
-        )),
+        project_system_prompt.as_deref(),
     )
     .await?;
+    let panel_harnesses = build_panel_harnesses(&base_config, &worktree, issue_tool).await?;
     let implementer = build_model_harness(
         &base_config,
         "implementation",
-        ModelSpec::parse(&cli.implementer_model).map_err(anyhow::Error::msg)?,
+        ModelSpec::parse(&cli.implementation_model).map_err(anyhow::Error::msg)?,
         ReasoningEffort::Xhigh,
         &worktree,
     )
@@ -455,65 +465,45 @@ async fn main() -> anyhow::Result<()> {
     let reviewer = build_model_harness(
         &base_config,
         "code review",
-        ModelSpec::parse(&cli.reviewer_model).map_err(anyhow::Error::msg)?,
+        ModelSpec::parse(&cli.review_model).map_err(anyhow::Error::msg)?,
         ReasoningEffort::Xhigh,
         &worktree,
     )
     .await?;
     let pr_writer = build_model_harness(
         &base_config,
-        "pr drafting",
-        ModelSpec::parse(&cli.pr_model).map_err(anyhow::Error::msg)?,
+        "pull request drafting",
+        ModelSpec::parse(&cli.pull_request_model).map_err(anyhow::Error::msg)?,
         ReasoningEffort::Medium,
         &worktree,
     )
     .await?;
 
-    let candidates = if let Some(candidates) = checkpoint.candidates.clone() {
-        info!("using issue candidates from factory checkpoint");
-        candidates
-    } else {
-        let candidates = if let Some(number) = requested_issue {
-            let issue = issues
-                .iter()
-                .find(|issue| issue.number == number)
-                .with_context(|| format!("failed to find requested issue #{number} after fetch"))?;
-            info!(issue = number, "using requested issue as the candidate set");
-            candidate_set_for_issue(issue)
-        } else {
-            propose_issue_candidates(
-                &glm,
-                &worktree,
-                &repo,
-                &corpus,
-                project_system_prompt.as_deref(),
-            )
-            .await?
-        };
-        checkpoint.candidates = Some(candidates.clone());
-        write_checkpoint(&checkpoint_path, &checkpoint).await?;
-        candidates
-    };
     let selection = if let Some(selection) = checkpoint.selection.clone() {
-        info!("using judge selection from factory checkpoint");
+        info!("using issue selection from factory checkpoint");
         selection
     } else {
-        let selection = judge_issue_plan(
-            &judge,
+        let selection = select_issue_with_panel_decision(
+            &panel_harnesses,
+            &default_session,
             &worktree,
             &repo,
             &planning_corpus,
-            &candidates,
-            IMPLEMENTATION_PLAN_PATH,
+            requested_issue,
             project_system_prompt.as_deref(),
         )
         .await?;
         checkpoint.selection = Some(selection.clone());
-        let implementation_plan = read_implementation_plan(&implementation_plan_path).await?;
-        checkpoint.implementation_plan = Some(implementation_plan);
         write_checkpoint(&checkpoint_path, &checkpoint).await?;
         selection
     };
+    let issue_numbers = selected_issue_numbers(&selection);
+    if issue_numbers.is_empty() {
+        bail!("failed to select work: issue selection did not return issue numbers");
+    }
+    ensure_requested_issue_selection(&selection, requested_issue).map_err(anyhow::Error::msg)?;
+    ensure_selected_issues_are_open(&issues, &issue_numbers)?;
+
     let implementation_plan =
         if let Some(implementation_plan) = checkpoint.implementation_plan.clone() {
             if implementation_plan.trim().is_empty() {
@@ -522,17 +512,21 @@ async fn main() -> anyhow::Result<()> {
             restore_implementation_plan(&implementation_plan_path, &implementation_plan).await?;
             implementation_plan
         } else {
-            let implementation_plan = read_implementation_plan(&implementation_plan_path).await?;
+            let implementation_plan = create_implementation_plan_with_panel_decision(
+                &panel_harnesses,
+                &default_session,
+                &worktree,
+                &repo,
+                &selection,
+                &issues,
+                project_system_prompt.as_deref(),
+            )
+            .await?;
+            restore_implementation_plan(&implementation_plan_path, &implementation_plan).await?;
             checkpoint.implementation_plan = Some(implementation_plan.clone());
             write_checkpoint(&checkpoint_path, &checkpoint).await?;
             implementation_plan
         };
-    let issue_numbers = selected_issue_numbers(&selection);
-    if issue_numbers.is_empty() {
-        bail!("failed to select work: judge did not return issue numbers");
-    }
-    ensure_requested_issue_selection(&selection, requested_issue).map_err(anyhow::Error::msg)?;
-    ensure_selected_issues_are_open(&issues, &issue_numbers)?;
 
     let (current_branch, base_ref) = if let Some(branch) = checkpoint.branch.clone() {
         info!(branch = %branch, "checking out checkpoint branch");
@@ -663,7 +657,7 @@ async fn main() -> anyhow::Result<()> {
     if cli.monitor {
         monitor_pr(MonitorContext {
             github: &github,
-            glm: &glm,
+            default_harness: &default_harness,
             implementer: &implementer,
             reviewer: &reviewer,
             worktree: &worktree,
@@ -684,7 +678,9 @@ async fn main() -> anyhow::Result<()> {
     write_checkpoint(&checkpoint_path, &checkpoint).await?;
 
     info!("shutting down harnesses");
-    shutdown_all([&glm, &judge, &implementer, &reviewer, &pr_writer]).await;
+    let _ = default_session.shutdown("software_factory_complete").await;
+    shutdown_all([&default_harness, &implementer, &reviewer, &pr_writer]).await;
+    shutdown_all(panel_harnesses.iter().map(|panel| &panel.harness)).await;
     info!("software factory run complete");
     Ok(())
 }
@@ -948,49 +944,17 @@ fn default_factory_config() -> HarnessConfig {
             openrouter: Some(ProviderConfig::default()),
         },
         models: ModelsConfig {
-            default: Some(ModelSlot::Reference(ModelSlotRef::ModelJudge)),
+            default: Some(ModelSlot::Inline(default_session_model_config(
+                DEFAULT_MODEL_SPEC,
+            ))),
             subagent: Some(ModelSlot::Reference(ModelSlotRef::AutoResolve)),
-            small: Some(model_config(
-                ConfiguredProvider::OpenRouter,
-                "z-ai/glm-5.2",
+            small: Some(model_config_from_spec(
+                DEFAULT_MODEL_SPEC,
                 ReasoningEffort::Medium,
+                Some(FACTORY_AGENT_MAX_INPUT_TOKENS),
+                Some(FACTORY_AGENT_MAX_OUTPUT_TOKENS),
             )),
-            model_judge: Some(ModelJudgeConfig {
-                mode: ModelJudgeMode::FullTurn,
-                default: model_config(
-                    ConfiguredProvider::OpenRouter,
-                    "z-ai/glm-5.2",
-                    ReasoningEffort::Xhigh,
-                ),
-                synthesis: model_config(
-                    ConfiguredProvider::OpenRouter,
-                    "google/gemma-4-31b-it",
-                    ReasoningEffort::High,
-                ),
-                panel: vec![
-                    model_config(
-                        ConfiguredProvider::OpenRouter,
-                        "minimax/minimax-m3",
-                        ReasoningEffort::Xhigh,
-                    ),
-                    model_config(
-                        ConfiguredProvider::OpenRouter,
-                        "nvidia/nemotron-3-ultra-550b-a55b",
-                        ReasoningEffort::Xhigh,
-                    ),
-                    // model_config(
-                    //     ConfiguredProvider::OpenRouter,
-                    //     "moonshotai/kimi-k2.6",
-                    //     ReasoningEffort::Xhigh,
-                    // ),
-                    model_config(
-                        ConfiguredProvider::OpenRouter,
-                        "qwen/qwen3.6-27b",
-                        ReasoningEffort::Xhigh,
-                    ),
-                ],
-                panel_isolation: PanelIsolation::ReadOnly,
-            }),
+            ..ModelsConfig::default()
         },
         resources: ResourcesConfig {
             skills: SearchRoots {
@@ -1001,12 +965,12 @@ fn default_factory_config() -> HarnessConfig {
             },
         },
         context: ContextConfig {
-            compaction_threshold: 230_000,
-            pre_compaction_target: 150_000,
+            compaction_threshold: DEFAULT_SESSION_COMPACTION_THRESHOLD,
+            pre_compaction_target: DEFAULT_SESSION_PRE_COMPACTION_TARGET,
             prune_signal_threshold: PruneSignalThreshold::Low,
         },
         tools: ToolsConfig {
-            enabled: judge_example_tools()
+            enabled: factory_example_tools()
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
@@ -1018,7 +982,7 @@ fn default_factory_config() -> HarnessConfig {
             max_concurrent_subagents: 8,
             shell: ShellPolicyConfig {
                 enabled: true,
-                allow: judge_example_shell_allowlist()
+                allow: factory_example_shell_allowlist()
                     .into_iter()
                     .map(ToOwned::to_owned)
                     .collect(),
@@ -1038,22 +1002,38 @@ fn default_factory_config() -> HarnessConfig {
     }
 }
 
-fn model_config(
-    provider: ConfiguredProvider,
-    model: impl Into<String>,
-    reasoning: ReasoningEffort,
-) -> ModelConfig {
-    ModelConfig {
-        provider,
-        model: model.into(),
-        max_input_tokens: None,
-        max_output_tokens: None,
-        reasoning: Some(reasoning),
-        tokens_per_minute: Some(500_000),
-    }
+fn default_session_model_config(raw: &str) -> ModelConfig {
+    model_config_from_spec(
+        raw,
+        ReasoningEffort::Xhigh,
+        Some(DEFAULT_SESSION_COMPACTION_THRESHOLD as u32),
+        Some(FACTORY_AGENT_MAX_OUTPUT_TOKENS),
+    )
 }
 
-fn judge_example_tools() -> [&'static str; 17] {
+fn model_config_from_spec(
+    raw: &str,
+    reasoning: ReasoningEffort,
+    max_input_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> ModelConfig {
+    ModelSpec::parse(raw)
+        .unwrap_or_else(|error| panic!("invalid built-in model spec {raw:?}: {error}"))
+        .into_model_config(reasoning, max_input_tokens, max_output_tokens)
+}
+
+fn panel_model_specs() -> Vec<ModelSpec> {
+    PANEL_MODEL_SPECS
+        .into_iter()
+        .map(|raw| {
+            ModelSpec::parse(raw).unwrap_or_else(|error| {
+                panic!("invalid built-in panel model spec {raw:?}: {error}")
+            })
+        })
+        .collect()
+}
+
+fn factory_example_tools() -> [&'static str; 17] {
     [
         "read",
         "glob",
@@ -1075,7 +1055,7 @@ fn judge_example_tools() -> [&'static str; 17] {
     ]
 }
 
-fn judge_example_shell_allowlist() -> [&'static str; 19] {
+fn factory_example_shell_allowlist() -> [&'static str; 19] {
     [
         "git", "cargo", "rg", "ls", "find", "true", "cd", "python", "python3", "pwd", "echo",
         "date", "gh", "which", "sort", "nl", "sed", "wc", "head",
@@ -1191,6 +1171,97 @@ impl Tool for GitHubIssueTool {
     }
 }
 
+#[derive(Clone)]
+struct RankResponsesTool;
+
+#[async_trait]
+impl Tool for RankResponsesTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: ToolName::from(RANK_RESPONSES_TOOL),
+            description: "Submit a stack ranking of the panel responses. Provide every panel response model_id together with its rank, where rank 1 is the best response.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rankings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "model_id": { "type": "string" },
+                                "rank": { "type": "integer", "minimum": 1 }
+                            },
+                            "required": ["model_id", "rank"]
+                        }
+                    }
+                },
+                "required": ["rankings"]
+            }),
+            concurrency: ToolConcurrency::ReadOnly,
+            capabilities: ToolCapabilities {
+                mutating: false,
+                requires_approval: false,
+                cancellable: false,
+                long_running: false,
+            },
+            provider_aliases: Default::default(),
+        }
+    }
+
+    async fn execute(&self, _context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+        let count = rank_response_count(&input).map_err(anyhow::Error::msg)?;
+        info!(
+            rankings = %input,
+            count,
+            "recorded panel response ranking"
+        );
+        Ok(ToolResult::Json {
+            value: json!({
+                "recorded": true,
+                "ranked_panel_responses": count,
+            }),
+        })
+    }
+}
+
+fn rank_response_count(input: &Value) -> Result<usize, String> {
+    let rankings = input
+        .get("rankings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "rankings must be an array".to_owned())?;
+    if rankings.is_empty() {
+        return Err("rankings must not be empty".to_owned());
+    }
+    let mut seen_model_ids = HashSet::new();
+    let mut seen_ranks = HashSet::new();
+    for entry in rankings {
+        let model_id = entry
+            .get("model_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "ranking model_id must be a non-empty string".to_owned())?;
+        if !seen_model_ids.insert(model_id.to_owned()) {
+            return Err(format!(
+                "ranking model_id {model_id} appears more than once"
+            ));
+        }
+        let rank = entry
+            .get("rank")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("ranking for {model_id} must include a positive rank"))?;
+        if rank == 0 {
+            return Err(format!(
+                "ranking for {model_id} must include a positive rank"
+            ));
+        }
+        if !seen_ranks.insert(rank) {
+            return Err(format!("rank {rank} appears more than once"));
+        }
+    }
+    Ok(rankings.len())
+}
+
 fn add_worktree_policy(config: &mut HarnessConfig, worktree: &Path) {
     absolutize_relative_roots(&mut config.policy.allowed_write_roots, worktree);
     if !config
@@ -1226,22 +1297,88 @@ fn path_starts_with_tilde(path: &Path) -> bool {
         .is_some_and(|component| matches!(component, Component::Normal(value) if value == "~"))
 }
 
-async fn build_judge_harness(
+struct PanelHarness {
+    id: String,
+    harness: Halter,
+}
+
+async fn build_default_harness(
+    config: &HarnessConfig,
+    worktree: &Path,
+    model: ModelSpec,
+    issue_tool: Arc<dyn Tool>,
+    rank_tool: Arc<dyn Tool>,
+) -> anyhow::Result<Halter> {
+    info!(
+        provider = ?model.provider,
+        model = %model.model,
+        compaction_threshold = DEFAULT_SESSION_COMPACTION_THRESHOLD,
+        "building default decision harness"
+    );
+    let mut config = config.clone();
+    add_worktree_policy(&mut config, worktree);
+    config.context.compaction_threshold = DEFAULT_SESSION_COMPACTION_THRESHOLD;
+    config.context.pre_compaction_target = DEFAULT_SESSION_PRE_COMPACTION_TARGET;
+    let model = model.into_model_config(
+        ReasoningEffort::Xhigh,
+        Some(DEFAULT_SESSION_COMPACTION_THRESHOLD as u32),
+        Some(FACTORY_AGENT_MAX_OUTPUT_TOKENS),
+    );
+    config.models.default = Some(ModelSlot::Inline(model.clone()));
+    config.models.small = Some(model.clone());
+    config.models.subagent = Some(ModelSlot::Inline(model));
+    add_enabled_tool(&mut config, "github_issue");
+    add_enabled_tool(&mut config, RANK_RESPONSES_TOOL);
+    let resources = ResourceCompiler::from_config(&config).compile().await?;
+    let harness = Halter::builder()
+        .with_config(config)
+        .with_compiled_resources(resources)
+        .with_tool(issue_tool)
+        .with_tool(rank_tool)
+        .build()
+        .await?;
+    info!("built default decision harness");
+    Ok(harness)
+}
+
+async fn build_panel_harnesses(
     config: &HarnessConfig,
     worktree: &Path,
     issue_tool: Arc<dyn Tool>,
+) -> anyhow::Result<Vec<PanelHarness>> {
+    let mut panels = Vec::new();
+    for (index, model) in panel_model_specs().into_iter().enumerate() {
+        let id = format!("panel-{}", index + 1);
+        let harness = build_panel_harness(config, &id, model, worktree, issue_tool.clone()).await?;
+        panels.push(PanelHarness { id, harness });
+    }
+    Ok(panels)
+}
+
+async fn build_panel_harness(
+    config: &HarnessConfig,
+    panel_id: &str,
+    model: ModelSpec,
+    worktree: &Path,
+    issue_tool: Arc<dyn Tool>,
 ) -> anyhow::Result<Halter> {
-    info!("building model judge harness");
+    info!(
+        panel_id,
+        provider = ?model.provider,
+        model = %model.model,
+        "building panel harness"
+    );
     let mut config = config.clone();
     add_worktree_policy(&mut config, worktree);
-    if !config
-        .tools
-        .enabled
-        .iter()
-        .any(|tool| tool == "github_issue")
-    {
-        config.tools.enabled.push("github_issue".to_owned());
-    }
+    let model = model.into_model_config(
+        ReasoningEffort::Xhigh,
+        Some(FACTORY_AGENT_MAX_INPUT_TOKENS),
+        Some(FACTORY_AGENT_MAX_OUTPUT_TOKENS),
+    );
+    config.models.default = Some(ModelSlot::Inline(model.clone()));
+    config.models.small = Some(model.clone());
+    config.models.subagent = Some(ModelSlot::Inline(model));
+    add_enabled_tool(&mut config, "github_issue");
     let resources = ResourceCompiler::from_config(&config).compile().await?;
     let harness = Halter::builder()
         .with_config(config)
@@ -1249,7 +1386,7 @@ async fn build_judge_harness(
         .with_tool(issue_tool)
         .build()
         .await?;
-    info!("built model judge harness");
+    info!(panel_id, "built panel harness");
     Ok(harness)
 }
 
@@ -1269,7 +1406,11 @@ async fn build_model_harness(
     );
     let mut config = config.clone();
     add_worktree_policy(&mut config, worktree);
-    let model = model.into_model_config(reasoning, Some(230_000), Some(16_384));
+    let model = model.into_model_config(
+        reasoning,
+        Some(FACTORY_AGENT_MAX_INPUT_TOKENS),
+        Some(FACTORY_AGENT_MAX_OUTPUT_TOKENS),
+    );
     config.models.default = Some(ModelSlot::Inline(model.clone()));
     config.models.small = Some(model.clone());
     config.models.subagent = Some(ModelSlot::Inline(model));
@@ -1277,6 +1418,12 @@ async fn build_model_harness(
     let harness = Halter::from_compiled_resources(config, resources).await?;
     info!(role, "built model harness");
     Ok(harness)
+}
+
+fn add_enabled_tool(config: &mut HarnessConfig, name: &str) {
+    if !config.tools.enabled.iter().any(|tool| tool == name) {
+        config.tools.enabled.push(name.to_owned());
+    }
 }
 
 async fn shutdown_all<'a>(harnesses: impl IntoIterator<Item = &'a Halter>) {
@@ -1441,6 +1588,33 @@ impl FactorySystemPrompt {
             Self::Coding => prompts::coding_agent_prompt_segment(),
         }
     }
+}
+
+async fn create_default_session(
+    harness: &Halter,
+    worktree: &Path,
+    project_system_prompt: Option<&str>,
+) -> anyhow::Result<HalterSession> {
+    let mut init = SessionInit {
+        working_dir: worktree.to_path_buf(),
+        system_prompt_seed: vec![FactorySystemPrompt::General.segment()],
+        ..SessionInit::default()
+    };
+    if let Some(segment) = project_guidance_prompt_segment(project_system_prompt) {
+        init.system_prompt_seed.push(segment);
+    }
+    init.system_prompt_seed
+        .push(default_decision_session_prompt_segment());
+    harness
+        .new_session(init)
+        .await
+        .context("failed to create default decision session")
+}
+
+fn default_decision_session_prompt_segment() -> PromptSegment {
+    append_prompt_segment(
+        "You are the default software-factory decision session. For panel synthesis turns, call the rank_responses tool before writing the final decision. Keep model names out of user-facing reasoning; refer to panel responses by their provided panel ids.",
+    )
 }
 
 fn session_init_with_appended_context(
@@ -1644,12 +1818,56 @@ async fn run_agent_with_prompt_kind(
             max_turns,
         )?)
         .await?;
+    let run = run_session_turn(
+        &session,
+        label,
+        Turn::user(FACTORY_TURN_USER_MESSAGE),
+        text_requirement,
+        None,
+    )
+    .await;
+    info!(stage = label, "shutting down agent session");
+    session.shutdown(label).await?;
+    run
+}
+
+async fn run_existing_session_with_required_tool(
+    session: &HalterSession,
+    label: &str,
+    prompt: impl Into<String>,
+) -> anyhow::Result<AgentRun> {
+    let prompt = prompt.into();
+    info!(
+        stage = label,
+        prompt_bytes = prompt.len(),
+        required_tool = RANK_RESPONSES_TOOL,
+        "starting default session turn"
+    );
+    run_session_turn(
+        session,
+        label,
+        Turn::user(prompt),
+        AgentTextRequirement::Required,
+        Some(RANK_RESPONSES_TOOL),
+    )
+    .await
+}
+
+async fn run_session_turn(
+    session: &HalterSession,
+    label: &str,
+    turn: Turn,
+    text_requirement: AgentTextRequirement,
+    required_tool: Option<&str>,
+) -> anyhow::Result<AgentRun> {
     let mut events = session
-        .submit_turn(Turn::user(FACTORY_TURN_USER_MESSAGE))
-        .await?;
+        .submit_turn(turn)
+        .await
+        .with_context(|| format!("failed to start agent stage {label}"))?;
     let mut latest_text = None;
     let mut delta_text = String::new();
     let mut usage = Usage::default();
+    let mut required_tool_completed_count = 0usize;
 
     while let Some(event) = events.next().await {
         let event =
@@ -1731,6 +1949,9 @@ async fn run_agent_with_prompt_kind(
                 let call_id = outcome.call.id;
                 match outcome.result {
                     Ok(result) => {
+                        if required_tool.is_some_and(|required| tool.0.as_str() == required) {
+                            required_tool_completed_count += 1;
+                        }
                         info!(
                             stage = label,
                             tool = %tool,
@@ -1797,7 +2018,6 @@ async fn run_agent_with_prompt_kind(
                     error = %error,
                     "agent turn failed"
                 );
-                let _ = session.shutdown("turn_failed").await;
                 return Err(anyhow::Error::new(AgentStageTurnFailure {
                     label: label.to_owned(),
                     error,
@@ -1815,8 +2035,13 @@ async fn run_agent_with_prompt_kind(
         }
     }
 
-    info!(stage = label, "shutting down agent session");
-    session.shutdown(label).await?;
+    if let Some(tool) = required_tool {
+        match required_tool_completed_count {
+            1 => {}
+            0 => bail!("agent stage {label} did not complete required tool `{tool}`"),
+            count => bail!("agent stage {label} completed required tool `{tool}` {count} times"),
+        }
+    }
     let run = agent_run_from_text(label, latest_text, delta_text, text_requirement)?;
     if text_requirement == AgentTextRequirement::Optional && run.text.is_empty() {
         info!(
@@ -1856,130 +2081,270 @@ fn agent_run_from_text(
     }
 }
 
-async fn propose_issue_candidates(
-    glm: &Halter,
+async fn run_panel_prompt(
+    panels: &[PanelHarness],
     worktree: &Path,
-    repo: &RepoSlug,
-    corpus: &str,
+    stage: &str,
+    prompt: String,
     project_system_prompt: Option<&str>,
-) -> anyhow::Result<CandidateSet> {
-    let prompt = format!(
-        r#"You are triaging open GitHub issues for {repo}.
+) -> anyhow::Result<Vec<PanelResponse>> {
+    let futures = panels.iter().map(|panel| {
+        let prompt = prompt.clone();
+        async move {
+            let label = format!("{stage} {}", panel.id);
+            let result = run_agent_with_system_prompt(
+                &panel.harness,
+                worktree,
+                &label,
+                prompt,
+                project_system_prompt,
+            )
+            .await;
+            (panel.id.clone(), result)
+        }
+    });
 
-Read the entire issue corpus and identify up to 3 excellent groups of open issues that can be solved holistically with one elegant pull request. Do not design the implementation. Prefer groups that:
-- clearly share one root cause or cohesive code path
-- can be solved without more maintainer input
-- are likely contained enough for one PR
-- avoid speculative feature work
-
-If there are not enough good groups, choose individual open issues that are straightforward, contained, and do not need maintainer input.
-
-{JSON_ONLY_OUTPUT_RULE} Use this shape:
-{{
-  "candidates": [
-    {{
-      "title": "short candidate name",
-      "issue_numbers": [123],
-      "rationale": "why this is cohesive and suitable",
-      "maintainer_input_risk": "why this does not need maintainer input"
-    }}
-  ]
-}}
-
-ISSUE CORPUS:
-{corpus}
-"#
-    );
-    let raw = run_agent_with_system_prompt(
-        glm,
-        worktree,
-        "glm issue grouping",
-        prompt,
-        project_system_prompt,
-    )
-    .await?
-    .text;
-    let candidates: CandidateSet = parse_json_response(&raw).map_err(anyhow::Error::msg)?;
-    if candidates.candidates.is_empty() {
-        bail!("GLM did not return any candidate issue groups");
+    let mut responses = Vec::new();
+    for (id, result) in join_all(futures).await {
+        match result {
+            Ok(run) if !run.text.trim().is_empty() => {
+                responses.push(PanelResponse { id, text: run.text });
+            }
+            Ok(_) => {
+                warn!(stage, panel_id = %id, "panel produced empty output; skipping");
+            }
+            Err(error) => {
+                warn!(stage, panel_id = %id, error = %error, "panel failed; continuing");
+            }
+        }
     }
-    Ok(candidates)
+
+    ensure_panel_responses(stage, &responses).map_err(anyhow::Error::msg)?;
+    Ok(responses)
 }
 
-async fn judge_issue_plan(
-    judge: &Halter,
+async fn select_issue_with_panel_decision(
+    panels: &[PanelHarness],
+    default_session: &HalterSession,
     worktree: &Path,
     repo: &RepoSlug,
     corpus: &str,
-    candidates: &CandidateSet,
-    implementation_plan_path: &str,
+    requested_issue: Option<u64>,
     project_system_prompt: Option<&str>,
-) -> anyhow::Result<JudgeSelection> {
-    let candidates_json = serde_json::to_string_pretty(candidates)?;
-    let prompt = format!(
-        r#"You are a model-judge planning group for a software factory workflow targeting {repo}.
-
-The full open-issue corpus is provided below (each issue body is capped at roughly 1k tokens). A prior model also proposed candidate issue groups as a first pass. You have everything you need to decide immediately. Work through these steps in order:
-
-1. Group alike issues. Use the corpus and the candidate proposals to cluster issues that share one root cause or cohesive code path; refine or discard the proposals as needed.
-2. Narrow the groups and individual issues down to the strongest, most contained candidates.
-3. Agree on a shortlist of at most 3 groups/issues worth working on.
-4. Select exactly one — the smallest cohesive PR you have high confidence in — and design its implementation plan.
-
-Selection rules:
-- prefer the smallest cohesive PR with high confidence
-- select only issues whose corpus state is open
-- reject any candidate that needs maintainer clarification
-- only maintainer comments are included; non-maintainer comments are intentionally omitted
-- corpus bodies are truncated, so use the `github_issue` tool to fetch the complete untruncated text of any issue before you commit to selecting it
-
-The implementation plan you write must:
-- be saved as markdown to {implementation_plan_path}
-- include selected issue numbers, scope, concrete files/modules to inspect, step-by-step changes, happy-path and sad-path tests, verification commands, and risks
-- not contain code
-
-Output protocol — follow in this exact order:
-1. Write the full plan to {implementation_plan_path} using the write tool.
-2. Confirm the file is non-empty.
-3. Only then, as your FINAL message, return ONLY the JSON object below — no markdown code fences, no surrounding prose, and no plan text (the plan belongs only in the file).
-
-JSON shape:
-{{
-  "title": "PR-sized implementation title",
-  "issue_numbers": [123],
-  "notes": "judge rationale and constraints"
-}}
-
-CANDIDATE GROUPINGS (first-pass proposals to refine):
-{candidates_json}
-
-OPEN ISSUE CORPUS:
-{corpus}
-"#
-    );
-    let raw = run_agent_with_system_prompt(
-        judge,
+) -> anyhow::Result<IssueSelection> {
+    let panel_prompt = issue_selection_panel_prompt(repo, corpus, requested_issue);
+    let panel_responses = run_panel_prompt(
+        panels,
         worktree,
-        "model judge planning",
-        prompt,
+        "issue selection panel",
+        panel_prompt,
         project_system_prompt,
+    )
+    .await?;
+    let synthesis_prompt =
+        issue_selection_synthesis_prompt(repo, corpus, requested_issue, &panel_responses);
+    let raw = run_existing_session_with_required_tool(
+        default_session,
+        "issue selection synthesis",
+        synthesis_prompt,
     )
     .await?
     .text;
     parse_json_response(&raw).map_err(anyhow::Error::msg)
 }
 
-async fn read_implementation_plan(path: &Path) -> anyhow::Result<String> {
-    let plan = tokio::fs::read_to_string(path)
+async fn create_implementation_plan_with_panel_decision(
+    panels: &[PanelHarness],
+    default_session: &HalterSession,
+    worktree: &Path,
+    repo: &RepoSlug,
+    selection: &IssueSelection,
+    issues: &[IssueDoc],
+    project_system_prompt: Option<&str>,
+) -> anyhow::Result<String> {
+    let selection_json = serde_json::to_string_pretty(selection)?;
+    let selected_issues = selected_issue_details(selection, issues);
+    let panel_prompt = implementation_plan_panel_prompt(repo, &selection_json, &selected_issues);
+    let panel_responses = run_panel_prompt(
+        panels,
+        worktree,
+        "implementation planning panel",
+        panel_prompt,
+        project_system_prompt,
+    )
+    .await?;
+
+    info!("compacting default decision session before implementation plan synthesis");
+    default_session
+        .compact(
+            "before_implementation_plan_synthesis",
+            Some("Preserve the selected issue decision, selection rationale, and constraints needed for final implementation planning."),
+        )
         .await
-        .with_context(|| format!("failed to read implementation plan {}", path.display()))?;
-    if plan.trim().is_empty() {
-        bail!(
-            "failed to read implementation plan: {} is empty",
-            path.display()
-        );
+        .context("failed to compact default decision session before implementation plan synthesis")?;
+
+    let synthesis_prompt =
+        implementation_plan_synthesis_prompt(&selection_json, &selected_issues, &panel_responses);
+    let plan = run_existing_session_with_required_tool(
+        default_session,
+        "implementation plan synthesis",
+        synthesis_prompt,
+    )
+    .await?
+    .text;
+    let plan = plan.trim();
+    if plan.is_empty() {
+        bail!("implementation plan synthesis produced an empty plan");
     }
-    Ok(plan)
+    Ok(format!("{plan}\n"))
+}
+
+fn requested_issue_instruction(requested_issue: Option<u64>) -> String {
+    requested_issue.map_or_else(
+        || "No specific issue was requested; select the smallest cohesive group or single issue with high confidence.".to_owned(),
+        |number| {
+            format!(
+                "The user explicitly requested issue #{number}. Select exactly that issue unless its corpus state or full text makes it impossible to proceed without maintainer clarification."
+            )
+        },
+    )
+}
+
+fn issue_selection_panel_prompt(
+    repo: &RepoSlug,
+    corpus: &str,
+    requested_issue: Option<u64>,
+) -> String {
+    let requested = requested_issue_instruction(requested_issue);
+    format!(
+        r#"You are one independent issue-selection panelist for a software factory workflow targeting {repo}.
+
+Group alike open issues and select exactly one smallest cohesive PR-sized unit of work. Do not design the implementation plan yet.
+
+Selection rules:
+- prefer the smallest cohesive PR with high confidence
+- select only issues whose corpus state is open
+- reject any choice that needs maintainer clarification
+- only maintainer comments are included; non-maintainer comments are intentionally omitted
+- corpus bodies are truncated, so use the `github_issue` tool to fetch complete untruncated text before committing to a final selection
+- {requested}
+
+{JSON_ONLY_OUTPUT_RULE} Use this shape:
+{{
+  "title": "PR-sized implementation title",
+  "issue_numbers": [123],
+  "notes": "selection rationale and constraints"
+}}
+
+OPEN ISSUE CORPUS:
+{corpus}
+"#
+    )
+}
+
+fn issue_selection_synthesis_prompt(
+    repo: &RepoSlug,
+    corpus: &str,
+    requested_issue: Option<u64>,
+    panel_responses: &[PanelResponse],
+) -> String {
+    let requested = requested_issue_instruction(requested_issue);
+    let panel_responses = render_panel_responses(panel_responses);
+    format!(
+        r#"You are the default software-factory decision session for {repo}.
+
+You have independent panel responses for issue grouping and selection. Follow this workflow exactly:
+1. Call the `rank_responses` tool exactly once, ranking every panel response by `model_id`.
+2. After the tool result is returned, synthesize and judge the panel responses.
+3. Return the final issue selection JSON only.
+
+Selection rules:
+- prefer the smallest cohesive PR with high confidence
+- select only issues whose corpus state is open
+- reject any choice that needs maintainer clarification
+- only maintainer comments are included; non-maintainer comments are intentionally omitted
+- use the issue corpus as the source of truth if panel responses disagree
+- {requested}
+
+{JSON_ONLY_OUTPUT_RULE} Use this shape:
+{{
+  "title": "PR-sized implementation title",
+  "issue_numbers": [123],
+  "notes": "selection rationale and constraints"
+}}
+
+PANEL RESPONSES:
+{panel_responses}
+
+OPEN ISSUE CORPUS:
+{corpus}
+"#
+    )
+}
+
+fn implementation_plan_panel_prompt(
+    repo: &RepoSlug,
+    selection_json: &str,
+    selected_issues: &str,
+) -> String {
+    format!(
+        r#"You are one independent implementation-planning panelist for a software factory workflow targeting {repo}.
+
+The default decision session selected the work below. Create a concrete implementation plan for that selected work only. Inspect the repository with tools as needed. Do not edit files, commit, push, or open a PR.
+
+The plan must:
+- include selected issue numbers and scope
+- name concrete files/modules to inspect or change
+- describe step-by-step changes
+- include happy-path and sad-path tests
+- include verification commands
+- call out risks and ambiguity
+- avoid code snippets
+
+Return markdown only.
+
+SELECTED WORK:
+{selection_json}
+
+SELECTED ISSUE DETAILS:
+{selected_issues}
+"#
+    )
+}
+
+fn implementation_plan_synthesis_prompt(
+    selection_json: &str,
+    selected_issues: &str,
+    panel_responses: &[PanelResponse],
+) -> String {
+    let panel_responses = render_panel_responses(panel_responses);
+    format!(
+        r#"You are the default software-factory decision session.
+
+You have independent implementation plans for the selected work. Follow this workflow exactly:
+1. Call the `rank_responses` tool exactly once, ranking every panel plan by `model_id`.
+2. After the tool result is returned, synthesize and judge the panel plans.
+3. Write the final implementation plan as markdown only. The orchestrator will save your final markdown to {IMPLEMENTATION_PLAN_PATH}; do not use the write tool.
+
+The final plan must:
+- include selected issue numbers and scope
+- name concrete files/modules to inspect or change
+- describe step-by-step changes
+- include happy-path and sad-path tests
+- include verification commands
+- call out risks and ambiguity
+- avoid code snippets
+
+SELECTED WORK:
+{selection_json}
+
+SELECTED ISSUE DETAILS:
+{selected_issues}
+
+PANEL IMPLEMENTATION PLANS:
+{panel_responses}
+"#
+    )
 }
 
 async fn prepare_branch(
@@ -1988,7 +2353,7 @@ async fn prepare_branch(
     requested_branch: Option<&str>,
     allow_dirty: bool,
     repo: &RepoSlug,
-    selection: &JudgeSelection,
+    selection: &IssueSelection,
     excluded_dirty_paths: &[&str],
     run_id: &str,
 ) -> anyhow::Result<String> {
@@ -2021,7 +2386,7 @@ async fn implement_plan(
     implementer: &Halter,
     worktree: &Path,
     repo: &RepoSlug,
-    selection: &JudgeSelection,
+    selection: &IssueSelection,
     implementation_plan: &str,
     issues: &[IssueDoc],
     project_system_prompt: Option<&str>,
@@ -2050,7 +2415,7 @@ IMPLEMENTATION PLAN:
     run_coding_action_with_system_prompt(
         implementer,
         worktree,
-        "kimi implementation",
+        "implementation",
         prompt,
         project_system_prompt,
     )
@@ -2058,7 +2423,7 @@ IMPLEMENTATION PLAN:
     Ok(())
 }
 
-fn selected_issue_details(selection: &JudgeSelection, issues: &[IssueDoc]) -> String {
+fn selected_issue_details(selection: &IssueSelection, issues: &[IssueDoc]) -> String {
     let selected: HashSet<u64> = selected_issue_numbers(selection).into_iter().collect();
     let selected_issues = issues
         .iter()
@@ -2083,7 +2448,7 @@ fn ensure_selected_issues_are_open(
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
         bail!(
-            "failed to select work: judge selected issue(s) not present in the corpus: {}",
+            "failed to select work: selected issue(s) not present in the corpus: {}",
             unknown.join(", ")
         );
     }
@@ -2100,7 +2465,7 @@ fn ensure_selected_issues_are_open(
         .collect::<Vec<_>>();
     if !closed.is_empty() {
         bail!(
-            "failed to select work: judge selected non-open issue(s): {}",
+            "failed to select work: selected non-open issue(s): {}",
             closed.join(", ")
         );
     }
@@ -2153,7 +2518,7 @@ async fn run_review_loop(
         run_coding_action_with_system_prompt(
             implementer,
             worktree,
-            "kimi review repair",
+            "review repair",
             prompt,
             project_system_prompt,
         )
@@ -2275,7 +2640,7 @@ async fn draft_pr(
     pr_writer: &Halter,
     worktree: &Path,
     repo: &RepoSlug,
-    selection: &JudgeSelection,
+    selection: &IssueSelection,
     implementation_plan: &str,
     issue_numbers: &[u64],
     diff: &str,
@@ -2316,7 +2681,7 @@ FINAL BRANCH DIFF:
     let raw = run_agent_with_system_prompt(
         pr_writer,
         worktree,
-        "gemma pr draft",
+        "pull request draft",
         prompt,
         project_system_prompt,
     )
@@ -2327,7 +2692,7 @@ FINAL BRANCH DIFF:
 
 struct MonitorContext<'a> {
     github: &'a GitHubClient,
-    glm: &'a Halter,
+    default_harness: &'a Halter,
     implementer: &'a Halter,
     reviewer: &'a Halter,
     worktree: &'a Path,
@@ -2335,7 +2700,7 @@ struct MonitorContext<'a> {
     pr_number: u64,
     branch: &'a str,
     base_ref: &'a str,
-    selection: &'a JudgeSelection,
+    selection: &'a IssueSelection,
     implementation_plan: &'a str,
     project_system_prompt: Option<&'a str>,
     excluded_commit_paths: &'a [&'a str],
@@ -2418,7 +2783,7 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
         if !action.plsfix_comments.is_empty() {
             let comments = action.plsfix_comments.join("\n\n---\n\n");
             let instruction = refine_plsfix_comments(
-                ctx.glm,
+                ctx.default_harness,
                 ctx.worktree,
                 ctx.selection,
                 ctx.implementation_plan,
@@ -2451,9 +2816,9 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
 }
 
 async fn refine_plsfix_comments(
-    glm: &Halter,
+    default_harness: &Halter,
     worktree: &Path,
-    selection: &JudgeSelection,
+    selection: &IssueSelection,
     implementation_plan: &str,
     comments: &str,
     project_system_prompt: Option<&str>,
@@ -2475,9 +2840,9 @@ IMPLEMENTATION PLAN:
         serde_json::to_string_pretty(selection)?
     );
     Ok(run_agent_with_system_prompt(
-        glm,
+        default_harness,
         worktree,
-        "glm plsfix refinement",
+        "feedback refinement",
         prompt,
         project_system_prompt,
     )
@@ -2514,7 +2879,7 @@ FEEDBACK:
     run_coding_action_with_system_prompt(
         implementer,
         worktree,
-        "kimi pr feedback",
+        "pr feedback implementation",
         prompt,
         project_system_prompt,
     )
@@ -3140,11 +3505,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_factory_config_matches_judge_example_tool_and_shell_lists() {
+    fn default_factory_config_matches_factory_tool_shell_and_default_model_settings() {
         let config = default_factory_config();
-        assert_eq!(config.tools.enabled, judge_example_tools());
-        assert_eq!(config.policy.shell.allow, judge_example_shell_allowlist());
+        assert_eq!(config.tools.enabled, factory_example_tools());
+        assert_eq!(config.policy.shell.allow, factory_example_shell_allowlist());
         assert!(config.policy.network.enabled);
+        assert_eq!(
+            config.context.compaction_threshold,
+            DEFAULT_SESSION_COMPACTION_THRESHOLD
+        );
+        let expected_default_model = ModelSpec::parse(DEFAULT_MODEL_SPEC)
+            .expect("valid default model")
+            .model;
+        assert!(matches!(
+            config.models.default,
+            Some(ModelSlot::Inline(ref model)) if model.model == expected_default_model
+        ));
         assert!(
             config.models.subagent.is_some_and(|slot| matches!(
                 slot,
@@ -3333,6 +3709,99 @@ mod tests {
             assert_eq!(tool_result_kind(&result), expected_kind);
             assert_eq!(tool_result_size(&result), expected_size);
         }
+    }
+
+    #[test]
+    fn rank_response_count_covers_success_and_error_cases() {
+        let valid = json!({
+            "rankings": [
+                { "model_id": "panel-1", "rank": 1 },
+                { "model_id": "panel-2", "rank": 2 }
+            ]
+        });
+        assert_eq!(rank_response_count(&valid).expect("valid rankings"), 2);
+
+        let cases = [
+            ("missing rankings", json!({}), "rankings must be an array"),
+            (
+                "empty rankings",
+                json!({ "rankings": [] }),
+                "rankings must not be empty",
+            ),
+            (
+                "blank model id",
+                json!({ "rankings": [{ "model_id": " ", "rank": 1 }] }),
+                "model_id",
+            ),
+            (
+                "missing rank",
+                json!({ "rankings": [{ "model_id": "panel-1" }] }),
+                "positive rank",
+            ),
+            (
+                "zero rank",
+                json!({ "rankings": [{ "model_id": "panel-1", "rank": 0 }] }),
+                "positive rank",
+            ),
+            (
+                "duplicate model id",
+                json!({
+                    "rankings": [
+                        { "model_id": "panel-1", "rank": 1 },
+                        { "model_id": "panel-1", "rank": 2 }
+                    ]
+                }),
+                "appears more than once",
+            ),
+            (
+                "duplicate rank",
+                json!({
+                    "rankings": [
+                        { "model_id": "panel-1", "rank": 1 },
+                        { "model_id": "panel-2", "rank": 1 }
+                    ]
+                }),
+                "rank 1 appears more than once",
+            ),
+        ];
+
+        for (name, input, expected) in cases {
+            let error = rank_response_count(&input).expect_err(name);
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn synthesis_prompts_require_ranking_tool_and_use_panel_ids() {
+        let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        let responses = vec![PanelResponse {
+            id: "panel-1".to_owned(),
+            text: "Select issue #7 because it is contained.".to_owned(),
+        }];
+
+        let issue_prompt = issue_selection_synthesis_prompt(&repo, "ISSUE #7", Some(7), &responses);
+        assert!(issue_prompt.contains(RANK_RESPONSES_TOOL));
+        assert!(issue_prompt.contains("model_id: panel-1"));
+        assert!(issue_prompt.contains("issue #7"));
+        assert!(issue_prompt.contains("Return ONLY the JSON object"));
+
+        let plan_prompt = implementation_plan_synthesis_prompt(
+            "{\"issue_numbers\":[7]}",
+            "Issue details",
+            &responses,
+        );
+        assert!(plan_prompt.contains(RANK_RESPONSES_TOOL));
+        assert!(plan_prompt.contains("model_id: panel-1"));
+        assert!(plan_prompt.contains(IMPLEMENTATION_PLAN_PATH));
+        assert!(plan_prompt.contains("markdown only"));
+    }
+
+    #[test]
+    fn requested_issue_instruction_covers_absent_and_explicit_issue() {
+        assert!(requested_issue_instruction(None).contains("No specific issue was requested"));
+        let explicit = requested_issue_instruction(Some(42));
+        assert!(explicit.contains("#42"));
+        assert!(explicit.contains("Select exactly that issue"));
     }
 
     #[tokio::test]
@@ -3633,14 +4102,14 @@ mod tests {
     #[test]
     fn agent_stage_turn_failure_display_and_retry_metadata_match() {
         let retryable = AgentStageTurnFailure {
-            label: "kimi implementation".to_owned(),
+            label: "implementation".to_owned(),
             error: "provider overloaded".to_owned(),
             retryable: false,
             cancelled: false,
         };
         assert_eq!(
             retryable.to_string(),
-            "agent stage kimi implementation failed: provider overloaded"
+            "agent stage implementation failed: provider overloaded"
         );
         assert!(retryable.should_retry());
 
@@ -3658,7 +4127,6 @@ mod tests {
         validate_checkpoint_for_run(&valid, &repo, "main", Some(7), false)
             .expect("valid checkpoint");
         let mut completed = valid.clone();
-        completed.candidates = Some(sample_candidates());
         completed.selection = Some(sample_selection());
         completed.implementation_plan = Some("plan".to_owned());
         completed.branch = Some("factory/test".to_owned());
@@ -3715,13 +4183,6 @@ mod tests {
         }
 
         let cases = [
-            Case {
-                name: "selection without candidates",
-                mutate: Box::new(|checkpoint| {
-                    checkpoint.selection = Some(sample_selection());
-                }),
-                expected: "selection",
-            },
             Case {
                 name: "plan without selection",
                 mutate: Box::new(|checkpoint| {
@@ -4065,19 +4526,8 @@ mod tests {
         );
     }
 
-    fn sample_candidates() -> CandidateSet {
-        CandidateSet {
-            candidates: vec![crate::core::IssueCandidate {
-                title: "Fix issue".to_owned(),
-                issue_numbers: vec![7],
-                rationale: "selected".to_owned(),
-                maintainer_input_risk: "low".to_owned(),
-            }],
-        }
-    }
-
-    fn sample_selection() -> JudgeSelection {
-        JudgeSelection {
+    fn sample_selection() -> IssueSelection {
+        IssueSelection {
             title: "Fix issue".to_owned(),
             issue_numbers: vec![7],
             notes: "notes".to_owned(),
