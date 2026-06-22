@@ -597,3 +597,152 @@ async fn ac1_14_nonexistent_read_root_is_surfaced_not_silently_dropped() {
         other => panic!("expected NonexistentRoot, got {other:?}"),
     }
 }
+
+// ------------- Issue #115: sensitive-path glob set cache
+
+#[tokio::test]
+async fn default_policy_compiles_lazily() {
+    let policy = DefaultToolPolicy::new(PolicySettings::default());
+    let err = policy
+        .check_read_path(std::path::Path::new("/etc/shadow"), 16)
+        .await
+        .expect_err("shadow read before initialization must be denied");
+    assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
+}
+
+#[tokio::test]
+async fn custom_sensitive_pattern_cached_and_enforced() {
+    let dir = TempDir::new().expect("tempdir");
+    let target_secret = dir.path().join(".custom_secret");
+    std::fs::write(&target_secret, "secret").unwrap();
+    let target_normal = dir.path().join("plain.txt");
+    std::fs::write(&target_normal, "plain").unwrap();
+
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        allowed_read_roots: vec![dir.path().to_path_buf()],
+        allowed_write_roots: vec![dir.path().to_path_buf()],
+        sensitive_path_patterns: vec!["**/.custom_secret".to_owned()],
+        ..PolicySettings::default()
+    });
+
+    // First denial populates the cache.
+    let err = policy
+        .check_read_path(&target_secret, 6)
+        .await
+        .expect_err("custom sensitive file must be denied");
+    assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
+
+    // Subsequent checks reuse the cached glob set and still deny.
+    for _ in 0..3 {
+        let err = policy
+            .check_read_path(&target_secret, 6)
+            .await
+            .expect_err("cached custom sensitive file must still be denied");
+        assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
+    }
+
+    // Non-sensitive file is unaffected.
+    policy
+        .check_read_path(&target_normal, 5)
+        .await
+        .expect("non-sensitive file under allowed root must succeed");
+}
+
+#[tokio::test]
+async fn empty_patterns_allow_all() {
+    let dir = TempDir::new().expect("tempdir");
+    let target = dir.path().join("anything.txt");
+    std::fs::write(&target, "any").unwrap();
+
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        allowed_read_roots: vec![dir.path().to_path_buf()],
+        allowed_write_roots: vec![dir.path().to_path_buf()],
+        sensitive_path_patterns: vec![],
+        ..PolicySettings::default()
+    });
+
+    policy
+        .check_read_path(&target, 3)
+        .await
+        .expect("empty sensitive patterns must not deny reads");
+}
+
+#[tokio::test]
+async fn invalid_pattern_surfaces_on_check() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        sensitive_path_patterns: vec!["[z-a".to_owned()],
+        ..PolicySettings::default()
+    });
+
+    for _ in 0..2 {
+        let err = policy
+            .check_read_path(std::path::Path::new("/etc/shadow"), 16)
+            .await
+            .expect_err("malformed pattern must surface as invalid_pattern");
+        assert!(
+            matches!(
+                err,
+                PolicyError::SensitivePathDenied {
+                    rule: "invalid_pattern",
+                    ..
+                }
+            ),
+            "expected invalid_pattern, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn clone_preserves_cache_semantics() {
+    let dir = TempDir::new().expect("tempdir");
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        allowed_read_roots: vec![dir.path().to_path_buf()],
+        allowed_write_roots: vec![dir.path().to_path_buf()],
+        ..PolicySettings::default()
+    });
+
+    // Clone before initialization; each instance lazily compiles independently.
+    let cloned_uninit = policy.clone();
+    let err = cloned_uninit
+        .check_read_path(std::path::Path::new("/etc/shadow"), 16)
+        .await
+        .expect_err("clone before init must still deny sensitive path");
+    assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
+
+    // Force initialization of the original policy.
+    let _ = policy
+        .check_read_path(std::path::Path::new("/etc/shadow"), 16)
+        .await;
+
+    // Cloning an initialized policy copies the compiled glob set.
+    let cloned_init = policy.clone();
+    let err = cloned_init
+        .check_read_path(std::path::Path::new("/etc/shadow"), 16)
+        .await
+        .expect_err("clone after init must deny sensitive path");
+    assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_sensitive_checks_are_safe() {
+    use std::sync::Arc;
+
+    let policy = Arc::new(DefaultToolPolicy::new(PolicySettings::default()));
+    let mut handles = Vec::new();
+
+    for _ in 0..8 {
+        let p = Arc::clone(&policy);
+        handles.push(tokio::spawn(async move {
+            p.check_read_path(std::path::Path::new("/etc/shadow"), 16)
+                .await
+        }));
+    }
+
+    for handle in handles {
+        let err = handle
+            .await
+            .expect("task joined")
+            .expect_err("concurrent sensitive path must be denied");
+        assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
+    }
+}
