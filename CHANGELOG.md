@@ -133,6 +133,10 @@ matrix".
 - SQLite migration table has a compile-time strict-monotonicity
   assertion; silently-skipped entries in an unsorted future table are
   now a build error.
+- CLI noisy-target log suppressions now layer *under* the user's
+  `RUST_LOG` filter instead of overriding it; an explicit
+  `RUST_LOG=hyper=trace` is honored while `RUST_LOG=debug` still
+  suppresses noisy targets to `warn`. (#99)
 
 ### Known follow-ups (not blocking this branch)
 
