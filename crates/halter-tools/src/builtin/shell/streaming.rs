@@ -12,7 +12,10 @@ use crate::{ToolEventSink, ToolRuntimeEvent};
 const REPLACEMENT: &str = "\u{FFFD}";
 const BUFFER_SIZE: usize = 65_536;
 const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
-const TRUNCATION_NOTICE: &str = "\n[output truncated after 1048576 bytes]\n";
+
+fn truncation_notice() -> String {
+    format!("\n[output truncated after {} bytes]\n", OUTPUT_CAP_BYTES)
+}
 
 pub async fn collect_output(
     reader: fs::File,
@@ -165,10 +168,11 @@ fn emit_chunk(
     }
 
     if emitted.len() < original_len {
-        collected.push_str(TRUNCATION_NOTICE);
+        let notice = truncation_notice();
+        collected.push_str(&notice);
         emit.emit(ToolRuntimeEvent::ToolOutput {
             tool_name: tool_name.to_owned(),
-            chunk: TRUNCATION_NOTICE.to_owned(),
+            chunk: notice,
         });
         *truncated = true;
     }
@@ -250,4 +254,22 @@ pub fn pipe_to_files(label: &str) -> anyhow::Result<(fs::File, fs::File)> {
     };
 
     Ok((reader, writer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_notice_derived_from_output_cap() {
+        let expected = format!("\n[output truncated after {} bytes]\n", OUTPUT_CAP_BYTES);
+        assert_eq!(truncation_notice(), expected);
+    }
+
+    #[test]
+    fn truncation_notice_contains_byte_count() {
+        let notice = truncation_notice();
+        assert!(!notice.is_empty());
+        assert!(notice.contains(&OUTPUT_CAP_BYTES.to_string()));
+    }
 }
