@@ -1,9 +1,9 @@
 // pattern: Imperative Shell
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::fs;
 
 use anyhow::Context;
 use halter_config::HarnessConfig;
