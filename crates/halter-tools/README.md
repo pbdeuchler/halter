@@ -162,6 +162,11 @@ generated worktrees.
 
 This is the main security and operability boundary for tool use.
 
+`DefaultToolPolicy` compiles `sensitive_path_patterns` into a `globset::GlobSet`
+lazily on the first check and caches it for the lifetime of the policy
+instance. This avoids rebuilding the set on every read/write authorization
+without changing the observable error surface.
+
 `ToolPolicy` exposes a capability-oriented surface
 (`check_read_path`, `check_write_path`, `check_process_signal`,
 `check_shell_enabled`, `check_shell_command_strict`, `check_network`,

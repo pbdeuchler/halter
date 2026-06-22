@@ -13,6 +13,7 @@
 use std::io::Cursor;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use brush_parser::{Parser, ParserOptions, SourceInfo, ast};
@@ -192,13 +193,20 @@ pub trait ToolPolicy: Send + Sync {
 /// Default tool policy implementation.
 pub struct DefaultToolPolicy {
     settings: PolicySettings,
+    sensitive_glob_set: OnceLock<GlobSet>,
 }
 
 impl DefaultToolPolicy {
     /// Build a policy from explicit settings.
+    ///
+    /// The sensitive-path glob set is compiled lazily on the first check that
+    /// needs it and then cached for the lifetime of this policy.
     #[must_use]
     pub fn new(settings: PolicySettings) -> Self {
-        Self { settings }
+        Self {
+            settings,
+            sensitive_glob_set: OnceLock::new(),
+        }
     }
 
     /// Borrow the underlying policy settings.
@@ -215,7 +223,11 @@ impl DefaultToolPolicy {
         }
     }
 
-    fn sensitive_glob_set(&self) -> Result<GlobSet, PolicyError> {
+    fn sensitive_glob_set(&self) -> Result<&GlobSet, PolicyError> {
+        if let Some(set) = self.sensitive_glob_set.get() {
+            return Ok(set);
+        }
+
         let mut builder = GlobSetBuilder::new();
         for pattern in &self.settings.sensitive_path_patterns {
             let glob = Glob::new(pattern).map_err(|_| PolicyError::SensitivePathDenied {
@@ -224,12 +236,17 @@ impl DefaultToolPolicy {
             })?;
             builder.add(glob);
         }
-        builder
+        let set = builder
             .build()
             .map_err(|_| PolicyError::SensitivePathDenied {
                 attempted: PathBuf::new(),
                 rule: "invalid_pattern_set",
-            })
+            })?;
+
+        // If multiple threads race here, all builds use the same inputs and
+        // produce the same set; dropping a loser is harmless.
+        let _ = self.sensitive_glob_set.set(set);
+        Ok(self.sensitive_glob_set.get().expect("just initialized"))
     }
 
     fn canonical_read_roots(&self) -> Result<Vec<PathBuf>, PolicyError> {
