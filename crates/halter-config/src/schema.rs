@@ -931,6 +931,8 @@ fn default_shell_allowlist() -> Vec<String> {
         "rg".to_owned(),
         "ls".to_owned(),
         "find".to_owned(),
+        "true".to_owned(),
+        "cd".to_owned(),
     ]
 }
 
@@ -1075,6 +1077,14 @@ mod tests {
                 .to_string()
                 .contains("invalid configuration: [models.default] is required")
         );
+    }
+
+    #[test]
+    fn shell_policy_defaults_allow_basic_noop_and_directory_change_commands() {
+        let shell = ShellPolicyConfig::default();
+
+        assert!(shell.allow.iter().any(|command| command == "true"));
+        assert!(shell.allow.iter().any(|command| command == "cd"));
     }
 
     #[test]

@@ -92,6 +92,8 @@ impl Default for PolicySettings {
                 "rg".to_owned(),
                 "ls".to_owned(),
                 "find".to_owned(),
+                "true".to_owned(),
+                "cd".to_owned(),
             ],
             shell_timeout_secs: 30,
             network_enabled: false,

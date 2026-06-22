@@ -5,7 +5,7 @@ into an implementation pull request. It is intentionally write-capable: it can
 create a branch, edit files, run commands, commit, push, and open a PR.
 
 The example is useful when you want to see Halter used as an embedded Rust
-runtime instead of as a CLI wrapper. It builds several model-specific harnesses,
+runtime instead of as a CLI wrapper. It builds several role-specific harnesses,
 adds a custom GitHub issue tool, streams canonical session events, persists
 checkpoint state, and coordinates a multi-stage coding workflow.
 
@@ -23,15 +23,19 @@ The command runs this workflow:
 2. Read project guidance from top-level `CLAUDE.md`, `AGENTS.md`, and `SOUL.md`
    files when they exist.
 3. Fetch recent open GitHub issues, or fetch one issue when `--issue` is set.
-4. Build issue candidates. With `--issue`, the requested issue becomes the
-   candidate set. Without it, a model proposes up to three issue groups.
-5. Ask a model-judge harness to select the smallest high-confidence unit of work.
-6. Write an implementation plan to
+4. Ask three fresh panel sessions to propose issue groupings/selections, then
+   ask the persistent default session to rank the panel outputs and choose the
+   smallest high-confidence unit of work.
+5. Ask three fresh panel sessions to draft implementation plans for that
+   selection, compact the default session, then ask it to rank the plans and
+   synthesize the final implementation plan.
+6. Write the final implementation plan to
    `.halter/software-factory/implementation-plan.md`.
 7. Create a branch from the base branch.
 8. Run an implementation agent.
-9. Run a reviewer agent against the branch diff and ask the implementation agent
-   to repair findings until the review is clean or the iteration limit is hit.
+9. Run a reviewer agent that inspects the branch changes and ask the
+   implementation agent to repair findings until the review is clean or the
+   iteration limit is hit.
 10. Commit, push, draft a PR body, and open the PR.
 11. With `--monitor`, poll the PR for maintainer review feedback and maintainer
     `/plsfix` comments, apply requested fixes, commit, and push again until the
@@ -147,12 +151,12 @@ Model options use `provider/model` form, where `provider` is `openai`,
 
 | option | default |
 | --- | --- |
-| `--glm-model` | `openrouter/z-ai/glm-5.2` |
-| `--implementer-model` | `openrouter/moonshotai/kimi-k2.7-code` |
-| `--reviewer-model` | `openai/gpt-5.5` |
-| `--pr-model` | `openrouter/google/gemma-4-31b-it` |
+| `--default-model` | `openrouter/z-ai/glm-5.2` |
+| `--implementation-model` | `openrouter/moonshotai/kimi-k2.7-code` |
+| `--review-model` | `openrouter/z-ai/glm-5.2` |
+| `--pull-request-model` | `openrouter/google/gemma-4-31b-it` |
 
-The model-judge panel is configured in `default_factory_config()` in
+The issue-selection and implementation-planning panel models are centralized in
 `src/main.rs`.
 
 ## state and resume
@@ -160,8 +164,8 @@ The model-judge panel is configured in `default_factory_config()` in
 The workflow checkpoints after each major stage:
 
 - issue corpus loaded
-- candidate set proposed
-- judge selection and implementation plan written
+- issue selection written
+- implementation plan written
 - branch prepared
 - implementation complete
 - review loop complete
@@ -223,15 +227,18 @@ The code is split by side-effect boundary:
 
 The example builds separate harnesses for separate jobs:
 
-- GLM: issue grouping and `/plsfix` refinement.
-- Model judge: issue selection and implementation planning.
-- Implementer: code changes and repair work.
-- Reviewer: branch-diff review.
+- Default decision session: panel synthesis, issue selection, implementation
+  plan synthesis, and `/plsfix` refinement.
+- Planning panels: independent issue-selection and implementation-plan drafts.
+- Implementation: code changes and repair work.
+- Reviewer: branch review.
 - PR writer: PR title and body drafting.
 
-The judge harness registers a custom `github_issue` tool. The tool lets the
-judge fetch full issue text for issues already present in the current issue
-corpus, while still keeping selection bounded to the issues the workflow loaded.
+The planning and default-decision harnesses register a custom `github_issue`
+tool. The tool lets them fetch full issue text for issues already present in the
+current issue corpus, while still keeping selection bounded to the issues the
+workflow loaded. The default-decision harness also registers `rank_responses`,
+and each synthesis turn must call it before returning the final decision.
 
 All agent turns consume `SessionEventPayload` events. The runner logs tool
 starts, tool results, warnings, hook runs, compaction, usage, failures, and lagged

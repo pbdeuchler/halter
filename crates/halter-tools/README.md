@@ -146,7 +146,7 @@ Defaults:
 - `max_read_bytes = 1_048_576`
 - shell enabled = `true`
 - `shell_mode = Strict` (rejects `eval`, `exec`, `source`, `.`, and function definitions at the AST level)
-- shell allowlist = `git`, `cargo`, `rg`, `ls`, `find`
+- shell allowlist = `git`, `cargo`, `rg`, `ls`, `find`, `true`, `cd`
 - shell timeout = `30`
 - network enabled = `false`
 - `allowed_loopback = []` (loopback addresses require an explicit entry to be reached)
@@ -790,7 +790,7 @@ max_concurrent_subagents = 2
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find"]
+allow = ["git", "cargo", "rg", "ls", "find", "true", "cd"]
 timeout_secs = 20
 ```
 
@@ -811,7 +811,7 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "python", "echo"]
+allow = ["git", "cargo", "rg", "ls", "find", "true", "cd", "python", "echo"]
 timeout_secs = 30
 ```
 
