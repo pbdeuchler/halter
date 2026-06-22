@@ -478,7 +478,7 @@ async fn execute_hooks(
     let (merged, conflicts) = merge_outputs(&merge_inputs);
     for conflict in conflicts {
         warn!(
-            field = conflict.field,
+            field = %conflict.field,
             winner = %conflict.winner,
             loser = %conflict.loser,
             "hooks.merge_conflict"

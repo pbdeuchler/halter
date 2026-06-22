@@ -21,8 +21,9 @@ pub use engine::{
 };
 pub use matcher::{CompiledMatcher, MatcherCompileError};
 pub use merge::{
-    HandlerPriority, HandlerPriorityGroup, HookDecision, HookMergedOutcome, HookOutput,
-    HookSpecificOutput, MergeInput, PermissionDecision, merge_outputs, summary_entries,
+    ConflictField, HandlerPriority, HandlerPriorityGroup, HookDecision, HookMergedOutcome,
+    HookOutput, HookSpecificOutput, MergeConflict, MergeInput, PermissionDecision, merge_outputs,
+    summary_entries,
 };
 pub use sdk::{
     Hook, HookCallback, HookCallbackFuture, HookFunctionFactory, HookInput, HookKind, HookResponse,

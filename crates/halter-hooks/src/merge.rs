@@ -47,10 +47,37 @@ pub struct HookMergedOutcome {
     pub suppress_output: bool,
 }
 
+/// Closed set of fields that can carry a merge conflict.
+///
+/// The `Display` rendering of each variant is load-bearing for tracing
+/// observability: consumers of `hooks.merge_conflict` events (including log
+/// scrapers and tests) expect `"updated_input"` and `"updated_output"`.
+/// Do not change these renderings without also updating the consumers.
+///
+/// This enum is intentionally not `#[non_exhaustive]` and intentionally does
+/// not derive `Serialize`/`Deserialize`: the set is closed, and
+/// `MergeConflict` is only constructed and consumed inside this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictField {
+    /// The `updated_input` hook-specific field conflicted.
+    UpdatedInput,
+    /// The `updated_output` hook-specific field conflicted.
+    UpdatedOutput,
+}
+
+impl std::fmt::Display for ConflictField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConflictField::UpdatedInput => write!(f, "updated_input"),
+            ConflictField::UpdatedOutput => write!(f, "updated_output"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Record of a field-level merge conflict.
 pub struct MergeConflict {
-    pub field: &'static str,
+    pub field: ConflictField,
     pub winner: String,
     pub loser: String,
 }
@@ -188,7 +215,7 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
                 winning_updated_input = Some(input.handler_id.clone());
             } else if let Some(winner) = winning_updated_input.as_ref() {
                 conflicts.push(MergeConflict {
-                    field: "updated_input",
+                    field: ConflictField::UpdatedInput,
                     winner: winner.clone(),
                     loser: input.handler_id.clone(),
                 });
@@ -206,7 +233,7 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
                 winning_updated_output = Some(input.handler_id.clone());
             } else if let Some(winner) = winning_updated_output.as_ref() {
                 conflicts.push(MergeConflict {
-                    field: "updated_output",
+                    field: ConflictField::UpdatedOutput,
                     winner: winner.clone(),
                     loser: input.handler_id.clone(),
                 });
@@ -677,5 +704,143 @@ mod tests {
         );
         assert_eq!(merged.block_reason.as_deref(), Some("earlier"));
         assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_field_display_renders_legacy_strings() {
+        assert_eq!(
+            format!("{}", ConflictField::UpdatedInput),
+            "updated_input"
+        );
+        assert_eq!(
+            format!("{}", ConflictField::UpdatedOutput),
+            "updated_output"
+        );
+    }
+
+    #[test]
+    fn merge_conflict_updated_input_records_conflict_field() {
+        let (_, conflicts) = merge_outputs(&[
+            merge_input(
+                "winner",
+                priority(HandlerPriorityGroup::PluginFiles, 0, 0, 0, 0),
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        updated_input: Some(json!({"command": "echo winner"})),
+                        ..HookSpecificOutput::default()
+                    }),
+                    ..HookOutput::default()
+                },
+            ),
+            merge_input(
+                "loser",
+                priority(HandlerPriorityGroup::PluginFiles, 1, 0, 0, 0),
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        updated_input: Some(json!({"command": "echo loser"})),
+                        ..HookSpecificOutput::default()
+                    }),
+                    ..HookOutput::default()
+                },
+            ),
+        ]);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].field, ConflictField::UpdatedInput);
+        assert_eq!(conflicts[0].winner, "winner");
+        assert_eq!(conflicts[0].loser, "loser");
+    }
+
+    #[test]
+    fn merge_conflict_updated_output_records_conflict_field() {
+        let (_, conflicts) = merge_outputs(&[
+            merge_input(
+                "winner",
+                priority(HandlerPriorityGroup::PluginFiles, 0, 0, 0, 0),
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        updated_mcp_tool_output: Some(json!({"result": "winner"})),
+                        ..HookSpecificOutput::default()
+                    }),
+                    ..HookOutput::default()
+                },
+            ),
+            merge_input(
+                "loser",
+                priority(HandlerPriorityGroup::PluginFiles, 1, 0, 0, 0),
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        updated_mcp_tool_output: Some(json!({"result": "loser"})),
+                        ..HookSpecificOutput::default()
+                    }),
+                    ..HookOutput::default()
+                },
+            ),
+        ]);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].field, ConflictField::UpdatedOutput);
+        assert_eq!(conflicts[0].winner, "winner");
+        assert_eq!(conflicts[0].loser, "loser");
+    }
+
+    #[test]
+    fn merge_conflict_both_fields_in_one_merge() {
+        let (merged, conflicts) = merge_outputs(&[
+            merge_input(
+                "input-winner",
+                priority(HandlerPriorityGroup::PluginFiles, 0, 0, 0, 0),
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        updated_input: Some(json!({"command": "echo input-winner"})),
+                        ..HookSpecificOutput::default()
+                    }),
+                    ..HookOutput::default()
+                },
+            ),
+            merge_input(
+                "input-loser",
+                priority(HandlerPriorityGroup::PluginFiles, 1, 0, 0, 0),
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        updated_input: Some(json!({"command": "echo input-loser"})),
+                        ..HookSpecificOutput::default()
+                    }),
+                    ..HookOutput::default()
+                },
+            ),
+            merge_input(
+                "output-winner",
+                priority(HandlerPriorityGroup::PluginFiles, 2, 0, 0, 0),
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        updated_mcp_tool_output: Some(json!({"result": "output-winner"})),
+                        ..HookSpecificOutput::default()
+                    }),
+                    ..HookOutput::default()
+                },
+            ),
+            merge_input(
+                "output-loser",
+                priority(HandlerPriorityGroup::PluginFiles, 3, 0, 0, 0),
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        updated_mcp_tool_output: Some(json!({"result": "output-loser"})),
+                        ..HookSpecificOutput::default()
+                    }),
+                    ..HookOutput::default()
+                },
+            ),
+        ]);
+
+        assert_eq!(merged.updated_input, Some(json!({"command": "echo input-winner"})));
+        assert_eq!(merged.updated_output, Some(json!({"result": "output-winner"})));
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].field, ConflictField::UpdatedInput);
+        assert_eq!(conflicts[0].winner, "input-winner");
+        assert_eq!(conflicts[0].loser, "input-loser");
+        assert_eq!(conflicts[1].field, ConflictField::UpdatedOutput);
+        assert_eq!(conflicts[1].winner, "output-winner");
+        assert_eq!(conflicts[1].loser, "output-loser");
     }
 }
