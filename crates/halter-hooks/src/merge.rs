@@ -704,10 +704,7 @@ mod tests {
 
     #[test]
     fn conflict_field_display_renders_legacy_strings() {
-        assert_eq!(
-            format!("{}", ConflictField::UpdatedInput),
-            "updated_input"
-        );
+        assert_eq!(format!("{}", ConflictField::UpdatedInput), "updated_input");
         assert_eq!(
             format!("{}", ConflictField::UpdatedOutput),
             "updated_output"
@@ -829,8 +826,14 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(merged.updated_input, Some(json!({"command": "echo input-winner"})));
-        assert_eq!(merged.updated_output, Some(json!({"result": "output-winner"})));
+        assert_eq!(
+            merged.updated_input,
+            Some(json!({"command": "echo input-winner"}))
+        );
+        assert_eq!(
+            merged.updated_output,
+            Some(json!({"result": "output-winner"}))
+        );
         assert_eq!(conflicts.len(), 2);
         assert_eq!(conflicts[0].field, ConflictField::UpdatedInput);
         assert_eq!(conflicts[0].winner, "input-winner");
