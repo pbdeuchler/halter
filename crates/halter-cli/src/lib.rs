@@ -442,11 +442,26 @@ fn write_output_line(output: &mut dyn Write, line: impl std::fmt::Display) -> an
 /// Third-party `tracing` targets that emit one DEBUG line per shell token,
 /// HTTP connection, or pool event. Promoting them to WARN keeps the harness's
 /// own DEBUG output readable when users opt into `RUST_LOG=debug`. Listed in
-/// the directive string *after* the user's filter so target-specific
-/// directives override the global level (per `EnvFilter` precedence).
+/// the directive string *before* the user's filter so an explicit per-target
+/// user directive (e.g. `RUST_LOG=hyper=trace`) wins over the suppression
+/// (per `EnvFilter` last-match-wins precedence), while the suppression still
+/// overrides a global level like `debug` or `trace` for these noisy targets.
 const NOISY_TARGET_SUPPRESSIONS: &str = "tokenize=warn,parse=warn,expansion=warn,commands=warn,pattern=warn,\
      completion=warn,jobs=warn,unimplemented=warn,\
      hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,rustls=warn";
+
+/// Compose the `EnvFilter` directive string so that user directives come last.
+/// Per `EnvFilter` precedence, the last matching directive wins; putting user
+/// directives after the suppressions lets explicit `RUST_LOG=hyper=trace`
+/// overrides take effect while still quieting noisy targets for `RUST_LOG=debug`.
+fn compose_logging_filter(user_directives: Option<&str>) -> String {
+    let user = user_directives.map(str::trim).unwrap_or("");
+    if user.is_empty() {
+        format!("{NOISY_TARGET_SUPPRESSIONS},warn")
+    } else {
+        format!("{NOISY_TARGET_SUPPRESSIONS},{user}")
+    }
+}
 
 fn init_logging(writer: TraceWriter, json: bool) -> anyhow::Result<()> {
     let user_directives = match env::var(EnvFilter::DEFAULT_ENV) {
@@ -454,7 +469,8 @@ fn init_logging(writer: TraceWriter, json: bool) -> anyhow::Result<()> {
         Err(env::VarError::NotPresent) => "warn".to_owned(),
         Err(env::VarError::NotUnicode(_)) => anyhow::bail!("invalid utf-8 in RUST_LOG"),
     };
-    let composed = format!("{user_directives},{NOISY_TARGET_SUPPRESSIONS}");
+    // User directives must come last so they win over suppressions.
+    let composed = compose_logging_filter(Some(&user_directives));
     let filter = EnvFilter::try_new(&composed).context("invalid RUST_LOG filter")?;
     let base = fmt::layer().with_writer(writer).with_target(true);
     let registry = tracing_subscriber::registry().with(filter);
@@ -592,5 +608,93 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).expect("read output");
         assert_eq!(contents, "hello world\n");
+    }
+
+    // --- logging composition tests ---
+
+    macro_rules! assert_target_level {
+        ($composed:expr, $target:literal, $level:path, $expected:expr) => {{
+            let filter = EnvFilter::try_new(&$composed).expect("valid filter");
+            let subscriber = tracing_subscriber::registry().with(filter);
+            let mut enabled = false;
+            tracing::subscriber::with_default(subscriber, || {
+                enabled = tracing::enabled!(target: $target, $level);
+            });
+            assert_eq!(
+                enabled, $expected,
+                "expected target={} level={:?} to be {}",
+                $target, $level, $expected
+            );
+        }};
+    }
+
+    #[test]
+    fn compose_filter_uses_warn_fallback_when_unset() {
+        let composed = compose_logging_filter(None);
+        assert!(composed.starts_with(NOISY_TARGET_SUPPRESSIONS));
+        assert!(composed.ends_with(",warn"));
+        EnvFilter::try_new(&composed).expect("valid filter");
+    }
+
+    #[test]
+    fn compose_filter_parses_whitespace_only_rust_log() {
+        let composed = compose_logging_filter(Some("   "));
+        assert_eq!(composed, compose_logging_filter(None));
+        EnvFilter::try_new(&composed).expect("valid filter");
+    }
+
+    #[test]
+    fn compose_filter_honors_global_level() {
+        let composed = compose_logging_filter(Some("info"));
+        EnvFilter::try_new(&composed).expect("valid filter");
+        assert_target_level!(composed, "halter", tracing::Level::INFO, true);
+        assert_target_level!(composed, "halter", tracing::Level::DEBUG, false);
+        assert_target_level!(composed, "tokenize", tracing::Level::DEBUG, false);
+        assert_target_level!(composed, "hyper", tracing::Level::DEBUG, false);
+    }
+
+    #[test]
+    fn compose_filter_honors_multi_directive_user_filter() {
+        let composed = compose_logging_filter(Some("debug,halter=trace"));
+        EnvFilter::try_new(&composed).expect("valid filter");
+        assert_target_level!(composed, "halter", tracing::Level::TRACE, true);
+        assert_target_level!(composed, "some_crate", tracing::Level::DEBUG, true);
+        assert_target_level!(composed, "tokenize", tracing::Level::DEBUG, false);
+    }
+
+    #[test]
+    fn regression_99_explicit_per_target_wins_over_suppression() {
+        let composed = compose_logging_filter(Some("hyper=trace"));
+        assert_target_level!(composed, "hyper", tracing::Level::TRACE, true);
+    }
+
+    #[test]
+    fn regression_99_explicit_target_overrides_global_warn_and_suppression() {
+        let composed = compose_logging_filter(Some("warn,hyper=trace"));
+        assert_target_level!(composed, "some_other_crate", tracing::Level::INFO, false);
+        assert_target_level!(composed, "hyper", tracing::Level::TRACE, true);
+    }
+
+    #[test]
+    fn regression_99_multiple_suppressed_targets_can_be_overridden() {
+        let composed = compose_logging_filter(Some("reqwest=debug,h2=info"));
+        assert_target_level!(composed, "reqwest", tracing::Level::DEBUG, true);
+        assert_target_level!(composed, "h2", tracing::Level::INFO, true);
+        assert_target_level!(composed, "hyper", tracing::Level::DEBUG, false);
+    }
+
+    #[test]
+    fn compose_filter_global_debug_still_suppresses_noisy_targets() {
+        let composed = compose_logging_filter(Some("debug"));
+        assert_target_level!(composed, "halter", tracing::Level::DEBUG, true);
+        assert_target_level!(composed, "tokenize", tracing::Level::DEBUG, false);
+        assert_target_level!(composed, "hyper", tracing::Level::DEBUG, false);
+        assert_target_level!(composed, "reqwest", tracing::Level::DEBUG, false);
+    }
+
+    #[test]
+    fn compose_filter_rejects_invalid_user_directive() {
+        let composed = compose_logging_filter(Some("hyper=invalid_level"));
+        EnvFilter::try_new(&composed).expect_err("invalid user directive should fail");
     }
 }
