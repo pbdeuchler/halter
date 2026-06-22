@@ -1,9 +1,9 @@
 // pattern: Imperative Shell
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::{env, fs};
 
 use anyhow::Context;
 use halter_config::HarnessConfig;
@@ -646,29 +646,13 @@ fn normalized_roots(roots: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     let mut seen = BTreeSet::new();
     let mut normalized = Vec::new();
     for root in roots {
-        let expanded = expand_path(root);
+        let expanded = halter_config::expand_path(root);
         let key = expanded.to_string_lossy().to_string();
         if seen.insert(key) {
             normalized.push(expanded);
         }
     }
     Ok(normalized)
-}
-
-/// Expands a resource-root path's leading `~/` against `$HOME`. No other
-/// substitutions (`$VAR`, `${VAR}`, `~user/`) are performed — see
-/// [`halter_config::expand_path`] for the rationale. Plugin component paths
-/// have a *separate*, explicitly scoped alias mechanism (the
-/// `${CLAUDE_PLUGIN_ROOT}` family) handled by
-/// [`expand_plugin_component_path`].
-fn expand_path(path: &Path) -> PathBuf {
-    let raw = path.to_string_lossy();
-    if let Some(stripped) = raw.strip_prefix("~/")
-        && let Ok(home) = env::var("HOME")
-    {
-        return PathBuf::from(home).join(stripped);
-    }
-    PathBuf::from(raw.as_ref())
 }
 
 /// Expand plugin template variables in `text`.

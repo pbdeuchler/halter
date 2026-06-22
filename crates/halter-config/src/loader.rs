@@ -414,9 +414,16 @@ pub fn config_fingerprint(config: &HarnessConfig) -> String {
 /// explicitly with an explicit threat model.
 #[must_use]
 pub fn expand_path(path: &Path) -> PathBuf {
+    expand_path_with(path, |name| env::var_os(name))
+}
+
+fn expand_path_with<F>(path: &Path, mut lookup: F) -> PathBuf
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
     let raw = path.to_string_lossy();
     if let Some(stripped) = raw.strip_prefix("~/")
-        && let Ok(home) = env::var("HOME")
+        && let Some(home) = lookup("HOME")
     {
         return PathBuf::from(home).join(stripped);
     }
@@ -706,5 +713,104 @@ allow = ["just"]
             ]
         );
         assert_eq!(loaded.policy.shell.allow, vec!["just"]);
+    }
+
+    #[test]
+    fn expand_path_with_expands_tilde_slash() {
+        let result = expand_path_with(Path::new("~/skills"), |name| {
+            assert_eq!(name, "HOME");
+            Some(OsString::from("/tmp/fake-home"))
+        });
+        assert_eq!(result, PathBuf::from("/tmp/fake-home/skills"));
+    }
+
+    #[test]
+    fn expand_path_with_passes_through_absolute_path() {
+        let result = expand_path_with(Path::new("/etc/halter"), |_name| {
+            unreachable!("lookup must not be called for non-tilde paths")
+        });
+        assert_eq!(result, PathBuf::from("/etc/halter"));
+    }
+
+    #[test]
+    fn expand_path_with_passes_through_relative_path() {
+        let result = expand_path_with(Path::new("./skills"), |_name| {
+            unreachable!("lookup must not be called for non-tilde paths")
+        });
+        assert_eq!(result, PathBuf::from("./skills"));
+    }
+
+    #[test]
+    fn expand_path_with_only_tilde_slash() {
+        let result = expand_path_with(Path::new("~/"), |name| {
+            assert_eq!(name, "HOME");
+            Some(OsString::from("/tmp/fake-home"))
+        });
+        assert_eq!(result, PathBuf::from("/tmp/fake-home/"));
+    }
+
+    #[test]
+    fn expand_path_with_home_missing() {
+        let result = expand_path_with(Path::new("~/foo"), |_name| None);
+        assert_eq!(result, PathBuf::from("~/foo"));
+    }
+
+    #[test]
+    fn expand_path_with_leaves_env_var_literal_alone() {
+        let result = expand_path_with(Path::new("$HOME/skills"), |_name| {
+            unreachable!("lookup must not be called for non-tilde paths")
+        });
+        assert_eq!(result, PathBuf::from("$HOME/skills"));
+    }
+
+    #[test]
+    fn expand_path_with_leaves_dollar_brace_literal_alone() {
+        let result = expand_path_with(Path::new("${HOME}/skills"), |_name| {
+            unreachable!("lookup must not be called for non-tilde paths")
+        });
+        assert_eq!(result, PathBuf::from("${HOME}/skills"));
+    }
+
+    #[test]
+    fn expand_path_with_leaves_tilde_user_alone() {
+        let result = expand_path_with(Path::new("~bob/skills"), |_name| {
+            unreachable!("lookup must not be called for non-tilde paths")
+        });
+        assert_eq!(result, PathBuf::from("~bob/skills"));
+    }
+
+    #[test]
+    fn expand_path_with_tilde_alone() {
+        let result = expand_path_with(Path::new("~"), |_name| {
+            unreachable!("lookup must not be called for non-tilde paths")
+        });
+        assert_eq!(result, PathBuf::from("~"));
+    }
+
+    #[test]
+    fn expand_path_with_tilde_in_middle() {
+        let result = expand_path_with(Path::new("path/with/~/in/middle"), |_name| {
+            unreachable!("lookup must not be called for non-tilde paths")
+        });
+        assert_eq!(result, PathBuf::from("path/with/~/in/middle"));
+    }
+
+    #[test]
+    fn expand_path_with_empty_input() {
+        let result = expand_path_with(Path::new(""), |_name| {
+            unreachable!("lookup must not be called for non-tilde paths")
+        });
+        assert_eq!(result, PathBuf::from(""));
+    }
+
+    #[test]
+    fn expand_path_with_empty_home() {
+        // Lookup returns an empty OsString. join behaves as if HOME were an
+        // empty prefix, so the stripped text becomes the whole result.
+        let result = expand_path_with(Path::new("~/foo"), |name| {
+            assert_eq!(name, "HOME");
+            Some(OsString::new())
+        });
+        assert_eq!(result, PathBuf::from("foo"));
     }
 }

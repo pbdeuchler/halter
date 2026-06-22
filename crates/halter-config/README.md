@@ -319,7 +319,10 @@ These roots are consumed by `halter::ResourceCompiler`.
 
 ### Path expansion
 
-`expand_path(...)` expands `~/...` using `$HOME`.
+`expand_path(...)` expands `~/...` using `$HOME`. Internally the `halter-config`
+crate resolves `$HOME` through an injectable environment lookup (the same `_with`
+convention used by env overrides), so the expansion rules are unit-testable;
+the public `expand_path` wrapper reads the real process environment.
 
 It does **not** perform general shell expansion.
 
