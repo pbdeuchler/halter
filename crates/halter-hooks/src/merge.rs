@@ -53,10 +53,6 @@ pub struct HookMergedOutcome {
 /// observability: consumers of `hooks.merge_conflict` events (including log
 /// scrapers and tests) expect `"updated_input"` and `"updated_output"`.
 /// Do not change these renderings without also updating the consumers.
-///
-/// This enum is intentionally not `#[non_exhaustive]` and intentionally does
-/// not derive `Serialize`/`Deserialize`: the set is closed, and
-/// `MergeConflict` is only constructed and consumed inside this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictField {
     /// The `updated_input` hook-specific field conflicted.
