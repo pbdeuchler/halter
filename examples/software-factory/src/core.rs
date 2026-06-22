@@ -129,6 +129,10 @@ impl ModelSpec {
             tokens_per_minute: Some(500_000),
         }
     }
+
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.provider, self.model)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -518,6 +522,7 @@ mod tests {
         let spec = ModelSpec::parse("openrouter/vendor/family-model").expect("valid model");
         assert_eq!(spec.provider, ConfiguredProvider::OpenRouter);
         assert_eq!(spec.model, "vendor/family-model");
+        assert_eq!(spec.label(), "openrouter/vendor/family-model");
 
         let openai = ModelSpec::parse("openai/default-model").expect("valid openai model");
         assert_eq!(openai.provider, ConfiguredProvider::OpenAi);

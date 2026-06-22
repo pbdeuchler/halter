@@ -132,7 +132,6 @@ struct Cli {
 const NOISY_TARGET_SUPPRESSIONS: &str = "tokenize=warn,parse=warn,expansion=warn,commands=warn,\
      pattern=warn,completion=warn,jobs=warn,unimplemented=warn,\
      hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,rustls=warn";
-const FACTORY_LOCAL_STATE_PATHS: [&str; 2] = [IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH];
 const DEFAULT_MODEL_SPEC: &str = "openrouter/z-ai/glm-5.2";
 const DEFAULT_IMPLEMENTATION_MODEL_SPEC: &str = "openrouter/moonshotai/kimi-k2.7-code";
 const DEFAULT_REVIEW_MODEL_SPEC: &str = DEFAULT_MODEL_SPEC;
@@ -147,6 +146,12 @@ const DEFAULT_SESSION_PRE_COMPACTION_TARGET: u64 = 200_000;
 const FACTORY_AGENT_MAX_INPUT_TOKENS: u32 = 230_000;
 const FACTORY_AGENT_MAX_OUTPUT_TOKENS: u32 = 16_384;
 const RANK_RESPONSES_TOOL: &str = "rank_responses";
+const FACTORY_TRANSIENT_OUTPUT_DIR: &str = ".halter/software-factory/tmp";
+const FACTORY_LOCAL_STATE_PATHS: [&str; 3] = [
+    IMPLEMENTATION_PLAN_PATH,
+    CHECKPOINT_PATH,
+    FACTORY_TRANSIENT_OUTPUT_DIR,
+];
 
 fn logging_filter_spec(user_directives: Option<&str>) -> String {
     let directives = user_directives
@@ -176,9 +181,13 @@ fn init_logging() -> anyhow::Result<()> {
 
 fn excluded_commit_paths(commit_impl_plan: bool) -> Vec<&'static str> {
     if commit_impl_plan {
-        vec![CHECKPOINT_PATH]
+        vec![CHECKPOINT_PATH, FACTORY_TRANSIENT_OUTPUT_DIR]
     } else {
-        vec![IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH]
+        vec![
+            IMPLEMENTATION_PLAN_PATH,
+            CHECKPOINT_PATH,
+            FACTORY_TRANSIENT_OUTPUT_DIR,
+        ]
     }
 }
 
@@ -438,7 +447,15 @@ async fn main() -> anyhow::Result<()> {
         issue_cache.clone(),
         allowed_issue_numbers,
     ));
-    let rank_tool: Arc<dyn Tool> = Arc::new(RankResponsesTool);
+    let ranking_model_names = Arc::new(RwLock::new(HashMap::new()));
+    let panel_harnesses = build_panel_harnesses(
+        &base_config,
+        &worktree,
+        issue_tool.clone(),
+        ranking_model_names.clone(),
+    )
+    .await?;
+    let rank_tool: Arc<dyn Tool> = Arc::new(RankResponsesTool::new(ranking_model_names));
     let default_harness = build_default_harness(
         &base_config,
         &worktree,
@@ -453,7 +470,6 @@ async fn main() -> anyhow::Result<()> {
         project_system_prompt.as_deref(),
     )
     .await?;
-    let panel_harnesses = build_panel_harnesses(&base_config, &worktree, issue_tool).await?;
     let implementer = build_model_harness(
         &base_config,
         "implementation",
@@ -479,11 +495,12 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let selection = if let Some(selection) = checkpoint.selection.clone() {
+    let (selection, selection_text) = if let Some(selection) = checkpoint.selection.clone() {
         info!("using issue selection from factory checkpoint");
-        selection
+        let selection_text = serde_json::to_string_pretty(&selection)?;
+        (selection, selection_text)
     } else {
-        let selection = select_issue_with_panel_decision(
+        let output = select_issue_with_panel_decision(
             &panel_harnesses,
             &default_session,
             &worktree,
@@ -493,9 +510,9 @@ async fn main() -> anyhow::Result<()> {
             project_system_prompt.as_deref(),
         )
         .await?;
-        checkpoint.selection = Some(selection.clone());
+        checkpoint.selection = Some(output.selection.clone());
         write_checkpoint(&checkpoint_path, &checkpoint).await?;
-        selection
+        (output.selection, output.text)
     };
     let issue_numbers = selected_issue_numbers(&selection);
     if issue_numbers.is_empty() {
@@ -518,6 +535,7 @@ async fn main() -> anyhow::Result<()> {
                 &worktree,
                 &repo,
                 &selection,
+                &selection_text,
                 &issues,
                 project_system_prompt.as_deref(),
             )
@@ -1172,14 +1190,22 @@ impl Tool for GitHubIssueTool {
 }
 
 #[derive(Clone)]
-struct RankResponsesTool;
+struct RankResponsesTool {
+    model_names: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl RankResponsesTool {
+    fn new(model_names: Arc<RwLock<HashMap<String, String>>>) -> Self {
+        Self { model_names }
+    }
+}
 
 #[async_trait]
 impl Tool for RankResponsesTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from(RANK_RESPONSES_TOOL),
-            description: "Submit a stack ranking of the panel responses. Provide every panel response model_id together with its rank, where rank 1 is the best response.".to_owned(),
+            description: "Submit a stack ranking of the anonymized panel responses. Provide every anonymous model_id together with its rank, where rank 1 is the best response.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1209,22 +1235,46 @@ impl Tool for RankResponsesTool {
     }
 
     async fn execute(&self, _context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
-        let count = rank_response_count(&input).map_err(anyhow::Error::msg)?;
+        let model_names = self.model_names.read().await;
+        let rankings = deanonymized_rankings(&input, &model_names).map_err(anyhow::Error::msg)?;
+        let ranking_log = rankings
+            .iter()
+            .map(|ranking| {
+                json!({
+                    "anonymous_id": ranking.anonymous_id,
+                    "model": ranking.model_name,
+                    "rank": ranking.rank,
+                })
+            })
+            .collect::<Vec<_>>();
         info!(
-            rankings = %input,
-            count,
+            rankings = %json!(ranking_log),
+            count = rankings.len(),
             "recorded panel response ranking"
         );
         Ok(ToolResult::Json {
             value: json!({
                 "recorded": true,
-                "ranked_panel_responses": count,
+                "ranked_panel_responses": rankings.len(),
             }),
         })
     }
 }
 
-fn rank_response_count(input: &Value) -> Result<usize, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RankingEntry {
+    anonymous_id: String,
+    rank: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeanonymizedRanking {
+    anonymous_id: String,
+    model_name: String,
+    rank: u64,
+}
+
+fn ranking_entries(input: &Value) -> Result<Vec<RankingEntry>, String> {
     let rankings = input
         .get("rankings")
         .and_then(Value::as_array)
@@ -1234,6 +1284,7 @@ fn rank_response_count(input: &Value) -> Result<usize, String> {
     }
     let mut seen_model_ids = HashSet::new();
     let mut seen_ranks = HashSet::new();
+    let mut entries = Vec::with_capacity(rankings.len());
     for entry in rankings {
         let model_id = entry
             .get("model_id")
@@ -1258,8 +1309,37 @@ fn rank_response_count(input: &Value) -> Result<usize, String> {
         if !seen_ranks.insert(rank) {
             return Err(format!("rank {rank} appears more than once"));
         }
+        entries.push(RankingEntry {
+            anonymous_id: model_id.to_owned(),
+            rank,
+        });
     }
-    Ok(rankings.len())
+    Ok(entries)
+}
+
+fn deanonymized_rankings(
+    input: &Value,
+    model_names: &HashMap<String, String>,
+) -> Result<Vec<DeanonymizedRanking>, String> {
+    ranking_entries(input)?
+        .into_iter()
+        .map(|entry| {
+            let model_name = model_names
+                .get(&entry.anonymous_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "ranking referenced unknown anonymous model_id {}",
+                        entry.anonymous_id
+                    )
+                })?;
+            Ok(DeanonymizedRanking {
+                anonymous_id: entry.anonymous_id,
+                model_name,
+                rank: entry.rank,
+            })
+        })
+        .collect()
 }
 
 fn add_worktree_policy(config: &mut HarnessConfig, worktree: &Path) {
@@ -1300,6 +1380,16 @@ fn path_starts_with_tilde(path: &Path) -> bool {
 struct PanelHarness {
     id: String,
     harness: Halter,
+}
+
+struct IssueSelectionOutput {
+    selection: IssueSelection,
+    text: String,
+}
+
+struct CodeReviewOutput {
+    review: CodeReview,
+    text: String,
 }
 
 async fn build_default_harness(
@@ -1345,14 +1435,23 @@ async fn build_panel_harnesses(
     config: &HarnessConfig,
     worktree: &Path,
     issue_tool: Arc<dyn Tool>,
+    ranking_model_names: Arc<RwLock<HashMap<String, String>>>,
 ) -> anyhow::Result<Vec<PanelHarness>> {
     let mut panels = Vec::new();
-    for (index, model) in panel_model_specs().into_iter().enumerate() {
-        let id = format!("panel-{}", index + 1);
+    for model in panel_model_specs() {
+        let id = random_panel_response_id();
+        ranking_model_names
+            .write()
+            .await
+            .insert(id.clone(), model.label());
         let harness = build_panel_harness(config, &id, model, worktree, issue_tool.clone()).await?;
         panels.push(PanelHarness { id, harness });
     }
     Ok(panels)
+}
+
+fn random_panel_response_id() -> String {
+    format!("response-{}", PromptSegmentId::new().0.replace('-', ""))
 }
 
 async fn build_panel_harness(
@@ -1437,16 +1536,131 @@ struct AgentRun {
     text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StageOutputFile {
+    prompt_path: String,
+    absolute_path: PathBuf,
+}
+
 const FACTORY_TURN_USER_MESSAGE: &str =
     "Execute the appended turn-specific instructions for this software factory stage.";
-
-/// Shared closing instruction for stages whose response is parsed as JSON.
-const JSON_ONLY_OUTPUT_RULE: &str = "Return ONLY the JSON object as your final message — no markdown code fences and no surrounding prose.";
 
 /// Shared rule for coding stages that run cargo, whose builds exceed the
 /// 30-second default shell timeout when no explicit timeout is supplied.
 const CARGO_TIMEOUT_RULE: &str = "When running builds, tests, lints, or other checks through the shell tool, pass an explicit timeout_ms of at least 120000; these commands routinely exceed the 30-second default.";
 const CODE_REVIEW_MAX_TURNS: u32 = 100;
+
+fn stage_output_file(worktree: &Path, stage: &str, extension: &str) -> StageOutputFile {
+    let token = PromptSegmentId::new().0.replace('-', "");
+    let relative_path = stage_output_relative_path(stage, &token, extension);
+    StageOutputFile {
+        prompt_path: relative_path.to_string_lossy().into_owned(),
+        absolute_path: worktree.join(relative_path),
+    }
+}
+
+fn stage_output_relative_path(stage: &str, token: &str, extension: &str) -> PathBuf {
+    let stage = output_file_component(stage);
+    let token = output_file_component(token);
+    let extension = output_file_component(extension.trim_start_matches('.'));
+    PathBuf::from(FACTORY_TRANSIENT_OUTPUT_DIR).join(format!("{stage}-{token}.{extension}"))
+}
+
+fn output_file_component(raw: &str) -> String {
+    let mut out = String::new();
+    let mut previous_dash = false;
+    for ch in raw.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if ch == '-' || ch == '_' || ch.is_whitespace() {
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(ch) = normalized {
+            if ch == '-' {
+                if !previous_dash && !out.is_empty() {
+                    out.push(ch);
+                    previous_dash = true;
+                }
+            } else {
+                out.push(ch);
+                previous_dash = false;
+            }
+        }
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "output".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+async fn prepare_stage_output_file(output: &StageOutputFile) -> anyhow::Result<()> {
+    let parent = output.absolute_path.parent().with_context(|| {
+        format!(
+            "failed to prepare stage output: {} has no parent",
+            output.absolute_path.display()
+        )
+    })?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    remove_file_if_exists(&output.absolute_path).await
+}
+
+async fn read_and_remove_stage_output_file(
+    output: &StageOutputFile,
+) -> anyhow::Result<Option<String>> {
+    let text = match tokio::fs::read_to_string(&output.absolute_path).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read stage output {}",
+                    output.absolute_path.display()
+                )
+            });
+        }
+    };
+    let text = scrub_stage_output_path_references(&text, output);
+    remove_file_if_exists(&output.absolute_path).await?;
+    if text.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(text))
+    }
+}
+
+fn scrub_stage_output_path_references(text: &str, output: &StageOutputFile) -> String {
+    let absolute_path = output.absolute_path.to_string_lossy();
+    text.replace(absolute_path.as_ref(), "[stage output file]")
+        .replace(&output.prompt_path, "[stage output file]")
+}
+
+async fn remove_stage_output_after_failure(output: &StageOutputFile, label: &str) {
+    if let Err(error) = remove_file_if_exists(&output.absolute_path).await {
+        warn!(
+            stage = label,
+            path = %output.absolute_path.display(),
+            error = %error,
+            "failed to remove stage output after failed turn"
+        );
+    }
+}
+
+async fn remove_file_if_exists(path: &Path) -> anyhow::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
 
 fn json_preview(value: &Value, max_chars: usize) -> String {
     single_line_preview(&value.to_string(), max_chars)
@@ -1496,6 +1710,7 @@ const CODING_STAGE_RETRY_POLICY: AgentStageRetryPolicy = AgentStageRetryPolicy {
     base_backoff: Duration::from_secs(5),
     max_backoff: Duration::from_secs(30),
 };
+const FILE_OUTPUT_RETRY_POLICY: AgentStageRetryPolicy = CODING_STAGE_RETRY_POLICY;
 const INFERRED_AGENT_STAGE_CAPACITY_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1674,26 +1889,6 @@ fn hash_prompt_text(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-async fn run_code_review_agent_with_system_prompt(
-    harness: &Halter,
-    worktree: &Path,
-    label: &str,
-    prompt: impl Into<String>,
-    project_system_prompt: Option<&str>,
-) -> anyhow::Result<AgentRun> {
-    run_agent_with_prompt_kind(
-        harness,
-        worktree,
-        label,
-        prompt,
-        FactorySystemPrompt::Coding,
-        project_system_prompt,
-        AgentTextRequirement::Required,
-        Some(CODE_REVIEW_MAX_TURNS),
-    )
-    .await
-}
-
 async fn run_coding_action_with_system_prompt(
     harness: &Halter,
     worktree: &Path,
@@ -1733,6 +1928,103 @@ async fn run_agent_with_system_prompt(
         None,
     )
     .await
+}
+
+async fn run_agent_to_file_with_system_prompt(
+    harness: &Halter,
+    worktree: &Path,
+    label: &str,
+    prompt: impl Into<String>,
+    project_system_prompt: Option<&str>,
+    output: &StageOutputFile,
+) -> anyhow::Result<String> {
+    run_agent_to_file_with_prompt_kind(
+        harness,
+        worktree,
+        label,
+        prompt,
+        FactorySystemPrompt::General,
+        project_system_prompt,
+        None,
+        output,
+    )
+    .await
+}
+
+async fn run_agent_to_file_with_prompt_kind(
+    harness: &Halter,
+    worktree: &Path,
+    label: &str,
+    prompt: impl Into<String>,
+    system_prompt: FactorySystemPrompt,
+    project_system_prompt: Option<&str>,
+    max_turns: Option<u32>,
+    output: &StageOutputFile,
+) -> anyhow::Result<String> {
+    let prompt = prompt.into();
+    let mut attempt = 1;
+
+    loop {
+        prepare_stage_output_file(output).await?;
+        let result = run_agent_with_prompt_kind(
+            harness,
+            worktree,
+            label,
+            prompt.clone(),
+            system_prompt,
+            project_system_prompt,
+            AgentTextRequirement::Optional,
+            max_turns,
+        )
+        .await;
+
+        match result {
+            Ok(_) => match read_and_remove_stage_output_file(output).await? {
+                Some(text) => return Ok(text),
+                None => {
+                    let message = "stage output file was missing or empty";
+                    if let Some(delay) =
+                        FILE_OUTPUT_RETRY_POLICY.delay_after_failure(attempt, message)
+                    {
+                        warn!(
+                            stage = label,
+                            attempt,
+                            max_attempts = FILE_OUTPUT_RETRY_POLICY.max_attempts,
+                            retry_in_ms = delay.as_millis() as u64,
+                            "retrying agent stage because output file was missing or empty"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    bail!("agent stage {label} did not write a non-empty output file");
+                }
+            },
+            Err(error) if agent_stage_error_is_retryable(&error) => {
+                let message = error.to_string();
+                if let Some(delay) = FILE_OUTPUT_RETRY_POLICY.delay_after_failure(attempt, &message)
+                {
+                    warn!(
+                        stage = label,
+                        attempt,
+                        max_attempts = FILE_OUTPUT_RETRY_POLICY.max_attempts,
+                        retry_in_ms = delay.as_millis() as u64,
+                        error = %message,
+                        "retrying file-output agent stage after transient failure"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                remove_stage_output_after_failure(output, label).await;
+                return Err(error);
+            }
+            Err(error) => {
+                remove_stage_output_after_failure(output, label).await;
+                return Err(error);
+            }
+        }
+    }
 }
 
 async fn run_agent_with_prompt_kind_with_retry(
@@ -1831,26 +2123,79 @@ async fn run_agent_with_prompt_kind(
     run
 }
 
-async fn run_existing_session_with_required_tool(
+async fn run_existing_session_to_file_with_required_tool(
     session: &HalterSession,
     label: &str,
     prompt: impl Into<String>,
-) -> anyhow::Result<AgentRun> {
+    output: &StageOutputFile,
+) -> anyhow::Result<String> {
     let prompt = prompt.into();
-    info!(
-        stage = label,
-        prompt_bytes = prompt.len(),
-        required_tool = RANK_RESPONSES_TOOL,
-        "starting default session turn"
-    );
-    run_session_turn(
-        session,
-        label,
-        Turn::user(prompt),
-        AgentTextRequirement::Required,
-        Some(RANK_RESPONSES_TOOL),
-    )
-    .await
+    let mut attempt = 1;
+
+    loop {
+        prepare_stage_output_file(output).await?;
+        info!(
+            stage = label,
+            prompt_bytes = prompt.len(),
+            required_tool = RANK_RESPONSES_TOOL,
+            "starting default session file-output turn"
+        );
+        let result = run_session_turn(
+            session,
+            label,
+            Turn::user(prompt.clone()),
+            AgentTextRequirement::Optional,
+            Some(RANK_RESPONSES_TOOL),
+        )
+        .await;
+
+        match result {
+            Ok(_) => match read_and_remove_stage_output_file(output).await? {
+                Some(text) => return Ok(text),
+                None => {
+                    let message = "stage output file was missing or empty";
+                    if let Some(delay) =
+                        FILE_OUTPUT_RETRY_POLICY.delay_after_failure(attempt, message)
+                    {
+                        warn!(
+                            stage = label,
+                            attempt,
+                            max_attempts = FILE_OUTPUT_RETRY_POLICY.max_attempts,
+                            retry_in_ms = delay.as_millis() as u64,
+                            "retrying default session because output file was missing or empty"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    bail!("agent stage {label} did not write a non-empty output file");
+                }
+            },
+            Err(error) if agent_stage_error_is_retryable(&error) => {
+                let message = error.to_string();
+                if let Some(delay) = FILE_OUTPUT_RETRY_POLICY.delay_after_failure(attempt, &message)
+                {
+                    warn!(
+                        stage = label,
+                        attempt,
+                        max_attempts = FILE_OUTPUT_RETRY_POLICY.max_attempts,
+                        retry_in_ms = delay.as_millis() as u64,
+                        error = %message,
+                        "retrying default session file-output turn after transient failure"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                remove_stage_output_after_failure(output, label).await;
+                return Err(error);
+            }
+            Err(error) => {
+                remove_stage_output_after_failure(output, label).await;
+                return Err(error);
+            }
+        }
+    }
 }
 
 async fn run_session_turn(
@@ -2081,23 +2426,29 @@ fn agent_run_from_text(
     }
 }
 
-async fn run_panel_prompt(
+async fn run_panel_output_prompt<F>(
     panels: &[PanelHarness],
     worktree: &Path,
     stage: &str,
-    prompt: String,
+    extension: &str,
+    prompt_builder: F,
     project_system_prompt: Option<&str>,
-) -> anyhow::Result<Vec<PanelResponse>> {
+) -> anyhow::Result<Vec<PanelResponse>>
+where
+    F: Fn(&str) -> String + Sync,
+{
     let futures = panels.iter().map(|panel| {
-        let prompt = prompt.clone();
+        let output = stage_output_file(worktree, &format!("{stage}-{}", panel.id), extension);
+        let prompt = prompt_builder(&output.prompt_path);
         async move {
             let label = format!("{stage} {}", panel.id);
-            let result = run_agent_with_system_prompt(
+            let result = run_agent_to_file_with_system_prompt(
                 &panel.harness,
                 worktree,
                 &label,
                 prompt,
                 project_system_prompt,
+                &output,
             )
             .await;
             (panel.id.clone(), result)
@@ -2107,8 +2458,8 @@ async fn run_panel_prompt(
     let mut responses = Vec::new();
     for (id, result) in join_all(futures).await {
         match result {
-            Ok(run) if !run.text.trim().is_empty() => {
-                responses.push(PanelResponse { id, text: run.text });
+            Ok(text) if !text.trim().is_empty() => {
+                responses.push(PanelResponse { id, text });
             }
             Ok(_) => {
                 warn!(stage, panel_id = %id, "panel produced empty output; skipping");
@@ -2131,26 +2482,36 @@ async fn select_issue_with_panel_decision(
     corpus: &str,
     requested_issue: Option<u64>,
     project_system_prompt: Option<&str>,
-) -> anyhow::Result<IssueSelection> {
-    let panel_prompt = issue_selection_panel_prompt(repo, corpus, requested_issue);
-    let panel_responses = run_panel_prompt(
+) -> anyhow::Result<IssueSelectionOutput> {
+    let panel_responses = run_panel_output_prompt(
         panels,
         worktree,
         "issue selection panel",
-        panel_prompt,
+        "json",
+        |output_path| issue_selection_panel_prompt(repo, corpus, requested_issue, output_path),
         project_system_prompt,
     )
     .await?;
-    let synthesis_prompt =
-        issue_selection_synthesis_prompt(repo, corpus, requested_issue, &panel_responses);
-    let raw = run_existing_session_with_required_tool(
+    let output = stage_output_file(worktree, "issue selection synthesis", "json");
+    let synthesis_prompt = issue_selection_synthesis_prompt(
+        repo,
+        corpus,
+        requested_issue,
+        &panel_responses,
+        &output.prompt_path,
+    );
+    let raw = run_existing_session_to_file_with_required_tool(
         default_session,
         "issue selection synthesis",
         synthesis_prompt,
+        &output,
     )
-    .await?
-    .text;
-    parse_json_response(&raw).map_err(anyhow::Error::msg)
+    .await?;
+    let selection = parse_json_response(&raw).map_err(anyhow::Error::msg)?;
+    Ok(IssueSelectionOutput {
+        selection,
+        text: raw,
+    })
 }
 
 async fn create_implementation_plan_with_panel_decision(
@@ -2159,17 +2520,19 @@ async fn create_implementation_plan_with_panel_decision(
     worktree: &Path,
     repo: &RepoSlug,
     selection: &IssueSelection,
+    selection_text: &str,
     issues: &[IssueDoc],
     project_system_prompt: Option<&str>,
 ) -> anyhow::Result<String> {
-    let selection_json = serde_json::to_string_pretty(selection)?;
     let selected_issues = selected_issue_details(selection, issues);
-    let panel_prompt = implementation_plan_panel_prompt(repo, &selection_json, &selected_issues);
-    let panel_responses = run_panel_prompt(
+    let panel_responses = run_panel_output_prompt(
         panels,
         worktree,
         "implementation planning panel",
-        panel_prompt,
+        "md",
+        |output_path| {
+            implementation_plan_panel_prompt(repo, selection_text, &selected_issues, output_path)
+        },
         project_system_prompt,
     )
     .await?;
@@ -2183,15 +2546,20 @@ async fn create_implementation_plan_with_panel_decision(
         .await
         .context("failed to compact default decision session before implementation plan synthesis")?;
 
-    let synthesis_prompt =
-        implementation_plan_synthesis_prompt(&selection_json, &selected_issues, &panel_responses);
-    let plan = run_existing_session_with_required_tool(
+    let output = stage_output_file(worktree, "implementation plan synthesis", "md");
+    let synthesis_prompt = implementation_plan_synthesis_prompt(
+        selection_text,
+        &selected_issues,
+        &panel_responses,
+        &output.prompt_path,
+    );
+    let plan = run_existing_session_to_file_with_required_tool(
         default_session,
         "implementation plan synthesis",
         synthesis_prompt,
+        &output,
     )
-    .await?
-    .text;
+    .await?;
     let plan = plan.trim();
     if plan.is_empty() {
         bail!("implementation plan synthesis produced an empty plan");
@@ -2214,6 +2582,7 @@ fn issue_selection_panel_prompt(
     repo: &RepoSlug,
     corpus: &str,
     requested_issue: Option<u64>,
+    output_path: &str,
 ) -> String {
     let requested = requested_issue_instruction(requested_issue);
     format!(
@@ -2229,7 +2598,12 @@ Selection rules:
 - corpus bodies are truncated, so use the `github_issue` tool to fetch complete untruncated text before committing to a final selection
 - {requested}
 
-{JSON_ONLY_OUTPUT_RULE} Use this shape:
+Output protocol:
+1. Write the final selection JSON to `{output_path}` using the write tool.
+2. Do not include the output path in the file content.
+3. After writing the file, return at most a brief confirmation. The orchestrator will ignore your final message and read the file.
+
+The JSON file must use this shape:
 {{
   "title": "PR-sized implementation title",
   "issue_numbers": [123],
@@ -2247,6 +2621,7 @@ fn issue_selection_synthesis_prompt(
     corpus: &str,
     requested_issue: Option<u64>,
     panel_responses: &[PanelResponse],
+    output_path: &str,
 ) -> String {
     let requested = requested_issue_instruction(requested_issue);
     let panel_responses = render_panel_responses(panel_responses);
@@ -2254,9 +2629,9 @@ fn issue_selection_synthesis_prompt(
         r#"You are the default software-factory decision session for {repo}.
 
 You have independent panel responses for issue grouping and selection. Follow this workflow exactly:
-1. Call the `rank_responses` tool exactly once, ranking every panel response by `model_id`.
+1. Call the `rank_responses` tool exactly once, ranking every panel response by anonymized `model_id`.
 2. After the tool result is returned, synthesize and judge the panel responses.
-3. Return the final issue selection JSON only.
+3. Write the final issue selection JSON to `{output_path}` using the write tool.
 
 Selection rules:
 - prefer the smallest cohesive PR with high confidence
@@ -2266,7 +2641,11 @@ Selection rules:
 - use the issue corpus as the source of truth if panel responses disagree
 - {requested}
 
-{JSON_ONLY_OUTPUT_RULE} Use this shape:
+Output rules:
+- Do not include the output path in the file content.
+- After writing the file, return at most a brief confirmation. The orchestrator will ignore your final message and read the file.
+
+The JSON file must use this shape:
 {{
   "title": "PR-sized implementation title",
   "issue_numbers": [123],
@@ -2286,6 +2665,7 @@ fn implementation_plan_panel_prompt(
     repo: &RepoSlug,
     selection_json: &str,
     selected_issues: &str,
+    output_path: &str,
 ) -> String {
     format!(
         r#"You are one independent implementation-planning panelist for a software factory workflow targeting {repo}.
@@ -2301,7 +2681,10 @@ The plan must:
 - call out risks and ambiguity
 - avoid code snippets
 
-Return markdown only.
+Output protocol:
+1. Write the final markdown plan to `{output_path}` using the write tool.
+2. Do not include the output path in the file content.
+3. After writing the file, return at most a brief confirmation. The orchestrator will ignore your final message and read the file.
 
 SELECTED WORK:
 {selection_json}
@@ -2316,15 +2699,16 @@ fn implementation_plan_synthesis_prompt(
     selection_json: &str,
     selected_issues: &str,
     panel_responses: &[PanelResponse],
+    output_path: &str,
 ) -> String {
     let panel_responses = render_panel_responses(panel_responses);
     format!(
         r#"You are the default software-factory decision session.
 
 You have independent implementation plans for the selected work. Follow this workflow exactly:
-1. Call the `rank_responses` tool exactly once, ranking every panel plan by `model_id`.
+1. Call the `rank_responses` tool exactly once, ranking every panel plan by anonymized `model_id`.
 2. After the tool result is returned, synthesize and judge the panel plans.
-3. Write the final implementation plan as markdown only. The orchestrator will save your final markdown to {IMPLEMENTATION_PLAN_PATH}; do not use the write tool.
+3. Write the final implementation plan as markdown to `{output_path}` using the write tool.
 
 The final plan must:
 - include selected issue numbers and scope
@@ -2334,6 +2718,9 @@ The final plan must:
 - include verification commands
 - call out risks and ambiguity
 - avoid code snippets
+- not include the output path in the file content
+
+After writing the file, return at most a brief confirmation. The orchestrator will ignore your final message, read the file, and save the final plan to {IMPLEMENTATION_PLAN_PATH}.
 
 SELECTED WORK:
 {selection_json}
@@ -2486,7 +2873,7 @@ async fn run_review_loop(
             bail!("review loop cannot continue: branch diff is empty");
         }
         info!(iteration, max_iterations, "starting review iteration");
-        let review = review_diff(
+        let review_output = review_diff(
             reviewer,
             worktree,
             base_ref,
@@ -2497,19 +2884,18 @@ async fn run_review_loop(
             project_system_prompt,
         )
         .await?;
-        if review.clean && review.findings.is_empty() {
+        if review_output.review.clean && review_output.review.findings.is_empty() {
             info!(iteration, "review loop is clean");
-            return Ok(review);
+            return Ok(review_output.review);
         }
         warn!(
             iteration,
-            findings = review.findings.len(),
+            findings = review_output.review.findings.len(),
             "review requested changes"
         );
-        let review_json = serde_json::to_string_pretty(&review)?;
         let prompt = review_repair_prompt(
             implementation_plan,
-            &review_json,
+            &review_output.text,
             ReviewIteration {
                 current: iteration,
                 max: max_iterations,
@@ -2533,18 +2919,26 @@ async fn review_diff(
     base_ref: &str,
     iteration: ReviewIteration,
     project_system_prompt: Option<&str>,
-) -> anyhow::Result<CodeReview> {
-    let prompt = code_review_prompt(base_ref, iteration);
-    let raw = run_code_review_agent_with_system_prompt(
+) -> anyhow::Result<CodeReviewOutput> {
+    let output = stage_output_file(
+        worktree,
+        &format!("code review {}", iteration.current),
+        "json",
+    );
+    let prompt = code_review_prompt(base_ref, iteration, &output.prompt_path);
+    let raw = run_agent_to_file_with_prompt_kind(
         reviewer,
         worktree,
-        "gpt code review",
+        "code review",
         prompt,
+        FactorySystemPrompt::Coding,
         project_system_prompt,
+        Some(CODE_REVIEW_MAX_TURNS),
+        &output,
     )
-    .await?
-    .text;
-    parse_json_response(&raw).map_err(anyhow::Error::msg)
+    .await?;
+    let review = parse_json_response(&raw).map_err(anyhow::Error::msg)?;
+    Ok(CodeReviewOutput { review, text: raw })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2563,7 +2957,7 @@ impl ReviewIteration {
     }
 }
 
-fn code_review_prompt(base_ref: &str, iteration: ReviewIteration) -> String {
+fn code_review_prompt(base_ref: &str, iteration: ReviewIteration, output_path: &str) -> String {
     let intro = if iteration.is_first() {
         format!("You are reviewing the current branch against {base_ref}.")
     } else {
@@ -2582,7 +2976,12 @@ Review stance:
 - Inspect the branch diff yourself from the current worktree. Start with `git diff --find-renames {base_ref}`, then read changed files and run focused checks when needed.
 - {CARGO_TIMEOUT_RULE}
 {final_instruction}
-{JSON_ONLY_OUTPUT_RULE} Use this shape:
+Output protocol:
+1. Write the final review JSON to `{output_path}` using the write tool.
+2. Do not include the output path in the file content.
+3. After writing the file, return at most a brief confirmation. The orchestrator will ignore your final message and read the file.
+
+The JSON file must use this shape:
 {{
   "clean": false,
   "summary": "short review summary",
@@ -3562,10 +3961,17 @@ mod tests {
 
     #[test]
     fn excluded_commit_paths_cover_checkpoint_and_optional_plan() {
-        assert_eq!(excluded_commit_paths(true), vec![CHECKPOINT_PATH]);
+        assert_eq!(
+            excluded_commit_paths(true),
+            vec![CHECKPOINT_PATH, FACTORY_TRANSIENT_OUTPUT_DIR]
+        );
         assert_eq!(
             excluded_commit_paths(false),
-            vec![IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH]
+            vec![
+                IMPLEMENTATION_PLAN_PATH,
+                CHECKPOINT_PATH,
+                FACTORY_TRANSIENT_OUTPUT_DIR
+            ]
         );
     }
 
@@ -3712,14 +4118,46 @@ mod tests {
     }
 
     #[test]
-    fn rank_response_count_covers_success_and_error_cases() {
+    fn ranking_entries_and_deanonymization_cover_success_and_error_cases() {
         let valid = json!({
             "rankings": [
                 { "model_id": "panel-1", "rank": 1 },
                 { "model_id": "panel-2", "rank": 2 }
             ]
         });
-        assert_eq!(rank_response_count(&valid).expect("valid rankings"), 2);
+        assert_eq!(
+            ranking_entries(&valid).expect("valid rankings"),
+            vec![
+                RankingEntry {
+                    anonymous_id: "panel-1".to_owned(),
+                    rank: 1,
+                },
+                RankingEntry {
+                    anonymous_id: "panel-2".to_owned(),
+                    rank: 2,
+                },
+            ]
+        );
+
+        let model_names = HashMap::from([
+            ("panel-1".to_owned(), "openrouter/model-a".to_owned()),
+            ("panel-2".to_owned(), "anthropic/model-b".to_owned()),
+        ]);
+        assert_eq!(
+            deanonymized_rankings(&valid, &model_names).expect("known panel ids"),
+            vec![
+                DeanonymizedRanking {
+                    anonymous_id: "panel-1".to_owned(),
+                    model_name: "openrouter/model-a".to_owned(),
+                    rank: 1,
+                },
+                DeanonymizedRanking {
+                    anonymous_id: "panel-2".to_owned(),
+                    model_name: "anthropic/model-b".to_owned(),
+                    rank: 2,
+                },
+            ]
+        );
 
         let cases = [
             ("missing rankings", json!({}), "rankings must be an array"),
@@ -3766,34 +4204,121 @@ mod tests {
         ];
 
         for (name, input, expected) in cases {
-            let error = rank_response_count(&input).expect_err(name);
+            let error = ranking_entries(&input).expect_err(name);
             assert!(error.contains(expected), "{name}: {error}");
         }
+
+        let unknown = json!({ "rankings": [{ "model_id": "panel-3", "rank": 1 }] });
+        let error = deanonymized_rankings(&unknown, &model_names).expect_err("unknown panel id");
+        assert!(error.contains("unknown anonymous model_id panel-3"));
     }
 
     #[test]
     fn synthesis_prompts_require_ranking_tool_and_use_panel_ids() {
         let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
+        let output_path = ".halter/software-factory/tmp/result.json";
         let responses = vec![PanelResponse {
             id: "panel-1".to_owned(),
             text: "Select issue #7 because it is contained.".to_owned(),
         }];
 
-        let issue_prompt = issue_selection_synthesis_prompt(&repo, "ISSUE #7", Some(7), &responses);
+        let issue_prompt =
+            issue_selection_synthesis_prompt(&repo, "ISSUE #7", Some(7), &responses, output_path);
         assert!(issue_prompt.contains(RANK_RESPONSES_TOOL));
         assert!(issue_prompt.contains("model_id: panel-1"));
         assert!(issue_prompt.contains("issue #7"));
-        assert!(issue_prompt.contains("Return ONLY the JSON object"));
+        assert!(issue_prompt.contains(output_path));
+        assert!(issue_prompt.contains("Write the final issue selection JSON"));
+        assert!(issue_prompt.contains("orchestrator will ignore your final message"));
 
         let plan_prompt = implementation_plan_synthesis_prompt(
             "{\"issue_numbers\":[7]}",
             "Issue details",
             &responses,
+            output_path,
         );
         assert!(plan_prompt.contains(RANK_RESPONSES_TOOL));
         assert!(plan_prompt.contains("model_id: panel-1"));
         assert!(plan_prompt.contains(IMPLEMENTATION_PLAN_PATH));
-        assert!(plan_prompt.contains("markdown only"));
+        assert!(plan_prompt.contains(output_path));
+        assert!(plan_prompt.contains("Write the final implementation plan as markdown"));
+    }
+
+    #[test]
+    fn stage_output_relative_path_sanitizes_components() {
+        assert_eq!(
+            stage_output_relative_path("Issue Selection!", "ABC-123", ".json"),
+            PathBuf::from(".halter/software-factory/tmp/issue-selection-abc-123.json")
+        );
+        assert_eq!(
+            stage_output_relative_path("../", " ", "???"),
+            PathBuf::from(".halter/software-factory/tmp/output-output.output")
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_output_read_removes_file_and_reports_empty_or_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = StageOutputFile {
+            prompt_path: ".halter/software-factory/tmp/result.json".to_owned(),
+            absolute_path: dir.path().join("result.json"),
+        };
+
+        assert_eq!(
+            read_and_remove_stage_output_file(&output)
+                .await
+                .expect("missing read"),
+            None
+        );
+
+        tokio::fs::write(&output.absolute_path, "   \n")
+            .await
+            .expect("write empty");
+        assert_eq!(
+            read_and_remove_stage_output_file(&output)
+                .await
+                .expect("empty read"),
+            None
+        );
+        assert!(!output.absolute_path.exists());
+
+        tokio::fs::write(&output.absolute_path, "final text")
+            .await
+            .expect("write text");
+        assert_eq!(
+            read_and_remove_stage_output_file(&output)
+                .await
+                .expect("text read"),
+            Some("final text".to_owned())
+        );
+        assert!(!output.absolute_path.exists());
+
+        tokio::fs::write(
+            &output.absolute_path,
+            format!(
+                "relative {} absolute {}",
+                output.prompt_path,
+                output.absolute_path.display()
+            ),
+        )
+        .await
+        .expect("write path references");
+        let scrubbed = read_and_remove_stage_output_file(&output)
+            .await
+            .expect("path reference read")
+            .expect("scrubbed output");
+        assert!(!scrubbed.contains(&output.prompt_path));
+        assert!(!scrubbed.contains(&output.absolute_path.display().to_string()));
+        assert_eq!(
+            scrubbed,
+            "relative [stage output file] absolute [stage output file]"
+        );
+
+        tokio::fs::write(&output.absolute_path, "partial text")
+            .await
+            .expect("write partial text");
+        remove_stage_output_after_failure(&output, "test stage").await;
+        assert!(!output.absolute_path.exists());
     }
 
     #[test]
@@ -4467,14 +4992,22 @@ mod tests {
         tokio::fs::write(source.join(CHECKPOINT_PATH), "{}\n")
             .await
             .expect("write checkpoint");
-
-        let committed = commit_if_dirty(
-            &source,
-            "Commit tracked change",
-            &[IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH],
+        tokio::fs::create_dir_all(source.join(FACTORY_TRANSIENT_OUTPUT_DIR))
+            .await
+            .expect("create transient output dir");
+        tokio::fs::write(
+            source
+                .join(FACTORY_TRANSIENT_OUTPUT_DIR)
+                .join("review-output.json"),
+            "{}\n",
         )
         .await
-        .expect("commit tracked change");
+        .expect("write transient output");
+
+        let excluded = excluded_commit_paths(false);
+        let committed = commit_if_dirty(&source, "Commit tracked change", &excluded)
+            .await
+            .expect("commit tracked change");
         assert!(committed);
 
         let committed_paths = run_cmd(
@@ -4487,13 +5020,9 @@ mod tests {
         assert!(committed_paths.lines().any(|line| line == "tracked.txt"));
         assert!(!committed_paths.contains(".halter/software-factory"));
 
-        let committed = commit_if_dirty(
-            &source,
-            "Skip local state only",
-            &[IMPLEMENTATION_PLAN_PATH, CHECKPOINT_PATH],
-        )
-        .await
-        .expect("skip local state only");
+        let committed = commit_if_dirty(&source, "Skip local state only", &excluded)
+            .await
+            .expect("skip local state only");
         assert!(!committed);
     }
 
@@ -4716,7 +5245,8 @@ mod tests {
         ];
 
         for case in cases {
-            let prompt = code_review_prompt("origin/master", case.iteration);
+            let output_path = ".halter/software-factory/tmp/review.json";
+            let prompt = code_review_prompt("origin/master", case.iteration, output_path);
 
             assert_eq!(
                 prompt.contains("You are reviewing the current branch against origin/master."),
@@ -4736,7 +5266,17 @@ mod tests {
                 "{} final prompt mismatch",
                 case.name
             );
-            assert!(prompt.contains(JSON_ONLY_OUTPUT_RULE), "{}", case.name);
+            assert!(prompt.contains(output_path), "{}", case.name);
+            assert!(
+                prompt.contains("Write the final review JSON"),
+                "{}",
+                case.name
+            );
+            assert!(
+                prompt.contains("orchestrator will ignore your final message"),
+                "{}",
+                case.name
+            );
             assert!(
                 prompt.contains("git diff --find-renames origin/master"),
                 "{}",
