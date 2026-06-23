@@ -379,6 +379,33 @@ Plugin `skills` entries can point at a single skill directory containing `SKILL.
 
 Compiled resources use stable identifiers. Skill ids are based on the canonical skill path, plugin ids are based on plugin name, version, and canonical plugin path, and the final resource snapshot revision is derived from loaded skill revisions, rendered agent prompt revisions, plugin name/version pairs, and hook revisions. Skill bodies and agent prompts are rendered before their revisions are computed, so changing an alias expansion (e.g., loading the same plugin through a different absolute root) produces a different snapshot revision.
 
+#### Bundled agent plugins
+
+The repository ships a bundled plugin set under `halter-agent-plugins/`. Today it contains one plugin, `halter-rust` (`0.1.0`), described as "Rust engineering guidance for Halter." That plugin carries two skills: `basic-rust` and `workflows-rust`.
+
+Four catalog or manifest files describe the same plugin so it can be discovered by Halter's resource compiler and by Claude Code or Codex environments:
+
+- `halter-agent-plugins/plugins/halter-rust/.claude-plugin/plugin.json` — Claude-style plugin manifest.
+- `halter-agent-plugins/plugins/halter-rust/.codex-plugin/plugin.json` — Codex-style plugin manifest (same core fields plus an `interface` block with a display name, capabilities, and a default prompt).
+- `.claude-plugin/marketplace.json` — Claude Code marketplace catalog that lists `halter-rust`.
+- `.agents/plugins/marketplace.json` — Codex/agent-style marketplace catalog that lists `halter-rust`.
+
+Halter's disk resource parsing (see "Disk resource parsing" above) recognizes `.claude-plugin/plugin.json`, `.agent-plugin/plugin.json`, `.halter-plugin/plugin.json`, or bare `plugin.json` when it scans a plugin directory; it does not read `.codex-plugin/plugin.json`. The bundled `halter-rust` plugin ships a `.claude-plugin/plugin.json` so Halter loads it, while the parallel `.codex-plugin/plugin.json` is provided for Codex-style clients and its additional `interface` metadata is ignored by Halter.
+
+The two bundled skills cover different layers of Halter Rust development:
+
+- `basic-rust` — use when building, explaining, testing, or modifying Rust agent harnesses with the Halter library. It covers config-driven runners, the SDK builder, custom tools, hooks, policy, persistence, providers, subagents, and workspace Rust changes.
+- `workflows-rust` — use when building scripted, deterministic multi-agent workflows in Rust on top of the Halter SDK, such as fan-out/fan-in, staged pipelines, adversarial verification, judge panels, loop-until-budget loops, structured agent output, concurrency control, and resumable orchestration. It pairs with `basic-rust`, which covers harness construction.
+
+To load the bundled plugin, add its plugin directory to your plugin roots. For example, with a config file:
+
+```toml
+[resources.plugins]
+roots = ["./halter-agent-plugins/plugins"]
+```
+
+Halter scans that root, finds the `halter-rust` child directory by its manifest, and loads the two skills. The same path can be passed programmatically to `ResourceCompiler` or set in `HarnessConfig.resources.plugins.roots`.
+
 #### Config File Example (non-exhaustive)
 
 ```toml
@@ -479,7 +506,7 @@ a turn**:
    parallel (each receives the full context **and** the tool specs). A constant
    framing prefix is prepended as the first user message so each panelist answers
    as one advisory voice on a judged panel — comparable prose about what it
-   *would* do and why, rather than executing or replying. The prefix is added
+   _would_ do and why, rather than executing or replying. The prefix is added
    only on the panel path, so it never reaches the synthesis or default model.
 2. The `synthesis` model is given the panel responses and a `rank_responses`
    tool. It first stack-ranks the responses (emitted as structured `tracing`
@@ -493,7 +520,7 @@ per iteration.
 
 **`mode = "full_turn"`.** Each panelist runs a **complete agentic turn**
 (inference + tool loop to completion) on the user's message, **once per turn**.
-The `synthesis` model judges the *outcomes* of those turns (using the same
+The `synthesis` model judges the _outcomes_ of those turns (using the same
 `rank_responses` + judge flow), and the synthesis is injected as advisory
 guidance on the default model's opening inference of the turn. The default model
 then runs its own full turn, owning the real, user-visible execution. Heavier,
