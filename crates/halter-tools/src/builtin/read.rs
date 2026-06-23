@@ -11,7 +11,9 @@ use tracing::debug;
 
 use crate::{Tool, ToolContext};
 
-use super::common::{ToolScope, ensure_not_cancelled, optional_u64, required_string, resolve_path};
+use super::common::{
+    ToolScope, ensure_not_cancelled, optional_bool, optional_u64, required_string, resolve_path,
+};
 
 const MAX_READ_LIMIT: u64 = 500;
 const DEFAULT_READ_LIMIT: u64 = MAX_READ_LIMIT;
@@ -26,6 +28,9 @@ struct ReadWindow {
     content: String,
     sha256: String,
     total_lines: u64,
+    /// `(line_number, line_text)` pairs for every line in the requested window.
+    /// Only populated when `line_numbers` is requested; empty otherwise.
+    lines: Vec<(u64, String)>,
 }
 
 #[async_trait]
@@ -38,7 +43,10 @@ impl Tool for ReadTool {
                  be absolute or relative to the working directory. Page through larger files \
                  with `offset` (1-based start line) and `limit`; the response includes \
                  `total_lines`, so a returned count below it means the file continues past \
-                 the window. Returns the raw file text plus its sha256."
+                 the window. Returns the raw file text plus its sha256. When reviewing or \
+                 debugging code, set `line_numbers = true` to receive a `lines` array with \
+                 per-line `{{\"line_number\", \"line\"}}` entries instead of using shell \
+                 commands such as `nl`, `sed -n`, `awk`, or `wc -l`."
             ),
             input_schema: json!({
                 "type": "object",
@@ -55,6 +63,11 @@ impl Tool for ReadTool {
                         "type": "integer",
                         "minimum": 1,
                         "default": DEFAULT_READ_TIMEOUT_SECS
+                    },
+                    "line_numbers": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, return a structured `lines` array of `{\"line_number\": 1, \"line\": \"...\"}` objects in addition to the legacy `content` string."
                     }
                 },
                 "required": ["path"],
@@ -72,6 +85,7 @@ impl Tool for ReadTool {
         let offset = optional_u64(&input, "offset")?.unwrap_or(1);
         let limit = parse_limit(&input)?;
         let timeout = parse_timeout(&input)?;
+        let line_numbers = optional_bool(&input, "line_numbers")?.unwrap_or(false);
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(Instant::now);
@@ -81,6 +95,7 @@ impl Tool for ReadTool {
             offset,
             limit,
             timeout_secs = timeout.as_secs(),
+            line_numbers,
             "reading file"
         );
 
@@ -107,17 +122,39 @@ impl Tool for ReadTool {
         let read_window = tokio::task::spawn_blocking(move || {
             let _lock = path_locks.acquire_read(&path_for_read)?;
             let reader = BufReader::new(file);
-            read_window_from_reader(reader, offset, limit, timeout, deadline, readable_bytes)
+            read_window_from_reader(
+                reader,
+                offset,
+                limit,
+                line_numbers,
+                timeout,
+                deadline,
+                readable_bytes,
+            )
         })
         .await??;
 
+        let mut result = serde_json::Map::new();
+        result.insert("path".to_owned(), json!(canonical_path));
+        result.insert("content".to_owned(), json!(read_window.content));
+        result.insert("sha256".to_owned(), json!(read_window.sha256));
+        result.insert("total_lines".to_owned(), json!(read_window.total_lines));
+        if line_numbers {
+            let lines: Vec<Value> = read_window
+                .lines
+                .into_iter()
+                .map(|(line_number, line)| {
+                    json!({
+                        "line_number": line_number,
+                        "line": line,
+                    })
+                })
+                .collect();
+            result.insert("lines".to_owned(), json!(lines));
+        }
+
         Ok(ToolResult::Json {
-            value: json!({
-                "path": canonical_path,
-                "content": read_window.content,
-                "sha256": read_window.sha256,
-                "total_lines": read_window.total_lines,
-            }),
+            value: Value::Object(result),
         })
     }
 }
@@ -142,6 +179,7 @@ fn read_window_from_reader<R: BufRead>(
     mut reader: R,
     offset: u64,
     limit: u64,
+    line_numbers: bool,
     timeout: Duration,
     deadline: Instant,
     max_bytes: usize,
@@ -153,6 +191,7 @@ fn read_window_from_reader<R: BufRead>(
     let mut current_line = String::new();
     let mut hasher = Sha256::new();
     let mut bytes_read = 0usize;
+    let mut lines = Vec::new();
 
     loop {
         ensure_before_deadline(timeout, deadline)?;
@@ -173,6 +212,9 @@ fn read_window_from_reader<R: BufRead>(
         hasher.update(current_line.as_bytes());
         if (start_line..=end_line).contains(&total_lines) {
             content.push_str(&current_line);
+            if line_numbers {
+                lines.push((total_lines, current_line.clone()));
+            }
         }
     }
 
@@ -180,6 +222,7 @@ fn read_window_from_reader<R: BufRead>(
         content,
         sha256: format!("{:x}", hasher.finalize()),
         total_lines,
+        lines,
     })
 }
 
@@ -214,6 +257,7 @@ mod tests {
             Cursor::new("a\nb\nc\n"),
             2,
             1,
+            false,
             Duration::from_secs(10),
             Instant::now()
                 .checked_add(Duration::from_secs(10))
@@ -290,10 +334,126 @@ mod tests {
         };
 
         assert_eq!(value["content"], "b\n");
+        assert!(value.get("lines").is_none());
     }
 
     #[tokio::test]
-    async fn read_defaults_limit_to_500_lines() {
+    async fn read_returns_lines_array_when_line_numbers_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "a\nb\nc\nd\n").expect("write");
+
+        let ToolResult::Json { value } = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "offset": 2,
+                    "limit": 2,
+                    "line_numbers": true
+                }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        assert_eq!(value["content"], "b\nc\n");
+        assert_eq!(value["total_lines"], 4);
+        let lines = value["lines"].as_array().expect("lines array");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["line_number"], 2);
+        assert_eq!(lines[0]["line"], "b\n");
+        assert_eq!(lines[1]["line_number"], 3);
+        assert_eq!(lines[1]["line"], "c\n");
+    }
+
+    #[tokio::test]
+    async fn read_omits_lines_field_when_line_numbers_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "a\nb\nc\nd\n").expect("write");
+
+        let ToolResult::Json { value } = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "offset": 2,
+                    "limit": 2,
+                    "line_numbers": false
+                }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        assert_eq!(value["content"], "b\nc\n");
+        assert_eq!(value["total_lines"], 4);
+        assert!(value.get("lines").is_none());
+    }
+
+    #[tokio::test]
+    async fn read_line_numbers_default_is_false() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "a\nb\nc\nd\n").expect("write");
+
+        let ToolResult::Json { value } = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "offset": 2,
+                    "limit": 2
+                }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        assert!(value.get("lines").is_none());
+    }
+
+    #[tokio::test]
+    async fn read_line_numbers_respects_offset_and_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let text = (1..=10)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(temp.path().join("note.txt"), text).expect("write");
+
+        let ToolResult::Json { value } = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "offset": 4,
+                    "limit": 3,
+                    "line_numbers": true
+                }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        let lines = value["lines"].as_array().expect("lines array");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["line_number"], 4);
+        assert_eq!(lines[0]["line"], "line 4\n");
+        assert_eq!(lines[1]["line_number"], 5);
+        assert_eq!(lines[1]["line"], "line 5\n");
+        assert_eq!(lines[2]["line_number"], 6);
+        assert_eq!(lines[2]["line"], "line 6\n");
+        assert_eq!(value["total_lines"], 10);
+    }
+
+    #[tokio::test]
+    async fn read_line_numbers_truncates_to_max_limit() {
         let temp = tempfile::tempdir().expect("tempdir");
         let text = (1..=600)
             .map(|line| format!("line {line}\n"))
@@ -301,6 +461,45 @@ mod tests {
         std::fs::write(temp.path().join("note.txt"), text).expect("write");
 
         let ToolResult::Json { value } = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "line_numbers": true
+                }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        let lines = value["lines"].as_array().expect("lines array");
+        assert_eq!(lines.len(), 500);
+        assert_eq!(lines[0]["line_number"], 1);
+        assert_eq!(lines[499]["line_number"], 500);
+    }
+
+    #[tokio::test]
+    async fn read_line_numbers_sha256_matches_legacy_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "a\nb\nc\n").expect("write");
+
+        let ToolResult::Json { value: enabled } = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "line_numbers": true
+                }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        let ToolResult::Json { value: disabled } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({ "path": "note.txt" }),
@@ -311,11 +510,232 @@ mod tests {
             panic!("expected json result");
         };
 
-        let content = value["content"].as_str().expect("content string");
-        assert_eq!(content.lines().count(), 500);
-        assert!(content.contains("line 500"));
-        assert!(!content.contains("line 501"));
-        assert_eq!(value["total_lines"], 600);
+        assert_eq!(enabled["sha256"], disabled["sha256"]);
+    }
+
+    #[tokio::test]
+    async fn read_line_numbers_empty_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "").expect("write");
+
+        let ToolResult::Json { value } = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "line_numbers": true
+                }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        let lines = value["lines"].as_array().expect("lines array");
+        assert!(lines.is_empty());
+        assert_eq!(value["content"], "");
+        assert_eq!(value["total_lines"], 0);
+    }
+
+    #[tokio::test]
+    async fn read_line_numbers_zero_window_is_empty_array() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "1\n2\n3\n4\n5\n").expect("write");
+
+        let ToolResult::Json { value } = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "offset": 10,
+                    "limit": 1,
+                    "line_numbers": true
+                }),
+            )
+            .await
+            .expect("read succeeds")
+        else {
+            panic!("expected json result");
+        };
+
+        let lines = value["lines"].as_array().expect("lines array");
+        assert!(lines.is_empty());
+        assert_eq!(value["content"], "");
+        assert_eq!(value["total_lines"], 5);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_non_boolean_line_numbers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "a\n").expect("write");
+
+        let error = ReadTool
+            .execute(
+                tool_context(temp.path(), usize::MAX),
+                json!({
+                    "path": "note.txt",
+                    "line_numbers": "yes"
+                }),
+            )
+            .await
+            .expect_err("non-boolean line_numbers is rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("field 'line_numbers' must be a boolean")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_line_numbers_does_not_break_byte_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "a\nb\n").expect("write");
+
+        let error = ReadTool
+            .execute(
+                tool_context(temp.path(), 2),
+                json!({
+                    "path": "note.txt",
+                    "line_numbers": true
+                }),
+            )
+            .await
+            .expect_err("full file size exceeds policy");
+
+        assert!(
+            error
+                .to_string()
+                .contains("read size 4 exceeds max_read_bytes 2")
+        );
+    }
+
+    #[test]
+    fn read_window_helper_returns_lines_when_enabled() {
+        let window = read_window_from_reader(
+            Cursor::new("a\nb\nc\n"),
+            1,
+            2,
+            true,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_add(Duration::from_secs(10))
+                .expect("future deadline"),
+            usize::MAX,
+        )
+        .expect("window read succeeds");
+
+        assert_eq!(
+            window.lines,
+            vec![(1, "a\n".to_owned()), (2, "b\n".to_owned())]
+        );
+    }
+
+    #[test]
+    fn read_window_helper_lines_empty_when_disabled() {
+        let window = read_window_from_reader(
+            Cursor::new("a\nb\nc\n"),
+            1,
+            2,
+            false,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_add(Duration::from_secs(10))
+                .expect("future deadline"),
+            usize::MAX,
+        )
+        .expect("window read succeeds");
+
+        assert!(window.lines.is_empty());
+    }
+
+    #[test]
+    fn read_window_times_out() {
+        let error = read_window_from_reader(
+            Cursor::new("a\nb\n"),
+            1,
+            1,
+            false,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("past deadline"),
+            usize::MAX,
+        )
+        .expect_err("read should time out");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to execute read tool: timed out after 10 seconds")
+        );
+    }
+
+    #[test]
+    fn read_line_numbers_does_not_bypass_timeout() {
+        let error = read_window_from_reader(
+            Cursor::new("a\nb\n"),
+            1,
+            1,
+            true,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("past deadline"),
+            usize::MAX,
+        )
+        .expect_err("read should time out");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to execute read tool: timed out after 10 seconds")
+        );
+    }
+
+    #[test]
+    fn read_window_fails_when_reader_exceeds_authorized_bytes() {
+        let error = read_window_from_reader(
+            Cursor::new("a\nb\n"),
+            1,
+            2,
+            false,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_add(Duration::from_secs(10))
+                .expect("future deadline"),
+            2,
+        )
+        .expect_err("read should exceed authorized bytes");
+
+        assert!(
+            error
+                .to_string()
+                .contains("read exceeded authorized byte limit")
+        );
+    }
+
+    #[test]
+    fn read_line_numbers_does_not_bypass_byte_limit_in_helper() {
+        let error = read_window_from_reader(
+            Cursor::new("a\nb\n"),
+            1,
+            2,
+            true,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_add(Duration::from_secs(10))
+                .expect("future deadline"),
+            2,
+        )
+        .expect_err("read should exceed authorized bytes");
+
+        assert!(
+            error
+                .to_string()
+                .contains("read exceeded authorized byte limit")
+        );
     }
 
     #[tokio::test]
@@ -338,48 +758,6 @@ mod tests {
             error
                 .to_string()
                 .contains("invalid tool input: field 'limit' must be between 1 and 500")
-        );
-    }
-
-    #[test]
-    fn read_window_times_out() {
-        let error = read_window_from_reader(
-            Cursor::new("a\nb\n"),
-            1,
-            1,
-            Duration::from_secs(10),
-            Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .expect("past deadline"),
-            usize::MAX,
-        )
-        .expect_err("read should time out");
-
-        assert!(
-            error
-                .to_string()
-                .contains("failed to execute read tool: timed out after 10 seconds")
-        );
-    }
-
-    #[test]
-    fn read_window_fails_when_reader_exceeds_authorized_bytes() {
-        let error = read_window_from_reader(
-            Cursor::new("a\nb\n"),
-            1,
-            2,
-            Duration::from_secs(10),
-            Instant::now()
-                .checked_add(Duration::from_secs(10))
-                .expect("future deadline"),
-            2,
-        )
-        .expect_err("read should exceed authorized bytes");
-
-        assert!(
-            error
-                .to_string()
-                .contains("read exceeded authorized byte limit")
         );
     }
 }
