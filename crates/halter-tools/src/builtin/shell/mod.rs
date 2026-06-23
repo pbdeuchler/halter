@@ -62,6 +62,7 @@ impl Tool for ShellTool {
         let options = ShellRunOptions {
             command: required_string(&input, "command")?.to_owned(),
             cwd: optional_string(&input, "cwd").map(ToOwned::to_owned),
+            default_cwd: Some(context.working_dir.to_string_lossy().into_owned()),
             env: parse_env_map(input.get("env"))?,
             timeout: Some(timeout),
         };
@@ -88,5 +89,114 @@ impl Tool for ShellTool {
                 "cancelled": result.cancelled,
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use halter_protocol::ToolResult;
+    use serde_json::{Value, json};
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{
+        DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolContext, ToolPolicy,
+        ToolSessionStore,
+    };
+
+    use super::*;
+
+    fn tool_context(root: &std::path::Path, allowed_shell_commands: Vec<String>) -> ToolContext {
+        ToolContext {
+            session_id: halter_protocol::SessionId::new(),
+            working_dir: root.to_path_buf(),
+            path_locks: Arc::new(PathLockMap::default()),
+            tool_sessions: Arc::new(ToolSessionStore::default()),
+            snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(NoopToolEventSink),
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings {
+                allowed_write_roots: vec![root.to_path_buf()],
+                allowed_shell_commands,
+                ..PolicySettings::default()
+            })) as Arc<dyn ToolPolicy>,
+            shell_timeout_secs: 30,
+            subagent_parent: None,
+        }
+    }
+
+    fn json_value(result: ToolResult) -> Value {
+        match result {
+            ToolResult::Json { value } => value,
+            other => panic!("expected json result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_defaults_cwd_to_tool_context_working_dir() {
+        let tool_cwd = tempfile::tempdir().expect("tool cwd tempdir");
+
+        let value = json_value(
+            ShellTool
+                .execute(
+                    tool_context(tool_cwd.path(), vec!["pwd".to_owned()]),
+                    json!({
+                        "command": "pwd",
+                        "timeout_ms": 120_000
+                    }),
+                )
+                .await
+                .expect("shell command succeeds"),
+        );
+
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(
+            value["stdout"].as_str().expect("stdout string").trim(),
+            tool_cwd.path().to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_preserves_cwd_changes_after_default_initialization() {
+        let tool_cwd = tempfile::tempdir().expect("tool cwd tempdir");
+        let subdir = tool_cwd.path().join("nested");
+        tokio::fs::create_dir_all(&subdir)
+            .await
+            .expect("create nested dir");
+        let context = tool_context(tool_cwd.path(), vec!["cd".to_owned(), "pwd".to_owned()]);
+
+        let cd_result = json_value(
+            ShellTool
+                .execute(
+                    context.clone(),
+                    json!({
+                        "command": "cd nested",
+                        "timeout_ms": 120_000
+                    }),
+                )
+                .await
+                .expect("cd succeeds"),
+        );
+        assert_eq!(cd_result["exit_code"], 0);
+
+        let pwd_result = json_value(
+            ShellTool
+                .execute(
+                    context,
+                    json!({
+                        "command": "pwd",
+                        "timeout_ms": 120_000
+                    }),
+                )
+                .await
+                .expect("pwd succeeds"),
+        );
+
+        assert_eq!(pwd_result["exit_code"], 0);
+        assert_eq!(
+            pwd_result["stdout"].as_str().expect("stdout string").trim(),
+            subdir.to_string_lossy()
+        );
     }
 }

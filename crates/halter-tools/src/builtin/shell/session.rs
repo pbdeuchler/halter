@@ -35,6 +35,7 @@ pub struct ShellSessionCore {
 pub struct ShellRunOptions {
     pub command: String,
     pub cwd: Option<String>,
+    pub default_cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub timeout: Option<Duration>,
 }
@@ -66,6 +67,7 @@ pub async fn run_persistent_shell(
         let options = ShellRunOptions {
             command: options.command.clone(),
             cwd: options.cwd.clone(),
+            default_cwd: options.default_cwd.clone(),
             env: options.env.clone(),
             timeout: options.timeout,
         };
@@ -74,7 +76,15 @@ pub async fn run_persistent_shell(
             let mut guard = session.lock().await;
             let shell = match &mut *guard {
                 Some(shell) => shell,
-                None => guard.insert(create_session().await?),
+                None => {
+                    let mut shell = create_session().await?;
+                    if let Some(cwd) = options.default_cwd.as_deref() {
+                        shell.shell.set_working_dir(cwd).map_err(|error| {
+                            anyhow::anyhow!("failed to set default shell cwd: {error}")
+                        })?;
+                    }
+                    guard.insert(shell)
+                }
             };
 
             let result = run_shell_command(shell, &options, emit, run_cancel).await;

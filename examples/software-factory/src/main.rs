@@ -9,7 +9,7 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -369,6 +369,8 @@ async fn main() -> anyhow::Result<()> {
         cli.resume,
         &repo,
         &base_branch,
+        requested_issue,
+        cli.commit_impl_plan,
         &run_id,
     )
     .await?;
@@ -572,12 +574,14 @@ async fn main() -> anyhow::Result<()> {
         write_checkpoint(&checkpoint_path, &checkpoint).await?;
         (branch, base_ref)
     };
+    activate_execution_context(&worktree, &current_branch, "prepared branch").await?;
     info!(branch = %current_branch, base_ref = %base_ref, "prepared branch");
     let commit_excluded_paths = excluded_commit_paths(cli.commit_impl_plan);
 
     if checkpoint.implemented {
         info!("skipping implementation; factory checkpoint marks it complete");
     } else {
+        activate_execution_context(&worktree, &current_branch, "implementation").await?;
         implement_plan(
             &implementer,
             &worktree,
@@ -595,6 +599,7 @@ async fn main() -> anyhow::Result<()> {
     if checkpoint.reviewed {
         info!("skipping review loop; factory checkpoint marks it complete");
     } else {
+        activate_execution_context(&worktree, &current_branch, "review").await?;
         run_review_loop(
             &implementer,
             &reviewer,
@@ -612,6 +617,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if !checkpoint.committed {
+        activate_execution_context(&worktree, &current_branch, "commit").await?;
         if !branch_has_diff(&worktree, &base_ref).await? {
             bail!("failed to create PR: implementation produced no diff against {base_ref}");
         }
@@ -632,6 +638,7 @@ async fn main() -> anyhow::Result<()> {
     if checkpoint.pushed {
         info!("skipping push; factory checkpoint marks it complete");
     } else {
+        activate_execution_context(&worktree, &current_branch, "push").await?;
         run_cmd(&worktree, "git", &["push", "-u", "origin", &current_branch]).await?;
         checkpoint.pushed = true;
         write_checkpoint(&checkpoint_path, &checkpoint).await?;
@@ -641,6 +648,7 @@ async fn main() -> anyhow::Result<()> {
         info!("using PR draft from factory checkpoint");
         pr_draft
     } else {
+        activate_execution_context(&worktree, &current_branch, "pull request draft").await?;
         let final_diff = branch_diff(&worktree, &base_ref).await?;
         let pr_draft = draft_pr(
             &pr_writer,
@@ -674,6 +682,7 @@ async fn main() -> anyhow::Result<()> {
     println!("created PR: {}", pr.html_url);
 
     if cli.monitor {
+        activate_execution_context(&worktree, &current_branch, "PR monitor startup").await?;
         monitor_pr(MonitorContext {
             github: &github,
             default_harness: &default_harness,
@@ -716,6 +725,8 @@ async fn resolve_execution_worktree(
     resume: bool,
     repo: &RepoSlug,
     base_branch: &str,
+    requested_issue: Option<u64>,
+    commit_impl_plan: bool,
     run_id: &str,
 ) -> anyhow::Result<PathBuf> {
     if !use_tmp_worktree {
@@ -730,13 +741,125 @@ async fn resolve_execution_worktree(
             );
             return Ok(launch_worktree.to_path_buf());
         }
-        bail!(
-            "failed to resume --worktree: cd into the existing factory worktree under {} and run --resume",
-            factory_worktree_tmp_root().display()
-        );
+        return find_resume_worktree(repo, base_branch, requested_issue, commit_impl_plan).await;
     }
 
     create_factory_worktree(launch_worktree, repo, base_branch, run_id).await
+}
+
+#[derive(Debug)]
+struct ResumeWorktreeCandidate {
+    worktree: PathBuf,
+    checkpoint: FactoryCheckpoint,
+    modified: SystemTime,
+}
+
+async fn find_resume_worktree(
+    repo: &RepoSlug,
+    base_branch: &str,
+    requested_issue: Option<u64>,
+    commit_impl_plan: bool,
+) -> anyhow::Result<PathBuf> {
+    let root = factory_worktree_tmp_root();
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            bail!(
+                "failed to resume --worktree: no factory worktree directory exists at {}",
+                root.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to list factory worktrees in {}", root.display())
+            });
+        }
+    };
+
+    let mut candidates = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("failed to list factory worktrees in {}", root.display()))?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let worktree = entry.path();
+        let checkpoint_path = worktree.join(CHECKPOINT_PATH);
+        if !tokio::fs::try_exists(&checkpoint_path)
+            .await
+            .with_context(|| format!("failed to inspect {}", checkpoint_path.display()))?
+        {
+            continue;
+        }
+
+        let checkpoint = match read_checkpoint(&checkpoint_path).await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                debug!(
+                    path = %checkpoint_path.display(),
+                    error = %error,
+                    "ignoring unreadable factory checkpoint while resolving resume worktree"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = validate_checkpoint_for_run(
+            &checkpoint,
+            repo,
+            base_branch,
+            requested_issue,
+            commit_impl_plan,
+        ) {
+            debug!(
+                path = %checkpoint_path.display(),
+                error = %error,
+                "ignoring factory checkpoint that does not match this resume request"
+            );
+            continue;
+        }
+
+        let modified = tokio::fs::metadata(&checkpoint_path)
+            .await
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push(ResumeWorktreeCandidate {
+            worktree,
+            checkpoint,
+            modified,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| right.worktree.cmp(&left.worktree))
+    });
+
+    let selected = candidates
+        .iter()
+        .find(|candidate| !candidate.checkpoint.completed)
+        .or_else(|| candidates.first())
+        .with_context(|| {
+            format!(
+                "failed to resume --worktree: no matching factory checkpoint found under {}",
+                root.display()
+            )
+        })?;
+    info!(
+        worktree = %selected.worktree.display(),
+        checkpoint_completed = selected.checkpoint.completed,
+        candidates = candidates.len(),
+        "resolved factory resume worktree from checkpoint"
+    );
+    Ok(selected.worktree.clone())
 }
 
 fn factory_worktree_tmp_root() -> PathBuf {
@@ -3164,6 +3287,7 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
     );
     loop {
         info!(pr_number = ctx.pr_number, "polling PR state");
+        activate_execution_context(ctx.worktree, ctx.branch, "PR monitor poll").await?;
         let pr = ctx
             .github
             .fetch_pull_request(ctx.repo, ctx.pr_number)
@@ -3209,6 +3333,7 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
                 ctx.implementer,
                 ctx.reviewer,
                 ctx.worktree,
+                ctx.branch,
                 ctx.base_ref,
                 ctx.implementation_plan,
                 &feedback_context,
@@ -3243,6 +3368,7 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
                 ctx.implementer,
                 ctx.reviewer,
                 ctx.worktree,
+                ctx.branch,
                 ctx.base_ref,
                 ctx.implementation_plan,
                 &feedback_context,
@@ -3302,6 +3428,7 @@ async fn apply_feedback(
     implementer: &Halter,
     reviewer: &Halter,
     worktree: &Path,
+    branch: &str,
     base_ref: &str,
     implementation_plan: &str,
     feedback_context: &str,
@@ -3325,6 +3452,7 @@ FEEDBACK CONTEXT:
 {feedback_context}
 "#
     );
+    activate_execution_context(worktree, branch, "PR feedback implementation").await?;
     run_coding_action_with_system_prompt(
         implementer,
         worktree,
@@ -3333,6 +3461,7 @@ FEEDBACK CONTEXT:
         project_system_prompt,
     )
     .await?;
+    activate_execution_context(worktree, branch, "PR feedback review").await?;
     run_review_loop(
         implementer,
         reviewer,
@@ -3357,7 +3486,9 @@ async fn commit_and_push_feedback_changes(
     if branch.is_empty() {
         bail!("failed to push monitor feedback: branch is empty");
     }
+    activate_execution_context(worktree, branch, "monitor feedback commit").await?;
     let committed = commit_if_dirty(worktree, message, excluded_paths).await?;
+    activate_execution_context(worktree, branch, "monitor feedback push").await?;
     run_cmd(worktree, "git", &["push", "origin", branch]).await?;
     Ok(committed)
 }
@@ -3383,6 +3514,33 @@ async fn checkout_branch(worktree: &Path, branch: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     run_cmd(worktree, "git", &["checkout", branch]).await?;
+    Ok(())
+}
+
+async fn activate_execution_context(
+    worktree: &Path,
+    branch: &str,
+    stage: &str,
+) -> anyhow::Result<()> {
+    checkout_branch(worktree, branch).await.with_context(|| {
+        format!(
+            "failed to activate {stage} in worktree {} on branch {branch}",
+            worktree.display()
+        )
+    })?;
+    let current = current_branch(worktree).await?;
+    if current != branch {
+        bail!(
+            "failed to activate {stage}: expected branch {branch} in {}, got {current}",
+            worktree.display()
+        );
+    }
+    info!(
+        stage,
+        branch,
+        worktree = %worktree.display(),
+        "activated factory execution context"
+    );
     Ok(())
 }
 
@@ -4927,26 +5085,73 @@ mod tests {
         let repo = RepoSlug::parse("pbdeuchler/halter").expect("valid repo");
         let dir = tempfile::tempdir().expect("tempdir");
 
-        let current =
-            resolve_execution_worktree(dir.path(), false, false, &repo, "main", "20260617")
-                .await
-                .expect("current worktree mode");
+        let current = resolve_execution_worktree(
+            dir.path(),
+            false,
+            false,
+            &repo,
+            "main",
+            None,
+            false,
+            "20260617",
+        )
+        .await
+        .expect("current worktree mode");
         assert_eq!(current, dir.path());
 
         let tmp = factory_worktree_tmp_root().join("resume-target");
-        let resumed = resolve_execution_worktree(&tmp, true, true, &repo, "main", "20260617")
-            .await
-            .expect("resume from tmp factory worktree");
+        let resumed =
+            resolve_execution_worktree(&tmp, true, true, &repo, "main", None, false, "20260617")
+                .await
+                .expect("resume from tmp factory worktree");
         assert_eq!(resumed, tmp);
 
-        let error = resolve_execution_worktree(dir.path(), true, true, &repo, "main", "20260617")
+        let error = resolve_execution_worktree(
+            dir.path(),
+            true,
+            true,
+            &repo,
+            "main",
+            Some(999_999),
+            false,
+            "20260617",
+        )
+        .await
+        .expect_err("resume outside tmp factory worktree without checkpoint should fail");
+        assert!(error.to_string().contains("no matching factory checkpoint"));
+    }
+
+    #[tokio::test]
+    async fn resolve_execution_worktree_finds_matching_checkpoint_from_launch_worktree() {
+        let run_id = unique_test_run_id("resume");
+        let repo =
+            RepoSlug::parse(&format!("factory-test/repo-{run_id}")).expect("valid unique repo");
+        let launch = tempfile::tempdir().expect("launch worktree");
+        let worktree = factory_worktree_tmp_root().join(format!("resume-target-{run_id}"));
+        remove_dir_if_exists(&worktree).await;
+
+        let mut checkpoint = FactoryCheckpoint::new(&repo, "main", None, false);
+        checkpoint.selection = Some(sample_selection());
+        checkpoint.branch = Some("factory/resume-target".to_owned());
+        write_checkpoint(&worktree.join(CHECKPOINT_PATH), &checkpoint)
             .await
-            .expect_err("resume outside tmp factory worktree should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("cd into the existing factory worktree")
-        );
+            .expect("write matching checkpoint");
+
+        let resumed = resolve_execution_worktree(
+            launch.path(),
+            true,
+            true,
+            &repo,
+            "main",
+            None,
+            false,
+            &run_id,
+        )
+        .await
+        .expect("resume locates matching checkpoint");
+
+        assert_eq!(resumed, worktree);
+        remove_dir_if_exists(&worktree).await;
     }
 
     #[tokio::test]
@@ -5141,6 +5346,40 @@ mod tests {
             .expect("push clean branch");
 
         assert!(!committed);
+        let local = current_commit(&source).await.expect("local head");
+        assert_eq!(
+            origin_branch_sha(&source, branch).await.as_deref(),
+            Some(local.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_and_push_feedback_changes_activates_target_branch_before_commit() {
+        let (_dir, source) = init_git_repo_with_origin().await;
+        let branch = "feedback/activate-before-commit";
+        run_cmd(&source, "git", &["checkout", "-b", branch])
+            .await
+            .expect("create feedback branch");
+        run_cmd(&source, "git", &["checkout", "main"])
+            .await
+            .expect("switch away from feedback branch");
+        tokio::fs::write(source.join("README.md"), "hello\nfeedback from monitor\n")
+            .await
+            .expect("write feedback change while branch is inactive");
+
+        let committed = commit_and_push_feedback_changes(&source, branch, "Address feedback", &[])
+            .await
+            .expect("commit and push feedback after activation");
+
+        assert!(committed);
+        assert_eq!(
+            current_branch(&source).await.expect("current branch"),
+            branch
+        );
+        assert!(
+            !git_is_dirty(&source, &[]).await.expect("clean worktree"),
+            "activation should leave a clean target branch"
+        );
         let local = current_commit(&source).await.expect("local head");
         assert_eq!(
             origin_branch_sha(&source, branch).await.as_deref(),
