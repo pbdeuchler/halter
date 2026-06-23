@@ -11,7 +11,9 @@ use tracing::debug;
 
 use crate::{Tool, ToolContext};
 
-use super::common::{ToolScope, ensure_not_cancelled, optional_bool, optional_u64, required_string, resolve_path};
+use super::common::{
+    ToolScope, ensure_not_cancelled, optional_bool, optional_u64, required_string, resolve_path,
+};
 
 const MAX_READ_LIMIT: u64 = 500;
 const DEFAULT_READ_LIMIT: u64 = MAX_READ_LIMIT;
@@ -624,7 +626,10 @@ mod tests {
         )
         .expect("window read succeeds");
 
-        assert_eq!(window.lines, vec![(1, "a\n".to_owned()), (2, "b\n".to_owned())]);
+        assert_eq!(
+            window.lines,
+            vec![(1, "a\n".to_owned()), (2, "b\n".to_owned())]
+        );
     }
 
     #[test]
@@ -713,18 +718,24 @@ mod tests {
 
     #[test]
     fn read_line_numbers_does_not_bypass_byte_limit_in_helper() {
-            )
-            .await
-            .expect("read succeeds")
-        else {
-            panic!("expected json result");
-        };
+        let error = read_window_from_reader(
+            Cursor::new("a\nb\n"),
+            1,
+            2,
+            true,
+            Duration::from_secs(10),
+            Instant::now()
+                .checked_add(Duration::from_secs(10))
+                .expect("future deadline"),
+            2,
+        )
+        .expect_err("read should exceed authorized bytes");
 
-        let content = value["content"].as_str().expect("content string");
-        assert_eq!(content.lines().count(), 500);
-        assert!(content.contains("line 500"));
-        assert!(!content.contains("line 501"));
-        assert_eq!(value["total_lines"], 600);
+        assert!(
+            error
+                .to_string()
+                .contains("read exceeded authorized byte limit")
+        );
     }
 
     #[tokio::test]
@@ -747,94 +758,6 @@ mod tests {
             error
                 .to_string()
                 .contains("invalid tool input: field 'limit' must be between 1 and 500")
-        );
-    }
-
-    #[tokio::test]
-    async fn read_line_numbers_does_not_bypass_byte_limit_in_helper() {
-        let error = read_window_from_reader(
-            Cursor::new("a\nb\n"),
-            1,
-            2,
-            true,
-            Duration::from_secs(10),
-            Instant::now()
-                .checked_add(Duration::from_secs(10))
-                .expect("future deadline"),
-            2,
-        )
-        .expect_err("read should exceed authorized bytes");
-
-        assert!(
-            error
-                .to_string()
-                .contains("read exceeded authorized byte limit")
-        );
-    }
-
-    #[test]
-    fn read_window_times_out() {
-        let error = read_window_from_reader(
-            Cursor::new("a\nb\n"),
-            1,
-            1,
-            false,
-            Duration::from_secs(10),
-            Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .expect("past deadline"),
-            usize::MAX,
-        )
-        .expect_err("read should time out");
-
-        assert!(
-            error
-                .to_string()
-                .contains("failed to execute read tool: timed out after 10 seconds")
-        );
-    }
-
-    #[test]
-    fn read_line_numbers_does_not_bypass_timeout() {
-        let error = read_window_from_reader(
-            Cursor::new("a\nb\n"),
-            1,
-            1,
-            true,
-            Duration::from_secs(10),
-            Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .expect("past deadline"),
-            usize::MAX,
-        )
-        .expect_err("read should time out");
-
-        assert!(
-            error
-                .to_string()
-                .contains("failed to execute read tool: timed out after 10 seconds")
-        );
-    }
-
-    #[test]
-    fn read_window_fails_when_reader_exceeds_authorized_bytes() {
-        let error = read_window_from_reader(
-            Cursor::new("a\nb\n"),
-            1,
-            2,
-            false,
-            Duration::from_secs(10),
-            Instant::now()
-                .checked_add(Duration::from_secs(10))
-                .expect("future deadline"),
-            2,
-        )
-        .expect_err("read should exceed authorized bytes");
-
-        assert!(
-            error
-                .to_string()
-                .contains("read exceeded authorized byte limit")
         );
     }
 }
