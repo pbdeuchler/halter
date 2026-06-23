@@ -602,6 +602,7 @@ async fn main() -> anyhow::Result<()> {
             &base_ref,
             &implementation_plan,
             cli.max_review_iterations,
+            None,
             project_system_prompt.as_deref(),
         )
         .await?;
@@ -2866,6 +2867,7 @@ async fn run_review_loop(
     base_ref: &str,
     implementation_plan: &str,
     max_iterations: usize,
+    feedback_context: Option<&str>,
     project_system_prompt: Option<&str>,
 ) -> anyhow::Result<CodeReview> {
     for iteration in 1..=max_iterations {
@@ -2881,6 +2883,7 @@ async fn run_review_loop(
                 current: iteration,
                 max: max_iterations,
             },
+            feedback_context,
             project_system_prompt,
         )
         .await?;
@@ -2900,6 +2903,7 @@ async fn run_review_loop(
                 current: iteration,
                 max: max_iterations,
             },
+            feedback_context,
         );
         run_coding_action_with_system_prompt(
             implementer,
@@ -2918,6 +2922,7 @@ async fn review_diff(
     worktree: &Path,
     base_ref: &str,
     iteration: ReviewIteration,
+    feedback_context: Option<&str>,
     project_system_prompt: Option<&str>,
 ) -> anyhow::Result<CodeReviewOutput> {
     let output = stage_output_file(
@@ -2925,7 +2930,7 @@ async fn review_diff(
         &format!("code review {}", iteration.current),
         "json",
     );
-    let prompt = code_review_prompt(base_ref, iteration, &output.prompt_path);
+    let prompt = code_review_prompt(base_ref, iteration, &output.prompt_path, feedback_context);
     let raw = run_agent_to_file_with_prompt_kind(
         reviewer,
         worktree,
@@ -2957,7 +2962,12 @@ impl ReviewIteration {
     }
 }
 
-fn code_review_prompt(base_ref: &str, iteration: ReviewIteration, output_path: &str) -> String {
+fn code_review_prompt(
+    base_ref: &str,
+    iteration: ReviewIteration,
+    output_path: &str,
+    feedback_context: Option<&str>,
+) -> String {
     let intro = if iteration.is_first() {
         format!("You are reviewing the current branch against {base_ref}.")
     } else {
@@ -2965,10 +2975,12 @@ fn code_review_prompt(base_ref: &str, iteration: ReviewIteration, output_path: &
             "Your previous code review has been addressed. Thoroughly re-review the current branch against {base_ref} and ensure all findings have been addressed and there are no new ones."
         )
     };
+    let feedback_focus = feedback_focus_section("review", feedback_context);
     let final_instruction = final_review_iteration_instruction(iteration, "review");
     format!(
         r#"{intro}
 
+{feedback_focus}
 Review stance:
 - Prioritize correctness bugs, regressions, missing tests, unsafe behavior, and broken edge cases.
 - Include but do not block on style nits unless they create real maintenance risk.
@@ -3003,11 +3015,14 @@ fn review_repair_prompt(
     implementation_plan: &str,
     review_json: &str,
     iteration: ReviewIteration,
+    feedback_context: Option<&str>,
 ) -> String {
+    let feedback_focus = feedback_focus_section("implementation", feedback_context);
     let final_instruction = final_review_iteration_instruction(iteration, "implementation");
     format!(
         r#"The code review for the current branch found issues. Fix every finding in the current worktree.
 
+{feedback_focus}
 Rules:
 - Do not create, switch, commit, push, or open branches/PRs.
 - Keep the fix scoped to the implementation plan and review findings.
@@ -3020,6 +3035,35 @@ IMPLEMENTATION PLAN:
 
 REVIEW RESULT:
 {review_json}
+"#
+    )
+}
+
+fn feedback_focus_section(participant: &str, feedback_context: Option<&str>) -> String {
+    let Some(feedback_context) = feedback_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return String::new();
+    };
+    let focus = match participant {
+        "review" => {
+            "Review only whether the feedback-driven changes implement the requested feedback correctly, include appropriate verification, and avoid regressions introduced by this monitor pass."
+        }
+        "implementation" => {
+            "Fix only the requested feedback and the review findings about that feedback. Do not revisit unrelated parts of the original implementation."
+        }
+        _ => "Keep this monitor pass scoped to the requested feedback.",
+    };
+    format!(
+        r#"Monitor feedback focus:
+This review loop was restarted because new PR feedback arrived after the branch was opened.
+- Use the feedback context below as the only requested scope for this monitor pass.
+- {focus}
+- Do not request or implement unrelated changes outside this feedback loop.
+
+FEEDBACK CONTEXT:
+{feedback_context}
 "#
     )
 }
@@ -3159,24 +3203,26 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
 
         if !action.code_review_feedback.is_empty() {
             let feedback = action.code_review_feedback.join("\n\n---\n\n");
+            let feedback_context =
+                format!("Monitor trigger: GitHub code review feedback\n\n{feedback}");
             apply_feedback(
                 ctx.implementer,
                 ctx.reviewer,
                 ctx.worktree,
                 ctx.base_ref,
                 ctx.implementation_plan,
-                &format!("Address this GitHub code review feedback:\n\n{feedback}"),
+                &feedback_context,
                 ctx.max_review_iterations,
                 ctx.project_system_prompt,
             )
             .await?;
-            commit_if_dirty(
+            commit_and_push_feedback_changes(
                 ctx.worktree,
+                ctx.branch,
                 "Address PR code review feedback",
                 ctx.excluded_commit_paths,
             )
             .await?;
-            run_cmd(ctx.worktree, "git", &["push", "origin", ctx.branch]).await?;
         }
 
         if !action.plsfix_comments.is_empty() {
@@ -3190,24 +3236,27 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
                 ctx.project_system_prompt,
             )
             .await?;
+            let feedback_context = format!(
+                "Monitor trigger: maintainer /plsfix comment(s)\n\nOriginal /plsfix comment(s):\n\n{comments}\n\nRefined implementation instruction:\n\n{instruction}"
+            );
             apply_feedback(
                 ctx.implementer,
                 ctx.reviewer,
                 ctx.worktree,
                 ctx.base_ref,
                 ctx.implementation_plan,
-                &instruction,
+                &feedback_context,
                 ctx.max_review_iterations,
                 ctx.project_system_prompt,
             )
             .await?;
-            commit_if_dirty(
+            commit_and_push_feedback_changes(
                 ctx.worktree,
+                ctx.branch,
                 "Address /plsfix PR feedback",
                 ctx.excluded_commit_paths,
             )
             .await?;
-            run_cmd(ctx.worktree, "git", &["push", "origin", ctx.branch]).await?;
         }
 
         tokio::time::sleep(Duration::from_secs(ctx.poll_seconds)).await;
@@ -3255,24 +3304,25 @@ async fn apply_feedback(
     worktree: &Path,
     base_ref: &str,
     implementation_plan: &str,
-    feedback: &str,
+    feedback_context: &str,
     max_review_iterations: usize,
     project_system_prompt: Option<&str>,
 ) -> anyhow::Result<()> {
     let prompt = format!(
-        r#"Apply this PR feedback in the current worktree.
+        r#"Apply this monitor-triggered PR feedback in the current worktree.
 
 Rules:
 - Do not create, switch, commit, push, or open branches/PRs.
-- Keep changes scoped to the selected issues and feedback.
+- This is not a new full implementation pass. Only make the changes needed to satisfy the feedback context below.
+- Keep changes scoped to the selected issues and feedback context.
 - Run focused verification for the changed behavior.
 - {CARGO_TIMEOUT_RULE}
 
 IMPLEMENTATION PLAN:
 {implementation_plan}
 
-FEEDBACK:
-{feedback}
+FEEDBACK CONTEXT:
+{feedback_context}
 "#
     );
     run_coding_action_with_system_prompt(
@@ -3290,10 +3340,26 @@ FEEDBACK:
         base_ref,
         implementation_plan,
         max_review_iterations,
+        Some(feedback_context),
         project_system_prompt,
     )
     .await?;
     Ok(())
+}
+
+async fn commit_and_push_feedback_changes(
+    worktree: &Path,
+    branch: &str,
+    message: &str,
+    excluded_paths: &[&str],
+) -> anyhow::Result<bool> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        bail!("failed to push monitor feedback: branch is empty");
+    }
+    let committed = commit_if_dirty(worktree, message, excluded_paths).await?;
+    run_cmd(worktree, "git", &["push", "origin", branch]).await?;
+    Ok(committed)
 }
 
 async fn git_is_dirty(worktree: &Path, excluded_paths: &[&str]) -> anyhow::Result<bool> {
@@ -5027,6 +5093,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_and_push_feedback_changes_commits_dirty_feedback_and_pushes() {
+        let (_dir, source) = init_git_repo_with_origin().await;
+        let branch = "feedback/dirty";
+        run_cmd(&source, "git", &["checkout", "-b", branch])
+            .await
+            .expect("create feedback branch");
+        tokio::fs::write(source.join("README.md"), "hello\nfeedback\n")
+            .await
+            .expect("write feedback change");
+
+        let committed = commit_and_push_feedback_changes(&source, branch, "Address feedback", &[])
+            .await
+            .expect("commit and push feedback");
+
+        assert!(committed);
+        let local = current_commit(&source).await.expect("local head");
+        assert_eq!(
+            origin_branch_sha(&source, branch).await.as_deref(),
+            Some(local.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_and_push_feedback_changes_pushes_existing_local_commit_when_clean() {
+        let (_dir, source) = init_git_repo_with_origin().await;
+        let branch = "feedback/already-committed";
+        run_cmd(&source, "git", &["checkout", "-b", branch])
+            .await
+            .expect("create feedback branch");
+        tokio::fs::write(source.join("README.md"), "hello\ncommitted by agent\n")
+            .await
+            .expect("write committed change");
+        run_cmd(&source, "git", &["add", "README.md"])
+            .await
+            .expect("stage committed change");
+        run_cmd(
+            &source,
+            "git",
+            &["commit", "-m", "Agent committed feedback"],
+        )
+        .await
+        .expect("agent commit");
+
+        let committed = commit_and_push_feedback_changes(&source, branch, "Address feedback", &[])
+            .await
+            .expect("push clean branch");
+
+        assert!(!committed);
+        let local = current_commit(&source).await.expect("local head");
+        assert_eq!(
+            origin_branch_sha(&source, branch).await.as_deref(),
+            Some(local.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_and_push_feedback_changes_rejects_empty_branch() {
+        let (_dir, source) = init_git_repo_with_origin().await;
+        tokio::fs::write(source.join("README.md"), "hello\nfeedback\n")
+            .await
+            .expect("write feedback change");
+
+        let error = commit_and_push_feedback_changes(&source, " \n", "Address feedback", &[])
+            .await
+            .expect_err("empty branch should fail");
+
+        assert!(
+            error.to_string().contains("branch is empty"),
+            "unexpected error: {error}"
+        );
+        assert!(git_is_dirty(&source, &[]).await.expect("dirty worktree"));
+    }
+
+    #[tokio::test]
     async fn branch_has_diff_covers_clean_changed_and_invalid_base_ref() {
         let (_dir, source) = init_git_repo_with_origin().await;
 
@@ -5153,6 +5293,14 @@ mod tests {
         .expect("remove git worktree");
     }
 
+    async fn origin_branch_sha(source: &Path, branch: &str) -> Option<String> {
+        let ref_name = format!("refs/heads/{branch}");
+        let output = run_cmd(source, "git", &["ls-remote", "origin", &ref_name])
+            .await
+            .expect("ls remote branch");
+        output.split_whitespace().next().map(str::to_owned)
+    }
+
     #[test]
     fn session_init_with_appended_context_uses_coding_prompt_and_append_segments() {
         let init = session_init_with_appended_context(
@@ -5246,7 +5394,7 @@ mod tests {
 
         for case in cases {
             let output_path = ".halter/software-factory/tmp/review.json";
-            let prompt = code_review_prompt("origin/master", case.iteration, output_path);
+            let prompt = code_review_prompt("origin/master", case.iteration, output_path, None);
 
             assert_eq!(
                 prompt.contains("You are reviewing the current branch against origin/master."),
@@ -5284,6 +5432,7 @@ mod tests {
             );
             assert!(!prompt.contains("BRANCH DIFF:"), "{}", case.name);
             assert!(!prompt.contains("diff --git"), "{}", case.name);
+            assert!(!prompt.contains("Monitor feedback focus:"), "{}", case.name);
         }
     }
 
@@ -5309,7 +5458,7 @@ mod tests {
         ];
 
         for case in cases {
-            let prompt = review_repair_prompt("plan", r#"{"clean":false}"#, case.iteration);
+            let prompt = review_repair_prompt("plan", r#"{"clean":false}"#, case.iteration, None);
 
             assert!(
                 prompt.contains("IMPLEMENTATION PLAN:\nplan"),
@@ -5336,7 +5485,40 @@ mod tests {
                 "{} final approach mismatch",
                 case.name
             );
+            assert!(!prompt.contains("Monitor feedback focus:"), "{}", case.name);
         }
+    }
+
+    #[test]
+    fn monitor_feedback_context_is_included_in_review_and_repair_prompts() {
+        let feedback_context = "Monitor trigger: maintainer /plsfix comment(s)\n\nOriginal /plsfix comment(s):\n\nadd windows coverage";
+
+        let review_prompt = code_review_prompt(
+            "origin/main",
+            ReviewIteration { current: 1, max: 2 },
+            ".halter/software-factory/tmp/review.json",
+            Some(feedback_context),
+        );
+        assert!(review_prompt.contains("This review loop was restarted"));
+        assert!(review_prompt.contains("only requested scope for this monitor pass"));
+        assert!(review_prompt.contains("Review only whether the feedback-driven changes"));
+        assert!(review_prompt.contains("Do not request or implement unrelated changes"));
+        assert!(review_prompt.contains("FEEDBACK CONTEXT:\nMonitor trigger"));
+        assert!(review_prompt.contains("Original /plsfix comment(s)"));
+        assert!(review_prompt.contains("add windows coverage"));
+
+        let repair_prompt = review_repair_prompt(
+            "plan",
+            r#"{"clean":false}"#,
+            ReviewIteration { current: 2, max: 2 },
+            Some(feedback_context),
+        );
+        assert!(repair_prompt.contains("This review loop was restarted"));
+        assert!(repair_prompt.contains("Fix only the requested feedback"));
+        assert!(repair_prompt.contains("Do not request or implement unrelated changes"));
+        assert!(repair_prompt.contains("FEEDBACK CONTEXT:\nMonitor trigger"));
+        assert!(repair_prompt.contains("Original /plsfix comment(s)"));
+        assert!(repair_prompt.contains("add windows coverage"));
     }
 
     #[tokio::test]

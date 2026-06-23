@@ -77,10 +77,7 @@ pub fn parse_github_remote_url(raw: &str) -> Result<RepoSlug, String> {
 }
 
 pub fn is_maintainer_author_association(value: &str) -> bool {
-    matches!(
-        value,
-        "OWNER" | "MEMBER" | "COLLABORATOR" | "owner" | "member" | "collaborator"
-    )
+    matches!(value, "OWNER" | "MEMBER" | "owner" | "member")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,14 +582,21 @@ mod tests {
 
     #[test]
     fn maintainer_author_association_matches_github_maintainer_roles() {
-        for value in ["OWNER", "MEMBER", "COLLABORATOR", "owner"] {
+        for value in ["OWNER", "MEMBER", "owner", "member"] {
             assert!(
                 is_maintainer_author_association(value),
                 "{value:?} should count as maintainer"
             );
         }
 
-        for value in ["CONTRIBUTOR", "FIRST_TIMER", "NONE", ""] {
+        for value in [
+            "COLLABORATOR",
+            "collaborator",
+            "CONTRIBUTOR",
+            "FIRST_TIMER",
+            "NONE",
+            "",
+        ] {
             assert!(
                 !is_maintainer_author_association(value),
                 "{value:?} should not count as maintainer"
