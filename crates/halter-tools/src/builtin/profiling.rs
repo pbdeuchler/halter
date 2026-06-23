@@ -1,24 +1,32 @@
 // pattern: Functional Core
 
-use std::cmp::Reverse;
-use std::collections::HashMap;
-use std::sync::LazyLock;
-use std::time::Instant;
+#[cfg(any(test, feature = "profiling"))]
+use std::{cmp::Reverse, collections::HashMap, sync::LazyLock, time::Instant};
 
+#[cfg(feature = "profiling")]
 use async_trait::async_trait;
+#[cfg(feature = "profiling")]
 use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+#[cfg(any(test, feature = "profiling"))]
 use parking_lot::Mutex;
+#[cfg(feature = "profiling")]
 use serde_json::json;
+#[cfg(any(test, feature = "profiling"))]
 use smallvec::SmallVec;
 
+#[cfg(feature = "profiling")]
 use crate::{Tool, ToolContext};
 
+#[cfg(any(test, feature = "profiling"))]
 const MAX_SAMPLES: usize = 10_000;
 
+#[cfg(any(test, feature = "profiling"))]
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+#[cfg(any(test, feature = "profiling"))]
 static PROFILE_BUFFER: LazyLock<Mutex<CircularBuffer>> =
     LazyLock::new(|| Mutex::new(CircularBuffer::new(MAX_SAMPLES)));
 
+#[cfg(any(test, feature = "profiling"))]
 #[derive(Clone)]
 struct ProfileSample {
     session_id: String,
@@ -27,12 +35,14 @@ struct ProfileSample {
     timestamp_us: u64,
 }
 
+#[cfg(any(test, feature = "profiling"))]
 struct CircularBuffer {
     samples: Vec<ProfileSample>,
     capacity: usize,
     write_pos: usize,
 }
 
+#[cfg(any(test, feature = "profiling"))]
 impl CircularBuffer {
     const fn new(capacity: usize) -> Self {
         Self {
@@ -64,12 +74,17 @@ impl CircularBuffer {
     }
 }
 
+#[cfg(not(any(test, feature = "profiling")))]
+pub struct FlatProfileGuard;
+
+#[cfg(any(test, feature = "profiling"))]
 pub struct FlatProfileGuard {
     region: &'static str,
     session_id: String,
     start: Instant,
 }
 
+#[cfg(any(test, feature = "profiling"))]
 impl FlatProfileGuard {
     fn new(region: &'static str, session_id: impl Into<String>) -> Self {
         Self {
@@ -80,6 +95,7 @@ impl FlatProfileGuard {
     }
 }
 
+#[cfg(any(test, feature = "profiling"))]
 impl Drop for FlatProfileGuard {
     fn drop(&mut self) {
         let duration_us = self.start.elapsed().as_micros() as u64;
@@ -95,11 +111,19 @@ impl Drop for FlatProfileGuard {
     }
 }
 
+#[cfg(not(any(test, feature = "profiling")))]
+#[must_use]
+pub(crate) fn profile_flat_region(_region: &'static str, _session_id: &str) -> FlatProfileGuard {
+    FlatProfileGuard
+}
+
+#[cfg(any(test, feature = "profiling"))]
 #[must_use]
 pub(crate) fn profile_flat_region(region: &'static str, session_id: &str) -> FlatProfileGuard {
     FlatProfileGuard::new(region, session_id)
 }
 
+#[cfg(any(test, feature = "profiling"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkProfile {
     pub folded: String,
@@ -263,7 +287,7 @@ fn generate_svg(folded: &str) -> Option<String> {
     String::from_utf8(output).ok()
 }
 
-#[cfg(not(feature = "profiling"))]
+#[cfg(all(test, not(feature = "profiling")))]
 fn generate_svg(_folded: &str) -> Option<String> {
     None
 }

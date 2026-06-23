@@ -112,6 +112,7 @@ struct SearchParams {
     mode: OutputMode,
     max_matches: Option<u64>,
     offset: u64,
+    #[cfg(feature = "advanced-tools")]
     multiline: bool,
 }
 
@@ -445,6 +446,7 @@ fn run_sequential_search(
         mode: config.output_mode,
         max_matches: Some(config.max_matches),
         offset: config.offset,
+        #[cfg(feature = "advanced-tools")]
         multiline: config.multiline,
     };
 
