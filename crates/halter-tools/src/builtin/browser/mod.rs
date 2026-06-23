@@ -10,6 +10,7 @@
 // ZST and concurrent agents working in different halter sessions can each
 // hold their own browser without collision.
 
+use std::fmt::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -429,23 +430,29 @@ fn truncate_snapshot(snapshot: &str) -> String {
     if snapshot.len() <= SNAPSHOT_TRUNCATE_THRESHOLD {
         return snapshot.to_owned();
     }
+
+    let total_lines = snapshot.lines().count();
     let mut buf = String::with_capacity(SNAPSHOT_TRUNCATE_THRESHOLD + 80);
     let mut consumed = 0usize;
     let mut kept_lines = 0usize;
-    let mut total_lines = 0usize;
+
     for line in snapshot.lines() {
-        total_lines += 1;
         if consumed + line.len() + 1 < SNAPSHOT_TRUNCATE_THRESHOLD {
             buf.push_str(line);
             buf.push('\n');
             consumed += line.len() + 1;
             kept_lines += 1;
+        } else {
+            break;
         }
     }
-    buf.push_str(&format!(
+
+    let dropped = total_lines.saturating_sub(kept_lines);
+    let _ = write!(
+        buf,
         "\n[... {} more lines truncated; use ref-targeted actions or 'screenshot' for context]",
-        total_lines.saturating_sub(kept_lines)
-    ));
+        dropped
+    );
     buf
 }
 
@@ -541,5 +548,103 @@ mod tests {
         let truncated = truncate_snapshot(&big);
         assert!(truncated.contains("more lines truncated"));
         assert!(truncated.len() < big.len());
+    }
+
+    #[test]
+    fn truncate_snapshot_empty_passthrough() {
+        assert_eq!(truncate_snapshot(""), "");
+    }
+
+    #[test]
+    fn truncate_snapshot_keeps_contiguous_prefix() {
+        let input = "x\n".repeat(5_000);
+        let total_lines = input.lines().count();
+        // Each kept line consumes one byte plus a newline, so the condition
+        // `consumed + 1 + 1 < 8_000` allows at most 3_999 lines.
+        let expected_kept = 3_999;
+        let expected_dropped = total_lines.saturating_sub(expected_kept);
+
+        let output = truncate_snapshot(&input);
+        let marker_pos = output.find("\n[...").expect("marker present");
+        let kept = &output[..marker_pos];
+
+        assert_eq!(kept.lines().count(), expected_kept);
+        assert_eq!(kept, "x\n".repeat(expected_kept));
+        assert!(output.contains(&format!("{expected_dropped} more lines truncated")));
+    }
+
+    #[test]
+    fn truncate_snapshot_marker_reports_accurate_dropped_count() {
+        let input = "x\n".repeat(5_000);
+        let total_lines = input.lines().count();
+        let expected_kept = 3_999;
+        let expected_dropped = total_lines.saturating_sub(expected_kept);
+
+        let output = truncate_snapshot(&input);
+
+        assert!(output.contains(&format!("{expected_dropped} more lines truncated")));
+    }
+
+    #[test]
+    fn truncate_snapshot_does_not_keep_later_short_line_after_skipping_long_line() {
+        let long = "a".repeat(SNAPSHOT_TRUNCATE_THRESHOLD);
+        let short = "short";
+        let input = format!("{long}\n{short}\n{long}\n");
+
+        let output = truncate_snapshot(&input);
+
+        assert!(!output.contains(short));
+        assert!(output.contains("more lines truncated"));
+    }
+
+    #[test]
+    fn truncate_snapshot_drops_all_subsequent_lines_when_first_does_not_fit() {
+        let long = "a".repeat(SNAPSHOT_TRUNCATE_THRESHOLD);
+        let input = format!("{long}\n") + &"short\n".repeat(50);
+
+        let output = truncate_snapshot(&input);
+
+        assert!(!output.contains("short"));
+        assert!(output.contains("51 more lines truncated"));
+        assert!(output.contains("more lines truncated"));
+    }
+
+    #[test]
+    fn truncate_snapshot_single_huge_line_drops_everything() {
+        let input = "a".repeat(SNAPSHOT_TRUNCATE_THRESHOLD + 100);
+        let output = truncate_snapshot(&input);
+        let expected =
+            "\n[... 1 more lines truncated; use ref-targeted actions or 'screenshot' for context]"
+                .to_string();
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn truncate_snapshot_boundary_kept_then_no_more() {
+        // Leave exactly room for one short line under the threshold.
+        let padding_len = SNAPSHOT_TRUNCATE_THRESHOLD - 10;
+        let first = "a".repeat(padding_len - 1);
+        let second = "b".repeat(10);
+        let input = format!("{first}\n{second}\nzzz\n");
+
+        let output = truncate_snapshot(&input);
+        let marker_pos = output.find("\n[...").expect("marker present");
+        let kept = &output[..marker_pos];
+
+        assert!(kept.contains(&first));
+        assert!(!kept.contains("zzz"));
+    }
+
+    #[test]
+    fn truncate_snapshot_multi_byte_utf8_does_not_panic_or_corrupt() {
+        let emoji = "🎉".repeat(3_000);
+        let input = format!("{emoji}\nline2\nline3\n");
+
+        let output = truncate_snapshot(&input);
+
+        assert!(output.contains("more lines truncated"));
+        assert!(!output.contains("line2"));
+        assert!(!output.contains("line3"));
     }
 }
