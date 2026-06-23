@@ -406,9 +406,6 @@ roots = ["./halter-agent-plugins/plugins"]
 
 Halter scans that root, finds the `halter-rust` child directory by its manifest, and loads the two skills. The same path can be passed programmatically to `ResourceCompiler` or set in `HarnessConfig.resources.plugins.roots`.
 
-> [!NOTE]
-> Remote plugin installation from GitHub URLs or a marketplace registry is not implemented yet. Only local filesystem plugin roots are supported today.
-
 #### Config File Example (non-exhaustive)
 
 ```toml
@@ -509,7 +506,7 @@ a turn**:
    parallel (each receives the full context **and** the tool specs). A constant
    framing prefix is prepended as the first user message so each panelist answers
    as one advisory voice on a judged panel — comparable prose about what it
-   *would* do and why, rather than executing or replying. The prefix is added
+   _would_ do and why, rather than executing or replying. The prefix is added
    only on the panel path, so it never reaches the synthesis or default model.
 2. The `synthesis` model is given the panel responses and a `rank_responses`
    tool. It first stack-ranks the responses (emitted as structured `tracing`
@@ -523,7 +520,7 @@ per iteration.
 
 **`mode = "full_turn"`.** Each panelist runs a **complete agentic turn**
 (inference + tool loop to completion) on the user's message, **once per turn**.
-The `synthesis` model judges the *outcomes* of those turns (using the same
+The `synthesis` model judges the _outcomes_ of those turns (using the same
 `rank_responses` + judge flow), and the synthesis is injected as advisory
 guidance on the default model's opening inference of the turn. The default model
 then runs its own full turn, owning the real, user-visible execution. Heavier,
