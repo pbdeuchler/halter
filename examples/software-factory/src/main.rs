@@ -138,7 +138,7 @@ const DEFAULT_REVIEW_MODEL_SPEC: &str = DEFAULT_MODEL_SPEC;
 const DEFAULT_PULL_REQUEST_MODEL_SPEC: &str = "openrouter/google/gemma-4-31b-it";
 const PANEL_MODEL_SPECS: [&str; 3] = [
     "openrouter/minimax/minimax-m3",
-    "openrouter/deepseek/deepseek-v4-pro",
+    "openrouter/poolside/laguna-m.1",
     "openrouter/qwen/qwen3.6-27b",
 ];
 const DEFAULT_SESSION_COMPACTION_THRESHOLD: u64 = 300_000;
