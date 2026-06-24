@@ -39,11 +39,12 @@ mod builder;
 mod resources;
 
 pub use builder::{Halter, HalterBuilder};
-pub use resources::{
-    CompiledResources, LoadedAgent, LoadedExecutable, LoadedHooksFile, LoadedLspServer,
-    LoadedMcpServer, LoadedOutputStyle, LoadedPlugin, LoadedResourceFile, LoadedSkill,
-    PluginDefaults, PluginLoader, ResourceCompiler, SkillLoader,
+pub use halter_config::{
+    LoadedAgent, LoadedExecutable, LoadedHooksFile, LoadedLspServer, LoadedMcpServer,
+    LoadedOutputStyle, LoadedPlugin, LoadedResourceFile, LoadedSkill, PluginDefaults, PluginLoader,
+    SkillLoader,
 };
+pub use resources::{CompiledResources, ResourceCompiler};
 
 pub mod session {
     pub use halter_session::{InMemorySessionStore, SessionStore, StoredSession};
