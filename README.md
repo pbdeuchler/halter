@@ -383,13 +383,6 @@ Compiled resources use stable identifiers. Skill ids are based on the canonical 
 
 The repository ships a bundled plugin set under `halter-agent-plugins/`. Today it contains one plugin, `halter-rust` (`0.1.0`), described as "Rust engineering guidance for Halter." That plugin carries two skills: `basic-rust` and `workflows-rust`.
 
-Four catalog or manifest files describe the same plugin so it can be discovered by Halter's resource compiler and by Claude Code or Codex environments:
-
-- `halter-agent-plugins/plugins/halter-rust/.claude-plugin/plugin.json` — Claude-style plugin manifest.
-- `halter-agent-plugins/plugins/halter-rust/.codex-plugin/plugin.json` — Codex-style plugin manifest (same core fields plus an `interface` block with a display name, capabilities, and a default prompt).
-- `.claude-plugin/marketplace.json` — Claude Code marketplace catalog that lists `halter-rust`.
-- `.agents/plugins/marketplace.json` — Codex/agent-style marketplace catalog that lists `halter-rust`.
-
 The two bundled skills cover different layers of using the halter SDK:
 
 - `basic-rust` — use when building, explaining, testing, or modifying Rust agent harnesses with the Halter library. It covers config-driven runners, the SDK builder, custom tools, hooks, policy, persistence, providers, subagents, and workspace Rust changes.
@@ -406,7 +399,7 @@ roots = ["./halter-agent-plugins/plugins"]
 
 The `halter-config` crate has an opt-in `remote-plugins` feature for SDKs that want to fetch GitHub-hosted plugins without installing them to a local cache. It returns the same `LoadedPlugin` values that `ResourceCompiler::with_loaded_plugins(...)` already accepts:
 
-These plugins are downloaded and made available to the harness dynamically and purely in memory. At the moment only skills and agents are supported; commands and hooks are on the roadmap but are not currently planned.
+These plugins are downloaded and made available to the harness dynamically and purely in memory. At the moment only skills and agents are supported, commands and hooks are on the roadmap but are not currently planned.
 
 ```rust,no_run
 use halter::HalterBuilder;
