@@ -22,18 +22,13 @@ const CODEX_MARKETPLACE_MANIFEST: &str = ".agents/plugins/marketplace.json";
 const CLAUDE_MARKETPLACE_MANIFEST: &str = ".claude-plugin/marketplace.json";
 
 /// Which plugins to take from a marketplace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum PluginSelection {
     /// Load every plugin listed by the marketplace.
+    #[default]
     All,
     /// Load only the named plugins.
     Only(Vec<String>),
-}
-
-impl Default for PluginSelection {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 /// Repo coordinates shared by both source kinds.
