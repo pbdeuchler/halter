@@ -3329,18 +3329,7 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
             let feedback = action.code_review_feedback.join("\n\n---\n\n");
             let feedback_context =
                 format!("Monitor trigger: GitHub code review feedback\n\n{feedback}");
-            apply_feedback(
-                ctx.implementer,
-                ctx.reviewer,
-                ctx.worktree,
-                ctx.branch,
-                ctx.base_ref,
-                ctx.implementation_plan,
-                &feedback_context,
-                ctx.max_review_iterations,
-                ctx.project_system_prompt,
-            )
-            .await?;
+            apply_feedback(&ctx, &feedback_context).await?;
             commit_and_push_feedback_changes(
                 ctx.worktree,
                 ctx.branch,
@@ -3364,18 +3353,7 @@ async fn monitor_pr(ctx: MonitorContext<'_>) -> anyhow::Result<()> {
             let feedback_context = format!(
                 "Monitor trigger: maintainer /plsfix comment(s)\n\nOriginal /plsfix comment(s):\n\n{comments}\n\nRefined implementation instruction:\n\n{instruction}"
             );
-            apply_feedback(
-                ctx.implementer,
-                ctx.reviewer,
-                ctx.worktree,
-                ctx.branch,
-                ctx.base_ref,
-                ctx.implementation_plan,
-                &feedback_context,
-                ctx.max_review_iterations,
-                ctx.project_system_prompt,
-            )
-            .await?;
+            apply_feedback(&ctx, &feedback_context).await?;
             commit_and_push_feedback_changes(
                 ctx.worktree,
                 ctx.branch,
@@ -3424,17 +3402,7 @@ IMPLEMENTATION PLAN:
     .text)
 }
 
-async fn apply_feedback(
-    implementer: &Halter,
-    reviewer: &Halter,
-    worktree: &Path,
-    branch: &str,
-    base_ref: &str,
-    implementation_plan: &str,
-    feedback_context: &str,
-    max_review_iterations: usize,
-    project_system_prompt: Option<&str>,
-) -> anyhow::Result<()> {
+async fn apply_feedback(ctx: &MonitorContext<'_>, feedback_context: &str) -> anyhow::Result<()> {
     let prompt = format!(
         r#"Apply this monitor-triggered PR feedback in the current worktree.
 
@@ -3450,27 +3418,29 @@ IMPLEMENTATION PLAN:
 
 FEEDBACK CONTEXT:
 {feedback_context}
-"#
+"#,
+        implementation_plan = ctx.implementation_plan,
+        feedback_context = feedback_context,
     );
-    activate_execution_context(worktree, branch, "PR feedback implementation").await?;
+    activate_execution_context(ctx.worktree, ctx.branch, "PR feedback implementation").await?;
     run_coding_action_with_system_prompt(
-        implementer,
-        worktree,
+        ctx.implementer,
+        ctx.worktree,
         "pr feedback implementation",
         prompt,
-        project_system_prompt,
+        ctx.project_system_prompt,
     )
     .await?;
-    activate_execution_context(worktree, branch, "PR feedback review").await?;
+    activate_execution_context(ctx.worktree, ctx.branch, "PR feedback review").await?;
     run_review_loop(
-        implementer,
-        reviewer,
-        worktree,
-        base_ref,
-        implementation_plan,
-        max_review_iterations,
+        ctx.implementer,
+        ctx.reviewer,
+        ctx.worktree,
+        ctx.base_ref,
+        ctx.implementation_plan,
+        ctx.max_review_iterations,
         Some(feedback_context),
-        project_system_prompt,
+        ctx.project_system_prompt,
     )
     .await?;
     Ok(())

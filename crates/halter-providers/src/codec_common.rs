@@ -138,13 +138,14 @@ pub(crate) fn bounded_provider_id_with_prefix(
     } else {
         sanitized
     };
-    // Invariant: `base` is ASCII — `sanitize_provider_id` maps every non
-    // alphanumeric/-/_ rune to `_`, and `short_hash` emits hex digits.
-    // The byte-slicing below (`&base[..head_len]`, `&suffix[..available]`)
-    // relies on this. Admitting multibyte runes into either path without
-    // switching to char-based truncation would panic on a char boundary
-    // (finding M21).
-    debug_assert!(base.is_ascii(), "provider id base must be ASCII");
+    // `base` is ASCII for any non-empty `value`, because
+    // `sanitize_provider_id` maps every non alphanumeric/-/_ rune to `_`.
+    // It may contain multi-byte runes only when `value` is empty and
+    // `empty_prefix` is not ASCII. Truncation below uses a
+    // `floor_char_boundary`-style clamp so the byte slices are
+    // char-boundary-safe for any UTF-8 input. The `debug_assert!` on the
+    // suffix (always hex / ASCII) remains as a defense-in-depth sentinel,
+    // not as the source of release-mode panic safety.
     if prefix.len() + base.len() <= max_len {
         return format!("{prefix}{base}");
     }
@@ -157,11 +158,15 @@ pub(crate) fn bounded_provider_id_with_prefix(
     let suffix = short_hash(value);
     debug_assert!(suffix.is_ascii(), "provider id suffix must be ASCII");
     if suffix.len() >= available {
-        return format!("{prefix}{}", &suffix[..available]);
+        return format!(
+            "{prefix}{}",
+            &suffix[..floor_char_boundary(&suffix, available)]
+        );
     }
 
     let head_len = available - suffix.len() - 1;
-    format!("{prefix}{}_{}", &base[..head_len], suffix)
+    let head_end = floor_char_boundary(&base, head_len);
+    format!("{prefix}{}_{}", &base[..head_end], suffix)
 }
 
 pub(crate) fn data_url(media_type: &str, data: &[u8]) -> String {
@@ -197,4 +202,112 @@ fn sanitize_provider_id(value: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Walks back from `idx` to the nearest UTF-8 char boundary at or before it.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut boundary = idx.min(s.len());
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_ascii_value_with_prefix_fits_unchanged() {
+        let value = "hello_world";
+        let result = bounded_provider_id_with_prefix("pre_", value, 64, "tool");
+        assert!(result.starts_with("pre_hello_world"));
+        assert_eq!(result.len(), "pre_hello_world".len());
+    }
+
+    #[test]
+    fn long_ascii_value_truncated_to_exact_max_len() {
+        let max_len = 16;
+        let value = "a".repeat(64);
+        let result = bounded_provider_id_with_prefix("", &value, max_len, "tool");
+        assert_eq!(
+            result.len(),
+            max_len,
+            "result should be exactly {max_len} bytes"
+        );
+        let expected_head_len = max_len - short_hash(&value).len() - "_".len();
+        let expected = format!("{}_{}", "a".repeat(expected_head_len), short_hash(&value));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn empty_ascii_value_is_truncated_to_max_len() {
+        let value = "";
+        let max_len = 10;
+        let result = bounded_provider_id_with_prefix("", value, max_len, "tool");
+        // base "tool_<hash>" is longer than max_len, so it is truncated to
+        // {head "t"}_{suffix}, giving exactly max_len bytes.
+        assert!(result.starts_with("t_"));
+        assert_eq!(result.len(), max_len);
+    }
+
+    #[test]
+    fn prefix_longer_than_max_len_returns_truncated_hash() {
+        let value = "ignored";
+        let result = bounded_provider_id_with_prefix("verylongprefix", value, 4, "tool");
+        assert_eq!(result.len(), 4);
+        // Should be the first 4 chars of the hex hash, all ASCII hex digits.
+        assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sanitize_provider_id_strips_non_ascii_to_underscores() {
+        let input = "héllo-世界_";
+        let out = sanitize_provider_id(input);
+        assert!(out.is_ascii());
+        assert_eq!(out, "h_llo-___");
+    }
+
+    #[test]
+    fn non_ascii_empty_prefix_suffix_path_is_safe() {
+        // `empty_prefix` is not sanitized, so empty `value` causes `base` to
+        // contain a multi-byte rune. With a small `max_len` we hit the suffix
+        // branch and must never slice on a char boundary.
+        let empty_prefix = "é";
+        let value = "";
+        let max_len = 2;
+        let result = bounded_provider_id_with_prefix("", value, max_len, empty_prefix);
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "result must be valid UTF-8"
+        );
+        assert!(result.len() <= max_len, "{} <= {}", result.len(), max_len);
+    }
+
+    #[test]
+    fn non_ascii_empty_prefix_head_path_is_safe() {
+        // Same non-ASCII `empty_prefix`, but with a max_len large enough to
+        // reach the {head}_{suffix} branch. The head slice must clamp to a
+        // char boundary (the 2-byte "é" would be split otherwise).
+        let empty_prefix = "é";
+        let value = "";
+        let max_len = 10;
+        let result = bounded_provider_id_with_prefix("", value, max_len, empty_prefix);
+        assert!(result.is_char_boundary(0));
+        assert!(result.is_char_boundary(result.len()));
+        assert!(result.len() <= max_len);
+    }
+
+    #[test]
+    fn suffix_truncation_path_is_char_boundary_safe() {
+        // Force the suffix branch by making the combined prefix+base exceed
+        // max_len while `available` is at most 8 (suffix length).
+        let value = "123456789";
+        let max_len = 12;
+        let prefix = "pre_";
+        let result = bounded_provider_id_with_prefix(prefix, value, max_len, "tool");
+        assert_eq!(result.len(), max_len);
+        assert!(result.is_char_boundary(0));
+        assert!(result.is_char_boundary(result.len()));
+    }
 }
