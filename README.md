@@ -377,12 +377,12 @@ Standalone skills are discovered recursively under each skill root:
 
 Plugins are discovered one level below each plugin root. Each child directory is treated as a plugin only if it contains a manifest at one of these paths, checked in order:
 
-1. `.claude-plugin/plugin.json`
-2. `.agent-plugin/plugin.json`
-3. `.halter-plugin/plugin.json`
+1. `.codex-plugin/plugin.json`
+2. `.claude-plugin/plugin.json`
+3. `.agent-plugin/plugin.json`
 4. `plugin.json`
 
-The manifest must include non-empty string fields `name` and `version`. Optional manifest fields include `skills`, `agents`, `hooks`, `mcpServers`, `lspServers`, `allowedHttpHosts`, and `allowedEnvVars`. Skill and agent entries must be paths relative to the plugin root and must start with `./`, unless they use a plugin alias. Supported aliases are `${CLAUDE_PLUGIN_ROOT}`, `${PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, and `${PLUGIN_DATA}`. `${PLUGIN_ROOT}` resolves to the enclosing plugin root (or the skill's own root for standalone skills), and `${PLUGIN_DATA}` resolves to `<root>/.data`. These aliases are also rendered inside skill (`SKILL.md`) bodies and agent prompt files at load time. Parent-directory traversal is rejected, and resolved paths must stay inside the plugin root.
+The manifest must include non-empty string fields `name` and `version`. Optional manifest fields include `skills`, `agents`, `hooks`, `mcpServers`, `lspServers`, `allowedHttpHosts`, and `allowedEnvVars`. `skills` and `agents` may be a string path or an array of string paths. Skill and agent entries must be paths relative to the plugin root and must start with `./`, unless they use a plugin alias. Supported aliases are `${CLAUDE_PLUGIN_ROOT}`, `${PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, and `${PLUGIN_DATA}`. `${PLUGIN_ROOT}` resolves to the enclosing plugin root (or the skill's own root for standalone skills), and `${PLUGIN_DATA}` resolves to `<root>/.data`. These aliases are also rendered inside skill (`SKILL.md`) bodies and agent prompt files at load time. Parent-directory traversal is rejected, and resolved paths must stay inside the plugin root.
 
 Plugin `skills` entries can point at a single skill directory containing `SKILL.md` or at a directory tree that should be searched recursively for skills. Plugin `agents` entries can point at one prompt file or a directory of prompt files; each file becomes an agent named after its file stem. Hooks are loaded from the manifest's `hooks` path, or from `hooks/hooks.json` when the manifest omits `hooks`. Hook parse failures are retained as hook warnings instead of aborting the whole resource compile.
 
@@ -392,16 +392,7 @@ Compiled resources use stable identifiers. Skill ids are based on the canonical 
 
 The repository ships a bundled plugin set under `halter-agent-plugins/`. Today it contains one plugin, `halter-rust` (`0.1.0`), described as "Rust engineering guidance for Halter." That plugin carries two skills: `basic-rust` and `workflows-rust`.
 
-Four catalog or manifest files describe the same plugin so it can be discovered by Halter's resource compiler and by Claude Code or Codex environments:
-
-- `halter-agent-plugins/plugins/halter-rust/.claude-plugin/plugin.json` — Claude-style plugin manifest.
-- `halter-agent-plugins/plugins/halter-rust/.codex-plugin/plugin.json` — Codex-style plugin manifest (same core fields plus an `interface` block with a display name, capabilities, and a default prompt).
-- `.claude-plugin/marketplace.json` — Claude Code marketplace catalog that lists `halter-rust`.
-- `.agents/plugins/marketplace.json` — Codex/agent-style marketplace catalog that lists `halter-rust`.
-
-Halter's disk resource parsing (see "Disk resource parsing" above) recognizes `.claude-plugin/plugin.json`, `.agent-plugin/plugin.json`, `.halter-plugin/plugin.json`, or bare `plugin.json` when it scans a plugin directory; it does not read `.codex-plugin/plugin.json`. The bundled `halter-rust` plugin ships a `.claude-plugin/plugin.json` so Halter loads it, while the parallel `.codex-plugin/plugin.json` is provided for Codex-style clients and its additional `interface` metadata is ignored by Halter.
-
-The two bundled skills cover different layers of Halter Rust development:
+The two bundled skills cover different layers of using the halter SDK:
 
 - `basic-rust` — use when building, explaining, testing, or modifying Rust agent harnesses with the Halter library. It covers config-driven runners, the SDK builder, custom tools, hooks, policy, persistence, providers, subagents, and workspace Rust changes.
 - `workflows-rust` — use when building scripted, deterministic multi-agent workflows in Rust on top of the Halter SDK, such as fan-out/fan-in, staged pipelines, adversarial verification, judge panels, loop-until-budget loops, structured agent output, concurrency control, and resumable orchestration. It pairs with `basic-rust`, which covers harness construction.
@@ -413,7 +404,35 @@ To load the bundled plugin, add its plugin directory to your plugin roots. For e
 roots = ["./halter-agent-plugins/plugins"]
 ```
 
-Halter scans that root, finds the `halter-rust` child directory by its manifest, and loads the two skills. The same path can be passed programmatically to `ResourceCompiler` or set in `HarnessConfig.resources.plugins.roots`.
+#### Remote GitHub plugins
+
+The `halter-config` crate has an opt-in `remote-plugins` feature for SDKs that want to fetch GitHub-hosted plugins without installing them to a local cache. It returns the same `LoadedPlugin` values that `ResourceCompiler::with_loaded_plugins(...)` already accepts:
+
+These plugins are downloaded and made available to the harness dynamically and purely in memory. At the moment only skills and agents are supported, commands and hooks are on the roadmap but are not currently planned.
+
+```rust,no_run
+use halter::HalterBuilder;
+use halter_config::github::{GithubPlugins, load_plugins};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let plugins = load_plugins([
+        GithubPlugins::plugin("https://github.com/acme/rust-tools")?,
+        GithubPlugins::marketplace("https://github.com/acme/agent-marketplace")?
+            .only(["pairs-review", "sql-guard"]),
+    ])
+    .await?;
+
+    let harness = HalterBuilder::new()
+        .with_loaded_plugins(plugins)
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+Remote marketplace loading checks `.agents/plugins/marketplace.json` first and falls back to `.claude-plugin/marketplace.json`. Remote plugin directories check `.codex-plugin/plugin.json` first and falls back to `.claude-plugin/plugin.json`. If neither manifest exists, loading fails.
 
 #### Config File Example (non-exhaustive)
 

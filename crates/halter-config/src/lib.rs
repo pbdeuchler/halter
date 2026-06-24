@@ -7,12 +7,18 @@
 // pattern: Functional Core
 
 mod loader;
+mod resources;
 mod schema;
 
 pub use halter_protocol::{PanelIsolation, SubagentEventForwarding};
 pub use loader::{
     LayeredConfigPaths, apply_env_overrides, config_fingerprint, expand_path, export_json_schema,
     generate_starter_config, load_layered, load_path, schema_as_json_value,
+};
+pub use resources::{
+    LoadedAgent, LoadedExecutable, LoadedHooksFile, LoadedLspServer, LoadedMcpServer,
+    LoadedOutputStyle, LoadedPlugin, LoadedResourceFile, LoadedSkill, PluginDefaults, PluginLoader,
+    SkillLoader,
 };
 pub use schema::{
     ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, HarnessConfig, LoopbackAllowConfig,
@@ -22,3 +28,6 @@ pub use schema::{
     SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig,
     ShellPolicyConfig, SystemPromptPreset, ToolsConfig, resolve_provider_runtime_config,
 };
+
+#[cfg(feature = "remote-plugins")]
+pub mod github;

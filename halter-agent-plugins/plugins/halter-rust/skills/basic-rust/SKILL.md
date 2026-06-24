@@ -157,7 +157,7 @@ Do not tell users that adding a tool name to `tools.enabled` compiles the featur
 Use resources for durable agent behavior instead of appending instructions to every turn.
 
 - Standalone skills are discovered recursively below `[resources.skills].roots`; each skill directory must contain `SKILL.md`.
-- Plugin roots are scanned one level deep. A plugin is a child directory with `.claude-plugin/plugin.json`, `.agent-plugin/plugin.json`, `.halter-plugin/plugin.json`, or `plugin.json`.
+- Plugin roots are scanned one level deep. A plugin is a child directory with `.codex-plugin/plugin.json`, `.claude-plugin/plugin.json`, `.agent-plugin/plugin.json`, or `plugin.json`.
 - Plugin manifests need `name` and `version`. Optional paths include `skills`, `agents`, `hooks`, `mcpServers`, `lspServers`, `allowedHttpHosts`, and `allowedEnvVars`.
 - Plugin `skills` and `agents` paths must be `./...` or an accepted plugin alias. Parent-directory traversal is rejected.
 - Agent prompt files become named `agent_type` values for `spawn_agent`.

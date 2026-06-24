@@ -12,15 +12,21 @@ rust-version.workspace = true
 
 [features]
 sqlite = []
+remote-plugins = ["dep:flate2", "dep:futures", "dep:reqwest", "dep:tar"]
 
 [dependencies]
 anyhow.workspace = true
+flate2 = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+halter-hooks = { path = "../halter-hooks", version = "0.1.0"  }
 halter-protocol = { path = "../halter-protocol", version = "0.1.0"  }
 indexmap.workspace = true
+reqwest = { workspace = true, optional = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tar = { workspace = true, optional = true }
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true

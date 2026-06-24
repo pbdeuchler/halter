@@ -21,6 +21,7 @@ pty = ["halter-runtime/pty", "halter-tools/pty"]
 profiling = ["halter-runtime/profiling", "halter-tools/profiling"]
 full = ["advanced-tools", "ast-tools", "browser-tools", "image-tools", "pty", "profiling"]
 sqlite = ["halter-config/sqlite", "halter-session/sqlite"]
+remote-plugins = ["halter-config/remote-plugins"]
 
 [dependencies]
 anyhow.workspace = true
