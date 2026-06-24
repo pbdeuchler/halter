@@ -406,9 +406,7 @@ roots = ["./halter-agent-plugins/plugins"]
 
 #### Remote GitHub plugins
 
-The `halter-config` crate has an opt-in `remote-plugins` feature for SDKs that want to fetch GitHub-hosted plugins without installing them to a local cache. It returns the same `LoadedPlugin` values that `ResourceCompiler::with_loaded_plugins(...)` already accepts:
-
-These plugins are downloaded and made available to the harness dynamically and purely in memory. At the moment only skills and agents are supported, commands and hooks are on the roadmap but are not currently planned.
+The `halter-config` crate has an opt-in `remote-plugins` feature for SDKs that want to fetch GitHub-hosted plugins without installing them to a local cache. These plugins are downloaded and made available to the harness dynamically and purely in memory. At the moment only skills and agents are supported, commands and hooks are on the roadmap but are not currently planned. It returns the same `LoadedPlugin` values that `ResourceCompiler::with_loaded_plugins(...)` already accepts:
 
 ```rust,no_run
 use halter::HalterBuilder;
