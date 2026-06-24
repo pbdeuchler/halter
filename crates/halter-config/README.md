@@ -334,10 +334,15 @@ Current prompt config surface:
 
 ```toml
 [prompts]
+preset = "general" # "general" (default) | "coding"
 system_prompt = "optional override text"
+append_system_prompt = """
+## House rules
+- Stable extra instructions appended after the resolved base prompt.
+"""
 ```
 
-This is a narrow part of the schema today. Most prompt assembly behavior lives in `halter-runtime`.
+`system_prompt` replaces the selected base prompt. `append_system_prompt` keeps the selected base prompt and adds static, prefix-cacheable System text after it.
 
 ---
 

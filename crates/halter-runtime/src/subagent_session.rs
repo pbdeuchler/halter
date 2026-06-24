@@ -233,14 +233,24 @@ mod tests {
                 subagent_event_forwarding: SubagentEventForwarding::All,
                 snapshot_revision: Revision::from("revision"),
                 working_dir: ".".into(),
-                system_prompt_seed: vec![PromptSegment {
-                    id: PromptSegmentId::new(),
-                    text: "base prompt".to_owned(),
-                    volatility: Volatility::Static,
-                    cache_scope: CacheScope::PrefixCacheable,
-                    content_hash: "base".into(),
-                    kind: PromptSegmentKind::System,
-                }],
+                system_prompt_seed: vec![
+                    PromptSegment {
+                        id: PromptSegmentId::new(),
+                        text: "base prompt".to_owned(),
+                        volatility: Volatility::Static,
+                        cache_scope: CacheScope::PrefixCacheable,
+                        content_hash: "base".into(),
+                        kind: PromptSegmentKind::System,
+                    },
+                    PromptSegment {
+                        id: PromptSegmentId::new(),
+                        text: "house rules".to_owned(),
+                        volatility: Volatility::Static,
+                        cache_scope: CacheScope::PrefixCacheable,
+                        content_hash: "house-rules".into(),
+                        kind: PromptSegmentKind::System,
+                    },
+                ],
                 max_turns: Some(4),
                 subagent_depth: 1,
             },
@@ -269,8 +279,11 @@ mod tests {
             Some(SubagentEventForwarding::All)
         );
         assert_eq!(init.subagent_depth, 2);
-        assert_eq!(init.system_prompt_seed.len(), 2);
-        assert_eq!(init.system_prompt_seed[1].text, "specialized helper prompt");
+        assert_eq!(init.system_prompt_seed.len(), 3);
+        assert_eq!(init.system_prompt_seed[0].text, "base prompt");
+        assert_eq!(init.system_prompt_seed[1].text, "house rules");
+        assert_eq!(init.system_prompt_seed[1].kind, PromptSegmentKind::System);
+        assert_eq!(init.system_prompt_seed[2].text, "specialized helper prompt");
     }
 
     #[test]

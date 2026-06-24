@@ -61,8 +61,9 @@ pub mod session {
 pub mod prompts {
     pub use halter_config::SystemPromptPreset;
     pub use halter_runtime::{
-        coding_agent_prompt_segment, default_coding_agent_prompt, default_compaction_prompt,
-        default_system_prompt, default_system_prompt_segment, system_prompt_segment,
+        appended_system_prompt_segment, coding_agent_prompt_segment, default_coding_agent_prompt,
+        default_compaction_prompt, default_system_prompt, default_system_prompt_segment,
+        system_prompt_segment,
     };
 }
 

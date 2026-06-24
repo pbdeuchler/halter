@@ -310,11 +310,15 @@ impl Halter {
 
     /// Create a new session.
     ///
-    /// The session's system prompt is resolved from `[prompts]` config unless
-    /// the caller installed an explicit one on `init` (see
-    /// [`SessionInit::with_system_prompt`]). Precedence, most specific first:
-    /// an explicit per-session prompt > `prompts.system_prompt` >
+    /// The session's base system prompt is resolved from `[prompts]` config
+    /// unless the caller installed an explicit one on `init` (see
+    /// [`SessionInit::with_system_prompt`]). Base precedence, most specific
+    /// first: an explicit per-session prompt > `prompts.system_prompt` >
     /// `prompts.preset` > the built-in general-purpose default.
+    ///
+    /// `prompts.append_system_prompt` is additive: when present, it is inserted
+    /// after the resolved base prompt and before any per-session appended
+    /// system-prompt segments.
     pub async fn new_session(&self, init: SessionInit) -> anyhow::Result<HalterSession> {
         let init = apply_prompt_config(&self.config.prompts, init);
         self.runtime.new_session(init).await
@@ -373,19 +377,38 @@ fn configured_system_prompt(prompts: &PromptsConfig) -> Option<String> {
     }
 }
 
+fn trimmed_prompt(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 /// Apply `[prompts]` config to a session seed. Config only replaces the
 /// built-in general default that `SessionInit::default()` installs; a
 /// caller-supplied system prompt is left untouched so explicit init wins.
+/// Config-level appended text is additive and lands immediately after the
+/// resolved base prompt, before any session-level appended system prompt.
 fn apply_prompt_config(prompts: &PromptsConfig, mut init: SessionInit) -> SessionInit {
-    let Some(configured) = configured_system_prompt(prompts) else {
-        return init;
-    };
-    let default_text = halter_runtime::default_system_prompt();
-    for segment in &mut init.system_prompt_seed {
-        if segment.kind == PromptSegmentKind::System && segment.text == default_text {
-            *segment = halter_runtime::system_prompt_segment(&configured);
+    if let Some(configured) = configured_system_prompt(prompts) {
+        let default_text = halter_runtime::default_system_prompt();
+        for segment in &mut init.system_prompt_seed {
+            if segment.kind == PromptSegmentKind::System && segment.text == default_text {
+                *segment = halter_runtime::system_prompt_segment(&configured);
+            }
         }
     }
+
+    if let Some(append) = trimmed_prompt(prompts.append_system_prompt.as_deref()) {
+        let segment = halter_runtime::appended_system_prompt_segment(&append);
+        let insert_index = init
+            .system_prompt_seed
+            .iter()
+            .position(|segment| segment.kind == PromptSegmentKind::System)
+            .map_or(0, |index| index + 1);
+        init.system_prompt_seed.insert(insert_index, segment);
+    }
+
     init
 }
 
@@ -1499,6 +1522,7 @@ mod tests {
         let prompts = PromptsConfig {
             preset: SystemPromptPreset::Coding,
             system_prompt: None,
+            append_system_prompt: None,
         };
         assert_eq!(
             configured_system_prompt(&prompts).as_deref(),
@@ -1511,6 +1535,7 @@ mod tests {
         let prompts = PromptsConfig {
             preset: SystemPromptPreset::Coding,
             system_prompt: Some("custom override".to_owned()),
+            append_system_prompt: None,
         };
         assert_eq!(
             configured_system_prompt(&prompts).as_deref(),
@@ -1524,6 +1549,7 @@ mod tests {
         let prompts = PromptsConfig {
             preset: SystemPromptPreset::General,
             system_prompt: Some("   ".to_owned()),
+            append_system_prompt: None,
         };
         assert_eq!(configured_system_prompt(&prompts), None);
     }
@@ -1533,6 +1559,7 @@ mod tests {
         let prompts = PromptsConfig {
             preset: SystemPromptPreset::Coding,
             system_prompt: None,
+            append_system_prompt: None,
         };
         let init = apply_prompt_config(&prompts, SessionInit::default());
         assert_eq!(
@@ -1554,9 +1581,117 @@ mod tests {
         let prompts = PromptsConfig {
             preset: SystemPromptPreset::Coding,
             system_prompt: Some("config wins?".to_owned()),
+            append_system_prompt: None,
         };
         let init = SessionInit::default().with_system_prompt("explicit session prompt");
         let init = apply_prompt_config(&prompts, init);
         assert_eq!(seed_text(&init), "explicit session prompt");
+    }
+
+    #[test]
+    fn apply_prompt_config_appends_after_default_base() {
+        let prompts = PromptsConfig {
+            append_system_prompt: Some("  house rules  ".to_owned()),
+            ..PromptsConfig::default()
+        };
+        let init = apply_prompt_config(&prompts, SessionInit::default());
+
+        assert_eq!(init.system_prompt_seed.len(), 2);
+        assert_eq!(
+            init.system_prompt_seed[0].text,
+            halter_runtime::default_system_prompt()
+        );
+        assert_eq!(init.system_prompt_seed[1].text, "house rules");
+        assert_eq!(init.system_prompt_seed[1].kind, PromptSegmentKind::System);
+    }
+
+    #[test]
+    fn apply_prompt_config_ignores_blank_append() {
+        let prompts = PromptsConfig {
+            append_system_prompt: Some(" \n\t ".to_owned()),
+            ..PromptsConfig::default()
+        };
+        let init = apply_prompt_config(&prompts, SessionInit::default());
+
+        assert_eq!(init.system_prompt_seed.len(), 1);
+        assert_eq!(seed_text(&init), halter_runtime::default_system_prompt());
+    }
+
+    #[test]
+    fn apply_prompt_config_appends_after_coding_preset_base() {
+        let prompts = PromptsConfig {
+            preset: SystemPromptPreset::Coding,
+            append_system_prompt: Some("house rules".to_owned()),
+            ..PromptsConfig::default()
+        };
+        let init = apply_prompt_config(&prompts, SessionInit::default());
+
+        assert_eq!(init.system_prompt_seed.len(), 2);
+        assert_eq!(
+            init.system_prompt_seed[0].text,
+            halter_runtime::default_coding_agent_prompt()
+        );
+        assert_eq!(init.system_prompt_seed[1].text, "house rules");
+    }
+
+    #[test]
+    fn apply_prompt_config_appends_after_system_prompt_override() {
+        let prompts = PromptsConfig {
+            system_prompt: Some("config base".to_owned()),
+            append_system_prompt: Some("house rules".to_owned()),
+            ..PromptsConfig::default()
+        };
+        let init = apply_prompt_config(&prompts, SessionInit::default());
+
+        assert_eq!(init.system_prompt_seed.len(), 2);
+        assert_eq!(init.system_prompt_seed[0].text, "config base");
+        assert_eq!(init.system_prompt_seed[1].text, "house rules");
+    }
+
+    #[test]
+    fn apply_prompt_config_stacks_config_append_before_session_append() {
+        let prompts = PromptsConfig {
+            append_system_prompt: Some("config rules".to_owned()),
+            ..PromptsConfig::default()
+        };
+        let init = SessionInit::default().append_system_prompt("session rules");
+        let init = apply_prompt_config(&prompts, init);
+        let texts = init
+            .system_prompt_seed
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            texts,
+            vec![
+                halter_runtime::default_system_prompt(),
+                "config rules",
+                "session rules",
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_prompt_config_keeps_explicit_base_and_adds_config_append() {
+        let prompts = PromptsConfig {
+            system_prompt: Some("config base".to_owned()),
+            append_system_prompt: Some("config rules".to_owned()),
+            ..PromptsConfig::default()
+        };
+        let init = SessionInit::default()
+            .with_system_prompt("explicit base")
+            .append_system_prompt("session rules");
+        let init = apply_prompt_config(&prompts, init);
+        let texts = init
+            .system_prompt_seed
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            texts,
+            vec!["explicit base", "config rules", "session rules"]
+        );
     }
 }

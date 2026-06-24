@@ -205,6 +205,20 @@ impl SessionInit {
         self.system_prompt_seed = vec![crate::prompt::system_prompt_segment(prompt.as_ref())];
         self
     }
+
+    /// Append static system-prompt instructions after the current base prompt.
+    ///
+    /// The appended text remains in the System prompt block, before skills, and
+    /// is prefix-cacheable. Whitespace-only values are ignored.
+    #[must_use]
+    pub fn append_system_prompt(mut self, prompt: impl AsRef<str>) -> Self {
+        let prompt = prompt.as_ref().trim();
+        if !prompt.is_empty() {
+            self.system_prompt_seed
+                .push(crate::prompt::appended_system_prompt_segment(prompt));
+        }
+        self
+    }
 }
 
 /// Drop-time hook eviction guard. Held inside an `Arc` on the session
@@ -2504,6 +2518,35 @@ mod tests {
     #[test]
     fn session_init_default_uses_embedded_system_prompt_seed() {
         let init = SessionInit::default();
+
+        assert_eq!(init.system_prompt_seed.len(), 1);
+        assert_eq!(
+            init.system_prompt_seed[0].text,
+            crate::prompt::default_system_prompt()
+        );
+    }
+
+    #[test]
+    fn session_init_append_system_prompt_pushes_system_segment_after_base() {
+        let init = SessionInit::default().append_system_prompt("  house rules  ");
+
+        assert_eq!(init.system_prompt_seed.len(), 2);
+        assert_eq!(
+            init.system_prompt_seed[0].text,
+            crate::prompt::default_system_prompt()
+        );
+        assert_eq!(init.system_prompt_seed[1].text, "house rules");
+        assert_eq!(init.system_prompt_seed[1].kind, PromptSegmentKind::System);
+        assert_eq!(init.system_prompt_seed[1].volatility, Volatility::Static);
+        assert_eq!(
+            init.system_prompt_seed[1].cache_scope,
+            CacheScope::PrefixCacheable
+        );
+    }
+
+    #[test]
+    fn session_init_append_system_prompt_ignores_whitespace() {
+        let init = SessionInit::default().append_system_prompt(" \n\t ");
 
         assert_eq!(init.system_prompt_seed.len(), 1);
         assert_eq!(
