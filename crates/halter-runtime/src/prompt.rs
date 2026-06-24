@@ -83,6 +83,13 @@ pub fn system_prompt_segment(text: &str) -> PromptSegment {
     }
 }
 
+/// Build a [`PromptSegment`] for static system-prompt text appended after the
+/// resolved base prompt.
+#[must_use]
+pub fn appended_system_prompt_segment(text: &str) -> PromptSegment {
+    system_prompt_segment(text)
+}
+
 /// The default general-purpose system prompt as a [`PromptSegment`].
 #[must_use]
 pub fn default_system_prompt_segment() -> PromptSegment {
@@ -333,12 +340,24 @@ mod tests {
         let same = system_prompt_segment("custom prompt");
         assert_eq!(same.text, "custom prompt");
         assert_eq!(same.kind, PromptSegmentKind::System);
+        assert_eq!(same.volatility, Volatility::Static);
+        assert_eq!(same.cache_scope, CacheScope::PrefixCacheable);
         // Distinct text yields a distinct content hash.
         let other = system_prompt_segment("different prompt");
         assert_ne!(same.content_hash, other.content_hash);
         // Equal text yields an equal content hash (cache stability).
         let twin = system_prompt_segment("custom prompt");
         assert_eq!(same.content_hash, twin.content_hash);
+    }
+
+    #[test]
+    fn appended_system_prompt_segment_is_static_prefix_cacheable_system_text() {
+        let segment = appended_system_prompt_segment("house rules");
+
+        assert_eq!(segment.text, "house rules");
+        assert_eq!(segment.kind, PromptSegmentKind::System);
+        assert_eq!(segment.volatility, Volatility::Static);
+        assert_eq!(segment.cache_scope, CacheScope::PrefixCacheable);
     }
 
     #[tokio::test]
@@ -547,5 +566,74 @@ mod tests {
             !assembled.cache_breakpoints.after_tools,
             "no tools provided → no tools breakpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn appended_system_prompt_stays_in_system_block_and_cached_prefix() {
+        let assembler = DefaultPromptAssembler;
+        let segments = vec![
+            system_prompt_segment("base prompt"),
+            skill_prompt_segment("pairs", "play nicely"),
+            appended_system_prompt_segment("house rules"),
+        ];
+        let plan = ContextPlan {
+            prompt_segments: segments,
+            transcript_window: TranscriptWindow {
+                messages: vec![Message::User(UserMessage::text("hi"))],
+                elided_message_count: 0,
+            },
+            compacted_prefix: vec![],
+            file_views: Vec::new(),
+            carried_summaries: vec![],
+            elided_tool_results: Vec::new(),
+            memory_items: Vec::new(),
+            tool_specs: Vec::new(),
+            observed_state: ObservedState {
+                cwd: ".".into(),
+                git_branch: None,
+                git_dirty: None,
+                now_utc: Utc::now(),
+                env_facts: Default::default(),
+            },
+            projected_input_tokens: 0,
+            cache_boundary_hash: "boundary".to_owned(),
+            messages: vec![Message::User(UserMessage::text("hi"))],
+            estimated_tokens: 0,
+            compaction: None,
+            previous_response_id: None,
+            new_messages_start: 0,
+        };
+
+        let assembled = assembler.assemble(&plan).await.expect("assemble");
+        let ordered_texts = assembled
+            .ordered_segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered_texts,
+            vec![
+                "base prompt",
+                "house rules",
+                "# Skill: pairs\n\nplay nicely"
+            ]
+        );
+        assert_eq!(assembled.system_segment_count, 2);
+        assert_eq!(assembled.skill_segment_count, 1);
+        assert!(assembled.cache_breakpoints.after_system);
+
+        let mut changed_turn = plan.clone();
+        changed_turn.transcript_window = TranscriptWindow {
+            messages: vec![Message::User(UserMessage::text("different turn"))],
+            elided_message_count: 0,
+        };
+        changed_turn.messages = changed_turn.transcript_window.messages.clone();
+        let changed_turn = assembler
+            .assemble(&changed_turn)
+            .await
+            .expect("assemble changed turn");
+
+        assert_eq!(assembled.prefix_cache_key, changed_turn.prefix_cache_key);
     }
 }

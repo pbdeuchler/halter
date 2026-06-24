@@ -33,9 +33,10 @@ pub use hooks_runtime::{
     run_user_prompt_submit,
 };
 pub use prompt::{
-    DefaultPromptAssembler, PromptAssembler, coding_agent_prompt_segment,
-    default_coding_agent_prompt, default_compaction_prompt, default_system_prompt,
-    default_system_prompt_segment, skill_prompt_segment, system_prompt_segment,
+    DefaultPromptAssembler, PromptAssembler, appended_system_prompt_segment,
+    coding_agent_prompt_segment, default_coding_agent_prompt, default_compaction_prompt,
+    default_system_prompt, default_system_prompt_segment, skill_prompt_segment,
+    system_prompt_segment,
 };
 pub use session::{
     HalterSession, ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit,

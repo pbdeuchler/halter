@@ -254,7 +254,7 @@ halter ships three built-in prompts, all available to SDK users:
 
 The two system prompts are assembled from a shared behavioral core plus a small role-specific intro, so common guidance (acting autonomously in headless runs, preferring the provided tools, honesty, safety) is defined in exactly one place.
 
-Read or compose them through the `halter::prompts` module, and seed a session with one via `SessionInit::with_system_prompt`:
+Read or compose them through the `halter::prompts` module, and seed a session with one via `SessionInit::with_system_prompt`. Use `SessionInit::append_system_prompt` to add stable house rules without restating the base prompt:
 
 ```rust
 use halter::prelude::*;
@@ -262,19 +262,28 @@ use halter::prompts;
 
 // Spin up a coding agent in one line:
 let session = harness
-    .new_session(SessionInit::default().with_system_prompt(prompts::default_coding_agent_prompt()))
+    .new_session(
+        SessionInit::default()
+            .with_system_prompt(prompts::default_coding_agent_prompt())
+            .append_system_prompt("## House rules\n- Never touch files under vendor/."),
+    )
     .await?;
 ```
 
-Or select a built-in from config — `prompts.preset` picks the built-in prompt, and `prompts.system_prompt` overrides it entirely:
+Or select a built-in from config — `prompts.preset` picks the built-in prompt, `prompts.system_prompt` overrides it entirely, and `prompts.append_system_prompt` adds static instructions after whichever base wins:
 
 ```toml
 [prompts]
 preset = "coding"            # "general" (default) | "coding"
 # system_prompt = "..."      # full override; wins over preset
+append_system_prompt = """
+## House rules
+- Conventional Commits for every commit.
+- Never touch files under vendor/.
+"""
 ```
 
-System-prompt precedence, most specific first: an explicit per-session prompt (`SessionInit::with_system_prompt`) > `prompts.system_prompt` > `prompts.preset` > the built-in general-purpose default.
+Base system-prompt precedence, most specific first: an explicit per-session prompt (`SessionInit::with_system_prompt`) > `prompts.system_prompt` > `prompts.preset` > the built-in general-purpose default. Appends are additive: config append applies after the resolved base, then per-session `append_system_prompt` calls apply after that. Appended text stays in the static, prefix-cacheable System block before skills.
 
 ---
 
@@ -428,6 +437,7 @@ reasoning = "medium"
 
 [prompts]
 preset = "general"   # "general" (default) | "coding"; system_prompt overrides either
+# append_system_prompt = "stable extra instructions appended after the base prompt"
 
 [resources.skills]
 roots = ["./.agent/skills"]

@@ -787,6 +787,10 @@ pub struct PromptsConfig {
     /// unset, the built-in prompt named by `preset` is used.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Additional static system-prompt text appended after the resolved base
+    /// prompt. Whitespace-only values are ignored by the session builder.
+    #[serde(default)]
+    pub append_system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

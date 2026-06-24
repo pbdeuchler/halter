@@ -137,6 +137,11 @@ reasoning = "medium"
 # model = "gpt-5-mini"
 # reasoning = "medium"
 
+[prompts]
+preset = "general" # "general" (default) | "coding"; system_prompt overrides either
+# system_prompt = "optional full override"
+# append_system_prompt = "optional extra instructions appended after the base prompt"
+
 [resources.skills]
 roots = ["./.agent/skills"]
 
@@ -440,6 +445,8 @@ pub fn schema_as_json_value() -> JsonValue {
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::schema::SystemPromptPreset;
+
     use super::*;
 
     #[tokio::test]
@@ -481,6 +488,8 @@ max_read_bytes = 99
     fn starter_config_is_parseable() {
         let parsed = parse_toml(&generate_starter_config()).expect("parse starter config");
         let config: HarnessConfig = parsed.try_into().expect("decode starter config");
+        assert_eq!(config.prompts.preset, SystemPromptPreset::General);
+        assert_eq!(config.prompts.append_system_prompt, None);
         config.validate().expect("starter config should validate");
         validate_runtime_requirements_with(&config, |name| {
             Some(OsString::from(match name {
@@ -504,6 +513,22 @@ max_read_bytes = 99
             }))
         })
         .expect("fixture config runtime requirements should validate");
+    }
+
+    #[test]
+    fn json_schema_exposes_append_system_prompt() {
+        let schema = schema_as_json_value();
+        let prompt_props = schema
+            .pointer("/$defs/PromptsConfig/properties")
+            .or_else(|| schema.pointer("/definitions/PromptsConfig/properties"))
+            .expect("prompts config schema properties");
+
+        assert!(
+            prompt_props
+                .as_object()
+                .expect("properties object")
+                .contains_key("append_system_prompt")
+        );
     }
 
     #[test]
