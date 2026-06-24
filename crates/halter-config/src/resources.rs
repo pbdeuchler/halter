@@ -10,8 +10,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-#[cfg(feature = "remote-plugins")]
-use halter_hooks::HookHandlerConfig;
 use halter_hooks::{HooksFile, HooksLoadWarning};
 use halter_protocol::{AgentId, ContentHash, PluginId, PluginManifest, SkillId};
 use serde_json::Value;
@@ -180,8 +178,8 @@ pub(crate) enum MissingManifest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExecComponentPolicy {
-    Allow,
+pub(crate) enum HookLoadPolicy {
+    Load,
     #[cfg(feature = "remote-plugins")]
     WarnAndSkip,
 }
@@ -191,7 +189,7 @@ pub(crate) struct PluginLoadOptions {
     manifest_search: ManifestSearch,
     #[cfg(feature = "remote-plugins")]
     missing_manifest: MissingManifest,
-    exec_policy: ExecComponentPolicy,
+    hook_policy: HookLoadPolicy,
 }
 
 impl PluginLoadOptions {
@@ -200,7 +198,7 @@ impl PluginLoadOptions {
             manifest_search: ManifestSearch::DiskCompatible,
             #[cfg(feature = "remote-plugins")]
             missing_manifest: MissingManifest::Skip,
-            exec_policy: ExecComponentPolicy::Allow,
+            hook_policy: HookLoadPolicy::Load,
         }
     }
 
@@ -209,7 +207,7 @@ impl PluginLoadOptions {
         Self {
             manifest_search: ManifestSearch::RemoteCodexClaude,
             missing_manifest: MissingManifest::Error,
-            exec_policy: ExecComponentPolicy::WarnAndSkip,
+            hook_policy: HookLoadPolicy::WarnAndSkip,
         }
     }
 }
@@ -499,7 +497,7 @@ pub(crate) fn load_plugin_tree<T: PluginTree>(
         agent.revision = hash_bytes(agent.prompt.as_bytes());
     }
 
-    let hooks = load_plugin_hooks(tree, &plugin_id, &manifest, options.exec_policy)?;
+    let hooks = load_plugin_hooks(tree, &plugin_id, &manifest, options.hook_policy)?;
 
     Ok(Some(LoadedPlugin {
         id: plugin_id,
@@ -701,7 +699,7 @@ fn load_plugin_hooks<T: PluginTree>(
     tree: &T,
     plugin_id: &PluginId,
     manifest: &PluginManifest,
-    exec_policy: ExecComponentPolicy,
+    hook_policy: HookLoadPolicy,
 ) -> anyhow::Result<Vec<LoadedHooksFile>> {
     let hooks_rel = match manifest.hooks.as_deref() {
         Some(component) => Some(resolve_plugin_path(component)?),
@@ -713,6 +711,22 @@ fn load_plugin_hooks<T: PluginTree>(
     let Some(source_rel) = hooks_rel else {
         return Ok(Vec::new());
     };
+
+    #[cfg(feature = "remote-plugins")]
+    if hook_policy == HookLoadPolicy::WarnAndSkip {
+        return Ok(vec![LoadedHooksFile {
+            plugin_id: plugin_id.clone(),
+            plugin_root: tree.root_display().to_path_buf(),
+            source_path: tree.display_path(&source_rel),
+            revision: hash_bytes(b"remote-hooks-skipped"),
+            parsed: HooksFile::default(),
+            warnings: vec![HooksLoadWarning::new(
+                "remote_unsupported_component",
+                "skipped hooks from remote in-memory plugin; only skills and agents are supported"
+                    .to_owned(),
+            )],
+        }]);
+    }
 
     let body = tree.read(&source_rel).with_context(|| {
         format!(
@@ -729,16 +743,7 @@ fn load_plugin_hooks<T: PluginTree>(
         ),
     };
     #[cfg(not(feature = "remote-plugins"))]
-    let _ = exec_policy;
-    #[cfg(feature = "remote-plugins")]
-    let (parsed, warnings) = {
-        let mut parsed = parsed;
-        let mut warnings = warnings;
-        if exec_policy == ExecComponentPolicy::WarnAndSkip {
-            skip_exec_backed_hooks(&mut parsed, &mut warnings);
-        }
-        (parsed, warnings)
-    };
+    let _ = hook_policy;
 
     Ok(vec![LoadedHooksFile {
         plugin_id: plugin_id.clone(),
@@ -748,29 +753,6 @@ fn load_plugin_hooks<T: PluginTree>(
         parsed,
         warnings,
     }])
-}
-
-#[cfg(feature = "remote-plugins")]
-fn skip_exec_backed_hooks(parsed: &mut HooksFile, warnings: &mut Vec<HooksLoadWarning>) {
-    let mut skipped = 0usize;
-    parsed.hooks.retain(|_, groups| {
-        groups.retain_mut(|group| {
-            let before = group.hooks.len();
-            group
-                .hooks
-                .retain(|hook| !matches!(hook.config, HookHandlerConfig::Command(_)));
-            skipped += before.saturating_sub(group.hooks.len());
-            !group.hooks.is_empty()
-        });
-        !groups.is_empty()
-    });
-
-    if skipped > 0 {
-        warnings.push(HooksLoadWarning::new(
-            "remote_exec_component",
-            format!("skipped {skipped} command hook(s) from remote in-memory plugin"),
-        ));
-    }
 }
 
 fn parse_frontmatter(body: &str) -> BTreeMap<String, String> {
@@ -857,7 +839,6 @@ fn manifest_candidates(search: ManifestSearch) -> &'static [&'static str] {
             ".codex-plugin/plugin.json",
             ".claude-plugin/plugin.json",
             ".agent-plugin/plugin.json",
-            ".halter-plugin/plugin.json",
             "plugin.json",
         ],
         #[cfg(feature = "remote-plugins")]
@@ -997,8 +978,6 @@ fn normalized_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "remote-plugins")]
-    use halter_hooks::{HookEventName, HookHandlerConfig};
 
     fn write_plugin(root: &Path, manifest_dir: &str, manifest: &str, skill_body: &str) -> PathBuf {
         let plugin_root = root.join("plugin");
@@ -1061,6 +1040,25 @@ mod tests {
     }
 
     #[test]
+    fn disk_scan_ignores_removed_halter_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_root = write_plugin(
+            temp.path(),
+            ".halter-plugin",
+            r#"{"name":"legacy","version":"0.1.0","skills":["./skills"]}"#,
+            "---\nname: reviewer\n---\n\n# Reviewer\n",
+        );
+        let tree = DiskTree::new(plugin_root).expect("tree");
+
+        let plugin = load_plugin_tree(&tree, PluginLoadOptions::disk_scan()).expect("load");
+
+        assert!(
+            plugin.is_none(),
+            ".halter-plugin manifests should not be loaded"
+        );
+    }
+
+    #[test]
     #[cfg(feature = "remote-plugins")]
     fn remote_mem_tree_loads_content_plugin() {
         let mut files = BTreeMap::new();
@@ -1111,7 +1109,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "remote-plugins")]
-    fn remote_command_hooks_are_warned_and_skipped() {
+    fn remote_hooks_are_warned_and_skipped() {
         let mut files = BTreeMap::new();
         files.insert(
             PathBuf::from(".claude-plugin/plugin.json"),
@@ -1132,18 +1130,9 @@ mod tests {
             hooks
                 .warnings
                 .iter()
-                .any(|warning| warning.category == "remote_exec_component")
+                .any(|warning| warning.category == "remote_unsupported_component")
         );
-        let groups = hooks
-            .parsed
-            .hooks
-            .get(&HookEventName::PreToolUse)
-            .expect("pre tool hooks");
-        assert_eq!(groups[0].hooks.len(), 1);
-        assert!(matches!(
-            groups[0].hooks[0].config,
-            HookHandlerConfig::Prompt(_)
-        ));
+        assert!(hooks.parsed.hooks.is_empty());
     }
 
     #[test]

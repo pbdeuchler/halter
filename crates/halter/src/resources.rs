@@ -332,7 +332,7 @@ description: reviews code
     async fn resource_compiler_uses_stable_plugin_ids() {
         let temp = tempfile::tempdir().expect("tempdir");
         let plugin_root = temp.path().join("plugin");
-        let manifest_dir = plugin_root.join(".halter-plugin");
+        let manifest_dir = plugin_root.join(".claude-plugin");
 
         fs::create_dir_all(&manifest_dir).expect("create manifest dir");
         fs::write(
@@ -428,7 +428,7 @@ description: says hello
     async fn m8_plugin_manifest_missing_name_fails_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let plugin_root = temp.path().join("plugin");
-        let manifest_dir = plugin_root.join(".halter-plugin");
+        let manifest_dir = plugin_root.join(".claude-plugin");
 
         fs::create_dir_all(&manifest_dir).expect("create manifest dir");
         fs::write(manifest_dir.join("plugin.json"), r#"{"version": "0.1.0"}"#)
@@ -456,7 +456,7 @@ description: says hello
     async fn m8_plugin_manifest_missing_version_fails_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let plugin_root = temp.path().join("plugin");
-        let manifest_dir = plugin_root.join(".halter-plugin");
+        let manifest_dir = plugin_root.join(".claude-plugin");
 
         fs::create_dir_all(&manifest_dir).expect("create manifest dir");
         fs::write(manifest_dir.join("plugin.json"), r#"{"name": "example"}"#)
@@ -484,7 +484,7 @@ description: says hello
     async fn m8_plugin_manifest_blank_name_fails_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let plugin_root = temp.path().join("plugin");
-        let manifest_dir = plugin_root.join(".halter-plugin");
+        let manifest_dir = plugin_root.join(".claude-plugin");
 
         fs::create_dir_all(&manifest_dir).expect("create manifest dir");
         fs::write(

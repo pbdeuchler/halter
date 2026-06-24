@@ -371,8 +371,7 @@ Plugins are discovered one level below each plugin root. Each child directory is
 1. `.codex-plugin/plugin.json`
 2. `.claude-plugin/plugin.json`
 3. `.agent-plugin/plugin.json`
-4. `.halter-plugin/plugin.json`
-5. `plugin.json`
+4. `plugin.json`
 
 The manifest must include non-empty string fields `name` and `version`. Optional manifest fields include `skills`, `agents`, `hooks`, `mcpServers`, `lspServers`, `allowedHttpHosts`, and `allowedEnvVars`. `skills` and `agents` may be a string path or an array of string paths. Skill and agent entries must be paths relative to the plugin root and must start with `./`, unless they use a plugin alias. Supported aliases are `${CLAUDE_PLUGIN_ROOT}`, `${PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, and `${PLUGIN_DATA}`. `${PLUGIN_ROOT}` resolves to the enclosing plugin root (or the skill's own root for standalone skills), and `${PLUGIN_DATA}` resolves to `<root>/.data`. These aliases are also rendered inside skill (`SKILL.md`) bodies and agent prompt files at load time. Parent-directory traversal is rejected, and resolved paths must stay inside the plugin root.
 
@@ -391,9 +390,7 @@ Four catalog or manifest files describe the same plugin so it can be discovered 
 - `.claude-plugin/marketplace.json` — Claude Code marketplace catalog that lists `halter-rust`.
 - `.agents/plugins/marketplace.json` — Codex/agent-style marketplace catalog that lists `halter-rust`.
 
-Halter reads the bundled `halter-rust` plugin from `.codex-plugin/plugin.json` first and ignores Codex-only `interface` metadata. The parallel `.claude-plugin/plugin.json` remains available for Claude Code clients and for fallback loading.
-
-The two bundled skills cover different layers of Halter Rust development:
+The two bundled skills cover different layers of using the halter SDK:
 
 - `basic-rust` — use when building, explaining, testing, or modifying Rust agent harnesses with the Halter library. It covers config-driven runners, the SDK builder, custom tools, hooks, policy, persistence, providers, subagents, and workspace Rust changes.
 - `workflows-rust` — use when building scripted, deterministic multi-agent workflows in Rust on top of the Halter SDK, such as fan-out/fan-in, staged pipelines, adversarial verification, judge panels, loop-until-budget loops, structured agent output, concurrency control, and resumable orchestration. It pairs with `basic-rust`, which covers harness construction.
@@ -405,11 +402,11 @@ To load the bundled plugin, add its plugin directory to your plugin roots. For e
 roots = ["./halter-agent-plugins/plugins"]
 ```
 
-Halter scans that root, finds the `halter-rust` child directory by its manifest, and loads the two skills. The same path can be passed programmatically to `ResourceCompiler` or set in `HarnessConfig.resources.plugins.roots`.
-
 #### Remote GitHub plugins
 
 The `halter-config` crate has an opt-in `remote-plugins` feature for SDKs that want to fetch GitHub-hosted plugins without installing them to a local cache. It returns the same `LoadedPlugin` values that `ResourceCompiler::with_loaded_plugins(...)` already accepts:
+
+These plugins are downloaded and made available to the harness dynamically and purely in memory. At the moment only skills and agents are supported; commands and hooks are on the roadmap but are not currently planned.
 
 ```rust,no_run
 use halter::HalterBuilder;
@@ -433,7 +430,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Remote marketplace loading checks `.agents/plugins/marketplace.json` first and falls back to `.claude-plugin/marketplace.json`. Remote plugin directories check `.codex-plugin/plugin.json` first and fall back to `.claude-plugin/plugin.json`. If neither manifest exists, loading fails. Command hooks from remote in-memory plugins are skipped with a hook warning because they require an executable file on disk.
+Remote marketplace loading checks `.agents/plugins/marketplace.json` first and falls back to `.claude-plugin/marketplace.json`. Remote plugin directories check `.codex-plugin/plugin.json` first and falls back to `.claude-plugin/plugin.json`. If neither manifest exists, loading fails.
 
 #### Config File Example (non-exhaustive)
 
