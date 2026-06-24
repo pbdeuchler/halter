@@ -1,6 +1,6 @@
 [package]
 name = "halter-tools"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 license-file = "../../LICENSE"
 authors = ["Philip Deuchler (pbdeuchler@gmail.com)"]
@@ -34,7 +34,7 @@ globset.workspace = true
 grep-matcher.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
-halter-protocol = { path = "../halter-protocol", version = "0.1.0"  }
+halter-protocol = { path = "../halter-protocol", version = "0.2.0" }
 ignore.workspace = true
 image = { workspace = true, optional = true }
 inferno = { workspace = true, optional = true }

@@ -2,7 +2,7 @@
 name = "halter"
 edition.workspace = true
 license-file = "../../LICENSE"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["pbdeuchler"]
 description = "Programmatic agent runtime, protocol, and tool harness"
 repository = "https://github.com/pbdeuchler/halter"
@@ -26,13 +26,13 @@ remote-plugins = ["halter-config/remote-plugins"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-halter-config = { path = "../halter-config", version = "0.1.2" }
-halter-hooks = { path = "../halter-hooks", version = "0.1.0"  }
-halter-protocol = { path = "../halter-protocol", version = "0.1.0"  }
-halter-providers = { path = "../halter-providers", version = "0.1.2"  }
-halter-runtime = { path = "../halter-runtime", version = "0.1.0"  }
-halter-session = { path = "../halter-session", version = "0.1.0"  }
-halter-tools = { path = "../halter-tools", version = "0.1.0"  }
+halter-config = { path = "../halter-config", version = "0.2.0" }
+halter-hooks = { path = "../halter-hooks", version = "0.2.0" }
+halter-protocol = { path = "../halter-protocol", version = "0.2.0" }
+halter-providers = { path = "../halter-providers", version = "0.2.0" }
+halter-runtime = { path = "../halter-runtime", version = "0.2.0" }
+halter-session = { path = "../halter-session", version = "0.2.0" }
+halter-tools = { path = "../halter-tools", version = "0.2.0" }
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true

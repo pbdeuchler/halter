@@ -6,16 +6,27 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](https://semver.org/)
 once a `1.0.0` line is cut.
 
-## [Unreleased] — `pbd/opus-4.7-review`
+## [0.2.0] - 2026-06-24
 
-Feature branch that consolidates the 2026-04-16 codebase review
-remediation. Thirteen sub-branches plus a final-polish commit close 121
-of the 135 enumerated findings. The remaining 14 are tracked as
-follow-ups in
-[`docs/plans/2026-04-17-review-remediation-roadmap.md`](docs/plans/2026-04-17-review-remediation-roadmap.md).
-Status for every finding is in
-[`docs/review-2026-04-16.md`](docs/review-2026-04-16.md) under "Status
-matrix".
+This release cuts the first `0.2` line for the Halter crates. The minor
+version bump is intentional: several public protocol, hooks, runtime,
+and facade APIs changed in ways that are not patch-compatible with the
+`0.1` line.
+
+Published crates:
+
+- `halter`
+- `halter-config`
+- `halter-hooks`
+- `halter-protocol`
+- `halter-providers`
+- `halter-runtime`
+- `halter-session`
+- `halter-tools`
+
+`halter-cli` also moves to `0.2.0`, but remains `publish = false`.
+The vendored `halter-brush-core` and `halter-brush-builtins` crates are
+unchanged in this release.
 
 ### Security hardening
 
@@ -60,6 +71,10 @@ matrix".
   `&'static str`; the rendered form in `hooks.merge_conflict` tracing
   output is unchanged. `ConflictField` and `MergeConflict` are now
   re-exported from `halter_hooks`.
+- **`PanelIsolation`.** Model-judge full-turn panelists can run in
+  read-only, shared-full, or worktree isolation mode.
+- **`WaitSubagentResponse.target_statuses`.** Timed-out waits now
+  include the current status of every requested target.
 - **`SessionHandle` / `SessionInner`.** `HalterSession` no longer
   derives `Clone + Drop` over shared state. `SessionHandle` is the
   public cheap-clonable surface; `SessionInner` holds the owned graph.
@@ -98,9 +113,25 @@ matrix".
   synthesis output to the default model as internal guidance. Panel
   responses, the synthesis message, and rankings are emitted as
   structured `tracing` telemetry on the `halter::model_judge` target.
+- **Resource and plugin loading.** `halter-config` now exposes loaded
+  skill, plugin, hook, MCP, LSP, executable, output-style, and agent
+  resource types. The facade re-exports these from `halter-config`.
+- **Remote plugins.** The `remote-plugins` feature adds in-memory
+  GitHub plugin loading without forcing callers to unpack plugin
+  archives to disk.
+- **Prompt configuration.** Config can select a built-in system prompt
+  preset, append extra system prompt text, and access built-in prompt
+  segment helpers through the runtime and facade crates.
+- **Line-numbered reads.** The `read` tool can return line-numbered
+  output while preserving byte-limit handling.
+- **Software-factory example.** A full example harness was added with
+  panel planning, file-output coordination, worktree handling, and
+  stricter trigger-role defaults.
 
 ### Protocol additions
 
+- `Message::Meta` - out-of-band synthesis messages for model-judge
+  guidance.
 - `ProviderError::Cancelled` — first-class cancellation signal at the
   provider boundary.
 - `SessionEventPayload::Lagged { dropped_events }` — emitted by
@@ -137,8 +168,20 @@ matrix".
   `RUST_LOG` filter instead of overriding it; an explicit
   `RUST_LOG=hyper=trace` is honored while `RUST_LOG=debug` still
   suppresses noisy targets to `warn`. (#99)
+- Bounded provider IDs now truncate on character boundaries in release
+  builds instead of relying on debug-only ASCII assertions.
+- Snapshot truncation preserves line ordering and avoids extra
+  `format!` allocations.
+- Shell working-directory handling and software-factory worktree resume
+  behavior were fixed.
 
-### Known follow-ups (not blocking this branch)
+### Release tooling
+
+- `bin/crate-release-candidates` now emits `halter-hooks` before
+  `halter-config`, matching the actual dependency graph for fresh
+  coordinated crate publishes.
+
+### Known follow-ups
 
 Tracked in the roadmap's "Deferred findings" section:
 
