@@ -1,5 +1,7 @@
 // pattern: Functional Core
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Bounded retry policy shared by the streaming provider pipeline. Replaces
@@ -7,22 +9,22 @@ use std::time::{Duration, Instant, SystemTime};
 /// `responses_provider`, which had no per-stream cap and no cumulative
 /// deadline (AC3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RetryPolicy {
+pub struct RetryPolicy {
     /// Total attempts allowed (initial attempt + retries).
-    pub(crate) max_attempts: u32,
+    pub max_attempts: u32,
     /// Base delay used as the seed for exponential growth.
-    pub(crate) base_backoff: Duration,
+    pub base_backoff: Duration,
     /// Upper bound for any single backoff, even if exponential growth or a
     /// server-supplied hint would exceed it.
-    pub(crate) max_backoff: Duration,
+    pub max_backoff: Duration,
     /// Cumulative wall time budget across all attempts. Once exceeded,
     /// further retries are denied even if `max_attempts` has not been hit.
-    pub(crate) deadline: Duration,
+    pub deadline: Duration,
     /// Random offset, expressed as a percentage of the computed backoff,
     /// added on top to break thundering-herd synchronization across
     /// concurrent retrying clients. `0` disables jitter (used in tests for
     /// deterministic timing).
-    pub(crate) jitter_pct: u32,
+    pub jitter_pct: u32,
 }
 
 impl Default for RetryPolicy {
@@ -46,7 +48,7 @@ impl Default for RetryPolicy {
 pub(crate) struct RetryGate {
     policy: RetryPolicy,
     started: Instant,
-    attempt: u32,
+    completed_attempts: u32,
 }
 
 impl RetryGate {
@@ -54,7 +56,7 @@ impl RetryGate {
         Self {
             policy,
             started: Instant::now(),
-            attempt: 0,
+            completed_attempts: 0,
         }
     }
 
@@ -62,7 +64,7 @@ impl RetryGate {
     /// Useful for tagging a stream attempt with its sequence number when
     /// deduplicating cross-attempt events (AC3.6).
     pub(crate) fn next_attempt_id(&self) -> u32 {
-        self.attempt + 1
+        self.completed_attempts.saturating_add(1)
     }
 
     /// Records a failed attempt and returns the backoff to wait before the
@@ -74,13 +76,13 @@ impl RetryGate {
         &mut self,
         hint: Option<Duration>,
     ) -> Option<Duration> {
-        self.attempt = self.attempt.saturating_add(1);
-        if self.attempt >= self.policy.max_attempts
+        self.completed_attempts = self.completed_attempts.saturating_add(1);
+        if self.completed_attempts >= self.policy.max_attempts
             || self.started.elapsed() >= self.policy.deadline
         {
             return None;
         }
-        Some(compute_backoff(&self.policy, self.attempt, hint))
+        Some(compute_backoff(&self.policy, self.completed_attempts, hint))
     }
 }
 
@@ -94,20 +96,24 @@ pub(crate) fn compute_backoff(
     hint: Option<Duration>,
 ) -> Duration {
     if let Some(hint) = hint {
-        return hint.min(policy.max_backoff);
+        let capped_ms = duration_millis_u64(hint.min(policy.max_backoff));
+        let jitter = jitter_offset(capped_ms, policy.jitter_pct);
+        return Duration::from_millis(capped_ms.saturating_add(jitter));
     }
     let exponent = attempt.saturating_sub(1).min(20);
     let exp_ms = (policy.base_backoff.as_millis() as u64).saturating_mul(1u64 << exponent);
-    let capped_ms = exp_ms.min(policy.max_backoff.as_millis() as u64);
+    let capped_ms = exp_ms.min(duration_millis_u64(policy.max_backoff));
     let jitter = jitter_offset(capped_ms, policy.jitter_pct);
     Duration::from_millis(capped_ms.saturating_add(jitter))
 }
 
-/// Pseudo-random jitter offset in `[0, capped * jitter_pct / 100]`. Seeded
-/// from the current wall clock so concurrent retries don't synchronize. We
-/// intentionally avoid pulling in a `rand` dependency for this single
-/// callsite — the entropy needed is "enough to avoid thundering herd," not
-/// cryptographic.
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Jitter offset in `[0, capped * jitter_pct / 100]`. `RandomState` seeds from
+/// the platform RNG, then the wall-clock sample gives each call a distinct
+/// input without adding a direct RNG dependency to this crate.
 fn jitter_offset(capped_ms: u64, jitter_pct: u32) -> u64 {
     if jitter_pct == 0 || capped_ms == 0 {
         return 0;
@@ -120,7 +126,9 @@ fn jitter_offset(capped_ms: u64, jitter_pct: u32) -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    entropy % max_offset
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(entropy);
+    hasher.finish() % max_offset
 }
 
 #[cfg(test)]
@@ -168,6 +176,22 @@ mod tests {
     }
 
     #[test]
+    fn compute_backoff_applies_jitter_to_hints() {
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            base_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(100),
+            deadline: Duration::from_secs(60),
+            jitter_pct: 25,
+        };
+        for _ in 0..32 {
+            let backoff = compute_backoff(&policy, 1, Some(Duration::from_millis(40)));
+            assert!(backoff >= Duration::from_millis(40));
+            assert!(backoff <= Duration::from_millis(50));
+        }
+    }
+
+    #[test]
     fn compute_backoff_with_jitter_stays_within_bounds() {
         let policy = RetryPolicy {
             max_attempts: 5,
@@ -195,6 +219,18 @@ mod tests {
         assert!(gate.record_failure_and_next_backoff(None).is_some()); // attempt 1
         assert!(gate.record_failure_and_next_backoff(None).is_some()); // attempt 2
         assert!(gate.record_failure_and_next_backoff(None).is_none()); // 3 → exhausted
+    }
+
+    #[test]
+    fn retry_gate_max_attempts_means_total_calls() {
+        let mut gate = RetryGate::new(deterministic_policy(5));
+
+        for failed_attempt in 1..=4 {
+            assert_eq!(gate.next_attempt_id(), failed_attempt);
+            assert!(gate.record_failure_and_next_backoff(None).is_some());
+        }
+        assert_eq!(gate.next_attempt_id(), 5);
+        assert!(gate.record_failure_and_next_backoff(None).is_none());
     }
 
     #[tokio::test]

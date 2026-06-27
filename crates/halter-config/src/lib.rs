@@ -24,9 +24,11 @@ pub use schema::{
     ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, HarnessConfig, LoopbackAllowConfig,
     ModelConfig, ModelJudgeConfig, ModelJudgeMode, ModelSlot, ModelSlotRef, ModelsConfig,
     NetworkPolicyConfig, OpenAiOAuthConfig, PolicyConfig, PromptsConfig, ProviderConfig,
-    ProvidersConfig, ResolvedProviderAuth, ResolvedProviderConfig, ResourcesConfig, RuntimeConfig,
-    SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig,
-    ShellPolicyConfig, SystemPromptPreset, ToolsConfig, resolve_provider_runtime_config,
+    ProvidersConfig, RequestRetryConfig, RequestRetryOverrideConfig, ResilienceConfig,
+    ResilienceOverrideConfig, ResilienceTimeoutsConfig, ResilienceTimeoutsOverrideConfig,
+    ResolvedProviderAuth, ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID,
+    SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig,
+    SystemPromptPreset, ToolsConfig, resolve_provider_runtime_config,
 };
 
 #[cfg(feature = "remote-plugins")]

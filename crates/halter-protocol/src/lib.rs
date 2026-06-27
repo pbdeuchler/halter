@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -991,12 +992,40 @@ impl ToolError {
     }
 }
 
-#[derive(Debug, Clone, Error, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+/// Provider error taxonomy used by retry policy and consumers.
+pub enum ProviderErrorKind {
+    /// 5xx, overload, transport, stream, timeout, and otherwise unknown
+    /// provider failures that may succeed on a later attempt.
+    Transient,
+    /// Provider rate limiting. `ProviderError::backoff_hint` may carry a
+    /// server-supplied retry-after value.
+    RateLimited,
+    /// Explicitly non-recoverable failures such as auth, malformed requests,
+    /// unknown models, context-window errors, or policy refusals.
+    #[default]
+    Fatal,
+    /// Runtime or user cancellation.
+    Cancelled,
+}
+
+impl ProviderErrorKind {
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::Transient | Self::RateLimited)
+    }
+}
+
+#[derive(Debug, Clone, Error, Serialize, JsonSchema, PartialEq, Eq)]
 #[error("{message}")]
 /// Error surfaced by a provider adapter.
 pub struct ProviderError {
     pub message: String,
-    pub retryable: bool,
+    #[serde(default)]
+    pub kind: ProviderErrorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_hint: Option<Duration>,
 }
 
 impl ProviderError {
@@ -1006,12 +1035,40 @@ impl ProviderError {
     pub const CANCELLED_MESSAGE: &str = "failed to execute provider request: request cancelled";
 
     /// Build a provider error with an explicit retryability flag.
+    ///
+    /// Prefer [`ProviderError::with_kind`] in new code so the error's nature is
+    /// preserved after a local retry budget is exhausted.
     #[must_use]
     pub fn new(message: impl Into<String>, retryable: bool) -> Self {
+        let kind = if retryable {
+            ProviderErrorKind::Transient
+        } else {
+            ProviderErrorKind::Fatal
+        };
+        Self::with_kind(message, kind)
+    }
+
+    /// Build a provider error with a typed classification and no backoff hint.
+    #[must_use]
+    pub fn with_kind(message: impl Into<String>, kind: ProviderErrorKind) -> Self {
         Self {
             message: message.into(),
-            retryable,
+            kind,
+            backoff_hint: None,
         }
+    }
+
+    /// Attach a server-supplied or inferred backoff hint.
+    #[must_use]
+    pub fn with_backoff_hint(mut self, backoff_hint: Option<Duration>) -> Self {
+        self.backoff_hint = backoff_hint;
+        self
+    }
+
+    /// Whether this error represents a retryable provider condition.
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        self.kind.retryable()
     }
 
     /// Construct a non-retryable cancellation error with the canonical
@@ -1021,14 +1078,49 @@ impl ProviderError {
     pub fn cancelled() -> Self {
         Self {
             message: Self::CANCELLED_MESSAGE.to_owned(),
-            retryable: false,
+            kind: ProviderErrorKind::Cancelled,
+            backoff_hint: None,
         }
     }
 
     /// Whether this error is the canonical cancellation sentinel.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.message == Self::CANCELLED_MESSAGE
+        self.kind == ProviderErrorKind::Cancelled || self.message == Self::CANCELLED_MESSAGE
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ProviderErrorWire {
+            message: String,
+            #[serde(default)]
+            kind: Option<ProviderErrorKind>,
+            #[serde(default)]
+            backoff_hint: Option<Duration>,
+            #[serde(default)]
+            retryable: Option<bool>,
+        }
+
+        let wire = ProviderErrorWire::deserialize(deserializer)?;
+        let kind = wire.kind.unwrap_or_else(|| {
+            if wire.message == ProviderError::CANCELLED_MESSAGE {
+                ProviderErrorKind::Cancelled
+            } else if wire.retryable.unwrap_or(false) {
+                ProviderErrorKind::Transient
+            } else {
+                ProviderErrorKind::Fatal
+            }
+        });
+        Ok(Self {
+            message: wire.message,
+            kind,
+            backoff_hint: wire.backoff_hint,
+        })
     }
 }
 

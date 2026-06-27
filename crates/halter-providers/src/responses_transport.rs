@@ -21,11 +21,12 @@ use tracing::info;
 
 use crate::header_overrides::HeaderOverrides;
 use crate::openai_error::{
-    Retryability, SYNTHETIC_SERVER_ERROR_CODE, classify, openai_api_error_retry_after,
-    parse_openai_http_error, parse_openai_stream_error,
+    SYNTHETIC_SERVER_ERROR_CODE, classify, openai_api_error_retry_after, parse_openai_http_error,
+    parse_openai_stream_error,
 };
 use crate::openai_rate_limit::{OpenAiRateLimitPermit, OpenAiRateLimiter};
 use crate::openai_rate_limit_policy::OpenAiReservation;
+use crate::resilience::ProviderTimeouts;
 use crate::secret::SecretString;
 
 /// Result of a transport-layer call. The variant carries the retryability
@@ -56,28 +57,34 @@ pub(crate) enum TransportError {
 
 impl TransportError {
     pub(crate) fn from_openai(source: OpenAIError) -> Self {
-        match classify(&source) {
-            Retryability::Retryable { backoff_hint } => Self::Retryable {
+        let retryability = classify(&source);
+        match retryability.kind {
+            halter_protocol::ProviderErrorKind::Transient
+            | halter_protocol::ProviderErrorKind::RateLimited => Self::Retryable {
                 source,
-                backoff_hint,
+                backoff_hint: retryability.backoff_hint,
             },
-            Retryability::Fatal => Self::Fatal { source },
+            halter_protocol::ProviderErrorKind::Fatal
+            | halter_protocol::ProviderErrorKind::Cancelled => Self::Fatal { source },
         }
     }
 
     pub(crate) fn from_reqwest(error: reqwest::Error, label: &str) -> Self {
         let wrapped = OpenAIError::Reqwest(error);
-        match classify(&wrapped) {
-            Retryability::Retryable { backoff_hint } => Self::Retryable {
+        let retryability = classify(&wrapped);
+        match retryability.kind {
+            halter_protocol::ProviderErrorKind::Transient
+            | halter_protocol::ProviderErrorKind::RateLimited => Self::Retryable {
                 source: OpenAIError::ApiError(ApiError {
                     message: format!("failed to execute {label} request: {wrapped}"),
                     r#type: None,
                     param: None,
                     code: Some(SYNTHETIC_SERVER_ERROR_CODE.to_owned()),
                 }),
-                backoff_hint,
+                backoff_hint: retryability.backoff_hint,
             },
-            Retryability::Fatal => Self::Fatal { source: wrapped },
+            halter_protocol::ProviderErrorKind::Fatal
+            | halter_protocol::ProviderErrorKind::Cancelled => Self::Fatal { source: wrapped },
         }
     }
 }
@@ -136,16 +143,32 @@ pub(crate) struct ResponsesTransport {
 }
 
 impl ResponsesTransport {
+    #[cfg(test)]
     pub(crate) fn try_new(
         bearer_token: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
+    ) -> anyhow::Result<Self> {
+        Self::try_new_with_timeouts(
+            bearer_token,
+            base_url,
+            header_overrides,
+            ProviderTimeouts::default(),
+        )
+    }
+
+    pub(crate) fn try_new_with_timeouts(
+        bearer_token: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        timeouts: ProviderTimeouts,
     ) -> anyhow::Result<Self> {
         Self::try_new_with_endpoint_mode(
             bearer_token,
             base_url,
             header_overrides,
             ResponsesEndpointMode::PublicApi,
+            timeouts,
         )
     }
 
@@ -154,11 +177,14 @@ impl ResponsesTransport {
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
         endpoint_mode: ResponsesEndpointMode,
+        timeouts: ProviderTimeouts,
     ) -> anyhow::Result<Self> {
         let bearer_token = bearer_token.into();
         let base_url = base_url.into();
         let client = ReqwestClient::builder()
             .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(timeouts.connect)
+            .timeout(timeouts.request)
             .build()
             .context("failed to build responses transport client")?;
 

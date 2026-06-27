@@ -1,24 +1,26 @@
 // pattern: Imperative Shell
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
+    ApiKind, CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
     ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::Provider;
+use crate::resilience::{ProviderErrorClassifier, ResiliencePolicy, ResilientProvider};
 use crate::responses_provider::{
     CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
-use crate::retry::RetryPolicy;
 use crate::secret::SecretString;
 
 #[derive(Debug, Clone)]
 /// OpenRouter provider using the Responses-compatible transport.
 pub struct OpenRouterProvider {
-    inner: ResponsesProvider,
+    inner: ResilientProvider<ResponsesProvider>,
 }
 
 impl OpenRouterProvider {
@@ -41,14 +43,41 @@ impl OpenRouterProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_headers_and_resilience(
+            api_key,
+            base_url,
+            header_overrides,
+            temperature,
+            ResiliencePolicy::default(),
+            Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+    }
+
+    /// Same as [`OpenRouterProvider::new_with_headers`] with an explicit
+    /// provider-request resilience policy and error classifier.
+    pub fn new_with_headers_and_resilience(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+        resilience_policy: ResiliencePolicy,
+        classifier: Arc<dyn ProviderErrorClassifier>,
+    ) -> anyhow::Result<Self> {
+        let config = config(resilience_policy);
+        let policy = config.resilience_policy;
         Ok(Self {
-            inner: ResponsesProvider::try_new(
-                config(),
-                api_key,
-                base_url,
-                header_overrides,
-                temperature,
-            )?,
+            inner: ResilientProvider::new_with_classifier(
+                "openrouter",
+                ResponsesProvider::try_new(
+                    config,
+                    api_key,
+                    base_url,
+                    header_overrides,
+                    temperature,
+                )?,
+                policy,
+                classifier,
+            ),
         })
     }
 }
@@ -68,6 +97,11 @@ impl Provider for OpenRouterProvider {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+        if request.model.api_kind != ApiKind::OpenAiResponses {
+            anyhow::bail!(
+                "failed to execute provider request: openrouter provider requires openai_responses api kind"
+            );
+        }
         self.inner.stream(request, cancel).await
     }
 
@@ -80,7 +114,7 @@ impl Provider for OpenRouterProvider {
     }
 }
 
-fn config() -> ResponsesProviderConfig {
+fn config(resilience_policy: ResiliencePolicy) -> ResponsesProviderConfig {
     ResponsesProviderConfig {
         label: "openrouter",
         capabilities: ProviderCapabilities {
@@ -108,7 +142,7 @@ fn config() -> ResponsesProviderConfig {
         },
         compact_strategy: Some(CompactStrategy::InlineResponses),
         rate_limit_strategy: None,
-        retry_policy: RetryPolicy::default(),
+        resilience_policy,
     }
 }
 

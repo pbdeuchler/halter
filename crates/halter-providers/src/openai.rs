@@ -1,19 +1,21 @@
 // pattern: Imperative Shell
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
+    ApiKind, CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
     ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::Provider;
+use crate::resilience::{ProviderErrorClassifier, ResiliencePolicy, ResilientProvider};
 use crate::responses_provider::{
     CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
 use crate::responses_transport::{ResponsesEndpointMode, ResponsesRateLimitStrategy};
-use crate::retry::RetryPolicy;
 use crate::secret::SecretString;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +60,7 @@ impl OpenAiOAuthCredentials {
 #[derive(Debug, Clone)]
 /// OpenAI Responses API provider.
 pub struct OpenAiProvider {
-    inner: ResponsesProvider,
+    inner: ResilientProvider<ResponsesProvider>,
 }
 
 impl OpenAiProvider {
@@ -82,13 +84,34 @@ impl OpenAiProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_headers_and_resilience(
+            api_key,
+            base_url,
+            header_overrides,
+            temperature,
+            ResiliencePolicy::default(),
+            Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+    }
+
+    /// Same as [`OpenAiProvider::new_with_headers`] with an explicit
+    /// provider-request resilience policy and error classifier.
+    pub fn new_with_headers_and_resilience(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+        resilience_policy: ResiliencePolicy,
+        classifier: Arc<dyn ProviderErrorClassifier>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: ResponsesProvider::try_new(
-                config(),
+            inner: resilient_responses_provider(
+                config(resilience_policy),
                 api_key,
                 base_url,
                 header_overrides,
                 temperature,
+                classifier,
             )?,
         })
     }
@@ -122,18 +145,60 @@ impl OpenAiProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_oauth_headers_and_resilience(
+            credentials,
+            base_url,
+            header_overrides,
+            temperature,
+            ResiliencePolicy::default(),
+            Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+    }
+
+    /// Same as [`OpenAiProvider::new_with_oauth_and_headers`] with an explicit
+    /// provider-request resilience policy and error classifier.
+    pub fn new_with_oauth_headers_and_resilience(
+        credentials: OpenAiOAuthCredentials,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+        resilience_policy: ResiliencePolicy,
+        classifier: Arc<dyn ProviderErrorClassifier>,
+    ) -> anyhow::Result<Self> {
         credentials.validate()?;
         Ok(Self {
-            inner: ResponsesProvider::try_new_with_endpoint_mode(
-                oauth_config(),
-                credentials.access_token,
-                base_url,
-                header_overrides,
-                temperature,
-                ResponsesEndpointMode::ChatGptCodexOAuth,
-            )?,
+            inner: ResilientProvider::new_with_classifier(
+                "openai",
+                ResponsesProvider::try_new_with_endpoint_mode(
+                    oauth_config(resilience_policy),
+                    credentials.access_token,
+                    base_url,
+                    header_overrides,
+                    temperature,
+                    ResponsesEndpointMode::ChatGptCodexOAuth,
+                )?,
+                resilience_policy,
+                classifier,
+            ),
         })
     }
+}
+
+fn resilient_responses_provider(
+    config: ResponsesProviderConfig,
+    api_key: impl Into<SecretString>,
+    base_url: impl Into<String>,
+    header_overrides: &[(String, String)],
+    temperature: Option<f32>,
+    classifier: Arc<dyn ProviderErrorClassifier>,
+) -> anyhow::Result<ResilientProvider<ResponsesProvider>> {
+    let policy = config.resilience_policy;
+    Ok(ResilientProvider::new_with_classifier(
+        "openai",
+        ResponsesProvider::try_new(config, api_key, base_url, header_overrides, temperature)?,
+        policy,
+        classifier,
+    ))
 }
 
 #[async_trait]
@@ -151,6 +216,11 @@ impl Provider for OpenAiProvider {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+        if request.model.api_kind != ApiKind::OpenAiResponses {
+            anyhow::bail!(
+                "failed to execute provider request: openai provider requires openai_responses api kind"
+            );
+        }
         self.inner.stream(request, cancel).await
     }
 
@@ -163,7 +233,7 @@ impl Provider for OpenAiProvider {
     }
 }
 
-fn config() -> ResponsesProviderConfig {
+fn config(resilience_policy: ResiliencePolicy) -> ResponsesProviderConfig {
     ResponsesProviderConfig {
         label: "openai",
         capabilities: ProviderCapabilities {
@@ -191,12 +261,12 @@ fn config() -> ResponsesProviderConfig {
         },
         compact_strategy: Some(CompactStrategy::DedicatedEndpoint),
         rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
-        retry_policy: RetryPolicy::default(),
+        resilience_policy,
     }
 }
 
-fn oauth_config() -> ResponsesProviderConfig {
-    let mut config = config();
+fn oauth_config(resilience_policy: ResiliencePolicy) -> ResponsesProviderConfig {
+    let mut config = config(resilience_policy);
     // ChatGPT's private Codex endpoint rejects otherwise valid Responses
     // payloads unless `instructions` is a top-level field. Public OpenAI
     // accepts the developer-message shape, so keep this compatibility shim
@@ -385,7 +455,7 @@ mod tests {
 
     #[test]
     fn openai_provider_oauth_config_uses_codex_instruction_and_store_shape() {
-        let config = oauth_config();
+        let config = oauth_config(ResiliencePolicy::default());
 
         assert_eq!(config.request.store, Some(false));
         assert_eq!(

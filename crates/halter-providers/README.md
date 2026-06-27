@@ -57,6 +57,19 @@ Core exports include:
 
 There is also a `responses_provider` adapter layer used by the OpenAI/OpenRouter side of the implementation.
 
+Provider resilience is exposed through:
+
+- `ProviderErrorKind`
+- `ProviderTimeouts`
+- `RetryPolicy`
+- `ResiliencePolicy`
+- `ProviderErrorClassifier`
+- `ResilientProvider`
+
+OpenAI and OpenRouter are wrapped in `ResilientProvider` by the higher-level
+builder. Anthropic currently consumes the configured HTTP timeouts; full retry
+classification parity is intentionally left to the Anthropic follow-up work.
+
 ---
 
 ## Mental model

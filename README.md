@@ -358,6 +358,30 @@ refresh_token = "..."
 
 Halter reads process environment variables. It does not parse `.env` files directly; if you use a `.env` file, load it into the process environment before starting the CLI or SDK process.
 
+Provider request resilience is configured globally under `[resilience]` and can
+be partially overridden per provider. `max_attempts` includes the initial
+request:
+
+```toml
+[resilience.timeouts]
+connect_secs = 10
+request_secs = 60
+stream_idle_secs = 60
+
+[resilience.request_retry]
+max_attempts = 5
+deadline_secs = 60
+base_backoff_ms = 500
+max_backoff_secs = 30
+jitter_pct = 25
+
+[providers.openrouter.resilience.request_retry]
+max_attempts = 3
+```
+
+SDK users can override the effective provider policy for all configured
+providers with `HalterBuilder::with_resilience_policy(...)`.
+
 #### Disk resource parsing
 
 `ResourceCompiler::from_config(&config).compile()` loads disk resources from `[resources.skills].roots` and `[resources.plugins].roots`. `Halter::from_config_file(...)` uses this path automatically.

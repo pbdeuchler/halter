@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use async_openai::error::{ApiError, OpenAIError};
+use halter_protocol::ProviderErrorKind;
 use serde_json::Value;
 
 const RATE_LIMIT_CODE: &str = "rate_limit_exceeded";
@@ -27,27 +28,47 @@ pub(crate) const UPSTREAM_PROVIDER_ERROR_CODE: &str = "transport.upstream_provid
 /// Whether a transport/stream failure should be retried. Retryable variants
 /// optionally carry a backoff hint extracted from the upstream response
 /// (e.g. `Please try again in 1.25s` or `Retry-After`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Retryability {
-    Retryable { backoff_hint: Option<Duration> },
-    Fatal,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Retryability {
+    pub(crate) kind: ProviderErrorKind,
+    pub(crate) backoff_hint: Option<Duration>,
 }
 
 impl Retryability {
-    pub(crate) fn is_retryable(&self) -> bool {
-        matches!(self, Self::Retryable { .. })
+    pub(crate) const fn transient(backoff_hint: Option<Duration>) -> Self {
+        Self {
+            kind: ProviderErrorKind::Transient,
+            backoff_hint,
+        }
     }
 
-    pub(crate) fn backoff_hint(&self) -> Option<Duration> {
-        match self {
-            Self::Retryable { backoff_hint } => *backoff_hint,
-            Self::Fatal => None,
+    pub(crate) const fn rate_limited(backoff_hint: Option<Duration>) -> Self {
+        Self {
+            kind: ProviderErrorKind::RateLimited,
+            backoff_hint,
         }
+    }
+
+    pub(crate) const fn fatal() -> Self {
+        Self {
+            kind: ProviderErrorKind::Fatal,
+            backoff_hint: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_retryable(&self) -> bool {
+        self.kind.retryable()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backoff_hint(&self) -> Option<Duration> {
+        self.backoff_hint
     }
 }
 
 /// Single retryability classifier used by both the transport-startup retry
-/// gate and the `ProviderError.retryable` flag. Replaces ad-hoc per-call-site
+/// gate and the typed provider error kind. Replaces ad-hoc per-call-site
 /// substring matches against `"rate limit"` (M19) and the divergent
 /// `stream_error_is_retryable` / `provider_error_from_*` predicates that
 /// previously could disagree on the same error (AC3.7).
@@ -60,42 +81,63 @@ pub(crate) fn classify(error: &OpenAIError) -> Retryability {
             .map(classify_api_error)
             .unwrap_or_else(|| {
                 capacity_backoff_hint(content)
-                    .map(|backoff_hint| Retryability::Retryable {
-                        backoff_hint: Some(backoff_hint),
-                    })
-                    .unwrap_or(Retryability::Fatal)
+                    .map(|backoff_hint| Retryability::transient(Some(backoff_hint)))
+                    .unwrap_or_else(|| Retryability::transient(None))
             }),
         // Network-layer faults and SSE framing errors are inherently
         // retryable — they are the connection failing, not the API rejecting
         // the request.
-        OpenAIError::Reqwest(error) => Retryability::Retryable {
-            backoff_hint: capacity_backoff_hint(&error.to_string()),
-        },
-        OpenAIError::StreamError(error) => Retryability::Retryable {
-            backoff_hint: capacity_backoff_hint(&error.to_string()),
-        },
+        OpenAIError::Reqwest(error) => {
+            Retryability::transient(capacity_backoff_hint(&error.to_string()))
+        }
+        OpenAIError::StreamError(error) => {
+            Retryability::transient(capacity_backoff_hint(&error.to_string()))
+        }
         OpenAIError::FileSaveError(_)
         | OpenAIError::FileReadError(_)
-        | OpenAIError::InvalidArgument(_) => Retryability::Fatal,
+        | OpenAIError::InvalidArgument(_) => Retryability::fatal(),
     }
 }
 
 fn classify_api_error(api: &ApiError) -> Retryability {
     if openai_api_error_is_rate_limit(api) {
-        Retryability::Retryable {
-            backoff_hint: openai_api_error_retry_after(api),
-        }
+        Retryability::rate_limited(openai_api_error_retry_after(api))
     } else if let Some(backoff_hint) = api_capacity_backoff_hint(api) {
-        Retryability::Retryable {
-            backoff_hint: Some(backoff_hint),
-        }
+        Retryability::transient(Some(backoff_hint))
     } else if matches!(
         api.code.as_deref(),
         Some(SYNTHETIC_SERVER_ERROR_CODE) | Some(UPSTREAM_PROVIDER_ERROR_CODE)
     ) {
-        Retryability::Retryable { backoff_hint: None }
+        Retryability::transient(None)
+    } else if openai_api_error_is_explicit_fatal(api) {
+        Retryability::fatal()
     } else {
-        Retryability::Fatal
+        Retryability::transient(None)
+    }
+}
+
+fn openai_api_error_is_explicit_fatal(error: &ApiError) -> bool {
+    let tags = [error.code.as_deref(), error.r#type.as_deref()];
+    tags.into_iter().flatten().any(|tag| {
+        matches!(
+            tag,
+            "invalid_request_error"
+                | "invalid_request"
+                | "authentication_error"
+                | "permission_error"
+                | "insufficient_quota"
+                | "model_not_found"
+                | "context_length_exceeded"
+                | "content_policy_violation"
+                | "invalid_api_key"
+        )
+    }) || {
+        let message = error.message.to_ascii_lowercase();
+        message.contains("invalid api key")
+            || message.contains("context length")
+            || message.contains("maximum context")
+            || message.contains("model") && message.contains("not found")
+            || message.contains("content policy")
     }
 }
 
@@ -260,9 +302,7 @@ mod tests {
         ));
         assert_eq!(
             classify(&err),
-            Retryability::Retryable {
-                backoff_hint: Some(Duration::from_millis(250)),
-            }
+            Retryability::rate_limited(Some(Duration::from_millis(250)))
         );
     }
 
@@ -273,10 +313,7 @@ mod tests {
             None,
             "internal server error",
         ));
-        assert_eq!(
-            classify(&err),
-            Retryability::Retryable { backoff_hint: None }
-        );
+        assert_eq!(classify(&err), Retryability::transient(None));
     }
 
     #[test]
@@ -286,7 +323,7 @@ mod tests {
             Some("invalid_request"),
             "missing required parameter",
         ));
-        assert_eq!(classify(&err), Retryability::Fatal);
+        assert_eq!(classify(&err), Retryability::fatal());
     }
 
     #[test]
@@ -301,9 +338,7 @@ mod tests {
             let err = OpenAIError::ApiError(api_error(code, kind, message));
             assert_eq!(
                 classify(&err),
-                Retryability::Retryable {
-                    backoff_hint: Some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS)),
-                },
+                Retryability::transient(Some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS))),
                 "{message}"
             );
         }
@@ -314,10 +349,7 @@ mod tests {
         let stream_err = OpenAIError::StreamError(Box::new(StreamError::EventStream(
             "connection reset".to_owned(),
         )));
-        assert_eq!(
-            classify(&stream_err),
-            Retryability::Retryable { backoff_hint: None }
-        );
+        assert_eq!(classify(&stream_err), Retryability::transient(None));
     }
 
     #[test]
@@ -327,9 +359,7 @@ mod tests {
         )));
         assert_eq!(
             classify(&stream_err),
-            Retryability::Retryable {
-                backoff_hint: Some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS)),
-            }
+            Retryability::transient(Some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS)))
         );
     }
 
@@ -349,28 +379,24 @@ mod tests {
         let err = OpenAIError::JSONDeserialize(json_err, payload);
         assert_eq!(
             classify(&err),
-            Retryability::Retryable {
-                backoff_hint: Some(Duration::from_millis(50)),
-            }
+            Retryability::rate_limited(Some(Duration::from_millis(50)))
         );
     }
 
     #[test]
-    fn classify_marks_unknown_jsondeserialize_payload_fatal() {
+    fn classify_marks_unknown_jsondeserialize_payload_transient() {
         let json_err = serde_json::from_str::<u32>("not a number").unwrap_err();
         let err = OpenAIError::JSONDeserialize(json_err, "not json".to_owned());
-        assert_eq!(classify(&err), Retryability::Fatal);
+        assert_eq!(classify(&err), Retryability::transient(None));
     }
 
     #[test]
     fn retryability_helpers_match_pattern() {
-        let retryable = Retryability::Retryable {
-            backoff_hint: Some(Duration::from_secs(2)),
-        };
+        let retryable = Retryability::rate_limited(Some(Duration::from_secs(2)));
         assert!(retryable.is_retryable());
         assert_eq!(retryable.backoff_hint(), Some(Duration::from_secs(2)));
 
-        let fatal = Retryability::Fatal;
+        let fatal = Retryability::fatal();
         assert!(!fatal.is_retryable());
         assert_eq!(fatal.backoff_hint(), None);
     }
@@ -442,10 +468,7 @@ mod tests {
             Some(UPSTREAM_PROVIDER_ERROR_CODE)
         );
         let err = OpenAIError::ApiError(api_error);
-        assert_eq!(
-            classify(&err),
-            Retryability::Retryable { backoff_hint: None }
-        );
+        assert_eq!(classify(&err), Retryability::transient(None));
     }
 
     #[test]
@@ -464,9 +487,7 @@ mod tests {
         let err = OpenAIError::ApiError(api_error);
         assert_eq!(
             classify(&err),
-            Retryability::Retryable {
-                backoff_hint: Some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS)),
-            }
+            Retryability::transient(Some(Duration::from_millis(INFERRED_CAPACITY_BACKOFF_MS)))
         );
     }
 

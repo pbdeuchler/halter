@@ -9,8 +9,8 @@ use anyhow::Context;
 use halter_config::{
     ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelJudgeConfig,
     ModelJudgeMode, ModelSlot, ModelSlotRef, OpenAiOAuthConfig, PolicyConfig, PromptsConfig,
-    ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID,
-    SessionBackend, SessionsConfig, SystemPromptPreset, expand_path, load_path,
+    ResilienceConfig, ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID,
+    SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, SystemPromptPreset, expand_path, load_path,
     resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
@@ -19,8 +19,10 @@ use halter_protocol::{
     ResourceSnapshot,
 };
 use halter_providers::{
-    AnthropicProvider, FullTurnJudgePlan, FullTurnPanelist, ModelJudgeMember, ModelJudgeProvider,
-    ModelRegistry, OpenAiOAuthCredentials, OpenAiProvider, OpenRouterProvider, Provider,
+    AnthropicProvider, DefaultProviderErrorClassifier, FullTurnJudgePlan, FullTurnPanelist,
+    ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials, OpenAiProvider,
+    OpenRouterProvider, Provider, ProviderErrorClassifier, ProviderTimeouts, ResiliencePolicy,
+    RetryPolicy,
 };
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
@@ -50,6 +52,8 @@ pub struct HalterBuilder {
     loaded_plugins: Vec<LoadedPlugin>,
     tools: Vec<Arc<dyn Tool>>,
     session_store: Option<Arc<dyn SessionStore>>,
+    resilience_policy: Option<ResiliencePolicy>,
+    provider_error_classifier: Option<Arc<dyn ProviderErrorClassifier>>,
 }
 
 impl HalterBuilder {
@@ -130,6 +134,25 @@ impl HalterBuilder {
         self
     }
 
+    /// Override provider request timeouts and retry policy for all provider
+    /// families built by this harness.
+    #[must_use]
+    pub fn with_resilience_policy(mut self, policy: ResiliencePolicy) -> Self {
+        self.resilience_policy = Some(policy);
+        self
+    }
+
+    /// Install a provider error classifier used by resilient providers after
+    /// provider-native classification and before retry decisions.
+    #[must_use]
+    pub fn with_provider_error_classifier(
+        mut self,
+        classifier: Arc<dyn ProviderErrorClassifier>,
+    ) -> Self {
+        self.provider_error_classifier = Some(classifier);
+        self
+    }
+
     /// Validate configuration, register tools/providers/hooks, and build the runtime.
     pub async fn build(self) -> anyhow::Result<Halter> {
         let HalterBuilder {
@@ -142,6 +165,8 @@ impl HalterBuilder {
             loaded_plugins,
             tools: custom_tools,
             session_store,
+            resilience_policy,
+            provider_error_classifier,
         } = self;
         debug!("validating halter builder config");
         config.validate()?;
@@ -186,7 +211,12 @@ impl HalterBuilder {
                 resources.hook_warnings.clone()
             });
 
-        let models = Arc::new(build_model_registry(&config)?);
+        let provider_options = ProviderBuildOptions {
+            resilience_policy,
+            provider_error_classifier: provider_error_classifier
+                .unwrap_or_else(|| Arc::new(DefaultProviderErrorClassifier)),
+        };
+        let models = Arc::new(build_model_registry(&config, &provider_options)?);
         let tools = Arc::new(ToolRuntime::new());
         register_builtin_tools(&tools, &config.tools.enabled);
         for tool in custom_tools {
@@ -451,7 +481,16 @@ fn describe_session_backend(config: &SessionsConfig) -> &'static str {
     }
 }
 
-fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry> {
+#[derive(Clone)]
+struct ProviderBuildOptions {
+    resilience_policy: Option<ResiliencePolicy>,
+    provider_error_classifier: Arc<dyn ProviderErrorClassifier>,
+}
+
+fn build_model_registry(
+    config: &HarnessConfig,
+    provider_options: &ProviderBuildOptions,
+) -> anyhow::Result<ModelRegistry> {
     let mut registry = ModelRegistry::new();
     // Each provider family is resolved and constructed at most once, then shared
     // across every role and model-judge member that references it.
@@ -462,6 +501,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         config,
         &mut registry,
         &mut family_providers,
+        provider_options,
         default_slot,
         ModelRole::default_role(),
         DEFAULT_MODEL_ID,
@@ -474,6 +514,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
             config,
             &mut registry,
             &mut family_providers,
+            provider_options,
             subagent_slot,
             ModelRole::subagent(),
             SUBAGENT_MODEL_ID,
@@ -483,6 +524,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
             config,
             &mut registry,
             &mut family_providers,
+            provider_options,
             default_slot,
             ModelRole::subagent(),
             SUBAGENT_MODEL_ID,
@@ -501,6 +543,7 @@ fn build_model_registry(config: &HarnessConfig) -> anyhow::Result<ModelRegistry>
         config,
         &mut registry,
         &mut family_providers,
+        provider_options,
         &small_config,
         ModelRole::small(),
         SMALL_MODEL_ID,
@@ -531,15 +574,22 @@ fn build_slot_model(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
     family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    provider_options: &ProviderBuildOptions,
     slot: &ModelSlot,
     role: ModelRole,
     id: &str,
     slot_label: &str,
 ) -> anyhow::Result<ResolvedModel> {
     match slot {
-        ModelSlot::Inline(model) => {
-            build_inline_model(config, registry, family_providers, model, role, id)
-        }
+        ModelSlot::Inline(model) => build_inline_model(
+            config,
+            registry,
+            family_providers,
+            provider_options,
+            model,
+            role,
+            id,
+        ),
         ModelSlot::Reference(ModelSlotRef::ModelJudge) => {
             let model_judge = config.model_judge().with_context(|| {
                 format!(
@@ -550,6 +600,7 @@ fn build_slot_model(
                 config,
                 registry,
                 family_providers,
+                provider_options,
                 model_judge,
                 role,
                 id,
@@ -566,11 +617,18 @@ fn build_inline_model(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
     family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    provider_options: &ProviderBuildOptions,
     model: &ModelConfig,
     role: ModelRole,
     id: &str,
 ) -> anyhow::Result<ResolvedModel> {
-    ensure_family_provider(config, registry, family_providers, model.provider)?;
+    ensure_family_provider(
+        config,
+        registry,
+        family_providers,
+        provider_options,
+        model.provider,
+    )?;
     Ok(resolved_model(
         model,
         role,
@@ -583,6 +641,7 @@ fn build_model_judge_model(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
     family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    provider_options: &ProviderBuildOptions,
     model_judge: &ModelJudgeConfig,
     role: ModelRole,
     id: &str,
@@ -597,6 +656,7 @@ fn build_model_judge_model(
             config,
             registry,
             family_providers,
+            provider_options,
             model_judge,
             role,
             id,
@@ -606,6 +666,7 @@ fn build_model_judge_model(
             config,
             registry,
             family_providers,
+            provider_options,
             model_judge,
             role,
             id,
@@ -621,21 +682,33 @@ fn build_one_shot_judge(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
     family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    provider_options: &ProviderBuildOptions,
     model_judge: &ModelJudgeConfig,
     role: ModelRole,
     id: &str,
     slot_label: &str,
 ) -> anyhow::Result<ResolvedModel> {
-    let default_member =
-        build_model_judge_member(config, registry, family_providers, &model_judge.default)?;
-    let synthesis_member =
-        build_model_judge_member(config, registry, family_providers, &model_judge.synthesis)?;
+    let default_member = build_model_judge_member(
+        config,
+        registry,
+        family_providers,
+        provider_options,
+        &model_judge.default,
+    )?;
+    let synthesis_member = build_model_judge_member(
+        config,
+        registry,
+        family_providers,
+        provider_options,
+        &model_judge.synthesis,
+    )?;
     let mut panel = Vec::with_capacity(model_judge.panel.len());
     for panelist in &model_judge.panel {
         panel.push(build_model_judge_member(
             config,
             registry,
             family_providers,
+            provider_options,
             panelist,
         )?);
     }
@@ -674,6 +747,7 @@ fn build_full_turn_judge(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
     family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    provider_options: &ProviderBuildOptions,
     model_judge: &ModelJudgeConfig,
     role: ModelRole,
     id: &str,
@@ -685,6 +759,7 @@ fn build_full_turn_judge(
         config,
         registry,
         family_providers,
+        provider_options,
         model_judge.default.provider,
     )?;
     let slot_model = resolved_model(
@@ -695,8 +770,13 @@ fn build_full_turn_judge(
     );
 
     // Synthesis is a single inner inference, identical to the OneShot path.
-    let synthesis =
-        build_model_judge_member(config, registry, family_providers, &model_judge.synthesis)?;
+    let synthesis = build_model_judge_member(
+        config,
+        registry,
+        family_providers,
+        provider_options,
+        &model_judge.synthesis,
+    )?;
 
     // Each panelist gets a unique, slot-scoped model id so the runtime can start
     // a sub-session against it; the label is the model name (disambiguated) used
@@ -704,7 +784,13 @@ fn build_full_turn_judge(
     let labels = panel_labels(&model_judge.panel);
     let mut panel = Vec::with_capacity(model_judge.panel.len());
     for (index, panelist) in model_judge.panel.iter().enumerate() {
-        ensure_family_provider(config, registry, family_providers, panelist.provider)?;
+        ensure_family_provider(
+            config,
+            registry,
+            family_providers,
+            provider_options,
+            panelist.provider,
+        )?;
         let model_id = ModelId::from(format!("model-judge-panel:{slot_label}:{index}"));
         registry.register_model(resolved_model(
             panelist,
@@ -755,9 +841,16 @@ fn build_model_judge_member(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
     family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    provider_options: &ProviderBuildOptions,
     model: &ModelConfig,
 ) -> anyhow::Result<ModelJudgeMember> {
-    let provider = ensure_family_provider(config, registry, family_providers, model.provider)?;
+    let provider = ensure_family_provider(
+        config,
+        registry,
+        family_providers,
+        provider_options,
+        model.provider,
+    )?;
     let resolved = resolved_model(
         model,
         ModelRole::default_role(),
@@ -776,13 +869,18 @@ fn ensure_family_provider(
     config: &HarnessConfig,
     registry: &mut ModelRegistry,
     family_providers: &mut HashMap<ConfiguredProvider, Arc<dyn Provider>>,
+    provider_options: &ProviderBuildOptions,
     family: ConfiguredProvider,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     if let Some(provider) = family_providers.get(&family) {
         return Ok(provider.clone());
     }
     let resolved = resolve_selected_provider_config(config, family)?;
-    let provider = build_provider(&resolved)?;
+    let provider = build_provider(
+        &resolved,
+        selected_resilience_policy(config, family, provider_options),
+        provider_options.provider_error_classifier.clone(),
+    )?;
     registry.register_provider(ProviderName::from(family.to_string()), provider.clone());
     family_providers.insert(family, provider.clone());
     Ok(provider)
@@ -810,6 +908,8 @@ fn resolved_model(
 
 fn build_provider(
     provider: &ResolvedProviderConfig,
+    resilience_policy: ResiliencePolicy,
+    classifier: Arc<dyn ProviderErrorClassifier>,
 ) -> anyhow::Result<Arc<dyn halter_providers::Provider>> {
     debug!(
         provider = %provider.provider,
@@ -818,36 +918,76 @@ fn build_provider(
         "constructing provider client"
     );
     let provider: Arc<dyn halter_providers::Provider> = match provider.provider {
-        ConfiguredProvider::Anthropic => Arc::new(AnthropicProvider::new_with_headers(
-            api_key_auth(provider)?,
-            provider.base_url.clone(),
-            &provider.headers,
-            provider.temperature,
-        )?),
-        ConfiguredProvider::OpenAi => match &provider.auth {
-            ResolvedProviderAuth::ApiKey(api_key) => Arc::new(OpenAiProvider::new_with_headers(
-                api_key.clone(),
+        ConfiguredProvider::Anthropic => {
+            Arc::new(AnthropicProvider::new_with_headers_and_timeouts(
+                api_key_auth(provider)?,
                 provider.base_url.clone(),
                 &provider.headers,
                 provider.temperature,
-            )?),
+                resilience_policy.timeouts,
+            )?)
+        }
+        ConfiguredProvider::OpenAi => match &provider.auth {
+            ResolvedProviderAuth::ApiKey(api_key) => {
+                Arc::new(OpenAiProvider::new_with_headers_and_resilience(
+                    api_key.clone(),
+                    provider.base_url.clone(),
+                    &provider.headers,
+                    provider.temperature,
+                    resilience_policy,
+                    classifier,
+                )?)
+            }
             ResolvedProviderAuth::OpenAiOAuth(oauth) => {
-                Arc::new(OpenAiProvider::new_with_oauth_and_headers(
+                Arc::new(OpenAiProvider::new_with_oauth_headers_and_resilience(
                     openai_oauth_credentials(oauth),
                     provider.base_url.clone(),
                     &provider.headers,
                     provider.temperature,
+                    resilience_policy,
+                    classifier,
                 )?)
             }
         },
-        ConfiguredProvider::OpenRouter => Arc::new(OpenRouterProvider::new_with_headers(
-            api_key_auth(provider)?,
-            provider.base_url.clone(),
-            &provider.headers,
-            provider.temperature,
-        )?),
+        ConfiguredProvider::OpenRouter => {
+            Arc::new(OpenRouterProvider::new_with_headers_and_resilience(
+                api_key_auth(provider)?,
+                provider.base_url.clone(),
+                &provider.headers,
+                provider.temperature,
+                resilience_policy,
+                classifier,
+            )?)
+        }
     };
     Ok(provider)
+}
+
+fn selected_resilience_policy(
+    config: &HarnessConfig,
+    family: ConfiguredProvider,
+    provider_options: &ProviderBuildOptions,
+) -> ResiliencePolicy {
+    provider_options
+        .resilience_policy
+        .unwrap_or_else(|| resilience_policy_from_config(config.resilience_for(family)))
+}
+
+fn resilience_policy_from_config(config: ResilienceConfig) -> ResiliencePolicy {
+    ResiliencePolicy {
+        timeouts: ProviderTimeouts {
+            connect: std::time::Duration::from_secs(config.timeouts.connect_secs),
+            request: std::time::Duration::from_secs(config.timeouts.request_secs),
+            stream_idle: std::time::Duration::from_secs(config.timeouts.stream_idle_secs),
+        },
+        request_retry: RetryPolicy {
+            max_attempts: config.request_retry.max_attempts,
+            base_backoff: std::time::Duration::from_millis(config.request_retry.base_backoff_ms),
+            max_backoff: std::time::Duration::from_secs(config.request_retry.max_backoff_secs),
+            deadline: std::time::Duration::from_secs(config.request_retry.deadline_secs),
+            jitter_pct: config.request_retry.jitter_pct,
+        },
+    }
 }
 
 fn api_key_auth(provider: &ResolvedProviderConfig) -> anyhow::Result<String> {
@@ -951,9 +1091,13 @@ fn allowed_read_roots_from_config(
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use async_trait::async_trait;
-    use halter_config::{ModelConfig, OpenAiOAuthConfig, ProviderConfig};
+    use halter_config::{
+        ModelConfig, OpenAiOAuthConfig, ProviderConfig, RequestRetryConfig, ResilienceConfig,
+        ResilienceTimeoutsConfig,
+    };
     use halter_protocol::{PluginManifest, ReasoningEffort, SkillId};
     use tempfile::tempdir;
 
@@ -985,6 +1129,64 @@ mod tests {
         };
 
         assert!(error.to_string().contains("missing resource snapshot"));
+    }
+
+    #[test]
+    fn resilience_policy_from_config_maps_config_units_to_durations() {
+        let policy = resilience_policy_from_config(ResilienceConfig {
+            timeouts: ResilienceTimeoutsConfig {
+                connect_secs: 2,
+                request_secs: 3,
+                stream_idle_secs: 4,
+            },
+            request_retry: RequestRetryConfig {
+                max_attempts: 7,
+                deadline_secs: 8,
+                base_backoff_ms: 250,
+                max_backoff_secs: 9,
+                jitter_pct: 10,
+            },
+        });
+
+        assert_eq!(policy.timeouts.connect, Duration::from_secs(2));
+        assert_eq!(policy.timeouts.request, Duration::from_secs(3));
+        assert_eq!(policy.timeouts.stream_idle, Duration::from_secs(4));
+        assert_eq!(policy.request_retry.max_attempts, 7);
+        assert_eq!(policy.request_retry.deadline, Duration::from_secs(8));
+        assert_eq!(
+            policy.request_retry.base_backoff,
+            Duration::from_millis(250)
+        );
+        assert_eq!(policy.request_retry.max_backoff, Duration::from_secs(9));
+        assert_eq!(policy.request_retry.jitter_pct, 10);
+    }
+
+    #[test]
+    fn selected_resilience_policy_prefers_sdk_override() {
+        let override_policy = ResiliencePolicy {
+            timeouts: ProviderTimeouts {
+                connect: Duration::from_secs(11),
+                request: Duration::from_secs(12),
+                stream_idle: Duration::from_secs(13),
+            },
+            request_retry: RetryPolicy {
+                max_attempts: 2,
+                base_backoff: Duration::from_millis(30),
+                max_backoff: Duration::from_secs(4),
+                deadline: Duration::from_secs(5),
+                jitter_pct: 0,
+            },
+        };
+        let options = ProviderBuildOptions {
+            resilience_policy: Some(override_policy),
+            provider_error_classifier: Arc::new(DefaultProviderErrorClassifier),
+        };
+        let mut config = HarnessConfig::default();
+        config.resilience.timeouts.request_secs = 99;
+
+        let selected = selected_resilience_policy(&config, ConfiguredProvider::OpenAi, &options);
+
+        assert_eq!(selected, override_policy);
     }
 
     #[test]
@@ -1071,7 +1273,8 @@ mod tests {
             panel_isolation: Default::default(),
         });
 
-        let registry = build_model_registry(&config).expect("model registry");
+        let options = default_provider_build_options();
+        let registry = build_model_registry(&config, &options).expect("model registry");
         let default_model = registry.default_model().expect("default model");
         assert_eq!(default_model.provider.0, "model-judge-default");
         assert_eq!(default_model.model, "gpt-default");
@@ -1113,7 +1316,8 @@ mod tests {
             panel_isolation: Default::default(),
         });
 
-        let registry = build_model_registry(&config).expect("model registry");
+        let options = default_provider_build_options();
+        let registry = build_model_registry(&config, &options).expect("model registry");
         let default_model = registry.default_model().expect("default model");
 
         // FullTurn leaves the slot pointing at a plain default provider (no
@@ -1163,7 +1367,8 @@ mod tests {
             panel_isolation: Default::default(),
         });
 
-        let registry = build_model_registry(&config).expect("model registry");
+        let options = default_provider_build_options();
+        let registry = build_model_registry(&config, &options).expect("model registry");
         let default_model = registry.default_model().expect("default model");
         let subagent_model = registry.subagent_model().expect("subagent model");
 
@@ -1432,6 +1637,13 @@ mod tests {
             ..ProviderConfig::default()
         });
         config
+    }
+
+    fn default_provider_build_options() -> ProviderBuildOptions {
+        ProviderBuildOptions {
+            resilience_policy: None,
+            provider_error_classifier: Arc::new(DefaultProviderErrorClassifier),
+        }
     }
 
     fn openai_oauth_config() -> OpenAiOAuthConfig {

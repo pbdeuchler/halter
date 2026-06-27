@@ -53,6 +53,13 @@ pub mod session {
     pub use halter_session::SqliteSessionStore;
 }
 
+pub mod providers {
+    pub use halter_providers::{
+        DefaultProviderErrorClassifier, ProviderErrorClassifier, ProviderErrorKind,
+        ProviderTimeouts, ResiliencePolicy, RetryPolicy,
+    };
+}
+
 /// Built-in default prompts and helpers for installing them.
 ///
 /// Read or compose the defaults, then seed a session with one via
@@ -73,8 +80,12 @@ pub mod prelude {
     pub use halter_protocol::{
         Message, ResourceSnapshot, SessionEvent, SessionEventPayload, SessionId, Turn,
     };
+    pub use halter_providers::{
+        ProviderErrorKind, ProviderTimeouts, ResiliencePolicy, RetryPolicy,
+    };
     pub use halter_runtime::{HalterSession, SessionInit, SessionRuntime, SubagentEventForwarding};
 
     pub use crate::prompts;
+    pub use crate::providers;
     pub use crate::{Halter, HalterBuilder, PluginLoader, ResourceCompiler, SkillLoader};
 }

@@ -27,6 +27,7 @@ mod openai_rate_limit;
 mod openai_rate_limit_policy;
 mod openrouter;
 mod registry;
+mod resilience;
 mod responses_provider;
 mod responses_transport;
 mod retry;
@@ -43,6 +44,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use anthropic::AnthropicProvider;
 pub use fake::FakeProvider;
+pub use halter_protocol::ProviderErrorKind;
 pub use model_judge::{
     Candidate, FullTurnJudgePlan, FullTurnPanelist, MODEL_JUDGE_RANK_TOOL,
     MODEL_JUDGE_TRACE_TARGET, ModelJudgeMember, ModelJudgeProvider, run_panel_synthesis,
@@ -51,6 +53,11 @@ pub use model_judge::{
 pub use openai::{OpenAiOAuthCredentials, OpenAiProvider};
 pub use openrouter::OpenRouterProvider;
 pub use registry::ModelRegistry;
+pub use resilience::{
+    DefaultProviderErrorClassifier, ProviderErrorClassifier, ProviderTimeouts, ResiliencePolicy,
+    ResilientProvider,
+};
+pub use retry::RetryPolicy;
 pub use secret::SecretString;
 pub use unsupported::UnsupportedProvider;
 

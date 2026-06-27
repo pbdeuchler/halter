@@ -10,6 +10,8 @@ use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::resilience::ProviderTimeouts;
+
 #[derive(Debug, Clone)]
 pub(crate) struct JsonRequest {
     pub provider_label: &'static str,
@@ -29,9 +31,11 @@ pub(crate) struct JsonHttpClient {
 }
 
 impl JsonHttpClient {
-    pub(crate) fn try_new() -> anyhow::Result<Self> {
+    pub(crate) fn try_new_with_timeouts(timeouts: ProviderTimeouts) -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(timeouts.connect)
+            .timeout(timeouts.request)
             .build()
             .context("failed to build provider http client")?;
         Ok(Self { client })

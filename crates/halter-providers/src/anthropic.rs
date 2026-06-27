@@ -14,6 +14,7 @@ use crate::Provider;
 use crate::anthropic_codec;
 use crate::header_overrides::HeaderOverrides;
 use crate::http_client::{JsonHttpClient, JsonRequest};
+use crate::resilience::ProviderTimeouts;
 use crate::secret::SecretString;
 
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
@@ -48,10 +49,26 @@ impl AnthropicProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_headers_and_timeouts(
+            api_key,
+            base_url,
+            header_overrides,
+            temperature,
+            ProviderTimeouts::default(),
+        )
+    }
+
+    pub fn new_with_headers_and_timeouts(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+        timeouts: ProviderTimeouts,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            client: JsonHttpClient::try_new()?,
+            client: JsonHttpClient::try_new_with_timeouts(timeouts)?,
             header_overrides: HeaderOverrides::new(header_overrides)?,
             temperature,
         })

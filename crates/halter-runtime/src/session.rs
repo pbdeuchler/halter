@@ -758,7 +758,7 @@ impl SessionHandle {
                 Err(error) => {
                     let provider_error = error.downcast_ref::<ProviderError>();
                     let retryable = provider_error
-                        .map(|provider_error| provider_error.retryable)
+                        .map(|provider_error| provider_error.retryable())
                         .unwrap_or(false);
                     let cancelled = task_cancel_status.is_cancelled()
                         || provider_error.is_some_and(ProviderError::is_cancelled);
