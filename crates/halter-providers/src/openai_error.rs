@@ -79,11 +79,7 @@ pub(crate) fn classify(error: &OpenAIError) -> Retryability {
         OpenAIError::JSONDeserialize(_, content) => parse_openai_stream_error(content)
             .as_ref()
             .map(classify_api_error)
-            .unwrap_or_else(|| {
-                capacity_backoff_hint(content)
-                    .map(|backoff_hint| Retryability::transient(Some(backoff_hint)))
-                    .unwrap_or_else(|| Retryability::transient(None))
-            }),
+            .unwrap_or_else(Retryability::fatal),
         // Network-layer faults and SSE framing errors are inherently
         // retryable — they are the connection failing, not the API rejecting
         // the request.
@@ -102,17 +98,17 @@ pub(crate) fn classify(error: &OpenAIError) -> Retryability {
 fn classify_api_error(api: &ApiError) -> Retryability {
     if openai_api_error_is_rate_limit(api) {
         Retryability::rate_limited(openai_api_error_retry_after(api))
-    } else if let Some(backoff_hint) = api_capacity_backoff_hint(api) {
-        Retryability::transient(Some(backoff_hint))
     } else if matches!(
         api.code.as_deref(),
         Some(SYNTHETIC_SERVER_ERROR_CODE) | Some(UPSTREAM_PROVIDER_ERROR_CODE)
     ) {
-        Retryability::transient(None)
+        Retryability::transient(api_capacity_backoff_hint(api))
     } else if openai_api_error_is_explicit_fatal(api) {
         Retryability::fatal()
+    } else if let Some(backoff_hint) = api_capacity_backoff_hint(api) {
+        Retryability::transient(Some(backoff_hint))
     } else {
-        Retryability::transient(None)
+        Retryability::fatal()
     }
 }
 
@@ -131,14 +127,7 @@ fn openai_api_error_is_explicit_fatal(error: &ApiError) -> bool {
                 | "content_policy_violation"
                 | "invalid_api_key"
         )
-    }) || {
-        let message = error.message.to_ascii_lowercase();
-        message.contains("invalid api key")
-            || message.contains("context length")
-            || message.contains("maximum context")
-            || message.contains("model") && message.contains("not found")
-            || message.contains("content policy")
-    }
+    })
 }
 
 pub(crate) fn parse_openai_http_error(body: &[u8]) -> Option<ApiError> {
@@ -345,6 +334,17 @@ mod tests {
     }
 
     #[test]
+    fn classify_keeps_typed_fatal_errors_fatal_even_with_capacity_words() {
+        let err = OpenAIError::ApiError(api_error(
+            Some("invalid_request_error"),
+            Some("invalid_request"),
+            "context length is at capacity",
+        ));
+
+        assert_eq!(classify(&err), Retryability::fatal());
+    }
+
+    #[test]
     fn classify_marks_stream_and_reqwest_failures_retryable() {
         let stream_err = OpenAIError::StreamError(Box::new(StreamError::EventStream(
             "connection reset".to_owned(),
@@ -384,10 +384,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_marks_unknown_jsondeserialize_payload_transient() {
+    fn classify_marks_unknown_jsondeserialize_payload_fatal() {
         let json_err = serde_json::from_str::<u32>("not a number").unwrap_err();
         let err = OpenAIError::JSONDeserialize(json_err, "not json".to_owned());
-        assert_eq!(classify(&err), Retryability::transient(None));
+        assert_eq!(classify(&err), Retryability::fatal());
+    }
+
+    #[test]
+    fn classify_marks_unknown_api_errors_fatal() {
+        let err = OpenAIError::ApiError(api_error(
+            Some("unknown_bad_request"),
+            Some("unknown_type"),
+            "provider rejected this request",
+        ));
+        assert_eq!(classify(&err), Retryability::fatal());
     }
 
     #[test]

@@ -81,7 +81,8 @@ pub mod prelude {
         Message, ResourceSnapshot, SessionEvent, SessionEventPayload, SessionId, Turn,
     };
     pub use halter_providers::{
-        ProviderErrorKind, ProviderTimeouts, ResiliencePolicy, RetryPolicy,
+        DefaultProviderErrorClassifier, ProviderErrorClassifier, ProviderErrorKind,
+        ProviderTimeouts, ResiliencePolicy, RetryPolicy,
     };
     pub use halter_runtime::{HalterSession, SessionInit, SessionRuntime, SubagentEventForwarding};
 

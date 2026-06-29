@@ -22,7 +22,7 @@ use halter_providers::{
     AnthropicProvider, DefaultProviderErrorClassifier, FullTurnJudgePlan, FullTurnPanelist,
     ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials, OpenAiProvider,
     OpenRouterProvider, Provider, ProviderErrorClassifier, ProviderTimeouts, ResiliencePolicy,
-    RetryPolicy,
+    ResilientProvider, RetryPolicy,
 };
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
@@ -918,15 +918,18 @@ fn build_provider(
         "constructing provider client"
     );
     let provider: Arc<dyn halter_providers::Provider> = match provider.provider {
-        ConfiguredProvider::Anthropic => {
-            Arc::new(AnthropicProvider::new_with_headers_and_timeouts(
+        ConfiguredProvider::Anthropic => Arc::new(ResilientProvider::new_with_classifier(
+            "anthropic",
+            AnthropicProvider::new_with_headers_and_timeouts(
                 api_key_auth(provider)?,
                 provider.base_url.clone(),
                 &provider.headers,
                 provider.temperature,
                 resilience_policy.timeouts,
-            )?)
-        }
+            )?,
+            resilience_policy,
+            classifier,
+        )),
         ConfiguredProvider::OpenAi => match &provider.auth {
             ResolvedProviderAuth::ApiKey(api_key) => {
                 Arc::new(OpenAiProvider::new_with_headers_and_resilience(
@@ -1095,6 +1098,10 @@ mod tests {
 
     use async_trait::async_trait;
     use halter_config::{
+        DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS, DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS,
+        DEFAULT_PROVIDER_RETRY_BASE_BACKOFF_MS, DEFAULT_PROVIDER_RETRY_DEADLINE_SECS,
+        DEFAULT_PROVIDER_RETRY_JITTER_PCT, DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS,
+        DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS, DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS,
         ModelConfig, OpenAiOAuthConfig, ProviderConfig, RequestRetryConfig, ResilienceConfig,
         ResilienceTimeoutsConfig,
     };
@@ -1159,6 +1166,39 @@ mod tests {
         );
         assert_eq!(policy.request_retry.max_backoff, Duration::from_secs(9));
         assert_eq!(policy.request_retry.jitter_pct, 10);
+    }
+
+    #[test]
+    fn config_default_constants_match_provider_policy_defaults() {
+        let timeouts = ProviderTimeouts::default();
+        assert_eq!(
+            timeouts.connect,
+            Duration::from_secs(DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            timeouts.request,
+            Duration::from_secs(DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            timeouts.stream_idle,
+            Duration::from_secs(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS)
+        );
+
+        let retry = RetryPolicy::default();
+        assert_eq!(retry.max_attempts, DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS);
+        assert_eq!(
+            retry.base_backoff,
+            Duration::from_millis(DEFAULT_PROVIDER_RETRY_BASE_BACKOFF_MS)
+        );
+        assert_eq!(
+            retry.max_backoff,
+            Duration::from_secs(DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS)
+        );
+        assert_eq!(
+            retry.deadline,
+            Duration::from_secs(DEFAULT_PROVIDER_RETRY_DEADLINE_SECS)
+        );
+        assert_eq!(retry.jitter_pct, DEFAULT_PROVIDER_RETRY_JITTER_PCT);
     }
 
     #[test]

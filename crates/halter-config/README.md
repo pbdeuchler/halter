@@ -193,8 +193,11 @@ jitter_pct = 25
 max_attempts = 3
 ```
 
-`max_attempts` includes the initial provider request. Timeout and retry values
-must be positive, and `jitter_pct` must be in `0..=100`.
+For streaming calls, `request_secs` bounds request setup through response
+headers and `stream_idle_secs` bounds the idle gap between stream items; it is
+not a total stream lifetime cap. `max_attempts` includes the initial provider
+request. Timeout and retry values must be positive, and `jitter_pct` must be in
+`0..=100`.
 
 ### Resolution rules
 

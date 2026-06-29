@@ -304,6 +304,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::{ProviderTimeouts, RetryPolicy};
 
     #[tokio::test]
     async fn openai_provider_rejects_chat_api_kind() {
@@ -387,6 +388,63 @@ mod tests {
         assert!(
             gap >= Duration::from_millis(15),
             "expected retry to honor cooldown, saw gap {gap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_provider_does_not_apply_request_timeout_to_active_stream_body() {
+        let base_url = spawn_slow_active_stream_server().await;
+        let policy = ResiliencePolicy {
+            timeouts: ProviderTimeouts {
+                connect: Duration::from_secs(1),
+                request: Duration::from_millis(20),
+                stream_idle: Duration::from_millis(250),
+            },
+            request_retry: RetryPolicy {
+                max_attempts: 1,
+                base_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                deadline: Duration::from_secs(1),
+                jitter_pct: 0,
+            },
+        };
+        let provider = OpenAiProvider::new_with_headers_and_resilience(
+            "test-key",
+            base_url,
+            &[],
+            None,
+            policy,
+            Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+        .expect("openai provider");
+        let started = Instant::now();
+        let mut stream = provider
+            .stream(
+                sample_request(ApiKind::OpenAiResponses),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("provider stream");
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            let event = item.expect("stream should stay healthy past request timeout");
+            let done = matches!(event, StreamEvent::MessageEnd { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        assert!(started.elapsed() > policy.timeouts.request);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "slow"
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::MessageEnd { .. }))
         );
     }
 
@@ -782,6 +840,100 @@ mod tests {
                     .await
                     .expect("write response");
             }
+        });
+
+        format!("http://{address}")
+    }
+
+    async fn spawn_slow_active_stream_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept socket");
+            read_http_request(&mut socket).await.expect("read request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write headers");
+
+            let created = json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_slow",
+                    "created_at": 0,
+                    "model": "gpt-5.4",
+                    "object": "response",
+                    "output": [],
+                    "status": "in_progress"
+                }
+            });
+            let added = json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg_slow",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": []
+                }
+            });
+            let delta = json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "item_id": "msg_slow",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "slow"
+            });
+            let completed = json!({
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": {
+                    "id": "resp_slow",
+                    "created_at": 0,
+                    "model": "gpt-5.4",
+                    "object": "response",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_slow",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "slow",
+                            "annotations": []
+                        }]
+                    }],
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 1,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": 1,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 2
+                    }
+                }
+            });
+            for event in [created, added, delta, completed] {
+                let chunk = format!("data: {event}\n\n");
+                socket
+                    .write_all(chunk.as_bytes())
+                    .await
+                    .expect("write stream chunk");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            socket
+                .write_all(b"data: [DONE]\n\n")
+                .await
+                .expect("write done");
         });
 
         format!("http://{address}")

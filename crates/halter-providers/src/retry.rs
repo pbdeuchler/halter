@@ -82,7 +82,11 @@ impl RetryGate {
         {
             return None;
         }
-        Some(compute_backoff(&self.policy, self.completed_attempts, hint))
+        let remaining = self.policy.deadline.saturating_sub(self.started.elapsed());
+        if remaining.is_zero() {
+            return None;
+        }
+        Some(compute_backoff(&self.policy, self.completed_attempts, hint).min(remaining))
     }
 }
 
@@ -133,6 +137,8 @@ fn jitter_offset(capped_ms: u64, jitter_pct: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     fn deterministic_policy(max_attempts: u32) -> RetryPolicy {
@@ -231,6 +237,29 @@ mod tests {
         }
         assert_eq!(gate.next_attempt_id(), 5);
         assert!(gate.record_failure_and_next_backoff(None).is_none());
+    }
+
+    #[test]
+    fn retry_gate_clamps_backoff_to_remaining_deadline() {
+        let policy = RetryPolicy {
+            max_attempts: 100,
+            base_backoff: Duration::from_millis(80),
+            max_backoff: Duration::from_millis(80),
+            deadline: Duration::from_millis(100),
+            jitter_pct: 0,
+        };
+        let mut gate = RetryGate {
+            policy,
+            started: Instant::now() - Duration::from_millis(75),
+            completed_attempts: 0,
+        };
+
+        let backoff = gate
+            .record_failure_and_next_backoff(None)
+            .expect("deadline should have a small remaining budget");
+
+        assert!(backoff < policy.base_backoff);
+        assert!(backoff <= Duration::from_millis(25));
     }
 
     #[tokio::test]

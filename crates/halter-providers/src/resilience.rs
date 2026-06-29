@@ -150,9 +150,10 @@ where
                     Ok(Ok(stream)) => stream,
                     Ok(Err(error)) => {
                         let error = classifier.classify(ProviderError::with_kind(
-                            error.to_string(),
-                            ProviderErrorKind::Fatal,
+                            format!("{error:#}"),
+                            ProviderErrorKind::Transient,
                         ));
+                        attempt_cancel.cancel();
                         if !retry_or_emit(
                             RetryContext {
                                 label,
@@ -177,6 +178,7 @@ where
                             ),
                             None,
                         );
+                        attempt_cancel.cancel();
                         if !retry_or_emit(
                             RetryContext {
                                 label,
@@ -223,6 +225,37 @@ where
                                     error = %error,
                                     "retryable pre-commit provider stream timeout"
                                 );
+                                attempt_cancel.cancel();
+                                if retry_or_emit(
+                                    RetryContext {
+                                        label,
+                                        attempt_id,
+                                        gate: &mut gate,
+                                        tx: &tx,
+                                        cancel: &cancel,
+                                    },
+                                    error,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                                return;
+                            }
+                            let _ = tx.unbounded_send(Err(error));
+                            return;
+                        }
+                        Ok(Some(Ok(StreamEvent::Error { error }))) => {
+                            let error = classifier.classify(error);
+                            if !committed && error.retryable() {
+                                warn!(
+                                    provider = label,
+                                    attempt = attempt_id,
+                                    error = %error,
+                                    backoff_hint = ?error.backoff_hint,
+                                    "retryable pre-commit provider stream error event"
+                                );
+                                attempt_cancel.cancel();
                                 if retry_or_emit(
                                     RetryContext {
                                         label,
@@ -253,7 +286,10 @@ where
                             }
 
                             pending_events.push(event);
-                            if pending_events.iter().any(stream_event_commits_attempt) {
+                            if pending_events
+                                .last()
+                                .is_some_and(stream_event_commits_attempt)
+                            {
                                 committed = true;
                                 for event in pending_events.drain(..) {
                                     if !commit_dedup.allow(&event) {
@@ -275,6 +311,7 @@ where
                                     backoff_hint = ?error.backoff_hint,
                                     "retryable pre-commit provider stream failure"
                                 );
+                                attempt_cancel.cancel();
                                 if retry_or_emit(
                                     RetryContext {
                                         label,
@@ -402,7 +439,7 @@ impl<S> Drop for CancelOnDrop<S> {
     }
 }
 
-/// Cross-attempt dedup for commit-eligible boundary events.
+/// Dedup for repeated commit-eligible boundary events within a committed stream.
 #[derive(Debug, Default)]
 struct CommitDedup {
     seen_message_starts: HashSet<MessageId>,
@@ -427,7 +464,6 @@ fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
             | StreamEvent::ToolCallEnd { .. }
             | StreamEvent::MessageEnd { .. }
             | StreamEvent::ProviderWarning { .. }
-            | StreamEvent::Error { .. }
     )
 }
 
@@ -508,6 +544,46 @@ mod tests {
                 anyhow::bail!("temporary transport failure");
             }
             Ok(stream::iter(success_events("msg_startup", "ok")).boxed())
+        }
+    }
+
+    #[derive(Debug)]
+    struct HangingStartupProvider {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for HangingStartupProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            Ok(stream::empty().boxed())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingStreamProvider;
+
+    #[async_trait]
+    impl Provider for PendingStreamProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            Ok(stream::pending().boxed())
         }
     }
 
@@ -602,6 +678,150 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn retries_startup_errors_by_default() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let provider = StartupFailureProvider {
+            attempts: attempts.clone(),
+        };
+        let resilient = ResilientProvider::new("test", provider, test_policy(2));
+
+        let events = collect_events(resilient).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "ok"
+        )));
+    }
+
+    #[tokio::test]
+    async fn exhausts_retry_budget_and_emits_final_error() {
+        let provider = ScriptedProvider::new(vec![
+            vec![Err(transient_error("first"))],
+            vec![Err(transient_error("final"))],
+        ]);
+        let attempts = provider.attempts();
+        let resilient = ResilientProvider::new("test", provider, test_policy(2));
+
+        let items = collect_items(resilient, CancellationToken::new()).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(items.len(), 1);
+        let error = items[0].as_ref().expect_err("final item should be error");
+        assert_eq!(error.message, "final");
+        assert!(error.retryable());
+    }
+
+    #[tokio::test]
+    async fn emits_fatal_pre_commit_error_without_retry() {
+        let provider = ScriptedProvider::new(vec![
+            vec![Err(ProviderError::with_kind(
+                "bad request",
+                ProviderErrorKind::Fatal,
+            ))],
+            success_events("msg_second", "should not run"),
+        ]);
+        let attempts = provider.attempts();
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        let items = collect_items(resilient, CancellationToken::new()).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(items.len(), 1);
+        let error = items[0].as_ref().expect_err("fatal item should be error");
+        assert_eq!(error.kind, ProviderErrorKind::Fatal);
+    }
+
+    #[tokio::test]
+    async fn retries_pre_commit_in_band_error_event() {
+        let provider = ScriptedProvider::new(vec![
+            vec![Ok(StreamEvent::Error {
+                error: transient_error("provider event error"),
+            })],
+            success_events("msg_retry_event", "done"),
+        ]);
+        let attempts = provider.attempts();
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        let events = collect_events(resilient).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "done"
+        )));
+    }
+
+    #[tokio::test]
+    async fn request_setup_timeout_emits_retryable_error() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let provider = HangingStartupProvider {
+            attempts: attempts.clone(),
+        };
+        let resilient = ResilientProvider::new("test", provider, timeout_policy());
+
+        let items = collect_items(resilient, CancellationToken::new()).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let error = items
+            .first()
+            .and_then(|item| item.as_ref().err())
+            .expect("timeout should emit an error");
+        assert_eq!(error.kind, ProviderErrorKind::Transient);
+        assert!(error.message.contains("request timed out"));
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_emits_retryable_error() {
+        let resilient = ResilientProvider::new("test", PendingStreamProvider, timeout_policy());
+
+        let items = collect_items(resilient, CancellationToken::new()).await;
+
+        let error = items
+            .first()
+            .and_then(|item| item.as_ref().err())
+            .expect("idle timeout should emit an error");
+        assert_eq!(error.kind, ProviderErrorKind::Transient);
+        assert!(error.message.contains("stream idle timeout"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_backoff_emits_cancelled_error() {
+        let provider = ScriptedProvider::new(vec![
+            vec![Err(transient_error("retry me"))],
+            success_events("msg_late", "late"),
+        ]);
+        let attempts = provider.attempts();
+        let policy = ResiliencePolicy {
+            request_retry: RetryPolicy {
+                base_backoff: Duration::from_secs(30),
+                max_backoff: Duration::from_secs(30),
+                ..test_policy(3).request_retry
+            },
+            ..test_policy(3)
+        };
+        let resilient = ResilientProvider::new("test", provider, policy);
+        let cancel = CancellationToken::new();
+        let mut stream = resilient
+            .stream(sample_request(), cancel.clone())
+            .await
+            .expect("stream");
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("cancel should produce an item")
+            .expect("cancelled item");
+
+        assert!(
+            item.expect_err("item should be cancellation")
+                .is_cancelled()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn cancel_on_drop_cancels_token_on_drop() {
         let token = CancellationToken::new();
@@ -660,6 +880,21 @@ mod tests {
         events
     }
 
+    async fn collect_items(
+        provider: ResilientProvider<impl Provider + 'static>,
+        cancel: CancellationToken,
+    ) -> Vec<Result<StreamEvent, ProviderError>> {
+        let mut stream = provider
+            .stream(sample_request(), cancel)
+            .await
+            .expect("stream");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        items
+    }
+
     fn success_events(message_id: &str, text: &str) -> Vec<Result<StreamEvent, ProviderError>> {
         let message_id = MessageId::from(message_id);
         let block_id = BlockId::from(format!("text_{message_id}"));
@@ -695,6 +930,23 @@ mod tests {
                 base_backoff: Duration::from_millis(1),
                 max_backoff: Duration::from_millis(1),
                 deadline: Duration::from_secs(5),
+                jitter_pct: 0,
+            },
+        }
+    }
+
+    fn timeout_policy() -> ResiliencePolicy {
+        ResiliencePolicy {
+            timeouts: ProviderTimeouts {
+                connect: Duration::from_millis(20),
+                request: Duration::from_millis(20),
+                stream_idle: Duration::from_millis(20),
+            },
+            request_retry: RetryPolicy {
+                max_attempts: 1,
+                base_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                deadline: Duration::from_millis(50),
                 jitter_pct: 0,
             },
         }

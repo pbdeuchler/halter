@@ -353,11 +353,7 @@ fn provider_error_from_transport(error: TransportError) -> ProviderError {
         TransportError::Retryable {
             source,
             backoff_hint,
-        } => {
-            let mut error = provider_error_from_openai(source);
-            error.backoff_hint = backoff_hint;
-            error
-        }
+        } => provider_error_from_openai(source).with_backoff_hint(backoff_hint),
         TransportError::Fatal { source } => provider_error_from_openai(source),
     }
 }

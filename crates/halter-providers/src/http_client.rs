@@ -1,5 +1,7 @@
 // pattern: Imperative Shell
 
+use std::time::Duration;
+
 use anyhow::Context;
 use eventsource_stream::Eventsource;
 use futures::{StreamExt, stream::BoxStream};
@@ -27,18 +29,30 @@ pub(crate) struct JsonRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct JsonHttpClient {
-    client: Client,
+    unary_client: Client,
+    streaming_client: Client,
+    request_timeout: Duration,
 }
 
 impl JsonHttpClient {
     pub(crate) fn try_new_with_timeouts(timeouts: ProviderTimeouts) -> anyhow::Result<Self> {
-        let client = Client::builder()
+        let unary_client = Client::builder()
             .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(timeouts.connect)
             .timeout(timeouts.request)
             .build()
             .context("failed to build provider http client")?;
-        Ok(Self { client })
+        let streaming_client = Client::builder()
+            .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.stream_idle)
+            .build()
+            .context("failed to build provider streaming http client")?;
+        Ok(Self {
+            unary_client,
+            streaming_client,
+            request_timeout: timeouts.request,
+        })
     }
 }
 
@@ -65,14 +79,21 @@ impl JsonHttpClient {
         );
         let header_map = request_headers(provider_label, headers)?;
         let builder = self
-            .client
+            .streaming_client
             .post(&url)
             .headers(header_map)
             .body(body_bytes_vec);
 
         let response = select! {
             _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),
-            result = builder.send() => result,
+            result = tokio::time::timeout(self.request_timeout, builder.send()) => match result {
+                Ok(result) => result,
+                Err(_) => anyhow::bail!(
+                    "failed to execute provider request: {} request timed out after {}s",
+                    provider_label,
+                    self.request_timeout.as_secs()
+                ),
+            },
         }
         .with_context(|| format!("failed to execute {} request", provider_label))?;
         let status = response.status();
@@ -159,7 +180,7 @@ impl JsonHttpClient {
         );
         let header_map = request_headers(provider_label, headers)?;
         let builder = self
-            .client
+            .unary_client
             .post(&url)
             .headers(header_map)
             .body(body_bytes_vec);

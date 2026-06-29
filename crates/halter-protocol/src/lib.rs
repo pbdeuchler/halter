@@ -15,6 +15,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use schemars::JsonSchema;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -994,6 +995,7 @@ impl ToolError {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 /// Provider error taxonomy used by retry policy and consumers.
 pub enum ProviderErrorKind {
     /// 5xx, overload, transport, stream, timeout, and otherwise unknown
@@ -1017,8 +1019,9 @@ impl ProviderErrorKind {
     }
 }
 
-#[derive(Debug, Clone, Error, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, JsonSchema, PartialEq, Eq)]
 #[error("{message}")]
+#[non_exhaustive]
 /// Error surfaced by a provider adapter.
 pub struct ProviderError {
     pub message: String,
@@ -1087,6 +1090,23 @@ impl ProviderError {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.kind == ProviderErrorKind::Cancelled || self.message == Self::CANCELLED_MESSAGE
+    }
+}
+
+impl Serialize for ProviderError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let field_count = if self.backoff_hint.is_some() { 4 } else { 3 };
+        let mut state = serializer.serialize_struct("ProviderError", field_count)?;
+        state.serialize_field("message", &self.message)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("retryable", &self.retryable())?;
+        if let Some(backoff_hint) = self.backoff_hint {
+            state.serialize_field("backoff_hint", &backoff_hint)?;
+        }
+        state.end()
     }
 }
 
@@ -1818,6 +1838,70 @@ mod tests {
         let encoded = serde_json::to_string(&event).expect("serialize event");
         let decoded: SessionEvent = serde_json::from_str(&encoded).expect("deserialize event");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn provider_error_serializes_retryable_for_legacy_consumers() {
+        let error = ProviderError::with_kind("slow down", ProviderErrorKind::RateLimited)
+            .with_backoff_hint(Some(Duration::from_secs(2)));
+
+        let value = serde_json::to_value(&error).expect("serialize provider error");
+
+        assert_eq!(value["message"], "slow down");
+        assert_eq!(value["kind"], "rate_limited");
+        assert_eq!(value["retryable"], true);
+        assert!(value.get("backoff_hint").is_some());
+
+        let decoded: ProviderError =
+            serde_json::from_value(value).expect("deserialize provider error");
+        assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn provider_error_deserializes_legacy_retryable_field() {
+        let cases = [
+            (
+                "retryable",
+                serde_json::json!({"message": "try again", "retryable": true}),
+                ProviderErrorKind::Transient,
+            ),
+            (
+                "fatal",
+                serde_json::json!({"message": "bad request", "retryable": false}),
+                ProviderErrorKind::Fatal,
+            ),
+            (
+                "missing_retryable",
+                serde_json::json!({"message": "old fatal"}),
+                ProviderErrorKind::Fatal,
+            ),
+            (
+                "cancelled_sentinel",
+                serde_json::json!({"message": ProviderError::CANCELLED_MESSAGE}),
+                ProviderErrorKind::Cancelled,
+            ),
+        ];
+
+        for (name, value, want_kind) in cases {
+            let error: ProviderError =
+                serde_json::from_value(value).expect("deserialize provider error");
+
+            assert_eq!(error.kind, want_kind, "{name}");
+            assert_eq!(error.retryable(), want_kind.retryable(), "{name}");
+        }
+    }
+
+    #[test]
+    fn provider_error_kind_takes_precedence_over_legacy_retryable() {
+        let error: ProviderError = serde_json::from_value(serde_json::json!({
+            "message": "locally exhausted rate limit",
+            "kind": "rate_limited",
+            "retryable": false
+        }))
+        .expect("deserialize provider error");
+
+        assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+        assert!(error.retryable());
     }
 
     #[test]

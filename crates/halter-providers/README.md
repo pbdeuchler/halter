@@ -66,9 +66,10 @@ Provider resilience is exposed through:
 - `ProviderErrorClassifier`
 - `ResilientProvider`
 
-OpenAI and OpenRouter are wrapped in `ResilientProvider` by the higher-level
-builder. Anthropic currently consumes the configured HTTP timeouts; full retry
-classification parity is intentionally left to the Anthropic follow-up work.
+OpenAI, OpenRouter, and Anthropic are wrapped in `ResilientProvider` by the
+higher-level builder. Streaming transports do not use reqwest's total request
+timeout for the SSE body; request setup and stream-idle liveness are bounded
+separately.
 
 ---
 

@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use halter_protocol::{
     ApiKind, CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderCompactionStrategy, ProviderError, ProviderRequest,
-    StreamEvent, ToolCallIdPolicy,
+    ProviderCompactionResponse, ProviderCompactionStrategy, ProviderError, ProviderErrorKind,
+    ProviderRequest, StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -141,20 +141,30 @@ impl Provider for AnthropicProvider {
         Ok(raw_stream
             .flat_map(move |item| {
                 let events = match item {
-                    Ok(event) => decoder.decode(&event).unwrap_or_else(|error| {
-                        vec![StreamEvent::Error {
-                            error: ProviderError::new(
-                                format!("failed to decode anthropic stream: {error}"),
-                                false,
-                            ),
-                        }]
-                    }),
-                    Err(error) => vec![StreamEvent::Error {
-                        error: ProviderError::new(error.to_string(), false),
-                    }],
+                    Ok(event) => decoder
+                        .decode(&event)
+                        .map(|events| {
+                            events
+                                .into_iter()
+                                .map(|event| match event {
+                                    StreamEvent::Error { error } => Err(error),
+                                    event => Ok(event),
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|error| {
+                            vec![Err(ProviderError::with_kind(
+                                format!("failed to decode anthropic stream: {error:#}"),
+                                ProviderErrorKind::Fatal,
+                            ))]
+                        }),
+                    Err(error) => vec![Err(ProviderError::with_kind(
+                        format!("{error:#}"),
+                        ProviderErrorKind::Transient,
+                    ))],
                 };
                 debug!(event_count = events.len(), "decoded anthropic stream event");
-                stream::iter(events.into_iter().map(Ok))
+                stream::iter(events)
             })
             .boxed())
     }

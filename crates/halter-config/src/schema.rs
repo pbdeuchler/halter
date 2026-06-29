@@ -35,6 +35,38 @@ pub const DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS: u64 = 30;
 /// Default provider retry jitter percentage.
 pub const DEFAULT_PROVIDER_RETRY_JITTER_PCT: u32 = 25;
 
+const fn default_provider_connect_timeout_secs() -> u64 {
+    DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS
+}
+
+const fn default_provider_request_timeout_secs() -> u64 {
+    DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS
+}
+
+const fn default_provider_stream_idle_timeout_secs() -> u64 {
+    DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS
+}
+
+const fn default_provider_retry_max_attempts() -> u32 {
+    DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS
+}
+
+const fn default_provider_retry_deadline_secs() -> u64 {
+    DEFAULT_PROVIDER_RETRY_DEADLINE_SECS
+}
+
+const fn default_provider_retry_base_backoff_ms() -> u64 {
+    DEFAULT_PROVIDER_RETRY_BASE_BACKOFF_MS
+}
+
+const fn default_provider_retry_max_backoff_secs() -> u64 {
+    DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS
+}
+
+const fn default_provider_retry_jitter_pct() -> u32 {
+    DEFAULT_PROVIDER_RETRY_JITTER_PCT
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 /// Top-level TOML configuration for a halter runtime.
@@ -440,7 +472,8 @@ impl fmt::Display for ConfiguredProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 /// Provider resilience policy shared by all provider families unless a
 /// provider-specific override is configured.
 pub struct ResilienceConfig {
@@ -459,28 +492,6 @@ impl Default for ResilienceConfig {
     }
 }
 
-impl<'de> Deserialize<'de> for ResilienceConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            #[serde(default)]
-            timeouts: ResilienceTimeoutsConfig,
-            #[serde(default)]
-            request_retry: RequestRetryConfig,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
-            timeouts: wire.timeouts,
-            request_retry: wire.request_retry,
-        })
-    }
-}
-
 impl ResilienceConfig {
     fn validate(&self, path: &str) -> anyhow::Result<()> {
         self.timeouts.validate(&format!("{path}.timeouts"))?;
@@ -490,11 +501,15 @@ impl ResilienceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 /// Provider timeout settings, expressed in seconds.
 pub struct ResilienceTimeoutsConfig {
+    #[serde(default = "default_provider_connect_timeout_secs")]
     pub connect_secs: u64,
+    #[serde(default = "default_provider_request_timeout_secs")]
     pub request_secs: u64,
+    #[serde(default = "default_provider_stream_idle_timeout_secs")]
     pub stream_idle_secs: u64,
 }
 
@@ -508,32 +523,6 @@ impl Default for ResilienceTimeoutsConfig {
     }
 }
 
-impl<'de> Deserialize<'de> for ResilienceTimeoutsConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            #[serde(default)]
-            connect_secs: Option<u64>,
-            #[serde(default)]
-            request_secs: Option<u64>,
-            #[serde(default)]
-            stream_idle_secs: Option<u64>,
-        }
-
-        let defaults = Self::default();
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
-            connect_secs: wire.connect_secs.unwrap_or(defaults.connect_secs),
-            request_secs: wire.request_secs.unwrap_or(defaults.request_secs),
-            stream_idle_secs: wire.stream_idle_secs.unwrap_or(defaults.stream_idle_secs),
-        })
-    }
-}
-
 impl ResilienceTimeoutsConfig {
     fn validate(&self, path: &str) -> anyhow::Result<()> {
         validate_positive_u64(&format!("{path}.connect_secs"), self.connect_secs)?;
@@ -543,14 +532,20 @@ impl ResilienceTimeoutsConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 /// Provider request retry policy. `max_attempts` includes the initial
 /// request; retries stop when either the attempt budget or deadline is spent.
 pub struct RequestRetryConfig {
+    #[serde(default = "default_provider_retry_max_attempts")]
     pub max_attempts: u32,
+    #[serde(default = "default_provider_retry_deadline_secs")]
     pub deadline_secs: u64,
+    #[serde(default = "default_provider_retry_base_backoff_ms")]
     pub base_backoff_ms: u64,
+    #[serde(default = "default_provider_retry_max_backoff_secs")]
     pub max_backoff_secs: u64,
+    #[serde(default = "default_provider_retry_jitter_pct")]
     pub jitter_pct: u32,
 }
 
@@ -563,38 +558,6 @@ impl Default for RequestRetryConfig {
             max_backoff_secs: DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS,
             jitter_pct: DEFAULT_PROVIDER_RETRY_JITTER_PCT,
         }
-    }
-}
-
-impl<'de> Deserialize<'de> for RequestRetryConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            #[serde(default)]
-            max_attempts: Option<u32>,
-            #[serde(default)]
-            deadline_secs: Option<u64>,
-            #[serde(default)]
-            base_backoff_ms: Option<u64>,
-            #[serde(default)]
-            max_backoff_secs: Option<u64>,
-            #[serde(default)]
-            jitter_pct: Option<u32>,
-        }
-
-        let defaults = Self::default();
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
-            max_attempts: wire.max_attempts.unwrap_or(defaults.max_attempts),
-            deadline_secs: wire.deadline_secs.unwrap_or(defaults.deadline_secs),
-            base_backoff_ms: wire.base_backoff_ms.unwrap_or(defaults.base_backoff_ms),
-            max_backoff_secs: wire.max_backoff_secs.unwrap_or(defaults.max_backoff_secs),
-            jitter_pct: wire.jitter_pct.unwrap_or(defaults.jitter_pct),
-        })
     }
 }
 
@@ -1809,6 +1772,100 @@ max_attempts = 2
         assert_eq!(effective.request_retry.deadline_secs, 90);
         assert_eq!(effective.request_retry.base_backoff_ms, 750);
         assert_eq!(effective.request_retry.max_attempts, 2);
+    }
+
+    #[test]
+    fn provider_resilience_override_can_apply_timeouts_and_retry_together() {
+        let base = ResilienceConfig {
+            timeouts: ResilienceTimeoutsConfig {
+                connect_secs: 10,
+                request_secs: 60,
+                stream_idle_secs: 60,
+            },
+            request_retry: RequestRetryConfig {
+                max_attempts: 5,
+                deadline_secs: 60,
+                base_backoff_ms: 500,
+                max_backoff_secs: 30,
+                jitter_pct: 25,
+            },
+        };
+        let override_config = ResilienceOverrideConfig {
+            timeouts: Some(ResilienceTimeoutsOverrideConfig {
+                request_secs: Some(120),
+                ..ResilienceTimeoutsOverrideConfig::default()
+            }),
+            request_retry: Some(RequestRetryOverrideConfig {
+                max_attempts: Some(2),
+                jitter_pct: Some(0),
+                ..RequestRetryOverrideConfig::default()
+            }),
+        };
+
+        let effective = override_config.apply_to(base);
+
+        assert_eq!(effective.timeouts.connect_secs, 10);
+        assert_eq!(effective.timeouts.request_secs, 120);
+        assert_eq!(effective.timeouts.stream_idle_secs, 60);
+        assert_eq!(effective.request_retry.max_attempts, 2);
+        assert_eq!(effective.request_retry.deadline_secs, 60);
+        assert_eq!(effective.request_retry.jitter_pct, 0);
+    }
+
+    #[test]
+    fn resilience_schema_keeps_defaulted_leaf_fields_optional() {
+        let schema = schemars::schema_for!(ResilienceConfig);
+        let value = serde_json::to_value(schema).expect("schema json");
+
+        let definitions = value
+            .get("definitions")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema definitions");
+        for type_name in ["ResilienceTimeoutsConfig", "RequestRetryConfig"] {
+            let required = definitions
+                .get(type_name)
+                .and_then(|schema| schema.get("required"))
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            assert!(
+                required.is_empty(),
+                "{type_name} should not require defaulted fields: {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resilience_blocks_reject_unknown_fields() {
+        let cases = [
+            (
+                "timeouts",
+                r#"
+[timeouts]
+connect_secs = 3
+unknown = 1
+"#,
+            ),
+            (
+                "request_retry",
+                r#"
+[request_retry]
+max_attempts = 2
+unknown = 1
+"#,
+            ),
+        ];
+
+        for (name, toml) in cases {
+            let error = toml::from_str::<ResilienceConfig>(toml)
+                .expect_err("unknown resilience field should fail");
+
+            assert!(
+                error.to_string().contains("unknown field"),
+                "{name}: unexpected error: {error}"
+            );
+        }
     }
 
     #[test]

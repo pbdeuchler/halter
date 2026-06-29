@@ -359,8 +359,10 @@ refresh_token = "..."
 Halter reads process environment variables. It does not parse `.env` files directly; if you use a `.env` file, load it into the process environment before starting the CLI or SDK process.
 
 Provider request resilience is configured globally under `[resilience]` and can
-be partially overridden per provider. `max_attempts` includes the initial
-request:
+be partially overridden per provider. For streaming calls, `request_secs` bounds
+request setup through response headers and `stream_idle_secs` bounds the idle
+gap between stream items; it is not a total stream lifetime cap. `max_attempts`
+includes the initial request:
 
 ```toml
 [resilience.timeouts]

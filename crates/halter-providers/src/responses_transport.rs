@@ -66,6 +66,7 @@ impl TransportError {
             },
             halter_protocol::ProviderErrorKind::Fatal
             | halter_protocol::ProviderErrorKind::Cancelled => Self::Fatal { source },
+            _ => Self::Fatal { source },
         }
     }
 
@@ -85,6 +86,7 @@ impl TransportError {
             },
             halter_protocol::ProviderErrorKind::Fatal
             | halter_protocol::ProviderErrorKind::Cancelled => Self::Fatal { source: wrapped },
+            _ => Self::Fatal { source: wrapped },
         }
     }
 }
@@ -134,7 +136,8 @@ pub(crate) struct ResponsesTransportRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesTransport {
-    client: ReqwestClient,
+    unary_client: ReqwestClient,
+    streaming_client: ReqwestClient,
     bearer_token: SecretString,
     base_url: String,
     endpoint_mode: ResponsesEndpointMode,
@@ -181,16 +184,23 @@ impl ResponsesTransport {
     ) -> anyhow::Result<Self> {
         let bearer_token = bearer_token.into();
         let base_url = base_url.into();
-        let client = ReqwestClient::builder()
+        let unary_client = ReqwestClient::builder()
             .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(timeouts.connect)
             .timeout(timeouts.request)
             .build()
             .context("failed to build responses transport client")?;
+        let streaming_client = ReqwestClient::builder()
+            .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.stream_idle)
+            .build()
+            .context("failed to build responses streaming transport client")?;
 
         Ok(Self {
             openai_rate_limiter: OpenAiRateLimiter::new(&bearer_token, &base_url),
-            client,
+            unary_client,
+            streaming_client,
             bearer_token,
             base_url,
             endpoint_mode,
@@ -206,6 +216,7 @@ impl ResponsesTransport {
     ) -> Result<ResponseStream, TransportError> {
         let response = self
             .send_json_request(
+                &self.streaming_client,
                 RESPONSES_PATH,
                 request,
                 request_meta.clone(),
@@ -232,6 +243,7 @@ impl ResponsesTransport {
         let provider_label = request_meta.provider_label;
         let response = self
             .send_json_request(
+                &self.unary_client,
                 RESPONSES_COMPACT_PATH,
                 request,
                 request_meta,
@@ -257,7 +269,13 @@ impl ResponsesTransport {
     ) -> anyhow::Result<Value> {
         let provider_label = request_meta.provider_label;
         let response = self
-            .send_json_request(RESPONSES_PATH, request, request_meta, cancel.child_token())
+            .send_json_request(
+                &self.unary_client,
+                RESPONSES_PATH,
+                request,
+                request_meta,
+                cancel.child_token(),
+            )
             .await
             .map_err(transport_error_to_anyhow)?;
         select! {
@@ -269,6 +287,7 @@ impl ResponsesTransport {
 
     async fn send_json_request(
         &self,
+        client: &ReqwestClient,
         path: &str,
         request: Value,
         request_meta: ResponsesTransportRequest,
@@ -309,8 +328,7 @@ impl ResponsesTransport {
                     code: None,
                 }),
             })?;
-        let request_builder = self
-            .client
+        let request_builder = client
             .post(provider_url(&self.base_url, path, self.endpoint_mode))
             .headers(headers)
             .body(body_bytes);
