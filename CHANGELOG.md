@@ -6,6 +6,48 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](https://semver.org/)
 once a `1.0.0` line is cut.
 
+## [Unreleased]
+
+Blank-slate review fixes on top of the provider resilience primitive
+(issue #183). Highlights:
+
+### Changed
+
+- Vendored brush shell crates rebased wholesale onto upstream releases
+  (`brush-core` 0.5.0 and `brush-builtins` 0.2.0, with `brush-parser`
+  bumped to 0.4.0); the only functional divergence carried forward is
+  the cancellation plumbing, reimplemented on the new base. The
+  pre-0.5.0 fork's bespoke Windows layer and other drift are dropped
+  (upstream 0.5.0 builds for Windows on stable natively). See
+  `vendor/VENDORING.md` for the exact divergence inventory.
+- **Breaking:** `AnthropicProvider` is now built around the same
+  `ResilientProvider` wrapping as the OpenAI and OpenRouter providers,
+  so all provider families share one retry/backoff/classification
+  strategy. `AnthropicProvider::new_with_headers_and_timeouts` is
+  replaced by `new_with_headers_and_resilience`.
+- **Breaking:** workspace MSRV raised from 1.86 to 1.88 (the declared
+  1.86 was already unbuildable due to transitive dependencies).
+- Session-store optimistic concurrency now uses structural state
+  equality in both the SQLite and in-memory backends (previously the
+  backends could disagree on conflicts for logically-equal states); a
+  shared conformance suite locks the contract in.
+- The SQLite session store serves reads from a read-only WAL
+  connection pool; writes keep the single writer connection.
+- Setup-time provider errors are classified (deterministic
+  encode/validation failures are fatal and no longer burn the retry
+  budget), Anthropic errors route through the shared retryability
+  classifier, and backoff jitter now respects `max_backoff`.
+- Hook execution is wired into the turn cancellation graph: an
+  interrupted turn aborts in-flight and pending hooks.
+- Session hook eviction is session-scoped rather than handle-scoped,
+  so subagent hook dispatch no longer resets the parent session's
+  stateful hooks.
+- Git working-tree probes run off the async executor, once per turn,
+  with hostile-repo hardening (`core.fsmonitor`, `core.hooksPath`, and
+  ambient git config neutralized).
+- CI now covers the default (no-sqlite) feature set, MSRV, a Windows
+  check, and `cargo audit`, with per-ref run cancellation.
+
 ## [0.2.0] - 2026-06-24
 
 This release cuts the first `0.2` line for the Halter crates. The minor

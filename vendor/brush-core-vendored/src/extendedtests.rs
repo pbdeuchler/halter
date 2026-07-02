@@ -2,8 +2,8 @@ use brush_parser::ast;
 use std::path::Path;
 
 use crate::{
-    ExecutionParameters, Shell, ShellFd, arithmetic, env, error, escape, expansion, namedoptions,
-    patterns,
+    ExecutionParameters, Shell, ShellFd, arithmetic, env, error, escape, expansion, extensions,
+    namedoptions, patterns,
     sys::{
         fs::{MetadataExt, PathExt},
         users,
@@ -14,7 +14,7 @@ use crate::{
 #[async_recursion::async_recursion]
 pub(crate) async fn eval_extended_test_expr(
     expr: &ast::ExtendedTestExpr,
-    shell: &mut Shell,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
 ) -> Result<bool, error::Error> {
     match expr {
@@ -47,12 +47,12 @@ pub(crate) async fn eval_extended_test_expr(
 async fn apply_unary_predicate(
     op: &ast::UnaryPredicate,
     operand: &ast::Word,
-    shell: &mut Shell,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
 ) -> Result<bool, error::Error> {
     let expanded_operand = expansion::basic_expand_word(shell, params, operand).await?;
 
-    if shell.options.print_commands_and_arguments {
+    if shell.options().print_commands_and_arguments {
         shell
             .trace_command(
                 params,
@@ -61,16 +61,17 @@ async fn apply_unary_predicate(
                     escape::quote_if_needed(&expanded_operand, escape::QuoteMode::SingleQuote)
                 ),
             )
-            .await?;
+            .await;
     }
 
     apply_unary_predicate_to_str(op, expanded_operand.as_str(), shell, params)
 }
 
+#[expect(clippy::too_many_lines)]
 pub(crate) fn apply_unary_predicate_to_str(
     op: &ast::UnaryPredicate,
     operand: &str,
-    shell: &Shell,
+    shell: &Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
 ) -> Result<bool, error::Error> {
     match op {
@@ -125,9 +126,10 @@ pub(crate) fn apply_unary_predicate_to_str(
             }
         }
         ast::UnaryPredicate::FdIsOpenTerminal => {
-            if let Ok(fd) = operand.parse::<ShellFd>() {
+            // Trim whitespace before parsing, matching bash behavior.
+            if let Ok(fd) = operand.trim().parse::<ShellFd>() {
                 if let Some(open_file) = params.try_fd(shell, fd) {
-                    Ok(open_file.is_term())
+                    Ok(open_file.is_terminal())
                 } else {
                     Ok(false)
                 }
@@ -177,24 +179,25 @@ pub(crate) fn apply_unary_predicate_to_str(
             if let Some(option) =
                 namedoptions::options(namedoptions::ShellOptionKind::SetO).get(shopt_name)
             {
-                Ok(option.get(&shell.options))
+                Ok(option.get(shell.options()))
             } else {
                 Ok(false)
             }
         }
-        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => Ok(shell.env.is_set(operand)),
-        ast::UnaryPredicate::ShellVariableIsSetAndNameRef => match shell.env.get(operand) {
+        ast::UnaryPredicate::ShellVariableIsSetAndAssigned => Ok(shell.env().is_set(operand)),
+        ast::UnaryPredicate::ShellVariableIsSetAndNameRef => match shell.env().get(operand) {
             Some((_, reffed)) => Ok(reffed.value().is_set() && reffed.is_treated_as_nameref()),
             None => Ok(false),
         },
     }
 }
 
+#[expect(clippy::too_many_lines)]
 async fn apply_binary_predicate(
     op: &ast::BinaryPredicate,
     left: &ast::Word,
     right: &ast::Word,
-    shell: &mut Shell,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
 ) -> Result<bool, error::Error> {
     match op {
@@ -204,10 +207,10 @@ async fn apply_binary_predicate(
                 .await?
                 .set_multiline(true);
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {s} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             let (matches, captures) = match regex.matches(s.as_str()) {
@@ -215,7 +218,7 @@ async fn apply_binary_predicate(
                 Ok(None) => (false, vec![]),
                 // If we can't compile the regex, don't abort the whole operation but make sure to
                 // report it.
-                // TODO: Docs indicate we should yield 2 on an invalid regex (not 1).
+                // TODO(test): Docs indicate we should yield 2 on an invalid regex (not 1).
                 Err(e) => {
                     tracing::warn!("error using regex: {}", e);
                     (false, vec![])
@@ -229,7 +232,7 @@ async fn apply_binary_predicate(
                     .collect(),
             ));
 
-            shell.env.update_or_add(
+            shell.env_mut().update_or_add(
                 "BASH_REMATCH",
                 captures_value,
                 |_| Ok(()),
@@ -243,10 +246,10 @@ async fn apply_binary_predicate(
             let left = expansion::basic_expand_word(shell, params, left).await?;
             let right = expansion::basic_expand_word(shell, params, right).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             Ok(left == right)
@@ -255,10 +258,10 @@ async fn apply_binary_predicate(
             let left = expansion::basic_expand_word(shell, params, left).await?;
             let right = expansion::basic_expand_word(shell, params, right).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             Ok(left != right)
@@ -267,10 +270,10 @@ async fn apply_binary_predicate(
             let s = expansion::basic_expand_word(shell, params, left).await?;
             let substring = expansion::basic_expand_word(shell, params, right).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {s} {op} {substring} ]]"))
-                    .await?;
+                    .await;
             }
 
             Ok(s.contains(substring.as_str()))
@@ -279,10 +282,10 @@ async fn apply_binary_predicate(
             let left = expansion::basic_expand_word(shell, params, left).await?;
             let right = expansion::basic_expand_word(shell, params, right).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             files_refer_to_same_device_and_inode_numbers(shell, left, right)
@@ -291,10 +294,10 @@ async fn apply_binary_predicate(
             let left = expansion::basic_expand_word(shell, params, left).await?;
             let right = expansion::basic_expand_word(shell, params, right).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             left_file_is_newer_or_exists_when_right_does_not(shell, left, right)
@@ -303,10 +306,10 @@ async fn apply_binary_predicate(
             let left = expansion::basic_expand_word(shell, params, left).await?;
             let right = expansion::basic_expand_word(shell, params, right).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             left_file_is_older_or_does_not_exist_when_right_does(shell, left, right)
@@ -315,26 +318,26 @@ async fn apply_binary_predicate(
             let left = expansion::basic_expand_word(shell, params, left).await?;
             let right = expansion::basic_expand_word(shell, params, right).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
-            // TODO: According to docs, should be lexicographical order of the current locale.
+            // TODO(test): According to docs, should be lexicographical order of the current locale.
             Ok(left < right)
         }
         ast::BinaryPredicate::LeftSortsAfterRight => {
             let left = expansion::basic_expand_word(shell, params, left).await?;
             let right = expansion::basic_expand_word(shell, params, right).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
-            // TODO: According to docs, should be lexicographical order of the current locale.
+            // TODO(test): According to docs, should be lexicographical order of the current locale.
             Ok(left > right)
         }
         ast::BinaryPredicate::ArithmeticEqualTo => {
@@ -343,10 +346,10 @@ async fn apply_binary_predicate(
             let right =
                 arithmetic::expand_and_eval(shell, params, right.value.as_str(), false).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             Ok(left == right)
@@ -357,10 +360,10 @@ async fn apply_binary_predicate(
             let right =
                 arithmetic::expand_and_eval(shell, params, right.value.as_str(), false).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             Ok(left != right)
@@ -371,10 +374,10 @@ async fn apply_binary_predicate(
             let right =
                 arithmetic::expand_and_eval(shell, params, right.value.as_str(), false).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             Ok(left < right)
@@ -385,10 +388,10 @@ async fn apply_binary_predicate(
             let right =
                 arithmetic::expand_and_eval(shell, params, right.value.as_str(), false).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             Ok(left <= right)
@@ -399,10 +402,10 @@ async fn apply_binary_predicate(
             let right =
                 arithmetic::expand_and_eval(shell, params, right.value.as_str(), false).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             Ok(left > right)
@@ -413,10 +416,10 @@ async fn apply_binary_predicate(
             let right =
                 arithmetic::expand_and_eval(shell, params, right.value.as_str(), false).await?;
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 shell
                     .trace_command(params, std::format!("[[ {left} {op} {right} ]]"))
-                    .await?;
+                    .await;
             }
 
             Ok(left >= right)
@@ -424,15 +427,16 @@ async fn apply_binary_predicate(
         // N.B. The "=", "==", and "!=" operators don't compare 2 strings; they check
         // for whether the lefthand operand (a string) is matched by the righthand
         // operand (treated as a shell pattern).
-        // TODO: implement case-insensitive matching if relevant via shopt options (nocasematch).
+        // TODO(test): implement case-insensitive matching if relevant via shopt options
+        // (nocasematch).
         ast::BinaryPredicate::StringExactlyMatchesPattern => {
             let s = expansion::basic_expand_word(shell, params, left).await?;
             let pattern = expansion::basic_expand_pattern(shell, params, right)
                 .await?
-                .set_extended_globbing(shell.options.extended_globbing)
-                .set_case_insensitive(shell.options.case_insensitive_conditionals);
+                .set_extended_globbing(shell.options().extended_globbing)
+                .set_case_insensitive(shell.options().case_insensitive_conditionals);
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 let expanded_right = expansion::basic_expand_word(shell, params, right).await?;
                 let escaped_right = escape::quote_if_needed(
                     expanded_right.as_str(),
@@ -440,7 +444,7 @@ async fn apply_binary_predicate(
                 );
                 shell
                     .trace_command(params, std::format!("[[ {s} {op} {escaped_right} ]]"))
-                    .await?;
+                    .await;
             }
 
             pattern.exactly_matches(s.as_str())
@@ -449,10 +453,10 @@ async fn apply_binary_predicate(
             let s = expansion::basic_expand_word(shell, params, left).await?;
             let pattern = expansion::basic_expand_pattern(shell, params, right)
                 .await?
-                .set_extended_globbing(shell.options.extended_globbing)
-                .set_case_insensitive(shell.options.case_insensitive_conditionals);
+                .set_extended_globbing(shell.options().extended_globbing)
+                .set_case_insensitive(shell.options().case_insensitive_conditionals);
 
-            if shell.options.print_commands_and_arguments {
+            if shell.options().print_commands_and_arguments {
                 let expanded_right = expansion::basic_expand_word(shell, params, right).await?;
                 let escaped_right = escape::quote_if_needed(
                     expanded_right.as_str(),
@@ -460,7 +464,7 @@ async fn apply_binary_predicate(
                 );
                 shell
                     .trace_command(params, std::format!("[[ {s} {op} {escaped_right} ]]"))
-                    .await?;
+                    .await;
             }
 
             let eq = pattern.exactly_matches(s.as_str())?;
@@ -473,7 +477,7 @@ pub(crate) fn apply_binary_predicate_to_strs(
     op: &ast::BinaryPredicate,
     left: &str,
     right: &str,
-    shell: &Shell,
+    shell: &Shell<impl extensions::ShellExtensions>,
 ) -> Result<bool, error::Error> {
     match op {
         ast::BinaryPredicate::FilesReferToSameDeviceAndInodeNumbers => {
@@ -486,11 +490,11 @@ pub(crate) fn apply_binary_predicate_to_strs(
             left_file_is_older_or_does_not_exist_when_right_does(shell, left, right)
         }
         ast::BinaryPredicate::LeftSortsBeforeRight => {
-            // TODO: According to docs, should be lexicographical order of the current locale.
+            // TODO(test): According to docs, should be lexicographical order of the current locale.
             Ok(left < right)
         }
         ast::BinaryPredicate::LeftSortsAfterRight => {
-            // TODO: According to docs, should be lexicographical order of the current locale.
+            // TODO(test): According to docs, should be lexicographical order of the current locale.
             Ok(left > right)
         }
         ast::BinaryPredicate::ArithmeticEqualTo => Ok(apply_test_binary_arithmetic_predicate(
@@ -521,15 +525,15 @@ pub(crate) fn apply_binary_predicate_to_strs(
         ),
         ast::BinaryPredicate::StringExactlyMatchesPattern => {
             let pattern = patterns::Pattern::from(right)
-                .set_extended_globbing(shell.options.extended_globbing)
-                .set_case_insensitive(shell.options.case_insensitive_conditionals);
+                .set_extended_globbing(shell.options().extended_globbing)
+                .set_case_insensitive(shell.options().case_insensitive_conditionals);
 
             pattern.exactly_matches(left)
         }
         ast::BinaryPredicate::StringDoesNotExactlyMatchPattern => {
             let pattern = patterns::Pattern::from(right)
-                .set_extended_globbing(shell.options.extended_globbing)
-                .set_case_insensitive(shell.options.case_insensitive_conditionals);
+                .set_extended_globbing(shell.options().extended_globbing)
+                .set_case_insensitive(shell.options().case_insensitive_conditionals);
 
             let eq = pattern.exactly_matches(left)?;
             Ok(!eq)
@@ -545,8 +549,9 @@ fn apply_test_binary_arithmetic_predicate(
     right: &str,
     op: fn(i64, i64) -> bool,
 ) -> bool {
-    let left: Result<i64, _> = left.parse();
-    let right: Result<i64, _> = right.parse();
+    // We trim leading/trailing whitespace (including newlines) before parsing integers.
+    let left: Result<i64, _> = left.trim().parse();
+    let right: Result<i64, _> = right.trim().parse();
 
     if let (Ok(left), Ok(right)) = (left, right) {
         op(left, right)
@@ -556,7 +561,7 @@ fn apply_test_binary_arithmetic_predicate(
 }
 
 fn left_file_is_older_or_does_not_exist_when_right_does(
-    shell: &Shell,
+    shell: &Shell<impl extensions::ShellExtensions>,
     left: impl AsRef<str>,
     right: impl AsRef<str>,
 ) -> Result<bool, error::Error> {
@@ -573,7 +578,7 @@ fn left_file_is_older_or_does_not_exist_when_right_does(
 }
 
 fn left_file_is_newer_or_exists_when_right_does_not(
-    shell: &Shell,
+    shell: &Shell<impl extensions::ShellExtensions>,
     left: impl AsRef<str>,
     right: impl AsRef<str>,
 ) -> Result<bool, error::Error> {
@@ -590,7 +595,7 @@ fn left_file_is_newer_or_exists_when_right_does_not(
 }
 
 fn files_refer_to_same_device_and_inode_numbers(
-    shell: &Shell,
+    shell: &Shell<impl extensions::ShellExtensions>,
     left: impl AsRef<str>,
     right: impl AsRef<str>,
 ) -> Result<bool, error::Error> {

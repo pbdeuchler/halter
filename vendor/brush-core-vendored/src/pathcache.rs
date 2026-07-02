@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 /// A cache of paths associated with names.
 #[derive(Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PathCache {
     /// The cache itself.
     cache: std::collections::HashMap<String, PathBuf>,
@@ -31,8 +32,8 @@ impl PathCache {
     ///
     /// * `name` - The name to set.
     /// * `path` - The path to associate with the name.
-    pub fn set<S: AsRef<str>>(&mut self, name: S, path: PathBuf) {
-        self.cache.insert(name.as_ref().to_string(), path);
+    pub fn set<T: Into<String>>(&mut self, name: T, path: PathBuf) {
+        self.cache.insert(name.into(), path);
     }
 
     /// Projects the cache into a shell value.

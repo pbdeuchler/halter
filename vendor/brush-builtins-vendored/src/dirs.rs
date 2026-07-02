@@ -44,25 +44,25 @@ pub(crate) struct DirsCommand {
     #[arg(short = 'v')]
     print_one_per_line_with_index: bool,
     //
-    // TODO: implement +N and -N
+    // TODO(dirs): implement +N and -N
 }
 
 impl builtins::Command for DirsCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.clear {
-            context.shell.directory_stack.clear();
+            context.shell.directory_stack_mut().clear();
         } else {
             let dirs = vec![context.shell.working_dir()]
                 .into_iter()
                 .chain(
                     context
                         .shell
-                        .directory_stack
+                        .directory_stack()
                         .iter()
                         .rev()
                         .map(|p| p.as_path()),

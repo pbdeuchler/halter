@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::{io::Write, ops::ControlFlow};
+use std::{ffi::OsString, io::Write, ops::ControlFlow};
 use uucore::format;
 
 use brush_core::{Error, ErrorKind, ExecutionResult, builtins, escape, expansion};
@@ -20,9 +20,9 @@ pub(crate) struct PrintfCommand {
 impl builtins::Command for PrintfCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         if let Some(variable_name) = &self.output_variable {
             // Format to a u8 vector.
@@ -83,12 +83,12 @@ fn format_special_case_for_percent_q(
 
 fn format_via_uucore(
     format_string: &str,
-    args: impl Iterator<Item = impl AsRef<str>>,
+    args: impl Iterator<Item = impl Into<OsString>>,
     mut writer: impl Write,
 ) -> Result<(), brush_core::Error> {
     // Convert string arguments to FormatArgument::Unparsed
     let format_args: Vec<_> = args
-        .map(|s| format::FormatArgument::Unparsed(s.as_ref().to_string().into()))
+        .map(|s| format::FormatArgument::Unparsed(s.into()))
         .collect();
 
     // Parse format string once.
@@ -104,10 +104,13 @@ fn format_via_uucore(
         for item in &format_items {
             let control_flow = item
                 .write(&mut writer, &mut format_args_wrapper)
-                .map_err(|e| {
-                    Error::from(ErrorKind::PrintfInvalidUsage(std::format!(
-                        "printf formatting error: {e}"
-                    )))
+                .map_err(|e| match e {
+                    // Propagate I/O errors directly so they can be handled appropriately
+                    format::FormatError::IoError(io_err) => Error::from(io_err),
+                    // Wrap other format errors
+                    other => Error::from(ErrorKind::PrintfInvalidUsage(std::format!(
+                        "printf formatting error: {other}"
+                    ))),
                 })?;
 
             if control_flow == ControlFlow::Break(()) {
@@ -149,7 +152,7 @@ mod tests {
 
     fn sprintf_via_uucore(
         format_string: &str,
-        args: impl Iterator<Item = impl AsRef<str>>,
+        args: impl Iterator<Item = impl Into<OsString>>,
     ) -> Result<String> {
         let mut result = vec![];
         format_via_uucore(format_string, args, &mut result)?;

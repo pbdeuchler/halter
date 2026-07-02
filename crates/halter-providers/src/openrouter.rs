@@ -1,24 +1,26 @@
 // pattern: Imperative Shell
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
+    ApiKind, CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
     ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::Provider;
+use crate::resilience::{ProviderErrorClassifier, ResiliencePolicy, ResilientProvider};
 use crate::responses_provider::{
     CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
-use crate::retry::RetryPolicy;
 use crate::secret::SecretString;
 
 #[derive(Debug, Clone)]
 /// OpenRouter provider using the Responses-compatible transport.
 pub struct OpenRouterProvider {
-    inner: ResponsesProvider,
+    inner: ResilientProvider<ResponsesProvider>,
 }
 
 impl OpenRouterProvider {
@@ -41,14 +43,41 @@ impl OpenRouterProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_headers_and_resilience(
+            api_key,
+            base_url,
+            header_overrides,
+            temperature,
+            ResiliencePolicy::default(),
+            Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+    }
+
+    /// Same as [`OpenRouterProvider::new_with_headers`] with an explicit
+    /// provider-request resilience policy and error classifier.
+    pub fn new_with_headers_and_resilience(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+        resilience_policy: ResiliencePolicy,
+        classifier: Arc<dyn ProviderErrorClassifier>,
+    ) -> anyhow::Result<Self> {
+        let config = config(resilience_policy);
+        let policy = config.resilience_policy;
         Ok(Self {
-            inner: ResponsesProvider::try_new(
-                config(),
-                api_key,
-                base_url,
-                header_overrides,
-                temperature,
-            )?,
+            inner: ResilientProvider::new_with_classifier(
+                "openrouter",
+                ResponsesProvider::try_new(
+                    config,
+                    api_key,
+                    base_url,
+                    header_overrides,
+                    temperature,
+                )?,
+                policy,
+                classifier,
+            ),
         })
     }
 }
@@ -68,6 +97,11 @@ impl Provider for OpenRouterProvider {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+        if request.model.api_kind != ApiKind::OpenAiResponses {
+            anyhow::bail!(
+                "failed to execute provider request: openrouter provider requires openai_responses api kind"
+            );
+        }
         self.inner.stream(request, cancel).await
     }
 
@@ -80,7 +114,7 @@ impl Provider for OpenRouterProvider {
     }
 }
 
-fn config() -> ResponsesProviderConfig {
+fn config(resilience_policy: ResiliencePolicy) -> ResponsesProviderConfig {
     ResponsesProviderConfig {
         label: "openrouter",
         capabilities: ProviderCapabilities {
@@ -108,7 +142,7 @@ fn config() -> ResponsesProviderConfig {
         },
         compact_strategy: Some(CompactStrategy::InlineResponses),
         rate_limit_strategy: None,
-        retry_policy: RetryPolicy::default(),
+        resilience_policy,
     }
 }
 
@@ -123,11 +157,12 @@ mod tests {
     };
     use indexmap::IndexMap;
     use serde_json::{Value, json};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
     use crate::Provider;
+    use crate::test_http::{find_headers_end, read_http_request};
 
     #[tokio::test]
     async fn openrouter_provider_rejects_chat_api_kind() {
@@ -424,42 +459,5 @@ mod tests {
             }],
             instructions: "Summarize the session".to_owned(),
         }
-    }
-
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
-
-        loop {
-            let read = socket.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(headers_end) = find_headers_end(&buffer) {
-                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    })
-                    .unwrap_or(0);
-                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
-                if body_bytes >= content_length {
-                    return Ok(buffer);
-                }
-            }
-        }
-
-        anyhow::bail!("incomplete http request")
-    }
-
-    fn find_headers_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n")
     }
 }

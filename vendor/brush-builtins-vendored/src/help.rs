@@ -25,9 +25,9 @@ pub(crate) struct HelpCommand {
 impl builtins::Command for HelpCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.topic_patterns.is_empty() {
             Self::display_general_help(&context)?;
@@ -43,7 +43,7 @@ impl builtins::Command for HelpCommand {
 
 impl HelpCommand {
     fn display_general_help(
-        context: &brush_core::ExecutionContext<'_>,
+        context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
     ) -> Result<(), brush_core::Error> {
         const COLUMN_COUNT: usize = 3;
 
@@ -75,12 +75,12 @@ impl HelpCommand {
 
     fn display_help_for_topic_pattern(
         &self,
-        context: &brush_core::ExecutionContext<'_>,
+        context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
         topic_pattern: &str,
     ) -> Result<(), brush_core::Error> {
         let pattern = brush_core::patterns::Pattern::from(topic_pattern)
-            .set_extended_globbing(context.shell.options.extended_globbing)
-            .set_case_insensitive(context.shell.options.case_insensitive_pathname_expansion);
+            .set_extended_globbing(context.shell.options().extended_globbing)
+            .set_case_insensitive(context.shell.options().case_insensitive_pathname_expansion);
 
         let mut found_count = 0;
         for (builtin_name, builtin_registration) in get_builtins_sorted_by_name(context) {
@@ -101,11 +101,11 @@ impl HelpCommand {
         Ok(())
     }
 
-    fn display_help_for_builtin(
+    fn display_help_for_builtin<SE: brush_core::ShellExtensions>(
         &self,
-        context: &brush_core::ExecutionContext<'_>,
+        context: &brush_core::ExecutionContext<'_, SE>,
         name: &str,
-        registration: &builtins::Registration,
+        registration: &builtins::Registration<SE>,
     ) -> Result<(), brush_core::Error> {
         let content_type = if self.short_description {
             builtins::ContentType::ShortDescription
@@ -117,18 +117,28 @@ impl HelpCommand {
             builtins::ContentType::DetailedHelp
         };
 
-        let content = (registration.content_func)(name, content_type)?;
+        let Some(mut stdout) = context.try_fd(brush_core::openfiles::OpenFiles::STDOUT_FD) else {
+            // If there's no stdout, nothing to do.
+            return Ok(());
+        };
 
-        write!(context.stdout(), "{content}")?;
-        context.stdout().flush()?;
+        // For now, we assume colorized output if stdout is a terminal.
+        let options = builtins::ContentOptions {
+            colorized: stdout.is_terminal(),
+        };
+
+        let content = (registration.content_func)(name, content_type, &options)?;
+
+        write!(stdout, "{content}")?;
+        stdout.flush()?;
 
         Ok(())
     }
 }
 
-fn get_builtins_sorted_by_name<'a>(
-    context: &'a brush_core::ExecutionContext<'_>,
-) -> Vec<(&'a String, &'a builtins::Registration)> {
+fn get_builtins_sorted_by_name<'a, SE: brush_core::ShellExtensions>(
+    context: &'a brush_core::ExecutionContext<'_, SE>,
+) -> Vec<(&'a String, &'a builtins::Registration<SE>)> {
     context
         .shell
         .builtins()

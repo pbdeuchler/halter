@@ -21,12 +21,18 @@ pub use resources::{
     SkillLoader,
 };
 pub use schema::{
-    ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, HarnessConfig, LoopbackAllowConfig,
-    ModelConfig, ModelJudgeConfig, ModelJudgeMode, ModelSlot, ModelSlotRef, ModelsConfig,
-    NetworkPolicyConfig, OpenAiOAuthConfig, PolicyConfig, PromptsConfig, ProviderConfig,
-    ProvidersConfig, ResolvedProviderAuth, ResolvedProviderConfig, ResourcesConfig, RuntimeConfig,
-    SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SearchRoots, SessionBackend, SessionsConfig,
-    ShellPolicyConfig, SystemPromptPreset, ToolsConfig, resolve_provider_runtime_config,
+    ConfiguredProvider, ContextConfig, DEFAULT_MODEL_ID, DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS,
+    DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS, DEFAULT_PROVIDER_RETRY_BASE_BACKOFF_MS,
+    DEFAULT_PROVIDER_RETRY_DEADLINE_SECS, DEFAULT_PROVIDER_RETRY_JITTER_PCT,
+    DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS, DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS,
+    DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS, HarnessConfig, LoopbackAllowConfig, ModelConfig,
+    ModelJudgeConfig, ModelJudgeMode, ModelSlot, ModelSlotRef, ModelsConfig, NetworkPolicyConfig,
+    OpenAiOAuthConfig, PolicyConfig, PromptsConfig, ProviderConfig, ProvidersConfig,
+    RequestRetryConfig, RequestRetryOverrideConfig, ResilienceConfig, ResilienceOverrideConfig,
+    ResilienceTimeoutsConfig, ResilienceTimeoutsOverrideConfig, ResolvedProviderAuth,
+    ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID,
+    SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig, SystemPromptPreset,
+    ToolsConfig, resolve_provider_runtime_config,
 };
 
 #[cfg(feature = "remote-plugins")]

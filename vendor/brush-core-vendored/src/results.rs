@@ -1,5 +1,10 @@
 //! Encapsulation of execution results.
 
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
+use tokio_util::sync::CancellationToken;
+
 use crate::{error, processes};
 
 /// Represents the result of executing a command or similar item.
@@ -26,7 +31,7 @@ impl ExecutionResult {
 
     /// Returns a new `ExecutionResult` reflecting a process that was stopped.
     pub fn stopped() -> Self {
-        // TODO: Decide how to sort this out in a platform-independent way.
+        // TODO(jobs): Decide how to sort this out in a platform-independent way.
         const SIGTSTP: std::os::raw::c_int = 20;
 
         #[expect(clippy::cast_possible_truncation)]
@@ -96,6 +101,34 @@ impl From<ExecutionExitCode> for ExecutionResult {
     }
 }
 
+impl From<ExecutionWaitResult> for ExecutionResult {
+    fn from(wait_result: ExecutionWaitResult) -> Self {
+        match wait_result {
+            ExecutionWaitResult::Completed(result) => result,
+            // TODO(jobs): We need to job-manage the stopped process.
+            ExecutionWaitResult::Stopped(..) => Self::stopped(),
+        }
+    }
+}
+
+impl From<std::process::Output> for ExecutionResult {
+    fn from(output: std::process::Output) -> Self {
+        if let Some(code) = output.status.code() {
+            #[expect(clippy::cast_sign_loss)]
+            return Self::new((code & 0xFF) as u8);
+        }
+
+        #[cfg(unix)]
+        if let Some(signal) = output.status.signal() {
+            #[expect(clippy::cast_sign_loss)]
+            return Self::new((signal & 0xFF) as u8 + 128);
+        }
+
+        tracing::error!("unhandled process exit");
+        Self::new(127)
+    }
+}
+
 /// Represents an exit code from execution.
 #[derive(Clone, Copy, Default)]
 pub enum ExecutionExitCode {
@@ -112,6 +145,8 @@ pub enum ExecutionExitCode {
     NotFound,
     /// Indicates execution was interrupted.
     Interrupted,
+    /// Indicates a broken pipe (SIGPIPE) was encountered.
+    BrokenPipe,
     /// Indicates unimplemented functionality was encountered.
     Unimplemented,
     /// A custom exit code.
@@ -135,6 +170,7 @@ impl From<u8> for ExecutionExitCode {
             126 => Self::CannotExecute,
             127 => Self::NotFound,
             130 => Self::Interrupted,
+            141 => Self::BrokenPipe,
             code => Self::Custom(code),
         }
     }
@@ -156,6 +192,7 @@ impl From<&ExecutionExitCode> for u8 {
             ExecutionExitCode::CannotExecute => 126,
             ExecutionExitCode::NotFound => 127,
             ExecutionExitCode::Interrupted => 130,
+            ExecutionExitCode::BrokenPipe => 141,
             ExecutionExitCode::Custom(code) => *code,
         }
     }
@@ -212,6 +249,8 @@ pub enum ExecutionSpawnResult {
     Completed(ExecutionResult),
     /// Indicates that a process was started and had not yet completed.
     StartedProcess(processes::ChildProcess),
+    /// Indicates that a task was started to handle the execution asynchronously.
+    StartedTask(tokio::task::JoinHandle<Result<ExecutionResult, error::Error>>),
 }
 
 impl From<ExecutionResult> for ExecutionSpawnResult {
@@ -220,45 +259,55 @@ impl From<ExecutionResult> for ExecutionSpawnResult {
     }
 }
 
-use tokio_util::sync::CancellationToken;
-
 impl ExecutionSpawnResult {
     /// Waits for the command to complete.
     ///
     /// # Arguments
     ///
-    /// * `no_wait` - If true, do not wait for the command to complete; return immediately.
-    /// * `cancel_token` - Optional cancellation token; if triggered, kills the process.
+    /// * `cancel_token` - Optionally provides a cancellation token; if the token is
+    ///   triggered before the command completes, any spawned process is abandoned
+    ///   and an interrupted (130) result is returned.
     pub async fn wait(
         self,
-        no_wait: bool,
         cancel_token: Option<CancellationToken>,
     ) -> Result<ExecutionWaitResult, error::Error> {
-        match self {
+        let result = match self {
             Self::StartedProcess(mut child) => {
-                let process_wait_result = if !no_wait {
-                    // Wait for the process to exit or for a relevant signal, whichever happens
-                    // first.
-                    child.wait(cancel_token).await?
-                } else {
-                    processes::ProcessWaitResult::Stopped
-                };
-
-                let wait_result = match process_wait_result {
+                // Wait for the process to exit or for a relevant signal, whichever happens
+                // first.
+                match child.wait(cancel_token).await? {
                     processes::ProcessWaitResult::Completed(output) => {
                         ExecutionWaitResult::Completed(ExecutionResult::from(output))
                     }
                     processes::ProcessWaitResult::Stopped => ExecutionWaitResult::Stopped(child),
                     processes::ProcessWaitResult::Cancelled => {
-                        // 130 = 128 + SIGINT (2), standard shell interrupted exit code
+                        // 130 = 128 + SIGINT: standard exit code for interrupted commands.
                         ExecutionWaitResult::Completed(ExecutionResult::new(130))
                     }
-                };
-
-                Ok(wait_result)
+                }
             }
-            Self::Completed(result) => Ok(ExecutionWaitResult::Completed(result)),
-        }
+            Self::Completed(result) => ExecutionWaitResult::Completed(result),
+            Self::StartedTask(join_handle) => {
+                let result = join_handle.await?;
+                ExecutionWaitResult::Completed(result?)
+            }
+        };
+
+        Ok(result)
+    }
+
+    pub(crate) async fn poll(self) -> Result<ExecutionWaitResult, error::Error> {
+        let result = match self {
+            Self::StartedProcess(child) => ExecutionWaitResult::Stopped(child),
+            Self::Completed(result) => ExecutionWaitResult::Completed(result),
+            Self::StartedTask(join_handle) => {
+                // TODO(jobs): This isn't right.
+                let result = join_handle.await?;
+                ExecutionWaitResult::Completed(result?)
+            }
+        };
+
+        Ok(result)
     }
 }
 

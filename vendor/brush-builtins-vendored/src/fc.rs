@@ -37,9 +37,9 @@ pub(crate) struct FcCommand {
 impl builtins::Command for FcCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         if self.substitute {
             return self.do_execute(context).await;
@@ -56,7 +56,7 @@ impl builtins::Command for FcCommand {
 impl FcCommand {
     fn do_list(
         &self,
-        context: &brush_core::ExecutionContext<'_>,
+        context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
     ) -> Result<ExecutionResult, brush_core::Error> {
         let history = context
             .shell
@@ -89,7 +89,7 @@ impl FcCommand {
 
     async fn do_execute(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
     ) -> Result<ExecutionResult, brush_core::Error> {
         let history = context
             .shell
@@ -142,10 +142,12 @@ impl FcCommand {
             .ok_or_else(|| brush_core::Error::from(brush_core::ErrorKind::HistoryNotEnabled))?;
         history_mut.remove_nth_item(history_mut.count().saturating_sub(1));
 
+        let source_info = brush_core::SourceInfo::from("(history)");
+
         // Execute the command
         let result = context
             .shell
-            .run_string(final_cmd.clone(), &context.params)
+            .run_string(final_cmd.clone(), &source_info, &context.params)
             .await?;
 
         // Add the executed command to history.

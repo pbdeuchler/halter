@@ -1,28 +1,25 @@
 // pattern: Imperative Shell
 
-use std::collections::HashSet;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-use async_openai::error::OpenAIError;
-use futures::{Stream, StreamExt, channel::mpsc, stream::BoxStream};
-use halter_protocol::{
-    ApiKind, CompactionWindow, Message, MessageId, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderCompactionStrategy, ProviderError, ProviderRequest,
-    StreamEvent,
+use futures::{
+    StreamExt,
+    stream::{self, BoxStream},
 };
-use tokio::select;
+use halter_protocol::{
+    ApiKind, CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderCompactionStrategy, ProviderError, ProviderErrorKind,
+    ProviderRequest, StreamEvent,
+};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
+use crate::Provider;
 use crate::openai_codec::{self, ResponsesInstructionMode, ResponsesRequestOptions};
-use crate::openai_error::classify;
 use crate::openai_rate_limit_policy::estimate_openai_request_cost;
+use crate::resilience::ResiliencePolicy;
 use crate::responses_transport::{
     ResponsesEndpointMode, ResponsesRateLimitStrategy, ResponsesTransport,
-    ResponsesTransportRequest, TransportError,
+    ResponsesTransportRequest, provider_error_from_openai, provider_error_from_transport,
 };
-use crate::retry::{RetryGate, RetryPolicy};
 use crate::secret::SecretString;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,14 +44,17 @@ pub(crate) struct ResponsesProviderConfig {
     pub request: ResponsesProviderRequestConfig,
     pub compact_strategy: Option<CompactStrategy>,
     pub rate_limit_strategy: Option<ResponsesRateLimitStrategy>,
-    /// Retry budget for the streaming pipeline. Defaults are appropriate
-    /// for production; tests inject smaller values to keep the suite fast.
-    pub retry_policy: RetryPolicy,
+    /// Resilience policy used by the outer provider decorator and the raw
+    /// transport's HTTP client.
+    pub resilience_policy: ResiliencePolicy,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesProvider {
     config: ResponsesProviderConfig,
+    /// Effective capabilities, precomputed once so `capabilities()` does not
+    /// rebuild the compaction fields on every call.
+    capabilities: ProviderCapabilities,
     transport: ResponsesTransport,
     temperature: Option<f32>,
 }
@@ -67,11 +67,14 @@ impl ResponsesProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
-        Ok(Self {
+        Self::try_new_with_endpoint_mode(
             config,
-            transport: ResponsesTransport::try_new(bearer_token, base_url, header_overrides)?,
+            bearer_token,
+            base_url,
+            header_overrides,
             temperature,
-        })
+            ResponsesEndpointMode::PublicApi,
+        )
     }
 
     pub(crate) fn try_new_with_endpoint_mode(
@@ -82,48 +85,33 @@ impl ResponsesProvider {
         temperature: Option<f32>,
         endpoint_mode: ResponsesEndpointMode,
     ) -> anyhow::Result<Self> {
+        let timeouts = config.resilience_policy.timeouts;
         Ok(Self {
-            config,
             transport: ResponsesTransport::try_new_with_endpoint_mode(
                 bearer_token,
                 base_url,
                 header_overrides,
                 endpoint_mode,
+                timeouts,
             )?,
+            capabilities: effective_capabilities(&config),
+            config,
             temperature,
         })
     }
 
-    #[must_use]
-    pub(crate) fn capabilities(&self) -> ProviderCapabilities {
-        let mut capabilities = self.config.capabilities.clone();
-        capabilities.supports_compaction = self.config.compact_strategy.is_some();
-        capabilities.compaction_strategy =
-            self.config.compact_strategy.map(|strategy| match strategy {
-                CompactStrategy::DedicatedEndpoint => ProviderCompactionStrategy::Dedicated,
-                CompactStrategy::InlineResponses => ProviderCompactionStrategy::Inline,
-            });
-        capabilities
-    }
-
-    pub(crate) fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
-        match self.config.compact_strategy {
-            Some(CompactStrategy::DedicatedEndpoint) => Some(
-                CompactionWindow::preserve_latest_assistant_response_block(messages),
-            ),
-            Some(CompactStrategy::InlineResponses) => {
-                Some(CompactionWindow::preserve_through_latest_user(messages))
-            }
-            None => None,
-        }
-    }
-
-    pub(crate) async fn stream(
+    async fn stream_inner(
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
-        validate_responses_request(self.config.label, &request)?;
+        // Deterministic setup failures (wrong api kind, unencodable request)
+        // surface as a single Fatal in-stream error so the resilience layer
+        // short-circuits instead of burning its retry budget on a request
+        // that fails identically every attempt.
+        if let Err(error) = validate_responses_request(self.config.label, &request) {
+            return Ok(fatal_setup_stream(error));
+        }
         info!(
             provider = self.config.label,
             session_id = %request.session_id,
@@ -134,7 +122,7 @@ impl ResponsesProvider {
             "starting responses request"
         );
 
-        let request_body = openai_codec::encode_responses_request(
+        let request_body = match openai_codec::encode_responses_request(
             &request,
             ResponsesRequestOptions {
                 stream: true,
@@ -149,7 +137,10 @@ impl ResponsesProvider {
                 instruction_mode: self.config.request.instruction_mode,
                 temperature: self.temperature,
             },
-        )?;
+        ) {
+            Ok(request_body) => request_body,
+            Err(error) => return Ok(fatal_setup_stream(error)),
+        };
         let request_bytes = request_body.to_string().len();
         debug!(
             provider = self.config.label,
@@ -166,202 +157,43 @@ impl ResponsesProvider {
             tokens_per_minute: request.model.tokens_per_minute,
         };
         let track_response_id = self.config.request.store != Some(false);
-        let (tx, rx) = mpsc::unbounded();
-        let provider_label = self.config.label;
-        let transport = self.transport.clone();
-        let retry_policy = self.config.retry_policy;
-        // Stream-scoped child token: cancellable by either the caller's
-        // outer `cancel` or by `CancelOnDrop` when the consumer drops the
-        // returned stream. Cancelling this child does not affect siblings
-        // of the caller's broader scope.
-        let stream_cancel = cancel.child_token();
-        let task_cancel = stream_cancel.clone();
-
-        tokio::spawn(async move {
-            let cancel = task_cancel;
-            // Single retry gate spans both startup failures and mid-stream
-            // pre-commit failures (AC3.4). Without a single gate, a stream
-            // that reliably failed *after* connecting could loop forever
-            // even though the transport startup retry counter was bounded.
-            let mut gate = RetryGate::new(retry_policy);
-            // Cross-attempt MessageStart dedup (AC3.6). When an earlier
-            // attempt's `pending_events` buffer is discarded by retry, the
-            // next attempt's decoder will re-emit `MessageStart` for the
-            // same response; we suppress the duplicate before forwarding.
-            let mut commit_dedup = CommitDedup::default();
-
-            loop {
-                let attempt_id = gate.next_attempt_id();
-                // Single attempt: try to start the stream, then consume
-                // events. Returns `Some((source, hint))` when this attempt
-                // failed *retryably* (either at startup or pre-commit) and
-                // the outer loop should consult the gate. Terminal outcomes
-                // (cancellation, fatal failure, post-commit failure, normal
-                // completion) handle their own consumer emissions and
-                // `return` directly out of the spawned task.
-                let retry_reason: Option<(OpenAIError, Option<std::time::Duration>)> = 'attempt: {
-                    let mut response_stream = match transport
-                        .responses_stream(
-                            request_body.clone(),
-                            request_meta.clone(),
-                            cancel.child_token(),
-                        )
-                        .await
-                    {
-                        Ok(stream) => stream,
-                        Err(TransportError::Cancelled) => {
-                            warn!(provider = provider_label, "responses request cancelled");
-                            let _ = tx.unbounded_send(Err(ProviderError::cancelled()));
-                            return;
-                        }
-                        Err(TransportError::Fatal { source }) => {
-                            let _ =
-                                tx.unbounded_send(Err(provider_error_from_openai(source, false)));
-                            return;
-                        }
-                        Err(TransportError::Retryable {
-                            source,
-                            backoff_hint,
-                        }) => {
-                            warn!(
-                                provider = provider_label,
-                                attempt = attempt_id,
-                                error = %source,
-                                backoff_hint = ?backoff_hint,
-                                "retryable transport startup failure"
-                            );
-                            break 'attempt Some((source, backoff_hint));
-                        }
-                    };
-                    let mut decoder =
-                        openai_codec::ResponsesStreamDecoder::new(&request, track_response_id);
-                    let mut pending_events = Vec::new();
-                    let mut committed = false;
-
-                    loop {
-                        select! {
-                            _ = cancel.cancelled() => {
-                                warn!(provider = provider_label, "responses request cancelled");
-                                let _ = tx.unbounded_send(Err(ProviderError::cancelled()));
-                                return;
-                            }
-                            item = response_stream.next() => match item {
-                                Some(Ok(event)) => match decoder.decode(event) {
-                                    Ok(events) => {
-                                        if committed {
-                                            for event in events {
-                                                if !commit_dedup.allow(&event) {
-                                                    continue;
-                                                }
-                                                if tx.unbounded_send(Ok(event)).is_err() {
-                                                    return;
-                                                }
-                                            }
-                                            continue;
-                                        }
-
-                                        pending_events.extend(events);
-                                        if pending_events.iter().any(stream_event_commits_attempt) {
-                                            committed = true;
-                                            for event in pending_events.drain(..) {
-                                                if !commit_dedup.allow(&event) {
-                                                    continue;
-                                                }
-                                                if tx.unbounded_send(Ok(event)).is_err() {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(error) => {
-                                        error!(provider = provider_label, error = %error, "failed to decode responses stream");
-                                        let _ = tx.unbounded_send(Err(ProviderError::new(error.to_string(), false)));
-                                        return;
-                                    }
-                                },
-                                Some(Err(error)) => {
-                                    let retryability = classify(&error);
-                                    if !committed && retryability.is_retryable() {
-                                        let hint = retryability.backoff_hint();
-                                        warn!(
-                                            provider = provider_label,
-                                            attempt = attempt_id,
-                                            error = %error,
-                                            backoff_hint = ?hint,
-                                            "retryable pre-commit stream failure"
-                                        );
-                                        break 'attempt Some((error, hint));
-                                    }
-                                    warn!(provider = provider_label, error = %error, "responses stream returned provider error");
-                                    let _ = tx.unbounded_send(Err(provider_error_from_openai(
-                                        error,
-                                        retryability.is_retryable(),
-                                    )));
-                                    return;
-                                }
-                                None => {
-                                    if !pending_events.is_empty() {
-                                        for event in pending_events.drain(..) {
-                                            if !commit_dedup.allow(&event) {
-                                                continue;
-                                            }
-                                            if tx.unbounded_send(Ok(event)).is_err() {
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    debug!(provider = provider_label, "responses stream completed");
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                };
-
-                // Retry decision: consult the gate, sleep, and loop. On
-                // exhaustion, surface the latest source as a non-retryable
-                // ProviderError (the retryable signal has been "spent" by
-                // the budget; further retries would be unbounded).
-                if let Some((source, hint)) = retry_reason {
-                    match gate.record_failure_and_next_backoff(hint) {
-                        Some(delay) => {
-                            info!(
-                                provider = provider_label,
-                                attempt = attempt_id,
-                                retry_in_ms = delay.as_millis() as u64,
-                                "retrying responses request"
-                            );
-                            tokio::time::sleep(delay).await;
-                        }
-                        None => {
-                            warn!(
-                                provider = provider_label,
-                                attempt = attempt_id,
-                                "responses retry budget exhausted"
-                            );
-                            let _ =
-                                tx.unbounded_send(Err(provider_error_from_openai(source, false)));
-                            return;
-                        }
-                    }
-                }
+        let response_stream = match self
+            .transport
+            .responses_stream(request_body, request_meta, cancel)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Ok(stream::iter([Err(provider_error_from_transport(error))]).boxed());
             }
-        });
-
-        // Wrap the receiver so that consumer drop fires `stream_cancel`,
-        // which propagates to the spawned worker and to the cancel-aware
-        // SSE decode task in `ResponsesTransport::stream_response`. Without
-        // this wrapper, dropping the stream would only signal back-pressure
-        // to the worker via channel send failure on the *next* event —
-        // leaving the SSE task parked on `byte_stream.next()` indefinitely.
-        Ok(CancelOnDrop {
-            inner: rx.boxed(),
-            cancel: stream_cancel,
-        }
-        .boxed())
+        };
+        let provider_label = self.config.label;
+        let mut decoder = openai_codec::ResponsesStreamDecoder::new(&request, track_response_id);
+        Ok(response_stream
+            .flat_map(move |item| {
+                let events = match item {
+                    Ok(event) => match decoder.decode(event) {
+                        Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
+                        Err(error) => {
+                            error!(
+                                provider = provider_label,
+                                error = %error,
+                                "failed to decode responses stream"
+                            );
+                            vec![Err(ProviderError::with_kind(
+                                error.to_string(),
+                                ProviderErrorKind::Fatal,
+                            ))]
+                        }
+                    },
+                    Err(error) => vec![Err(provider_error_from_openai(error))],
+                };
+                stream::iter(events)
+            })
+            .boxed())
     }
 
-    pub(crate) async fn compact(
+    async fn compact_inner(
         &self,
         request: ProviderCompactionRequest,
         cancel: CancellationToken,
@@ -446,6 +278,63 @@ impl ResponsesProvider {
     }
 }
 
+#[async_trait::async_trait]
+impl Provider for ResponsesProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities.clone()
+    }
+
+    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
+        match self.config.compact_strategy {
+            Some(CompactStrategy::DedicatedEndpoint) => Some(
+                CompactionWindow::preserve_latest_assistant_response_block(messages),
+            ),
+            Some(CompactStrategy::InlineResponses) => {
+                Some(CompactionWindow::preserve_through_latest_user(messages))
+            }
+            None => None,
+        }
+    }
+
+    async fn stream(
+        &self,
+        request: ProviderRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+        self.stream_inner(request, cancel).await
+    }
+
+    async fn compact(
+        &self,
+        request: ProviderCompactionRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<ProviderCompactionResponse> {
+        self.compact_inner(request, cancel).await
+    }
+}
+
+fn effective_capabilities(config: &ResponsesProviderConfig) -> ProviderCapabilities {
+    let mut capabilities = config.capabilities.clone();
+    capabilities.supports_compaction = config.compact_strategy.is_some();
+    capabilities.compaction_strategy = config.compact_strategy.map(|strategy| match strategy {
+        CompactStrategy::DedicatedEndpoint => ProviderCompactionStrategy::Dedicated,
+        CompactStrategy::InlineResponses => ProviderCompactionStrategy::Inline,
+    });
+    capabilities
+}
+
+/// A stream whose only item is a `Fatal` provider error, used for
+/// deterministic request-setup failures.
+fn fatal_setup_stream(
+    error: anyhow::Error,
+) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+    stream::iter([Err(ProviderError::with_kind(
+        format!("{error:#}"),
+        ProviderErrorKind::Fatal,
+    ))])
+    .boxed()
+}
+
 fn validate_responses_request(label: &str, request: &ProviderRequest) -> anyhow::Result<()> {
     if request.model.api_kind != ApiKind::OpenAiResponses {
         anyhow::bail!(
@@ -473,76 +362,6 @@ fn validate_responses_compaction_request(
     Ok(())
 }
 
-/// Convert an `OpenAIError` to a `ProviderError`, using the caller-provided
-/// `retryable` flag (already decided by `classify`). Centralizing the
-/// formatting here ensures every error string has the same prefix.
-fn provider_error_from_openai(error: OpenAIError, retryable: bool) -> ProviderError {
-    let message = match &error {
-        OpenAIError::ApiError(api_error) => {
-            format!("failed to execute provider request: {}", api_error.message)
-        }
-        OpenAIError::JSONDeserialize(json_error, content) => format!(
-            "failed to execute provider request: failed to deserialize api response: error:{json_error} content:{content}"
-        ),
-        other => format!("failed to execute provider request: {other}"),
-    };
-    ProviderError::new(message, retryable)
-}
-
-/// Stream wrapper that cancels its `CancellationToken` when dropped. Used to
-/// propagate consumer drop back into the spawned SSE decode task so the task
-/// exits promptly instead of leaking on a parked `byte_stream.next()` (AC3.1).
-struct CancelOnDrop<S> {
-    inner: S,
-    cancel: CancellationToken,
-}
-
-impl<S: Stream + Unpin> Stream for CancelOnDrop<S> {
-    type Item = S::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
-    }
-}
-
-impl<S> Drop for CancelOnDrop<S> {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
-}
-
-/// Cross-attempt dedup for commit-eligible boundary events. When an attempt
-/// fails before commit, the next attempt's decoder will re-emit the same
-/// `MessageStart` for the same response id; without suppression, downstream
-/// consumers would see two starts for one logical message (AC3.6).
-#[derive(Debug, Default)]
-struct CommitDedup {
-    seen_message_starts: HashSet<MessageId>,
-}
-
-impl CommitDedup {
-    fn allow(&mut self, event: &StreamEvent) -> bool {
-        if let StreamEvent::MessageStart { id } = event {
-            return self.seen_message_starts.insert(id.clone());
-        }
-        true
-    }
-}
-
-fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
-    matches!(
-        event,
-        StreamEvent::TextDelta { .. }
-            | StreamEvent::ThinkingDelta { .. }
-            | StreamEvent::ToolCallStart { .. }
-            | StreamEvent::ToolArgsDelta { .. }
-            | StreamEvent::ToolCallEnd { .. }
-            | StreamEvent::MessageEnd { .. }
-            | StreamEvent::ProviderWarning { .. }
-            | StreamEvent::Error { .. }
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -550,14 +369,114 @@ mod tests {
 
     use futures::StreamExt;
     use halter_protocol::{
-        AssembledPrompt, BlockId, MessageId, ModelId, ModelRole, ProviderKind, ProviderName,
-        ResolvedModel, SessionId, TurnId,
+        AssembledPrompt, ModelId, ModelRole, ProviderKind, ProviderName, ResolvedModel, SessionId,
+        TurnId,
     };
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::openai_error::classify;
+    use crate::test_http::read_http_request;
+    use crate::{ResilientProvider, RetryPolicy};
+
+    fn sample_config(label: &'static str, policy: ResiliencePolicy) -> ResponsesProviderConfig {
+        ResponsesProviderConfig {
+            label,
+            capabilities: ProviderCapabilities::default(),
+            request: ResponsesProviderRequestConfig {
+                store: Some(false),
+                include_prompt_cache_key: false,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
+            },
+            compact_strategy: None,
+            rate_limit_strategy: None,
+            resilience_policy: policy,
+        }
+    }
+
+    /// Deterministic setup failures must surface as a single in-stream
+    /// `Fatal` error, not a stream-construction `Err` that the resilience
+    /// layer would previously retry as `Transient` (H4).
+    #[tokio::test]
+    async fn responses_provider_surfaces_wrong_api_kind_as_fatal_stream_error() {
+        let provider = ResponsesProvider::try_new(
+            sample_config("responses-test", ResiliencePolicy::default()),
+            "test-key",
+            "http://127.0.0.1:1",
+            &[],
+            None,
+        )
+        .expect("responses provider");
+        let mut request = sample_responses_request();
+        request.model.api_kind = ApiKind::OpenAiChat;
+
+        let mut stream = provider
+            .stream(request, CancellationToken::new())
+            .await
+            .expect("setup failures must be in-stream errors");
+        let error = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("item should be the setup error");
+
+        assert_eq!(error.kind, ProviderErrorKind::Fatal);
+        assert!(error.message.contains("openai_responses api kind"));
+        assert!(stream.next().await.is_none());
+    }
+
+    /// The old bad behavior: a validation failure burned the full retry
+    /// budget as `Transient`. Now the resilience wrapper must observe the
+    /// `Fatal` classification and stop after one attempt.
+    #[tokio::test]
+    async fn resilient_wrapper_does_not_retry_setup_validation_failures() {
+        let policy = ResiliencePolicy {
+            request_retry: RetryPolicy {
+                max_attempts: 5,
+                base_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                deadline: Duration::from_secs(5),
+                jitter_pct: 0,
+            },
+            ..ResiliencePolicy::default()
+        };
+        let provider = ResilientProvider::new(
+            "responses-test",
+            ResponsesProvider::try_new(
+                sample_config("responses-test", policy),
+                "test-key",
+                "http://127.0.0.1:1",
+                &[],
+                None,
+            )
+            .expect("responses provider"),
+            policy,
+        );
+        let mut request = sample_responses_request();
+        request.model.api_kind = ApiKind::OpenAiChat;
+
+        let started = std::time::Instant::now();
+        let mut stream = provider
+            .stream(request, CancellationToken::new())
+            .await
+            .expect("provider stream");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+
+        assert_eq!(items.len(), 1, "fatal setup error must not be retried");
+        let error = items[0].as_ref().expect_err("setup error");
+        assert_eq!(error.kind, ProviderErrorKind::Fatal);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must short-circuit without a retry budget"
+        );
+    }
 
     #[tokio::test]
     async fn responses_provider_without_compaction_strategy_rejects_compaction() {
@@ -577,7 +496,7 @@ mod tests {
                 },
                 compact_strategy: None,
                 rate_limit_strategy: None,
-                retry_policy: RetryPolicy::default(),
+                resilience_policy: ResiliencePolicy::default(),
             },
             "test-key",
             "http://127.0.0.1:1",
@@ -671,15 +590,16 @@ mod tests {
 
         for (label, error, expected_retryable) in cases {
             let retryability = classify(&error);
-            let provider_error = provider_error_from_openai(error, retryability.is_retryable());
+            let provider_error = provider_error_from_openai(error);
             assert_eq!(
                 retryability.is_retryable(),
                 expected_retryable,
                 "{label}: classify mismatch"
             );
             assert_eq!(
-                provider_error.retryable, expected_retryable,
-                "{label}: ProviderError.retryable disagrees with classify"
+                provider_error.retryable(),
+                expected_retryable,
+                "{label}: ProviderError retryability disagrees with classify"
             );
             assert!(
                 provider_error
@@ -694,113 +614,56 @@ mod tests {
     fn provider_error_cancelled_is_distinguishable() {
         let err = ProviderError::cancelled();
         assert!(err.is_cancelled());
-        assert!(!err.retryable);
+        assert!(!err.retryable());
         assert_eq!(err.message, ProviderError::CANCELLED_MESSAGE);
-    }
-
-    /// AC3.1 wiring: `CancelOnDrop` must cancel its token on `Drop` so that
-    /// the parent token's downstream listeners (the spawned worker loop and
-    /// the cancel-aware SSE decoder) observe consumer drop without depending
-    /// on the channel surfacing a failed send.
-    #[test]
-    fn cancel_on_drop_cancels_token_on_drop() {
-        let token = CancellationToken::new();
-        {
-            let _wrapper = CancelOnDrop {
-                inner: futures::stream::empty::<i32>(),
-                cancel: token.clone(),
-            };
-            assert!(!token.is_cancelled());
-        }
-        assert!(token.is_cancelled());
-    }
-
-    /// AC3.6: When a pre-commit attempt fails and is retried, the next
-    /// attempt's decoder will re-emit `MessageStart` for the same response;
-    /// `CommitDedup` must suppress the duplicate so consumers see exactly one
-    /// start per logical message id. Distinct ids must still pass through —
-    /// otherwise a multi-message conversation would be silently truncated.
-    #[test]
-    fn commit_dedup_suppresses_duplicate_message_start() {
-        let mut dedup = CommitDedup::default();
-        let id = MessageId::from("msg_alpha");
-        let other = MessageId::from("msg_beta");
-
-        assert!(dedup.allow(&StreamEvent::MessageStart { id: id.clone() }));
-        assert!(!dedup.allow(&StreamEvent::MessageStart { id: id.clone() }));
-        assert!(dedup.allow(&StreamEvent::MessageStart { id: other }));
-    }
-
-    /// `CommitDedup` must only intercept `MessageStart`. All other events —
-    /// in particular repeats of the same `BlockId` for `TextStart` /
-    /// `TextDelta` — must always pass through, since the codec uses block
-    /// identity for normal in-stream segmentation, not for retry suppression.
-    #[test]
-    fn commit_dedup_passes_through_non_message_start_events() {
-        let mut dedup = CommitDedup::default();
-        let block = BlockId::from("blk_one");
-        let event = StreamEvent::TextStart { id: block.clone() };
-        assert!(dedup.allow(&event));
-        assert!(dedup.allow(&event));
-        assert!(dedup.allow(&StreamEvent::TextEnd { id: block }));
-    }
-
-    /// `CancelOnDrop` must remain a transparent stream proxy — adding the
-    /// drop side-effect should not perturb forward iteration semantics.
-    #[tokio::test]
-    async fn cancel_on_drop_passes_through_stream_items() {
-        let token = CancellationToken::new();
-        let mut wrapper = CancelOnDrop {
-            inner: futures::stream::iter(vec![1, 2, 3]),
-            cancel: token.clone(),
-        };
-        assert_eq!(wrapper.next().await, Some(1));
-        assert_eq!(wrapper.next().await, Some(2));
-        assert_eq!(wrapper.next().await, Some(3));
-        assert_eq!(wrapper.next().await, None);
-        assert!(!token.is_cancelled());
-        drop(wrapper);
-        assert!(token.is_cancelled());
     }
 
     /// AC3.4: When every attempt fails with a retryable error, the bounded
     /// `RetryPolicy::max_attempts` budget must be honored — the provider
     /// must stop after exactly that many requests, not loop forever, and the
-    /// final emitted `ProviderError` must be `retryable=false` (the budget
-    /// has been "spent"; further retries are no longer authorized).
+    /// final emitted `ProviderError` must preserve its typed classification
+    /// for any downstream policy that decides whether to retry the whole turn.
     #[tokio::test]
     async fn responses_provider_stops_after_retry_budget() {
         let attempts = Arc::new(tokio::sync::Mutex::new(0u32));
         let base_url = spawn_always_failing_stream_server(attempts.clone()).await;
 
         let max_attempts = 3u32;
-        let provider = ResponsesProvider::try_new(
-            ResponsesProviderConfig {
-                label: "responses-budget",
-                capabilities: ProviderCapabilities::default(),
-                request: ResponsesProviderRequestConfig {
-                    store: Some(false),
-                    include_prompt_cache_key: false,
-                    include_encrypted_reasoning: false,
-                    reasoning_summary: None,
-                    instruction_mode: ResponsesInstructionMode::DeveloperMessage,
-                },
-                compact_strategy: None,
-                rate_limit_strategy: None,
-                retry_policy: RetryPolicy {
-                    max_attempts,
-                    base_backoff: Duration::from_millis(1),
-                    max_backoff: Duration::from_millis(5),
-                    deadline: Duration::from_secs(60),
-                    jitter_pct: 0,
-                },
+        let policy = ResiliencePolicy {
+            request_retry: RetryPolicy {
+                max_attempts,
+                base_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(5),
+                deadline: Duration::from_secs(60),
+                jitter_pct: 0,
             },
-            "test-key",
-            base_url,
-            &[],
-            None,
-        )
-        .expect("responses provider");
+            ..ResiliencePolicy::default()
+        };
+        let provider = ResilientProvider::new(
+            "responses-budget",
+            ResponsesProvider::try_new(
+                ResponsesProviderConfig {
+                    label: "responses-budget",
+                    capabilities: ProviderCapabilities::default(),
+                    request: ResponsesProviderRequestConfig {
+                        store: Some(false),
+                        include_prompt_cache_key: false,
+                        include_encrypted_reasoning: false,
+                        reasoning_summary: None,
+                        instruction_mode: ResponsesInstructionMode::DeveloperMessage,
+                    },
+                    compact_strategy: None,
+                    rate_limit_strategy: None,
+                    resilience_policy: policy,
+                },
+                "test-key",
+                base_url,
+                &[],
+                None,
+            )
+            .expect("responses provider"),
+            policy,
+        );
 
         let mut stream = provider
             .stream(sample_responses_request(), CancellationToken::new())
@@ -818,10 +681,8 @@ mod tests {
         let final_error = errors
             .pop()
             .expect("provider should surface a final error after exhausting budget");
-        assert!(
-            !final_error.retryable,
-            "final error after budget exhaustion must be non-retryable: {final_error:?}"
-        );
+        assert_eq!(final_error.kind, ProviderErrorKind::RateLimited);
+        assert!(final_error.retryable());
         assert!(
             final_error
                 .message
@@ -913,42 +774,5 @@ mod tests {
         });
 
         format!("http://{address}")
-    }
-
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<()> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
-
-        loop {
-            let read = socket.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(headers_end) = find_headers_end(&buffer) {
-                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    })
-                    .unwrap_or(0);
-                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
-                if body_bytes >= content_length {
-                    return Ok(());
-                }
-            }
-        }
-
-        anyhow::bail!("incomplete http request")
-    }
-
-    fn find_headers_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n")
     }
 }

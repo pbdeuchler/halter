@@ -57,6 +57,29 @@ Core exports include:
 
 There is also a `responses_provider` adapter layer used by the OpenAI/OpenRouter side of the implementation.
 
+Provider resilience is exposed through:
+
+- `ProviderErrorKind`
+- `ProviderTimeouts`
+- `RetryPolicy`
+- `ResiliencePolicy`
+- `ProviderErrorClassifier`
+- `ResilientProvider`
+
+OpenAI, OpenRouter, and Anthropic all wrap their transport core in
+`ResilientProvider` internally, so every constructor — including plain
+`new(...)` — yields bounded retries with exponential backoff for transient
+failures (rate limits, 5xx/overload, network faults) on both `stream(...)` and
+`compact(...)`. Pass a custom policy and classifier with
+`new_with_headers_and_resilience(...)`; the higher-level builder only supplies
+the policy from config. Retryability is decided by one shared classifier
+across provider families, server-supplied backoff hints (`Retry-After`,
+"try again in …") are honored, and jitter stays within `max_backoff`.
+Deterministic setup failures (wrong api kind, unencodable request) are fatal
+and never retried, and a stream that has already emitted content is never
+retried. Streaming transports do not use reqwest's total request timeout for
+the SSE body; request setup and stream-idle liveness are bounded separately.
+
 ---
 
 ## Mental model

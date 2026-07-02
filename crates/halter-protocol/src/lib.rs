@@ -9,11 +9,13 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use schemars::JsonSchema;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -22,10 +24,6 @@ use uuid::Uuid;
 /// Shared string payloads stay as `String` for now; this is the swap point for any future `Arc<str>` migration.
 pub type SharedStr = String;
 
-/// Historical sampling temperature used by older config resolution. Provider
-/// requests now omit temperature unless `[providers.<name>].temperature` is
-/// configured explicitly.
-pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 /// MIME/media type label used for binary message parts.
 pub type MediaType = String;
 /// Provider-issued signature attached to replayable reasoning blocks.
@@ -991,12 +989,46 @@ impl ToolError {
     }
 }
 
-#[derive(Debug, Clone, Error, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+/// Provider error taxonomy used by retry policy and consumers.
+pub enum ProviderErrorKind {
+    /// 5xx, overload, transport, stream, timeout, and otherwise unknown
+    /// provider failures that may succeed on a later attempt.
+    Transient,
+    /// Provider rate limiting. `ProviderError::backoff_hint` may carry a
+    /// server-supplied retry-after value.
+    RateLimited,
+    /// Explicitly non-recoverable failures such as auth, malformed requests,
+    /// unknown models, context-window errors, or policy refusals.
+    #[default]
+    Fatal,
+    /// Runtime or user cancellation.
+    Cancelled,
+}
+
+impl ProviderErrorKind {
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::Transient | Self::RateLimited)
+    }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 #[error("{message}")]
+#[non_exhaustive]
 /// Error surfaced by a provider adapter.
+///
+/// Serde and `JsonSchema` are hand-written so the published schema matches
+/// the wire format exactly: serialization always emits `message`, `kind`,
+/// and the legacy `retryable` flag (derived from `kind`), plus
+/// `backoff_hint` when present; deserialization additionally accepts legacy
+/// payloads that carry only `message`/`retryable`.
 pub struct ProviderError {
     pub message: String,
-    pub retryable: bool,
+    pub kind: ProviderErrorKind,
+    pub backoff_hint: Option<Duration>,
 }
 
 impl ProviderError {
@@ -1006,12 +1038,40 @@ impl ProviderError {
     pub const CANCELLED_MESSAGE: &str = "failed to execute provider request: request cancelled";
 
     /// Build a provider error with an explicit retryability flag.
+    ///
+    /// Prefer [`ProviderError::with_kind`] in new code so the error's nature is
+    /// preserved after a local retry budget is exhausted.
     #[must_use]
     pub fn new(message: impl Into<String>, retryable: bool) -> Self {
+        let kind = if retryable {
+            ProviderErrorKind::Transient
+        } else {
+            ProviderErrorKind::Fatal
+        };
+        Self::with_kind(message, kind)
+    }
+
+    /// Build a provider error with a typed classification and no backoff hint.
+    #[must_use]
+    pub fn with_kind(message: impl Into<String>, kind: ProviderErrorKind) -> Self {
         Self {
             message: message.into(),
-            retryable,
+            kind,
+            backoff_hint: None,
         }
+    }
+
+    /// Attach a server-supplied or inferred backoff hint.
+    #[must_use]
+    pub fn with_backoff_hint(mut self, backoff_hint: Option<Duration>) -> Self {
+        self.backoff_hint = backoff_hint;
+        self
+    }
+
+    /// Whether this error represents a retryable provider condition.
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        self.kind.retryable()
     }
 
     /// Construct a non-retryable cancellation error with the canonical
@@ -1021,14 +1081,98 @@ impl ProviderError {
     pub fn cancelled() -> Self {
         Self {
             message: Self::CANCELLED_MESSAGE.to_owned(),
-            retryable: false,
+            kind: ProviderErrorKind::Cancelled,
+            backoff_hint: None,
         }
     }
 
     /// Whether this error is the canonical cancellation sentinel.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.message == Self::CANCELLED_MESSAGE
+        self.kind == ProviderErrorKind::Cancelled || self.message == Self::CANCELLED_MESSAGE
+    }
+}
+
+impl Serialize for ProviderError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let field_count = if self.backoff_hint.is_some() { 4 } else { 3 };
+        let mut state = serializer.serialize_struct("ProviderError", field_count)?;
+        state.serialize_field("message", &self.message)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("retryable", &self.retryable())?;
+        if let Some(backoff_hint) = self.backoff_hint {
+            state.serialize_field("backoff_hint", &backoff_hint)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ProviderErrorWire {
+            message: String,
+            #[serde(default)]
+            kind: Option<ProviderErrorKind>,
+            #[serde(default)]
+            backoff_hint: Option<Duration>,
+            #[serde(default)]
+            retryable: Option<bool>,
+        }
+
+        let wire = ProviderErrorWire::deserialize(deserializer)?;
+        let kind = wire.kind.unwrap_or_else(|| {
+            if wire.message == ProviderError::CANCELLED_MESSAGE {
+                ProviderErrorKind::Cancelled
+            } else if wire.retryable.unwrap_or(false) {
+                ProviderErrorKind::Transient
+            } else {
+                ProviderErrorKind::Fatal
+            }
+        });
+        Ok(Self {
+            message: wire.message,
+            kind,
+            backoff_hint: wire.backoff_hint,
+        })
+    }
+}
+
+impl JsonSchema for ProviderError {
+    fn schema_name() -> String {
+        "ProviderError".to_owned()
+    }
+
+    // Mirrors the hand-written `Serialize` impl: `retryable` is always
+    // emitted even though the struct has no such field.
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, ObjectValidation, SchemaObject};
+
+        let mut object = ObjectValidation::default();
+        for (name, schema) in [
+            ("message", generator.subschema_for::<String>()),
+            ("kind", generator.subschema_for::<ProviderErrorKind>()),
+            ("retryable", generator.subschema_for::<bool>()),
+            ("backoff_hint", generator.subschema_for::<Duration>()),
+        ] {
+            object.properties.insert(name.to_owned(), schema);
+        }
+        for required in ["message", "kind", "retryable"] {
+            object.required.insert(required.to_owned());
+        }
+
+        SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(object)),
+            ..SchemaObject::default()
+        }
+        .into()
     }
 }
 
@@ -1726,6 +1870,100 @@ mod tests {
         let encoded = serde_json::to_string(&event).expect("serialize event");
         let decoded: SessionEvent = serde_json::from_str(&encoded).expect("deserialize event");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn provider_error_serializes_retryable_for_legacy_consumers() {
+        let error = ProviderError::with_kind("slow down", ProviderErrorKind::RateLimited)
+            .with_backoff_hint(Some(Duration::from_secs(2)));
+
+        let value = serde_json::to_value(&error).expect("serialize provider error");
+
+        assert_eq!(value["message"], "slow down");
+        assert_eq!(value["kind"], "rate_limited");
+        assert_eq!(value["retryable"], true);
+        assert!(value.get("backoff_hint").is_some());
+
+        let decoded: ProviderError =
+            serde_json::from_value(value).expect("deserialize provider error");
+        assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn provider_error_deserializes_legacy_retryable_field() {
+        let cases = [
+            (
+                "retryable",
+                serde_json::json!({"message": "try again", "retryable": true}),
+                ProviderErrorKind::Transient,
+            ),
+            (
+                "fatal",
+                serde_json::json!({"message": "bad request", "retryable": false}),
+                ProviderErrorKind::Fatal,
+            ),
+            (
+                "missing_retryable",
+                serde_json::json!({"message": "old fatal"}),
+                ProviderErrorKind::Fatal,
+            ),
+            (
+                "cancelled_sentinel",
+                serde_json::json!({"message": ProviderError::CANCELLED_MESSAGE}),
+                ProviderErrorKind::Cancelled,
+            ),
+        ];
+
+        for (name, value, want_kind) in cases {
+            let error: ProviderError =
+                serde_json::from_value(value).expect("deserialize provider error");
+
+            assert_eq!(error.kind, want_kind, "{name}");
+            assert_eq!(error.retryable(), want_kind.retryable(), "{name}");
+        }
+    }
+
+    #[test]
+    fn provider_error_json_schema_matches_wire_format() {
+        let schema = schemars::schema_for!(ProviderError);
+        let value = serde_json::to_value(&schema).expect("schema json");
+        let properties = value
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema properties");
+        let required: Vec<&str> = value
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("schema required")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+
+        // Every serialized key is described, and vice versa.
+        let serialized = serde_json::to_value(
+            ProviderError::with_kind("boom", ProviderErrorKind::Transient)
+                .with_backoff_hint(Some(Duration::from_secs(1))),
+        )
+        .expect("serialize provider error");
+        for key in serialized.as_object().expect("object").keys() {
+            assert!(properties.contains_key(key), "schema missing key '{key}'");
+        }
+        assert_eq!(properties.len(), 4, "schema keys: {properties:?}");
+        // `required` serializes as a sorted set.
+        assert_eq!(required, ["kind", "message", "retryable"]);
+    }
+
+    #[test]
+    fn provider_error_kind_takes_precedence_over_legacy_retryable() {
+        let error: ProviderError = serde_json::from_value(serde_json::json!({
+            "message": "locally exhausted rate limit",
+            "kind": "rate_limited",
+            "retryable": false
+        }))
+        .expect("deserialize provider error");
+
+        assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+        assert!(error.retryable());
     }
 
     #[test]

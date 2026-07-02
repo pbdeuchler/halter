@@ -2,15 +2,20 @@
 
 use std::path::PathBuf;
 
-use crate::{Shell, ShellFd, results, sys};
+use crate::{Shell, ShellFd, extensions, results, sys};
 
 /// Unified error type for this crate. Contains just a kind for now,
 /// but will be extended later with additional context.
 #[derive(thiserror::Error, Debug)]
-#[error(transparent)]
+#[error("{kind}")]
 pub struct Error {
     /// The kind of error.
+    #[source]
     kind: ErrorKind,
+
+    /// Whether or not the error should be considered a "fatal" error that would
+    /// result in abnormal exit of a non-interactive shell.
+    fatal: bool,
 }
 
 /// Monolithic error type for the shell
@@ -82,8 +87,21 @@ pub enum ErrorKind {
     UnimplementedAndTracked(&'static str, u32),
 
     /// An expected environment scope could not be found.
-    #[error("missing scope")]
+    #[error("missing environment scope")]
     MissingScope,
+
+    /// The environment scope required for a new variable is not available.
+    #[error("environment scope required for new variable is not available")]
+    MissingScopeForNewVariable,
+
+    /// An unexpected environment scope type was encountered.
+    #[error("unexpected environment scope type: expected '{expected}', found '{actual}'")]
+    UnexpectedScopeType {
+        /// The expected scope type.
+        expected: crate::env::EnvironmentScope,
+        /// The actual scope type.
+        actual: crate::env::EnvironmentScope,
+    },
 
     /// The given path is not a directory.
     #[error("not a directory: {0}")]
@@ -102,7 +120,7 @@ pub enum ErrorKind {
     NoCurrentUser,
 
     /// The requested input or output redirection is invalid.
-    #[error("invalid redirection")]
+    #[error("invalid redirection target")]
     InvalidRedirection,
 
     /// An error occurred while redirecting input or output with the given file.
@@ -114,11 +132,20 @@ pub enum ErrorKind {
     EvalError(#[from] crate::arithmetic::EvalError),
 
     /// The given string could not be parsed as an integer.
-    #[error("failed to parse integer")]
-    IntParseError(#[from] std::num::ParseIntError),
+    #[error("failed to parse '{s}' as a {int_type_name}, base-{radix} integer: {inner}")]
+    IntParseError {
+        /// The string that failed to parse.
+        s: String,
+        /// The integer type being parsed.
+        int_type_name: &'static str,
+        /// The radix (base) used for parsing.
+        radix: u32,
+        /// The underlying parse error.
+        inner: std::num::ParseIntError,
+    },
 
-    /// The given string could not be parsed as an integer.
-    #[error("failed to parse integer")]
+    /// The given integer could not be converted to the target type.
+    #[error("integer conversion error")]
     TryIntParseError(#[from] std::num::TryFromIntError),
 
     /// A byte sequence could not be decoded as a valid UTF-8 string.
@@ -163,23 +190,23 @@ pub enum ErrorKind {
 
     /// An error occurred while parsing.
     #[error("{1}: {0}")]
-    ParseError(brush_parser::ParseError, brush_parser::SourceInfo),
+    ParseError(crate::parser::ParseError, crate::SourceInfo),
 
     /// An error occurred while parsing a function body.
     #[error("{0}: {1}")]
-    FunctionParseError(String, brush_parser::ParseError),
+    FunctionParseError(String, crate::parser::ParseError),
 
     /// An error occurred while parsing a word.
     #[error(transparent)]
-    WordParseError(#[from] brush_parser::WordParseError),
+    WordParseError(#[from] crate::parser::WordParseError),
 
     /// Unable to parse a test command.
-    #[error(transparent)]
-    TestCommandParseError(#[from] brush_parser::TestCommandParseError),
+    #[error("invalid test command")]
+    TestCommandParseError(#[from] crate::parser::TestCommandParseError),
 
     /// Unable to parse a key binding specification.
     #[error(transparent)]
-    BindingParseError(#[from] brush_parser::BindingParseError),
+    BindingParseError(#[from] crate::parser::BindingParseError),
 
     /// A threading error occurred.
     #[error("threading error")]
@@ -231,7 +258,7 @@ pub enum ErrorKind {
 
     /// Array index out of range.
     #[error("array index out of range: {0}")]
-    ArrayIndexOutOfRange(i64),
+    ArrayIndexOutOfRange(String),
 
     /// Unhandled key code.
     #[error("unhandled key code: {0:?}")]
@@ -249,15 +276,66 @@ pub enum ErrorKind {
     #[error("command history is not enabled in this shell")]
     HistoryNotEnabled,
 
-    /// Unknown key binding function.
-    #[error("unknown key binding function: {0}")]
-    UnknownKeyBindingFunction(String),
+    /// Expanding an unset variable.
+    #[error("expanding unset variable: {0}")]
+    ExpandingUnsetVariable(String),
+
+    /// An internal error occurred.
+    #[error("internal shell error: {0}")]
+    InternalError(String),
+
+    /// Attempted to perform an operation that requires an interactive session.
+    #[error("operation requires an interactive session")]
+    NotInInteractiveSession,
+
+    /// Attempted to perform an operation that requires command-string mode.
+    #[error("operation requires command-string mode")]
+    NotExecutingCommandString,
+
+    /// Too much data was provided to an operation.
+    #[error("too much data")]
+    TooMuchData,
+
+    /// Cannot convert open file to native file descriptor.
+    #[error("cannot convert open file to native file descriptor")]
+    CannotConvertToNativeFd,
+
+    /// History file is too large to import.
+    #[error("history file is too large to import")]
+    HistoryFileTooLargeToImport,
+
+    /// Too many open files.
+    #[error("too many open files")]
+    TooManyOpenFiles,
+
+    /// The function name shadows a special built-in command.
+    #[error("function name '{}' shadows a special built-in command", .name)]
+    FunctionNameShadowsSpecialBuiltin {
+        /// Name of the function.
+        name: String,
+    },
+
+    /// A glob pattern failed to match any files (failglob).
+    #[error("no match: {0}")]
+    NoMatch(String),
 }
 
-impl BuiltinError for Error {}
-
 /// Trait implementable by built-in commands to represent errors.
-pub trait BuiltinError: std::error::Error + ConvertibleToExitCode + Send + Sync {}
+pub trait BuiltinError: std::error::Error + ConvertibleToExitCode + Send + Sync {
+    /// Try to extract a reference to the underlying `std::io::Error`, if any.
+    /// Implementations should return `None` if there is no inner I/O error.
+    /// They should not attempt to *synthesize* an I/O error if one does not
+    /// naturally exist.
+    fn as_io_error(&self) -> Option<&std::io::Error> {
+        None
+    }
+}
+
+impl BuiltinError for Error {
+    fn as_io_error(&self) -> Option<&std::io::Error> {
+        self.as_io_error()
+    }
+}
 
 /// Helper trait for converting values to exit codes.
 pub trait ConvertibleToExitCode {
@@ -283,9 +361,22 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             }
             ErrorKind::ParseError(..) => Self::InvalidUsage,
             ErrorKind::FunctionParseError(..) => Self::InvalidUsage,
+            ErrorKind::TestCommandParseError(..) => Self::InvalidUsage,
             ErrorKind::FailedToExecuteCommand(..) => Self::CannotExecute,
+            ErrorKind::FunctionNameShadowsSpecialBuiltin { .. } => Self::InvalidUsage,
+            ErrorKind::IoError(io_err) => io_err.into(),
             ErrorKind::BuiltinError(inner, ..) => inner.as_exit_code(),
             _ => Self::GeneralError,
+        }
+    }
+}
+
+impl From<&std::io::Error> for results::ExecutionExitCode {
+    fn from(io_err: &std::io::Error) -> Self {
+        if io_err.kind() == std::io::ErrorKind::BrokenPipe {
+            Self::BrokenPipe
+        } else {
+            Self::GeneralError
         }
     }
 }
@@ -303,34 +394,71 @@ where
     fn from(convertible_to_kind: T) -> Self {
         Self {
             kind: convertible_to_kind.into(),
+            fatal: false,
         }
     }
 }
 
-/// Trait implementable by consumers of this crate to customize formatting errors into
-/// displayable text.
-pub trait ErrorFormatter: Send {
-    /// Format the given error for display within the context of the provided shell.
+impl Error {
+    /// Marks this error as fatal.
+    #[must_use]
+    pub const fn into_fatal(mut self) -> Self {
+        self.fatal = true;
+        self
+    }
+
+    /// Returns whether or not this error is fatal.
+    pub const fn is_fatal(&self) -> bool {
+        self.fatal
+    }
+
+    /// Returns a reference to the error kind.
+    pub const fn kind(&self) -> &ErrorKind {
+        &self.kind
+    }
+
+    /// Try to extract a reference to the underlying `std::io::Error`, if any.
+    pub fn as_io_error(&self) -> Option<&std::io::Error> {
+        match &self.kind {
+            ErrorKind::IoError(io_err) => Some(io_err),
+            ErrorKind::BuiltinError(inner, _) => inner.as_io_error(),
+            _ => None,
+        }
+    }
+
+    /// Converts this error into the appropriate control flow based on the shell's current state.
+    /// This centralizes the logic for determining how fatal errors should affect execution flow.
     ///
     /// # Arguments
     ///
-    /// * `error` - The error to format.
-    /// * `shell` - The shell in which the error occurred.
-    fn format_error(&self, error: &Error, shell: &Shell) -> String;
-}
-
-/// Default implementation of the [`ErrorFormatter`] trait.
-pub(crate) struct DefaultErrorFormatter {}
-
-impl DefaultErrorFormatter {
-    pub const fn new() -> Self {
-        Self {}
+    /// * `shell` - The shell instance, used to check interactive mode and script call stack.
+    pub fn to_control_flow(
+        &self,
+        shell: &Shell<impl extensions::ShellExtensions>,
+    ) -> results::ExecutionControlFlow {
+        if self.is_fatal() && !shell.options().interactive {
+            results::ExecutionControlFlow::ExitShell
+        } else {
+            results::ExecutionControlFlow::Normal
+        }
     }
-}
 
-impl ErrorFormatter for DefaultErrorFormatter {
-    fn format_error(&self, err: &Error, _shell: &Shell) -> String {
-        std::format!("error: {err:#}\n")
+    /// Converts this error into an execution result for the shell.
+    ///
+    /// # Arguments
+    ///
+    /// * `shell` - The shell instance, used to determine control flow.
+    pub fn into_result(
+        self,
+        shell: &Shell<impl extensions::ShellExtensions>,
+    ) -> results::ExecutionResult {
+        let next_control_flow = self.to_control_flow(shell);
+        let exit_code = results::ExecutionExitCode::from(&self);
+
+        results::ExecutionResult {
+            next_control_flow,
+            exit_code,
+        }
     }
 }
 
@@ -349,7 +477,6 @@ pub fn unimp<T>(msg: &'static str) -> Result<T, Error> {
 ///
 /// * `msg` - The message to include in the error
 /// * `project_issue_id` - The GitHub issue ID where the implementation is tracked.
-#[allow(unused)]
 pub fn unimp_with_issue<T>(msg: &'static str, project_issue_id: u32) -> Result<T, Error> {
     Err(ErrorKind::UnimplementedAndTracked(msg, project_issue_id).into())
 }

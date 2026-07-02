@@ -12,9 +12,9 @@ pub(crate) struct ShiftCommand {
 impl builtins::Command for ShiftCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let n = self.n.unwrap_or(1);
 
@@ -25,11 +25,13 @@ impl builtins::Command for ShiftCommand {
         #[expect(clippy::cast_sign_loss)]
         let n = n as usize;
 
-        if n > context.shell.positional_parameters.len() {
+        let args = context.shell.current_shell_args_mut();
+
+        if n > args.len() {
             return Ok(ExecutionExitCode::InvalidUsage.into());
         }
 
-        context.shell.positional_parameters.drain(0..n);
+        args.drain(0..n);
 
         Ok(ExecutionResult::success())
     }

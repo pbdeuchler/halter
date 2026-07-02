@@ -13,15 +13,15 @@ pub(crate) struct BgCommand {
 impl builtins::Command for BgCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut exit_code = ExecutionResult::success();
 
         if !self.job_specs.is_empty() {
             for job_spec in &self.job_specs {
-                if let Some(job) = context.shell.jobs.resolve_job_spec(job_spec) {
+                if let Some(job) = context.shell.jobs_mut().resolve_job_spec(job_spec) {
                     job.move_to_background()?;
                 } else {
                     writeln!(
@@ -34,7 +34,7 @@ impl builtins::Command for BgCommand {
                 }
             }
         } else {
-            if let Some(job) = context.shell.jobs.current_job_mut() {
+            if let Some(job) = context.shell.jobs_mut().current_job_mut() {
                 job.move_to_background()?;
             } else {
                 writeln!(context.stderr(), "{}: no current job", context.command_name)?;

@@ -18,9 +18,9 @@ impl builtins::DeclarationCommand for BuiltinCommand {
 impl builtins::Command for BuiltinCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        mut context: brush_core::ExecutionContext<'_>,
+        mut context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.args.is_empty() {
             return Ok(ExecutionResult::success());
@@ -33,7 +33,9 @@ impl builtins::Command for BuiltinCommand {
 
         let builtin_name = args[0].to_string();
 
-        if let Some(builtin) = context.shell.builtins().get(&builtin_name) {
+        if let Some(builtin) = context.shell.builtins().get(&builtin_name)
+            && !builtin.disabled
+        {
             context.command_name = builtin_name;
             (builtin.execute_func)(context, args).await
         } else {

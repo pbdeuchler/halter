@@ -3,6 +3,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -58,9 +59,27 @@ const _: () = {
     }
 };
 
+/// Number of read-only connections kept for concurrent reads. WAL mode lets
+/// these serve `load`/`replay`/`list` while a write transaction is open on
+/// the single writer connection.
+const READ_POOL_SIZE: usize = 4;
+
 /// Sqlite-backed session store.
+///
+/// Writes (`create_session`, `commit`) serialize through one writer
+/// connection; reads round-robin across a small pool of read-only WAL
+/// connections so they neither block each other nor wait on writers. For
+/// `:memory:` databases the pool is empty (each in-memory connection would
+/// open a distinct database) and reads fall back to the writer connection.
 pub struct SqliteSessionStore {
-    connection: Arc<Mutex<Connection>>,
+    writer: Arc<Mutex<Connection>>,
+    readers: Arc<ReadPool>,
+}
+
+/// Round-robin pool of read-only connections.
+struct ReadPool {
+    connections: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
 }
 
 impl SqliteSessionStore {
@@ -87,14 +106,27 @@ impl SqliteSessionStore {
         run_migrations(&mut connection, MIGRATIONS)?;
         let schema_version = current_version(&connection)?;
 
+        let readers = if is_in_memory_path(path) {
+            Vec::new()
+        } else {
+            (0..READ_POOL_SIZE)
+                .map(|_| open_read_connection(path).map(Mutex::new))
+                .collect::<Result<Vec<_>>>()?
+        };
+
         info!(
             path = %path.display(),
             schema_version,
+            read_pool = readers.len(),
             "opened sqlite session store"
         );
 
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            writer: Arc::new(Mutex::new(connection)),
+            readers: Arc::new(ReadPool {
+                connections: readers,
+                next: AtomicUsize::new(0),
+            }),
         })
     }
 
@@ -109,7 +141,7 @@ impl SqliteSessionStore {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let connection = Arc::clone(&self.connection);
+        let connection = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || {
             let mut guard = connection
                 .lock()
@@ -119,6 +151,46 @@ impl SqliteSessionStore {
         .await
         .context("failed to join sqlite session store task")?
     }
+
+    async fn with_read_conn<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.readers.connections.is_empty() {
+            return self.with_conn(move |conn| f(conn)).await;
+        }
+        let readers = Arc::clone(&self.readers);
+        tokio::task::spawn_blocking(move || {
+            let index = readers.next.fetch_add(1, Ordering::Relaxed) % readers.connections.len();
+            let guard = readers.connections[index]
+                .lock()
+                .map_err(|_| anyhow::anyhow!("failed to lock sqlite session store connection"))?;
+            f(&guard)
+        })
+        .await
+        .context("failed to join sqlite session store task")?
+    }
+}
+
+fn open_read_connection(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "failed to open read-only sqlite session store connection at {}",
+            path.display()
+        )
+    })?;
+    connection
+        .busy_timeout(Duration::from_millis(5_000))
+        .context("failed to set sqlite busy timeout")?;
+    connection
+        .pragma_update(None, "cache_size", -8_000i64)
+        .context("failed to set sqlite cache size")?;
+    Ok(connection)
 }
 
 #[async_trait]
@@ -134,7 +206,7 @@ impl SessionStore for SqliteSessionStore {
         let session_id = session_id.clone();
         let log_session_id = session_id.clone();
         let loaded = self
-            .with_conn(move |conn| load_session_with_conn(conn, &session_id))
+            .with_read_conn(move |conn| load_session_with_conn(conn, &session_id))
             .await?;
         debug!(session_id = %log_session_id, found = loaded.is_some(), "loading sqlite session");
         Ok(loaded)
@@ -159,14 +231,14 @@ impl SessionStore for SqliteSessionStore {
         let session_id = session_id.clone();
         let log_session_id = session_id.clone();
         let events = self
-            .with_conn(move |conn| replay_with_conn(conn, &session_id))
+            .with_read_conn(move |conn| replay_with_conn(conn, &session_id))
             .await?;
         debug!(session_id = %log_session_id, event_count = events.len(), "replaying sqlite session");
         Ok(events)
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionBlueprint>> {
-        let sessions = self.with_conn(list_sessions_with_conn).await?;
+        let sessions = self.with_read_conn(list_sessions_with_conn).await?;
         debug!(session_count = sessions.len(), "listing sqlite sessions");
         Ok(sessions)
     }
@@ -230,7 +302,7 @@ fn create_session_with_conn(conn: &mut Connection, session: StoredSession) -> Re
 }
 
 fn load_session_with_conn(
-    conn: &mut Connection,
+    conn: &Connection,
     session_id: &SessionId,
 ) -> Result<Option<StoredSession>> {
     let row = conn
@@ -305,9 +377,16 @@ fn commit_with_conn(
         })?;
 
     if let Some(expected_state) = expected_state.as_ref() {
-        let expected_state_json = serde_json::to_string(expected_state)
-            .context("failed to serialize expected session state")?;
-        if current_state_json != expected_state_json {
+        // Structural comparison, not JSON-string comparison: `SessionState`
+        // contains `IndexMap` fields whose `PartialEq` is order-insensitive
+        // while their JSON serialization is order-sensitive. Comparing
+        // deserialized values keeps this store's optimistic-concurrency
+        // semantics identical to `InMemorySessionStore` (see the
+        // `SessionStore::commit` contract and the shared conformance suite
+        // in tests/store_conformance.rs).
+        let current_state: SessionState = serde_json::from_str(&current_state_json)
+            .context("failed to deserialize current session state")?;
+        if current_state != *expected_state {
             return Err(SessionCommitConflict {
                 session_id: session_id.clone(),
             }
@@ -391,7 +470,7 @@ fn commit_with_conn(
     Ok(committed)
 }
 
-fn replay_with_conn(conn: &mut Connection, session_id: &SessionId) -> Result<Vec<SessionEvent>> {
+fn replay_with_conn(conn: &Connection, session_id: &SessionId) -> Result<Vec<SessionEvent>> {
     let mut statement = conn
         .prepare(
             "SELECT session_id, sequence, delivery, payload
@@ -426,7 +505,7 @@ fn replay_with_conn(conn: &mut Connection, session_id: &SessionId) -> Result<Vec
     Ok(events)
 }
 
-fn list_sessions_with_conn(conn: &mut Connection) -> Result<Vec<SessionBlueprint>> {
+fn list_sessions_with_conn(conn: &Connection) -> Result<Vec<SessionBlueprint>> {
     let mut statement = conn
         .prepare(
             "SELECT blueprint
@@ -683,6 +762,79 @@ mod tests {
                 .expect("table exists query");
             assert!(exists, "expected table '{table}' to exist");
         }
+    }
+
+    #[tokio::test]
+    async fn file_backed_store_serves_reads_through_read_pool() {
+        let dir = tempdir().expect("tempdir");
+        let store =
+            SqliteSessionStore::open(dir.path().join("sessions.db")).expect("open sqlite store");
+        assert_eq!(store.readers.connections.len(), READ_POOL_SIZE);
+
+        let session = test_session("pooled", "revision-a");
+        store
+            .create_session(session.clone())
+            .await
+            .expect("create session");
+        store
+            .commit(
+                &session.blueprint.session_id,
+                None,
+                None,
+                None,
+                vec![test_event("pooled-event", Delivery::Lossless)],
+            )
+            .await
+            .expect("commit event");
+
+        // More reads than pool slots so every read-only connection serves at
+        // least one query, concurrently.
+        let store = Arc::new(store);
+        let mut readers = Vec::new();
+        for _ in 0..READ_POOL_SIZE * 2 {
+            let store = Arc::clone(&store);
+            let session = session.clone();
+            readers.push(tokio::spawn(async move {
+                let loaded = store
+                    .load_session(&session.blueprint.session_id)
+                    .await
+                    .expect("load session")
+                    .expect("session exists");
+                assert_eq!(loaded.blueprint, session.blueprint);
+                assert_eq!(
+                    store
+                        .replay(&session.blueprint.session_id)
+                        .await
+                        .expect("replay events")
+                        .len(),
+                    1
+                );
+            }));
+        }
+        for reader in readers {
+            reader.await.expect("join read task");
+        }
+
+        assert_eq!(store.list_sessions().await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_reads_fall_back_to_writer_connection() {
+        let store = SqliteSessionStore::open(":memory:").expect("open sqlite store");
+        assert!(store.readers.connections.is_empty());
+
+        let session = test_session("fallback", "revision-a");
+        store
+            .create_session(session.clone())
+            .await
+            .expect("create session");
+        assert!(
+            store
+                .load_session(&session.blueprint.session_id)
+                .await
+                .expect("load session")
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -489,7 +489,7 @@ mod tests {
             .cloned()
             .expect("function handler");
 
-        let ConfiguredHandlerConfig::Function(callback) = handler.config else {
+        let ConfiguredHandlerConfig::Function(callback) = handler.config.clone() else {
             panic!("expected function handler");
         };
         let response = callback(HookInput {

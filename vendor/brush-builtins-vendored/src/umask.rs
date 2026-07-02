@@ -1,7 +1,7 @@
 use brush_core::{ErrorKind, ExecutionResult, builtins};
 use cfg_if::cfg_if;
 use clap::Parser;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 use nix::sys::stat::Mode;
 use std::io::Write;
 
@@ -23,13 +23,13 @@ pub(crate) struct UmaskCommand {
 impl builtins::Command for UmaskCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if let Some(mode) = &self.mode {
             if mode.starts_with(|c: char| c.is_digit(8)) {
-                let parsed = nix::sys::stat::mode_t::from_str_radix(mode.as_str(), 8)?;
+                let parsed = brush_core::int_utils::parse(mode.as_str(), 8)?;
                 set_umask(parsed)?;
             } else {
                 return brush_core::error::unimp("umask setting mode from symbolic value");
@@ -58,7 +58,7 @@ impl builtins::Command for UmaskCommand {
 }
 
 cfg_if! {
-    if #[cfg(target_os = "linux")] {
+    if #[cfg(any(target_os = "linux", target_os = "android"))] {
         fn get_umask() -> Result<u32, brush_core::Error> {
             let umask = procfs::process::Process::myself().ok().and_then(|me| me.status().ok()).and_then(|status| status.umask);
             umask.ok_or_else(|| brush_core::ErrorKind::InvalidUmask.into())

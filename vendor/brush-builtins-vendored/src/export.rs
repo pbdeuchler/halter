@@ -5,6 +5,7 @@ use std::io::Write;
 use brush_core::{
     ExecutionExitCode, ExecutionResult, builtins,
     env::{EnvironmentLookup, EnvironmentScope},
+    parser::ast,
     variables,
 };
 
@@ -40,9 +41,9 @@ impl builtins::DeclarationCommand for ExportCommand {
 impl builtins::Command for ExportCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        mut context: brush_core::ExecutionContext<'_>,
+        mut context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.declarations.is_empty() {
             display_all_exported_vars(&context)?;
@@ -64,7 +65,7 @@ impl builtins::Command for ExportCommand {
 impl ExportCommand {
     fn process_decl(
         &self,
-        context: &mut brush_core::ExecutionContext<'_>,
+        context: &mut brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
         decl: &brush_core::CommandArg,
     ) -> Result<ExecutionResult, brush_core::Error> {
         match decl {
@@ -86,7 +87,7 @@ impl ExportCommand {
                 }
                 // Try to find the variable already present; if we find it, then mark it
                 // exported.
-                else if let Some((_, variable)) = context.shell.env.get_mut(s) {
+                else if let Some((_, variable)) = context.shell.env_mut().get_mut(s) {
                     if self.unexport {
                         variable.unexport();
                     } else {
@@ -96,18 +97,18 @@ impl ExportCommand {
             }
             brush_core::CommandArg::Assignment(assignment) => {
                 let name = match &assignment.name {
-                    brush_parser::ast::AssignmentName::VariableName(name) => name,
-                    brush_parser::ast::AssignmentName::ArrayElementName(_, _) => {
+                    ast::AssignmentName::VariableName(name) => name,
+                    ast::AssignmentName::ArrayElementName(_, _) => {
                         writeln!(context.stderr(), "not a valid variable name")?;
                         return Ok(ExecutionExitCode::InvalidUsage.into());
                     }
                 };
 
                 let value = match &assignment.value {
-                    brush_parser::ast::AssignmentValue::Scalar(s) => {
+                    ast::AssignmentValue::Scalar(s) => {
                         variables::ShellValueLiteral::Scalar(s.flatten())
                     }
-                    brush_parser::ast::AssignmentValue::Array(a) => {
+                    ast::AssignmentValue::Array(a) => {
                         variables::ShellValueLiteral::Array(variables::ArrayLiteral(
                             a.iter()
                                 .map(|(k, v)| (k.as_ref().map(|k| k.flatten()), v.flatten()))
@@ -117,7 +118,7 @@ impl ExportCommand {
                 };
 
                 // Update the variable with the provided value and then mark it exported.
-                context.shell.env.update_or_add(
+                context.shell.env_mut().update_or_add(
                     name,
                     value,
                     |var| {
@@ -139,10 +140,10 @@ impl ExportCommand {
 }
 
 fn display_all_exported_vars(
-    context: &brush_core::ExecutionContext<'_>,
+    context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
 ) -> Result<(), brush_core::Error> {
     // Enumerate variables, sorted by key.
-    for (name, variable) in context.shell.env.iter().sorted_by_key(|v| v.0) {
+    for (name, variable) in context.shell.env().iter().sorted_by_key(|v| v.0) {
         if variable.is_exported() {
             let value = variable.value().try_get_cow_str(context.shell);
             if let Some(value) = value {

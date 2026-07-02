@@ -173,6 +173,32 @@ X-Trace-Id = "halter-dev"
 Header names must be ASCII graphic characters with no colons; values must be
 non-empty. Validation rejects malformed entries at load time.
 
+Provider-level resilience overrides inherit from the global `[resilience]`
+block and can override only the fields that need to differ:
+
+```toml
+[resilience.timeouts]
+connect_secs = 10
+request_secs = 60
+stream_idle_secs = 60
+
+[resilience.request_retry]
+max_attempts = 5
+deadline_secs = 60
+base_backoff_ms = 500
+max_backoff_secs = 30
+jitter_pct = 25
+
+[providers.openrouter.resilience.request_retry]
+max_attempts = 3
+```
+
+For streaming calls, `request_secs` bounds request setup through response
+headers and `stream_idle_secs` bounds the idle gap between stream items; it is
+not a total stream lifetime cap. `max_attempts` includes the initial provider
+request. Timeout and retry values must be positive, and `jitter_pct` must be in
+`0..=100`.
+
 ### Resolution rules
 
 `resolve_provider_runtime_config(...)` resolves provider settings this way:

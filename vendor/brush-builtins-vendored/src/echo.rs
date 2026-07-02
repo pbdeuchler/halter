@@ -29,7 +29,7 @@ impl builtins::Command for EchoCommand {
 
     /// Override the default [`builtins::Command::new`] function to handle clap's limitation related
     /// to `--`. See [`builtins::parse_known`] for more information
-    /// TODO: we can safely remove this after the issue is resolved
+    /// TODO(echo): we can safely remove this after the issue is resolved
     fn new<I>(args: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = String>,
@@ -41,9 +41,9 @@ impl builtins::Command for EchoCommand {
         Ok(this)
     }
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut trailing_newline = !self.no_trailing_newline;
         let mut s;

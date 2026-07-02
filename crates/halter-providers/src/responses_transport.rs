@@ -9,6 +9,7 @@ use async_openai::{
 };
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
+use halter_protocol::ProviderError;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Client as ReqwestClient, Response, StatusCode};
 use serde_json::Value;
@@ -20,12 +21,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::header_overrides::HeaderOverrides;
+use crate::http_client::{join_url, provider_http_clients};
 use crate::openai_error::{
-    Retryability, SYNTHETIC_SERVER_ERROR_CODE, classify, openai_api_error_retry_after,
-    parse_openai_http_error, parse_openai_stream_error,
+    SYNTHETIC_SERVER_ERROR_CODE, classify, openai_api_error_retry_after, parse_openai_http_error,
+    parse_openai_stream_error,
 };
 use crate::openai_rate_limit::{OpenAiRateLimitPermit, OpenAiRateLimiter};
 use crate::openai_rate_limit_policy::OpenAiReservation;
+use crate::resilience::ProviderTimeouts;
 use crate::secret::SecretString;
 
 /// Result of a transport-layer call. The variant carries the retryability
@@ -56,30 +59,64 @@ pub(crate) enum TransportError {
 
 impl TransportError {
     pub(crate) fn from_openai(source: OpenAIError) -> Self {
-        match classify(&source) {
-            Retryability::Retryable { backoff_hint } => Self::Retryable {
+        let retryability = classify(&source);
+        if retryability.kind.retryable() {
+            Self::Retryable {
                 source,
-                backoff_hint,
-            },
-            Retryability::Fatal => Self::Fatal { source },
+                backoff_hint: retryability.backoff_hint,
+            }
+        } else {
+            Self::Fatal { source }
         }
     }
 
     pub(crate) fn from_reqwest(error: reqwest::Error, label: &str) -> Self {
         let wrapped = OpenAIError::Reqwest(error);
-        match classify(&wrapped) {
-            Retryability::Retryable { backoff_hint } => Self::Retryable {
+        let retryability = classify(&wrapped);
+        if retryability.kind.retryable() {
+            Self::Retryable {
                 source: OpenAIError::ApiError(ApiError {
                     message: format!("failed to execute {label} request: {wrapped}"),
                     r#type: None,
                     param: None,
                     code: Some(SYNTHETIC_SERVER_ERROR_CODE.to_owned()),
                 }),
-                backoff_hint,
-            },
-            Retryability::Fatal => Self::Fatal { source: wrapped },
+                backoff_hint: retryability.backoff_hint,
+            }
+        } else {
+            Self::Fatal { source: wrapped }
         }
     }
+}
+
+/// Convert a [`TransportError`] to a typed [`ProviderError`], preserving the
+/// retryability decision and any backoff hint.
+pub(crate) fn provider_error_from_transport(error: TransportError) -> ProviderError {
+    match error {
+        TransportError::Cancelled => ProviderError::cancelled(),
+        TransportError::Retryable {
+            source,
+            backoff_hint,
+        } => provider_error_from_openai(source).with_backoff_hint(backoff_hint),
+        TransportError::Fatal { source } => provider_error_from_openai(source),
+    }
+}
+
+/// Convert an `OpenAIError` to a typed `ProviderError`. Centralizing the
+/// formatting here ensures every error string has the same prefix.
+pub(crate) fn provider_error_from_openai(error: OpenAIError) -> ProviderError {
+    let retryability = classify(&error);
+    let message = match &error {
+        OpenAIError::ApiError(api_error) => {
+            format!("failed to execute provider request: {}", api_error.message)
+        }
+        OpenAIError::JSONDeserialize(json_error, content) => format!(
+            "failed to execute provider request: failed to deserialize api response: error:{json_error} content:{content}"
+        ),
+        other => format!("failed to execute provider request: {other}"),
+    };
+    ProviderError::with_kind(message, retryability.kind)
+        .with_backoff_hint(retryability.backoff_hint)
 }
 
 const RESPONSES_PATH: &str = "/v1/responses";
@@ -127,7 +164,8 @@ pub(crate) struct ResponsesTransportRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesTransport {
-    client: ReqwestClient,
+    unary_client: ReqwestClient,
+    streaming_client: ReqwestClient,
     bearer_token: SecretString,
     base_url: String,
     endpoint_mode: ResponsesEndpointMode,
@@ -136,6 +174,7 @@ pub(crate) struct ResponsesTransport {
 }
 
 impl ResponsesTransport {
+    #[cfg(test)]
     pub(crate) fn try_new(
         bearer_token: impl Into<SecretString>,
         base_url: impl Into<String>,
@@ -146,6 +185,7 @@ impl ResponsesTransport {
             base_url,
             header_overrides,
             ResponsesEndpointMode::PublicApi,
+            ProviderTimeouts::default(),
         )
     }
 
@@ -154,17 +194,16 @@ impl ResponsesTransport {
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
         endpoint_mode: ResponsesEndpointMode,
+        timeouts: ProviderTimeouts,
     ) -> anyhow::Result<Self> {
         let bearer_token = bearer_token.into();
         let base_url = base_url.into();
-        let client = ReqwestClient::builder()
-            .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("failed to build responses transport client")?;
+        let (unary_client, streaming_client) = provider_http_clients(timeouts)?;
 
         Ok(Self {
             openai_rate_limiter: OpenAiRateLimiter::new(&bearer_token, &base_url),
-            client,
+            unary_client,
+            streaming_client,
             bearer_token,
             base_url,
             endpoint_mode,
@@ -180,6 +219,7 @@ impl ResponsesTransport {
     ) -> Result<ResponseStream, TransportError> {
         let response = self
             .send_json_request(
+                &self.streaming_client,
                 RESPONSES_PATH,
                 request,
                 request_meta.clone(),
@@ -206,6 +246,7 @@ impl ResponsesTransport {
         let provider_label = request_meta.provider_label;
         let response = self
             .send_json_request(
+                &self.unary_client,
                 RESPONSES_COMPACT_PATH,
                 request,
                 request_meta,
@@ -231,7 +272,13 @@ impl ResponsesTransport {
     ) -> anyhow::Result<Value> {
         let provider_label = request_meta.provider_label;
         let response = self
-            .send_json_request(RESPONSES_PATH, request, request_meta, cancel.child_token())
+            .send_json_request(
+                &self.unary_client,
+                RESPONSES_PATH,
+                request,
+                request_meta,
+                cancel.child_token(),
+            )
             .await
             .map_err(transport_error_to_anyhow)?;
         select! {
@@ -243,6 +290,7 @@ impl ResponsesTransport {
 
     async fn send_json_request(
         &self,
+        client: &ReqwestClient,
         path: &str,
         request: Value,
         request_meta: ResponsesTransportRequest,
@@ -283,8 +331,7 @@ impl ResponsesTransport {
                     code: None,
                 }),
             })?;
-        let request_builder = self
-            .client
+        let request_builder = client
             .post(provider_url(&self.base_url, path, self.endpoint_mode))
             .headers(headers)
             .body(body_bytes);
@@ -360,13 +407,16 @@ impl ResponsesTransport {
     }
 }
 
+/// Preserve the transport's retryability classification in the returned
+/// `anyhow` error so callers (e.g. `ResilientProvider::compact`) can recover
+/// the typed [`ProviderError`] by downcast instead of re-classifying text.
 fn transport_error_to_anyhow(error: TransportError) -> anyhow::Error {
-    anyhow::anyhow!("failed to execute provider request: {error}")
+    anyhow::Error::new(provider_error_from_transport(error))
 }
 
 fn provider_url(base_url: &str, path: &str, endpoint_mode: ResponsesEndpointMode) -> String {
     match endpoint_mode {
-        ResponsesEndpointMode::PublicApi => public_provider_url(base_url, path),
+        ResponsesEndpointMode::PublicApi => join_url(base_url, path),
         ResponsesEndpointMode::ChatGptCodexOAuth => {
             if is_chatgpt_codex_rewrite_path(path) {
                 // ChatGPT-issued OAuth tokens are not accepted by OpenAI's
@@ -379,7 +429,7 @@ fn provider_url(base_url: &str, path: &str, endpoint_mode: ResponsesEndpointMode
                 // not public OpenAI Platform API behavior.
                 CHATGPT_CODEX_RESPONSES_URL.to_owned()
             } else {
-                public_provider_url(base_url, path)
+                join_url(base_url, path)
             }
         }
     }
@@ -392,10 +442,6 @@ fn is_chatgpt_codex_rewrite_path(path: &str) -> bool {
 fn is_responses_path_or_child(path: &str) -> bool {
     path.strip_prefix(RESPONSES_PATH)
         .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-}
-
-fn public_provider_url(base_url: &str, path: &str) -> String {
-    format!("{}{}", base_url.trim_end_matches('/'), path)
 }
 
 #[derive(Debug, Clone)]
@@ -580,11 +626,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
     use crate::openai_rate_limit_policy::estimate_openai_request_cost;
+    use crate::test_http::read_http_request;
 
     #[test]
     fn provider_url_resolves_public_api_paths_against_base_url() {
@@ -861,43 +908,6 @@ mod tests {
         let _ = server.await;
     }
 
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<()> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
-
-        loop {
-            let read = socket.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(headers_end) = find_headers_end(&buffer) {
-                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    })
-                    .unwrap_or(0);
-                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
-                if body_bytes >= content_length {
-                    return Ok(());
-                }
-            }
-        }
-
-        anyhow::bail!("incomplete http request")
-    }
-
-    fn find_headers_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n")
-    }
-
     // AC2.3: Integration test verifying that send_json_request error branch
     // threads TPM into apply_retry_after when decoding a 429 error with a
     // retry-after hint in the JSON body.
@@ -915,8 +925,7 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept");
             // Read & discard the request bytes.
-            let mut buf = [0u8; 4096];
-            let _ = socket.read(&mut buf).await;
+            let _ = read_http_request(&mut socket).await;
 
             let body = serde_json::json!({
                 "error": {

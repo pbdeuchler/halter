@@ -4,6 +4,14 @@ on:
   push:
   pull_request:
 
+# Cancel superseded runs on the same ref (push + PR triggers otherwise
+# duplicate work on PR branches).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Cargo.lock is intentionally gitignored, so cargo invocations here run
+# without `--locked` and resolve fresh dependency versions per run.
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -14,5 +22,46 @@ jobs:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
       - run: cargo test --workspace --all-features
+
+  # The no-sqlite default build is what most library consumers get; compile
+  # and test it explicitly.
+  default-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # Keep the toolchain version in sync with `rust-version` in Cargo.toml.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features --all-targets
+      - run: cargo test --workspace --all-features
+
+  # Compiles the `#[cfg(windows)]` branches natively (check only, no tests).
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features --all-targets
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo generate-lockfile
+      - run: cargo audit

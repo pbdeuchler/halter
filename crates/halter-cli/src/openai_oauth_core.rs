@@ -153,10 +153,10 @@ pub(crate) fn api_key_exchange_readiness(
     }
 
     let auth_claim = payload.get(OPENAI_AUTH_CLAIM);
-    if let Some(auth_claim) = auth_claim {
-        if has_non_empty_string(auth_claim.get("organization_id")) {
-            return Ok(ApiKeyExchangeReadiness::Ready);
-        }
+    if let Some(auth_claim) = auth_claim
+        && has_non_empty_string(auth_claim.get("organization_id"))
+    {
+        return Ok(ApiKeyExchangeReadiness::Ready);
     }
 
     Ok(ApiKeyExchangeReadiness::MissingOrganizationId {

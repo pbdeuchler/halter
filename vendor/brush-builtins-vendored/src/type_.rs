@@ -1,11 +1,10 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use brush_parser::ast;
 use clap::Parser;
 
-use brush_core::sys::fs::PathExt;
-use brush_core::{ExecutionResult, Shell, builtins};
+use brush_core::sys::{self, fs::PathExt};
+use brush_core::{ExecutionResult, Shell, builtins, parser::ast};
 
 /// Inspect the type of a named shell item.
 #[derive(Parser)]
@@ -46,9 +45,9 @@ enum ResolvedType<'a> {
 impl builtins::Command for TypeCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut result = ExecutionResult::success();
 
@@ -92,7 +91,7 @@ impl builtins::Command for TypeCommand {
                 } else {
                     match resolved_type {
                         ResolvedType::Alias(target) => {
-                            writeln!(context.stdout(), "{name} is aliased to '{target}'")?;
+                            writeln!(context.stdout(), "{name} is aliased to `{target}'")?;
                         }
                         ResolvedType::Keyword => {
                             writeln!(context.stdout(), "{name} is a shell keyword")?;
@@ -141,12 +140,16 @@ impl builtins::Command for TypeCommand {
 }
 
 impl TypeCommand {
-    fn resolve_types<'a>(&self, shell: &'a Shell, name: &str) -> Vec<ResolvedType<'a>> {
+    fn resolve_types<'a, SE: brush_core::ShellExtensions>(
+        &self,
+        shell: &'a Shell<SE>,
+        name: &str,
+    ) -> Vec<ResolvedType<'a>> {
         let mut types = vec![];
 
         if !self.force_path_search {
             // Check for aliases.
-            if let Some(a) = shell.aliases.get(name) {
+            if let Some(a) = shell.aliases().get(name) {
                 types.push(ResolvedType::Alias(a.clone()));
                 if !self.all_locations {
                     return types;
@@ -181,7 +184,7 @@ impl TypeCommand {
         }
 
         // Look in path.
-        if name.contains(std::path::MAIN_SEPARATOR) {
+        if sys::fs::contains_path_separator(name) {
             if shell.absolute_path(Path::new(name)).executable() {
                 types.push(ResolvedType::File {
                     path: PathBuf::from(name),
@@ -193,7 +196,7 @@ impl TypeCommand {
                 }
             }
         } else {
-            if let Some(path) = shell.program_location_cache.get(name) {
+            if let Some(path) = shell.program_location_cache().get(name) {
                 types.push(ResolvedType::File { path, hashed: true });
                 if !self.all_locations {
                     return types;

@@ -67,6 +67,13 @@ struct TurnOutcome {
 
 const PARENT_HOOK_DISPATCH_MAX_RETRIES: usize = 3;
 
+/// Upper bound on `SubagentStop`-hook-driven turn resubmissions per subagent
+/// task. A hook that returns a `block_reason` resubmits the blocked turn with
+/// that reason as input; a hook that *always* blocks would otherwise loop
+/// forever (each resubmission is a full provider turn). Tripping the cap
+/// fails the subagent with a descriptive error instead.
+const SUBAGENT_STOP_RESUBMISSION_CAP: u32 = 8;
+
 fn active_subagent_count(registry: &SubagentRegistry) -> usize {
     registry
         .entries
@@ -192,7 +199,7 @@ impl RuntimeSubagentControl {
         let task_cancel = cancel.clone();
         let controller = self.clone();
         let session = HalterSession::new(services.clone(), task_session_id.clone())?;
-        let mut join_handle = Some(tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
             controller
                 .run_turn_task(
                     task_agent_id,
@@ -205,22 +212,26 @@ impl RuntimeSubagentControl {
                     session,
                 )
                 .await;
-        }));
+        });
 
         let mut registry = self.inner.registry.lock().await;
-        let entry = registry.entries.get_mut(&agent_id.0).with_context(|| {
-            format!(
-                "failed to execute subagent request: unknown agent '{}'",
-                agent_id.0
-            )
-        })?;
-        if entry.generation == generation && matches!(entry.status.state, SubagentState::Running) {
-            entry.running = Some(RunningTurn {
+        let orphan = register_running_turn(
+            &mut registry,
+            agent_id,
+            generation,
+            RunningTurn {
                 cancel,
-                join_handle: join_handle.take().expect("join handle set"),
-            });
-        }
+                join_handle,
+            },
+        );
         drop(registry);
+        if let Some(orphan) = orphan {
+            // `close` (or entry removal) raced the spawn before the turn was
+            // registered, so its cancel/abort found nothing to stop. Stop the
+            // freshly spawned task here instead of silently detaching it.
+            orphan.cancel.cancel();
+            orphan.join_handle.abort();
+        }
         self.signal_change();
         info!(
             agent_id = %status.agent_id,
@@ -244,6 +255,7 @@ impl RuntimeSubagentControl {
         session: HalterSession,
     ) {
         let mut next_input = message;
+        let mut resubmissions = 0u32;
         let outcome = loop {
             let turn_events = match session
                 .submit_turn_with_cancel(Turn::user(next_input.clone()), cancel.clone())
@@ -322,6 +334,20 @@ impl RuntimeSubagentControl {
             };
 
             if let Some(next_message) = continuation {
+                // Bounded: a SubagentStop hook that always blocks must not
+                // resubmit turns forever (each resubmission is a full
+                // provider turn).
+                if resubmissions >= SUBAGENT_STOP_RESUBMISSION_CAP {
+                    break TurnOutcome {
+                        state: SubagentState::Failed,
+                        last_message: None,
+                        usage: extract_subagent_usage(&own_turn_events),
+                        error: Some(format!(
+                            "subagent stop hooks kept blocking; resubmission cap of {SUBAGENT_STOP_RESUBMISSION_CAP} reached"
+                        )),
+                    };
+                }
+                resubmissions += 1;
                 next_input = next_message;
                 continue;
             }
@@ -487,6 +513,9 @@ impl RuntimeSubagentControl {
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
+        // Parent hook dispatch runs outside any turn scope; the token never
+        // fires.
+        let hook_cancel = CancellationToken::new();
         let dispatch = run_subagent_start(
             &session,
             &fired_hook_ids,
@@ -494,6 +523,7 @@ impl RuntimeSubagentControl {
                 turn_id: &turn_id,
                 model: &stored.blueprint.default_model,
                 working_dir: &stored.blueprint.working_dir,
+                cancel: &hook_cancel,
             },
             &status.agent_id,
             status
@@ -538,6 +568,9 @@ impl RuntimeSubagentControl {
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
+        // Parent hook dispatch runs outside any turn scope; the token never
+        // fires.
+        let hook_cancel = CancellationToken::new();
         let dispatch = run_subagent_stop(
             &session,
             &fired_hook_ids,
@@ -545,6 +578,7 @@ impl RuntimeSubagentControl {
                 turn_id: &turn_id,
                 model: &stored.blueprint.default_model,
                 working_dir: &stored.blueprint.working_dir,
+                cancel: &hook_cancel,
             },
             agent_id,
             agent_type.map_or("default", |agent_type| agent_type.0.as_str()),
@@ -757,6 +791,31 @@ impl SubagentControl for RuntimeSubagentControl {
         );
         self.signal_change();
         Ok(CloseSubagentResponse { previous_status })
+    }
+}
+
+/// Register `running` for `agent_id` when the entry is still at the spawning
+/// generation and in the `Running` state; otherwise hand the turn back to the
+/// caller as an orphan that must be cancelled and aborted. `close` can race
+/// `start_turn` in the window between task spawn and registration: it bumps
+/// the generation (and may mark the entry `Closed`) but finds no
+/// `RunningTurn` to stop, so the raced spawn would otherwise run a full
+/// uncancelled provider turn after the agent was closed.
+fn register_running_turn(
+    registry: &mut SubagentRegistry,
+    agent_id: &AgentId,
+    generation: u64,
+    running: RunningTurn,
+) -> Option<RunningTurn> {
+    match registry.entries.get_mut(&agent_id.0) {
+        Some(entry)
+            if entry.generation == generation
+                && matches!(entry.status.state, SubagentState::Running) =>
+        {
+            entry.running = Some(running);
+            None
+        }
+        _ => Some(running),
     }
 }
 
@@ -1098,6 +1157,13 @@ mod tests {
     }
 
     fn test_services(provider: Arc<dyn Provider>) -> Arc<RuntimeServices> {
+        test_services_with_hooks(provider, halter_hooks::RegisteredHooks::default())
+    }
+
+    fn test_services_with_hooks(
+        provider: Arc<dyn Provider>,
+        registered_hooks: halter_hooks::RegisteredHooks,
+    ) -> Arc<RuntimeServices> {
         let mut models = ModelRegistry::new();
         models.set_default_model(ResolvedModel {
             role: ModelRole::default(),
@@ -1131,7 +1197,7 @@ mod tests {
                 Arc::new(halter_hooks::Hooks::default()),
                 Vec::new(),
             )),
-            registered_hooks: Arc::new(halter_hooks::RegisteredHooks::default()),
+            registered_hooks: Arc::new(registered_hooks),
             session_hook_store: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             models: Arc::new(models),
             tools: Arc::new(ToolRuntime::new()),
@@ -1149,6 +1215,253 @@ mod tests {
             shell_timeout_secs: 30,
             trace_recorder: None,
         })
+    }
+
+    /// Persist the parent session so `run_subagent_stop_hooks` can load it
+    /// and dispatch `SubagentStop` hooks against real parent state.
+    async fn store_parent_session(services: &Arc<RuntimeServices>, parent: &SubagentParentContext) {
+        services
+            .sessions
+            .create_session(halter_session::StoredSession {
+                blueprint: parent.blueprint.clone(),
+                state: parent.state.clone(),
+                snapshot: parent.snapshot.clone(),
+            })
+            .await
+            .expect("store parent session");
+    }
+
+    /// Regression (M4): a `SubagentStop` hook that always blocks must not
+    /// resubmit turns forever — the resubmission cap fails the subagent with
+    /// a descriptive error after a bounded number of full provider turns.
+    #[tokio::test]
+    async fn always_blocking_stop_hook_trips_resubmission_cap() {
+        let provider_requests = Arc::new(Mutex::new(Vec::<ProviderRequest>::new()));
+        let mut registered = halter_hooks::RegisteredHooks::default();
+        registered.register(
+            halter_protocol::PluginId::from("internal"),
+            halter_hooks::RegisteredHookPriority::AfterPlugins,
+            halter_hooks::Hook::callback(
+                halter_hooks::HookEventName::SubagentStop,
+                |_input| async move { halter_hooks::HookResponse::block("do it again") },
+            ),
+        );
+        let services = test_services_with_hooks(
+            Arc::new(RecordingProvider::new(provider_requests.clone())),
+            registered,
+        );
+        let control = RuntimeSubagentControl::new(services.clone());
+        let parent = parent_context();
+        store_parent_session(&services, &parent).await;
+        // Keep a parent handle alive for the whole run, as a real parent
+        // session would while its subagents are managed.
+        let _parent_handle =
+            HalterSession::new(services.clone(), parent.blueprint.session_id.clone())
+                .expect("parent handle");
+
+        let spawned = control
+            .spawn(
+                &parent,
+                SpawnSubagentRequest {
+                    message: "delegate this".to_owned(),
+                    agent_type: None,
+                    fork_context: false,
+                    model: None,
+                },
+            )
+            .await
+            .expect("spawn");
+        let waited = control
+            .wait(WaitSubagentRequest {
+                targets: vec![spawned.agent_id],
+                timeout_ms: Some(30_000),
+            })
+            .await
+            .expect("wait");
+
+        let status = waited.status.expect("terminal status");
+        assert_eq!(status.state, SubagentState::Failed);
+        let error = status.error.expect("cap error");
+        assert!(
+            error.contains("resubmission cap of 8 reached"),
+            "unexpected error: {error}"
+        );
+        // Initial turn + capped resubmissions, then the loop stops.
+        assert_eq!(
+            provider_requests.lock().expect("requests").len(),
+            9,
+            "provider turns must stop at the cap"
+        );
+    }
+
+    /// Regression (H1): `SubagentStop` dispatch builds temporary parent
+    /// handles; dropping one between dispatches used to evict the parent's
+    /// hook-store entry, so the next dispatch saw freshly instantiated
+    /// (stateless) hooks. A stateful hook that blocks only on its first
+    /// invocation proves state now survives across dispatches: the subagent
+    /// completes after exactly one resubmission instead of looping to the cap.
+    #[tokio::test]
+    async fn stop_hook_state_persists_across_subagent_dispatches() {
+        let provider_requests = Arc::new(Mutex::new(Vec::<ProviderRequest>::new()));
+        let mut registered = halter_hooks::RegisteredHooks::default();
+        registered.register(
+            halter_protocol::PluginId::from("internal"),
+            halter_hooks::RegisteredHookPriority::AfterPlugins,
+            halter_hooks::Hook::function(halter_hooks::HookEventName::SubagentStop, || {
+                let calls = Arc::new(Mutex::new(0usize));
+                move |_input| {
+                    let calls = calls.clone();
+                    async move {
+                        let mut calls = calls.lock().expect("calls");
+                        *calls += 1;
+                        if *calls == 1 {
+                            halter_hooks::HookResponse::block("one more pass")
+                        } else {
+                            halter_hooks::HookResponse::passthrough()
+                        }
+                    }
+                }
+            }),
+        );
+        let services = test_services_with_hooks(
+            Arc::new(RecordingProvider::new(provider_requests.clone())),
+            registered,
+        );
+        let control = RuntimeSubagentControl::new(services.clone());
+        let parent = parent_context();
+        store_parent_session(&services, &parent).await;
+        let _parent_handle =
+            HalterSession::new(services.clone(), parent.blueprint.session_id.clone())
+                .expect("parent handle");
+
+        let spawned = control
+            .spawn(
+                &parent,
+                SpawnSubagentRequest {
+                    message: "delegate this".to_owned(),
+                    agent_type: None,
+                    fork_context: false,
+                    model: None,
+                },
+            )
+            .await
+            .expect("spawn");
+        let waited = control
+            .wait(WaitSubagentRequest {
+                targets: vec![spawned.agent_id],
+                timeout_ms: Some(30_000),
+            })
+            .await
+            .expect("wait");
+
+        let status = waited.status.expect("terminal status");
+        assert_eq!(
+            status.state,
+            SubagentState::Completed,
+            "hook state was lost between dispatches: {:?}",
+            status.error
+        );
+        // First turn blocked once, second turn passed through.
+        assert_eq!(provider_requests.lock().expect("requests").len(), 2);
+    }
+
+    /// Regression (M3): when `close` races `start_turn` in the window between
+    /// task spawn and registration, the spawned turn must be handed back as
+    /// an orphan for cancel+abort rather than registered or silently
+    /// detached.
+    #[tokio::test]
+    async fn register_running_turn_registers_current_and_orphans_stale_turns() {
+        fn registry_with(state: SubagentState, generation: u64) -> SubagentRegistry {
+            let mut registry = SubagentRegistry::default();
+            registry.entries.insert(
+                "agent".to_owned(),
+                RegisteredSubagent {
+                    status: SubagentStatus {
+                        agent_id: AgentId::from("agent"),
+                        session_id: SessionId::from("child"),
+                        agent_type: None,
+                        task: "task".to_owned(),
+                        state,
+                        last_message: None,
+                        usage: None,
+                        error: None,
+                    },
+                    generation,
+                    running: None,
+                },
+            );
+            registry
+        }
+
+        let cases = [
+            // (entry state, entry generation, should register)
+            (SubagentState::Running, 1u64, true),
+            // close bumped the generation before registration
+            (SubagentState::Running, 2, false),
+            // close marked the entry closed at the same generation
+            (SubagentState::Closed, 1, false),
+        ];
+        for (state, entry_generation, should_register) in cases {
+            let mut registry = registry_with(state, entry_generation);
+            let cancel = CancellationToken::new();
+            let join_handle = tokio::spawn(std::future::pending::<()>());
+            let orphan = register_running_turn(
+                &mut registry,
+                &AgentId::from("agent"),
+                1,
+                RunningTurn {
+                    cancel: cancel.clone(),
+                    join_handle,
+                },
+            );
+            let entry_running = registry
+                .entries
+                .get("agent")
+                .expect("entry")
+                .running
+                .is_some();
+            if should_register {
+                assert!(orphan.is_none(), "current turn must register");
+                assert!(entry_running, "registered turn must land on the entry");
+                let running = registry
+                    .entries
+                    .get_mut("agent")
+                    .expect("entry")
+                    .running
+                    .take()
+                    .expect("running turn");
+                running.join_handle.abort();
+            } else {
+                let orphan = orphan.expect("stale turn must be handed back");
+                assert!(!entry_running, "stale turn must not be registered");
+                // Caller contract: cancel and abort the orphan.
+                orphan.cancel.cancel();
+                orphan.join_handle.abort();
+                assert!(cancel.is_cancelled());
+            }
+        }
+
+        // Unknown agent: entry removed while spawning.
+        let mut registry = SubagentRegistry::default();
+        let join_handle = tokio::spawn(std::future::pending::<()>());
+        let orphan = register_running_turn(
+            &mut registry,
+            &AgentId::from("missing"),
+            1,
+            RunningTurn {
+                cancel: CancellationToken::new(),
+                join_handle,
+            },
+        );
+        let orphan = orphan.expect("turn for missing entry must be handed back");
+        orphan.join_handle.abort();
+        assert!(
+            orphan
+                .join_handle
+                .await
+                .expect_err("aborted task")
+                .is_cancelled()
+        );
     }
 
     fn parent_context() -> SubagentParentContext {

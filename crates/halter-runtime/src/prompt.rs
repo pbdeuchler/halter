@@ -123,8 +123,6 @@ pub fn skill_prompt_segment(name: &str, body: &str) -> PromptSegment {
 #[async_trait]
 impl PromptAssembler for DefaultPromptAssembler {
     async fn assemble(&self, plan: &ContextPlan) -> anyhow::Result<AssembledPrompt> {
-        let mut hasher = Sha256::new();
-
         // Group segments by kind so the on-wire layout is independent of
         // insertion order and so cache breakpoints land on stable section
         // boundaries rather than wherever an `Append` happened to be added.
@@ -141,10 +139,6 @@ impl PromptAssembler for DefaultPromptAssembler {
 
         let mut prefix_parts: Vec<String> = Vec::with_capacity(ordered_segments.len() + 8);
         for segment in &ordered_segments {
-            if matches!(segment.cache_scope, CacheScope::PrefixCacheable) {
-                hasher.update(segment.content_hash.as_bytes());
-                hasher.update(segment.text.as_bytes());
-            }
             prefix_parts.push(segment.text.clone());
         }
 
@@ -153,8 +147,6 @@ impl PromptAssembler for DefaultPromptAssembler {
         // turns while giving the model visibility into compacted earlier
         // conversation.
         for summary in &plan.carried_summaries {
-            hasher.update(summary.id.as_bytes());
-            hasher.update(summary.text.as_bytes());
             prefix_parts.push(summary.text.clone());
         }
 
@@ -162,13 +154,20 @@ impl PromptAssembler for DefaultPromptAssembler {
         // path. These sit after the last breakpoint, immediately before
         // the active transcript window.
         for item in &plan.compacted_prefix {
-            let serialized = stable_json(item);
-            hasher.update(serialized.as_bytes());
-            prefix_parts.push(serialized);
+            prefix_parts.push(stable_json(item));
         }
 
-        hasher.update(plan.cache_boundary_hash.as_bytes());
         let rendered_prefix = prefix_parts.join("\n\n");
+
+        // Invariant: `prefix_cache_key` fingerprints exactly the bytes of
+        // `rendered_prefix` (plus the plan's cache boundary hash), so two
+        // assemblies share a key iff their reusable prefixes are
+        // byte-identical. Dynamic `Append` segments render into the prefix
+        // and therefore must be covered too; hashing a subset would let the
+        // prefix change under a stable fingerprint.
+        let mut hasher = Sha256::new();
+        hasher.update(rendered_prefix.as_bytes());
+        hasher.update(plan.cache_boundary_hash.as_bytes());
 
         // Active conversation tail (mutable, uncached).
         let rendered_transcript = plan
@@ -194,6 +193,9 @@ impl PromptAssembler for DefaultPromptAssembler {
         );
 
         Ok(AssembledPrompt {
+            // `segments` preserves the plan's insertion order;
+            // `ordered_segments` is the provider-facing render order
+            // (system → skills → append) that runtime consumers use.
             segments: plan.prompt_segments.clone(),
             transcript: plan.transcript_window.messages.clone(),
             ordered_segments,
@@ -481,6 +483,69 @@ mod tests {
                 .rendered_prefix
                 .contains("earlier context was compacted")
         );
+    }
+
+    /// Regression: dynamic `Append` segments render into `rendered_prefix`
+    /// but were excluded from the fingerprint, so a hook-injected append
+    /// could change the prefix bytes under an unchanged cache key.
+    #[tokio::test]
+    async fn prefix_cache_key_changes_when_append_segment_changes() {
+        let assembler = DefaultPromptAssembler;
+        let append_segment = |text: &str| PromptSegment {
+            id: PromptSegmentId::new(),
+            text: text.to_owned(),
+            volatility: Volatility::TurnDynamic,
+            cache_scope: CacheScope::Dynamic,
+            content_hash: ContentHash::from("append"),
+            kind: PromptSegmentKind::Append,
+        };
+        let plan_with_append = |segment: PromptSegment| ContextPlan {
+            prompt_segments: vec![system_prompt_segment("system"), segment],
+            transcript_window: TranscriptWindow {
+                messages: vec![Message::User(UserMessage::text("hello"))],
+                elided_message_count: 0,
+            },
+            compacted_prefix: vec![],
+            file_views: Vec::new(),
+            carried_summaries: vec![],
+            elided_tool_results: Vec::new(),
+            memory_items: Vec::new(),
+            tool_specs: Vec::new(),
+            observed_state: ObservedState {
+                cwd: ".".into(),
+                git_branch: None,
+                git_dirty: None,
+                now_utc: Utc::now(),
+                env_facts: Default::default(),
+            },
+            projected_input_tokens: 10,
+            cache_boundary_hash: "boundary".to_owned(),
+            messages: vec![Message::User(UserMessage::text("hello"))],
+            estimated_tokens: 10,
+            compaction: None,
+            previous_response_id: None,
+            new_messages_start: 0,
+        };
+
+        let first = assembler
+            .assemble(&plan_with_append(append_segment("runtime hint A")))
+            .await
+            .expect("assemble first");
+        let changed = assembler
+            .assemble(&plan_with_append(append_segment("runtime hint B")))
+            .await
+            .expect("assemble changed");
+        let same = assembler
+            .assemble(&plan_with_append(append_segment("runtime hint A")))
+            .await
+            .expect("assemble same");
+
+        // The append text is part of the rendered prefix, so it must be
+        // covered by the fingerprint...
+        assert!(first.rendered_prefix.contains("runtime hint A"));
+        assert_ne!(first.prefix_cache_key, changed.prefix_cache_key);
+        // ...while byte-identical prefixes keep an identical key.
+        assert_eq!(first.prefix_cache_key, same.prefix_cache_key);
     }
 
     #[tokio::test]

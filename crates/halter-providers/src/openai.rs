@@ -1,19 +1,21 @@
 // pattern: Imperative Shell
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
+    ApiKind, CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
     ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::Provider;
+use crate::resilience::{ProviderErrorClassifier, ResiliencePolicy, ResilientProvider};
 use crate::responses_provider::{
     CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
 };
 use crate::responses_transport::{ResponsesEndpointMode, ResponsesRateLimitStrategy};
-use crate::retry::RetryPolicy;
 use crate::secret::SecretString;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +60,7 @@ impl OpenAiOAuthCredentials {
 #[derive(Debug, Clone)]
 /// OpenAI Responses API provider.
 pub struct OpenAiProvider {
-    inner: ResponsesProvider,
+    inner: ResilientProvider<ResponsesProvider>,
 }
 
 impl OpenAiProvider {
@@ -82,13 +84,34 @@ impl OpenAiProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_headers_and_resilience(
+            api_key,
+            base_url,
+            header_overrides,
+            temperature,
+            ResiliencePolicy::default(),
+            Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+    }
+
+    /// Same as [`OpenAiProvider::new_with_headers`] with an explicit
+    /// provider-request resilience policy and error classifier.
+    pub fn new_with_headers_and_resilience(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+        resilience_policy: ResiliencePolicy,
+        classifier: Arc<dyn ProviderErrorClassifier>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: ResponsesProvider::try_new(
-                config(),
+            inner: resilient_responses_provider(
+                config(resilience_policy),
                 api_key,
                 base_url,
                 header_overrides,
                 temperature,
+                classifier,
             )?,
         })
     }
@@ -122,18 +145,60 @@ impl OpenAiProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_oauth_headers_and_resilience(
+            credentials,
+            base_url,
+            header_overrides,
+            temperature,
+            ResiliencePolicy::default(),
+            Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+    }
+
+    /// Same as [`OpenAiProvider::new_with_oauth_and_headers`] with an explicit
+    /// provider-request resilience policy and error classifier.
+    pub fn new_with_oauth_headers_and_resilience(
+        credentials: OpenAiOAuthCredentials,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+        resilience_policy: ResiliencePolicy,
+        classifier: Arc<dyn ProviderErrorClassifier>,
+    ) -> anyhow::Result<Self> {
         credentials.validate()?;
         Ok(Self {
-            inner: ResponsesProvider::try_new_with_endpoint_mode(
-                oauth_config(),
-                credentials.access_token,
-                base_url,
-                header_overrides,
-                temperature,
-                ResponsesEndpointMode::ChatGptCodexOAuth,
-            )?,
+            inner: ResilientProvider::new_with_classifier(
+                "openai",
+                ResponsesProvider::try_new_with_endpoint_mode(
+                    oauth_config(resilience_policy),
+                    credentials.access_token,
+                    base_url,
+                    header_overrides,
+                    temperature,
+                    ResponsesEndpointMode::ChatGptCodexOAuth,
+                )?,
+                resilience_policy,
+                classifier,
+            ),
         })
     }
+}
+
+fn resilient_responses_provider(
+    config: ResponsesProviderConfig,
+    api_key: impl Into<SecretString>,
+    base_url: impl Into<String>,
+    header_overrides: &[(String, String)],
+    temperature: Option<f32>,
+    classifier: Arc<dyn ProviderErrorClassifier>,
+) -> anyhow::Result<ResilientProvider<ResponsesProvider>> {
+    let policy = config.resilience_policy;
+    Ok(ResilientProvider::new_with_classifier(
+        "openai",
+        ResponsesProvider::try_new(config, api_key, base_url, header_overrides, temperature)?,
+        policy,
+        classifier,
+    ))
 }
 
 #[async_trait]
@@ -151,6 +216,11 @@ impl Provider for OpenAiProvider {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+        if request.model.api_kind != ApiKind::OpenAiResponses {
+            anyhow::bail!(
+                "failed to execute provider request: openai provider requires openai_responses api kind"
+            );
+        }
         self.inner.stream(request, cancel).await
     }
 
@@ -163,7 +233,7 @@ impl Provider for OpenAiProvider {
     }
 }
 
-fn config() -> ResponsesProviderConfig {
+fn config(resilience_policy: ResiliencePolicy) -> ResponsesProviderConfig {
     ResponsesProviderConfig {
         label: "openai",
         capabilities: ProviderCapabilities {
@@ -191,12 +261,12 @@ fn config() -> ResponsesProviderConfig {
         },
         compact_strategy: Some(CompactStrategy::DedicatedEndpoint),
         rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
-        retry_policy: RetryPolicy::default(),
+        resilience_policy,
     }
 }
 
-fn oauth_config() -> ResponsesProviderConfig {
-    let mut config = config();
+fn oauth_config(resilience_policy: ResiliencePolicy) -> ResponsesProviderConfig {
+    let mut config = config(resilience_policy);
     // ChatGPT's private Codex endpoint rejects otherwise valid Responses
     // payloads unless `instructions` is a top-level field. Public OpenAI
     // accepts the developer-message shape, so keep this compatibility shim
@@ -230,10 +300,12 @@ mod tests {
         TurnId, UserMessage,
     };
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::test_http::{find_headers_end, read_http_request};
+    use crate::{ProviderTimeouts, RetryPolicy};
 
     #[tokio::test]
     async fn openai_provider_rejects_chat_api_kind() {
@@ -321,6 +393,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_provider_does_not_apply_request_timeout_to_active_stream_body() {
+        let base_url = spawn_slow_active_stream_server().await;
+        let policy = ResiliencePolicy {
+            timeouts: ProviderTimeouts {
+                connect: Duration::from_secs(1),
+                request: Duration::from_millis(20),
+                stream_idle: Duration::from_millis(250),
+            },
+            request_retry: RetryPolicy {
+                max_attempts: 1,
+                base_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                deadline: Duration::from_secs(1),
+                jitter_pct: 0,
+            },
+        };
+        let provider = OpenAiProvider::new_with_headers_and_resilience(
+            "test-key",
+            base_url,
+            &[],
+            None,
+            policy,
+            Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+        .expect("openai provider");
+        let started = Instant::now();
+        let mut stream = provider
+            .stream(
+                sample_request(ApiKind::OpenAiResponses),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("provider stream");
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            let event = item.expect("stream should stay healthy past request timeout");
+            let done = matches!(event, StreamEvent::MessageEnd { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        assert!(started.elapsed() > policy.timeouts.request);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "slow"
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::MessageEnd { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn openai_provider_applies_header_overrides() {
         let captured = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let base_url = spawn_header_capture_server(captured.clone()).await;
@@ -385,7 +514,7 @@ mod tests {
 
     #[test]
     fn openai_provider_oauth_config_uses_codex_instruction_and_store_shape() {
-        let config = oauth_config();
+        let config = oauth_config(ResiliencePolicy::default());
 
         assert_eq!(config.request.store, Some(false));
         assert_eq!(
@@ -464,9 +593,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept socket");
-            let buffer = read_http_request_buffer(&mut socket)
-                .await
-                .expect("read request");
+            let buffer = read_http_request(&mut socket).await.expect("read request");
             *captured.lock().await = buffer;
 
             let completed = json!({
@@ -501,41 +628,6 @@ mod tests {
         });
 
         format!("http://{address}")
-    }
-
-    async fn read_http_request_buffer(
-        socket: &mut tokio::net::TcpStream,
-    ) -> anyhow::Result<Vec<u8>> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
-
-        loop {
-            let read = socket.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(headers_end) = find_headers_end(&buffer) {
-                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    })
-                    .unwrap_or(0);
-                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
-                if body_bytes >= content_length {
-                    return Ok(buffer);
-                }
-            }
-        }
-
-        anyhow::bail!("incomplete http request")
     }
 
     fn sample_request(api_kind: ApiKind) -> ProviderRequest {
@@ -717,40 +809,97 @@ mod tests {
         format!("http://{address}")
     }
 
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<()> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
+    async fn spawn_slow_active_stream_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
 
-        loop {
-            let read = socket.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(headers_end) = find_headers_end(&buffer) {
-                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    })
-                    .unwrap_or(0);
-                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
-                if body_bytes >= content_length {
-                    return Ok(());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept socket");
+            read_http_request(&mut socket).await.expect("read request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write headers");
+
+            let created = json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_slow",
+                    "created_at": 0,
+                    "model": "gpt-5.4",
+                    "object": "response",
+                    "output": [],
+                    "status": "in_progress"
                 }
+            });
+            let added = json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg_slow",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": []
+                }
+            });
+            let delta = json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "item_id": "msg_slow",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "slow"
+            });
+            let completed = json!({
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": {
+                    "id": "resp_slow",
+                    "created_at": 0,
+                    "model": "gpt-5.4",
+                    "object": "response",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_slow",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "slow",
+                            "annotations": []
+                        }]
+                    }],
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 1,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": 1,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 2
+                    }
+                }
+            });
+            for event in [created, added, delta, completed] {
+                let chunk = format!("data: {event}\n\n");
+                socket
+                    .write_all(chunk.as_bytes())
+                    .await
+                    .expect("write stream chunk");
+                tokio::time::sleep(Duration::from_millis(30)).await;
             }
-        }
+            socket
+                .write_all(b"data: [DONE]\n\n")
+                .await
+                .expect("write done");
+        });
 
-        anyhow::bail!("incomplete http request")
-    }
-
-    fn find_headers_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+        format!("http://{address}")
     }
 }

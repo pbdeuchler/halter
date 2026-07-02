@@ -16,7 +16,7 @@ pub(crate) struct KillCommand {
     signal_number: Option<usize>,
 
     //
-    // TODO: implement -sigspec syntax
+    // TODO(kill): implement -sigspec syntax
     /// List known signal names.
     #[arg(short = 'l', short_alias = 'L')]
     list_signals: bool,
@@ -29,9 +29,9 @@ pub(crate) struct KillCommand {
 impl builtins::Command for KillCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         // Default signal is SIGKILL.
         let mut trap_signal = TrapSignal::Signal(nix::sys::signal::Signal::SIGKILL);
@@ -99,15 +99,14 @@ impl builtins::Command for KillCommand {
         if self.list_signals {
             return print_signals(&context, self.args.as_ref());
         } else {
-            if pid_or_job_spec.is_none() {
+            let Some(pid_or_job_spec) = pid_or_job_spec else {
                 writeln!(context.stderr(), "{}: invalid usage", context.command_name)?;
                 return Ok(ExecutionExitCode::InvalidUsage.into());
-            }
+            };
 
-            let pid_or_job_spec = pid_or_job_spec.unwrap();
             if pid_or_job_spec.starts_with('%') {
                 // It's a job spec.
-                if let Some(job) = context.shell.jobs.resolve_job_spec(pid_or_job_spec) {
+                if let Some(job) = context.shell.jobs_mut().resolve_job_spec(pid_or_job_spec) {
                     job.kill(trap_signal)?;
                 } else {
                     writeln!(
@@ -119,7 +118,7 @@ impl builtins::Command for KillCommand {
                     return Ok(ExecutionResult::general_error());
                 }
             } else {
-                let pid = pid_or_job_spec.parse::<i32>()?;
+                let pid = brush_core::int_utils::parse(pid_or_job_spec.as_str(), 10)?;
 
                 // It's a pid.
                 sys::signal::kill_process(pid, trap_signal)?;
@@ -130,7 +129,7 @@ impl builtins::Command for KillCommand {
 }
 
 fn print_signals(
-    context: &brush_core::ExecutionContext<'_>,
+    context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
     signals: &[String],
 ) -> Result<ExecutionResult, brush_core::Error> {
     let mut exit_code = ExecutionResult::success();
