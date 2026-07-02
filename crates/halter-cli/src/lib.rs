@@ -78,6 +78,22 @@ enum Commands {
     },
 }
 
+impl Commands {
+    /// Variant name for logging. Deliberately excludes payload fields —
+    /// `run` carries the user's task text, which must not reach the logs.
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::Chat => "chat",
+            Self::Run { .. } => "run",
+            Self::Resources => "resources",
+            Self::Validate => "validate",
+            Self::Auth { .. } => "auth",
+            Self::Config { .. } => "config",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum AuthCommands {
     #[command(name = "openai-oauth")]
@@ -94,7 +110,7 @@ pub async fn run() -> anyhow::Result<()> {
     let to_file = cli.output_file.is_some();
     let OutputHandles { mut output, trace } = open_output_handles(cli.output_file.as_deref())?;
     init_logging(trace, to_file)?;
-    debug!(config_path = %cli.config.display(), command = ?cli.command, "parsed cli arguments");
+    debug!(config_path = %cli.config.display(), command = cli.command.name(), "parsed cli arguments");
 
     match cli.command {
         Commands::Init => init_config(&cli.config, output.as_mut()).await,

@@ -113,6 +113,15 @@ Error message:
 
 This is exactly the right failure mode for multi-writer hazards.
 
+### Conflict semantics
+
+Staleness is decided **structurally**: the persisted state is compared to
+`expected_state` with `SessionState`'s `PartialEq`, which is order-insensitive
+for its map fields. Backends must never compare serialized representations
+(JSON key order is not significant). Both built-in backends implement this
+contract, locked in by the shared conformance suite in
+`tests/store_conformance.rs` — run it against any custom backend too.
+
 ### Practical interpretation
 
 If you see this error, two writers attempted to advance the same session from different assumptions about its latest state.
@@ -181,6 +190,14 @@ Important constructors:
 
 - `SqliteSessionStore::open(path)`
 - `SqliteSessionStore::open_default()`
+
+### Concurrency model
+
+The database runs in WAL mode. Writes serialize through one writer
+connection; reads (`load_session`, `replay`, `list_sessions`) are served by a
+small pool of read-only connections, so they proceed concurrently with each
+other and with an in-flight write. `:memory:` databases skip the pool and
+route reads through the writer connection.
 
 ### Migration schema
 

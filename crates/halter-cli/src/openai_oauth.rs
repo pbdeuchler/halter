@@ -122,11 +122,11 @@ pub(crate) async fn run(command: OpenAiOAuthCommand, output: &mut dyn Write) -> 
         originator: &command.originator,
     })?;
 
-    if !command.no_open_browser {
-        if let Err(error) = open_browser(&auth_url).await {
-            warn!(error = %error, "failed to open OAuth URL in browser");
-            eprintln!("failed to open browser automatically: {error}");
-        }
+    if !command.no_open_browser
+        && let Err(error) = open_browser(&auth_url).await
+    {
+        warn!(error = %error, "failed to open OAuth URL in browser");
+        eprintln!("failed to open browser automatically: {error}");
     }
 
     eprintln!("Open this URL to authenticate with OpenAI:");

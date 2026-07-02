@@ -513,6 +513,9 @@ impl RuntimeSubagentControl {
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
+        // Parent hook dispatch runs outside any turn scope; the token never
+        // fires.
+        let hook_cancel = CancellationToken::new();
         let dispatch = run_subagent_start(
             &session,
             &fired_hook_ids,
@@ -520,6 +523,7 @@ impl RuntimeSubagentControl {
                 turn_id: &turn_id,
                 model: &stored.blueprint.default_model,
                 working_dir: &stored.blueprint.working_dir,
+                cancel: &hook_cancel,
             },
             &status.agent_id,
             status
@@ -564,6 +568,9 @@ impl RuntimeSubagentControl {
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
+        // Parent hook dispatch runs outside any turn scope; the token never
+        // fires.
+        let hook_cancel = CancellationToken::new();
         let dispatch = run_subagent_stop(
             &session,
             &fired_hook_ids,
@@ -571,6 +578,7 @@ impl RuntimeSubagentControl {
                 turn_id: &turn_id,
                 model: &stored.blueprint.default_model,
                 working_dir: &stored.blueprint.working_dir,
+                cancel: &hook_cancel,
             },
             agent_id,
             agent_type.map_or("default", |agent_type| agent_type.0.as_str()),

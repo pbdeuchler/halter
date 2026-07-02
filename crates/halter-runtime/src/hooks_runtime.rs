@@ -81,6 +81,12 @@ pub struct HookInvocationContext<'a> {
     pub turn_id: &'a TurnId,
     pub model: &'a ModelId,
     pub working_dir: &'a Path,
+    /// Cancellation token of the surrounding turn or session operation.
+    /// Cancelling it aborts the in-flight hook handler and skips any
+    /// remaining handlers, surfacing `HookRunStatus::Cancelled`. Callers
+    /// without a cancellable scope (for example `notify`) pass a fresh
+    /// token, which never fires.
+    pub cancel: &'a CancellationToken,
 }
 
 /// Completed hook dispatch, including preview and final run summaries.
@@ -114,6 +120,7 @@ pub async fn run_session_start(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -140,6 +147,7 @@ pub async fn run_session_end(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -166,6 +174,7 @@ pub async fn run_user_prompt_submit(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -194,6 +203,7 @@ pub async fn run_pre_tool_use(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -224,6 +234,7 @@ pub async fn run_post_tool_use(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -254,6 +265,7 @@ pub async fn run_post_tool_use_failure(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -282,6 +294,7 @@ pub async fn run_stop(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -312,6 +325,7 @@ pub async fn run_subagent_start(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -351,6 +365,7 @@ pub async fn run_subagent_stop(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -379,6 +394,7 @@ pub async fn run_pre_compact(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -407,6 +423,7 @@ pub async fn run_post_compact(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -435,6 +452,7 @@ pub async fn run_notification(
             ),
             fired_hook_ids: fired_hook_ids.clone(),
         },
+        ctx.cancel,
     )
     .await
 }
@@ -442,6 +460,7 @@ pub async fn run_notification(
 async fn execute_hooks(
     sess: &HalterSession,
     request: HookDispatchRequest,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<ExecutedHookDispatch> {
     let hooks = sess.services().resources.hooks();
     let prepared = Hooks::prepare_many([hooks.as_ref(), sess.session_hooks().as_ref()], request);
@@ -457,11 +476,12 @@ async fn execute_hooks(
     for (handler, mut preview) in matched_handlers.into_iter().zip(prepared_previews) {
         preview.started_at = chrono::Utc::now();
         preview_runs.push(preview.clone());
-        let result = run_handler(sess, &request, handler, preview, CancellationToken::new()).await;
+        let result = run_handler(sess, &request, handler, preview, cancel.clone()).await;
         if result.handler.once && result.output.is_some() {
             fired_hook_ids.push(result.handler.handler_id.clone());
         }
         let should_stop = result.output.as_ref().is_some_and(should_cancel_siblings);
+        let cancelled = matches!(result.summary.status, HookRunStatus::Cancelled);
         if let Some(output) = result.output.clone() {
             merge_inputs.push(MergeInput {
                 handler_id: result.handler.handler_id.clone(),
@@ -470,7 +490,9 @@ async fn execute_hooks(
             });
         }
         completed_runs.push(result.summary);
-        if should_stop {
+        // Turn/session cancellation aborts the in-flight handler and skips
+        // every remaining one.
+        if should_stop || cancelled {
             break;
         }
     }
@@ -494,7 +516,7 @@ async fn execute_hooks(
 }
 
 struct HandlerRunResult {
-    handler: ConfiguredHandler,
+    handler: Arc<ConfiguredHandler>,
     summary: HookRunSummary,
     output: Option<HookOutput>,
 }
@@ -502,21 +524,30 @@ struct HandlerRunResult {
 async fn run_handler(
     sess: &HalterSession,
     request: &HookDispatchRequest,
-    handler: ConfiguredHandler,
+    handler: Arc<ConfiguredHandler>,
     preview: HookRunSummary,
     cancel: CancellationToken,
 ) -> HandlerRunResult {
-    let started_at = preview.started_at;
     let execution = execute_handler(sess, request, &handler, cancel).await;
+    handler_run_result(handler, preview, execution)
+}
 
-    match execution {
+/// Pure mapping from a handler execution outcome to its run summary:
+/// `Completed` maps to `Stopped`/`Blocked`/`Completed` depending on the
+/// output, `Cancelled` to `Cancelled`, and errors to `Failed`.
+fn handler_run_result(
+    handler: Arc<ConfiguredHandler>,
+    preview: HookRunSummary,
+    execution: anyhow::Result<HandlerExecution>,
+) -> HandlerRunResult {
+    let completed_at = chrono::Utc::now();
+    let duration_ms = completed_at
+        .signed_duration_since(preview.started_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    let (status, entries, output) = match execution {
         Ok(HandlerExecution::Completed(output)) => {
             let output = *output;
-            let completed_at = chrono::Utc::now();
-            let duration_ms = completed_at
-                .signed_duration_since(started_at)
-                .num_milliseconds()
-                .max(0) as u64;
             let status = if matches!(output.continue_execution, Some(false)) {
                 HookRunStatus::Stopped
             } else if matches!(output.decision, Some(halter_hooks::HookDecision::Block)) {
@@ -524,63 +555,40 @@ async fn run_handler(
             } else {
                 HookRunStatus::Completed
             };
-            HandlerRunResult {
-                handler,
-                summary: HookRunSummary {
-                    status,
-                    completed_at: Some(completed_at),
-                    duration_ms: Some(duration_ms),
-                    entries: summary_entries(&output),
-                    ..preview
-                },
-                output: Some(output),
-            }
+            (status, summary_entries(&output), Some(output))
         }
-        Ok(HandlerExecution::Cancelled) => {
-            let completed_at = chrono::Utc::now();
-            let duration_ms = completed_at
-                .signed_duration_since(started_at)
-                .num_milliseconds()
-                .max(0) as u64;
-            HandlerRunResult {
-                handler,
-                summary: HookRunSummary {
-                    status: HookRunStatus::Cancelled,
-                    completed_at: Some(completed_at),
-                    duration_ms: Some(duration_ms),
-                    entries: vec![HookOutputEntry {
-                        kind: HookOutputKind::Warning,
-                        text: "hook cancelled after higher-priority stop or block".to_owned(),
-                    }],
-                    ..preview
-                },
-                output: None,
-            }
-        }
-        Err(error) => {
-            let completed_at = chrono::Utc::now();
-            let duration_ms = completed_at
-                .signed_duration_since(started_at)
-                .num_milliseconds()
-                .max(0) as u64;
-            HandlerRunResult {
-                handler,
-                summary: HookRunSummary {
-                    status: HookRunStatus::Failed,
-                    completed_at: Some(completed_at),
-                    duration_ms: Some(duration_ms),
-                    entries: vec![HookOutputEntry {
-                        kind: HookOutputKind::Error,
-                        text: error.to_string(),
-                    }],
-                    ..preview
-                },
-                output: None,
-            }
-        }
+        Ok(HandlerExecution::Cancelled) => (
+            HookRunStatus::Cancelled,
+            vec![HookOutputEntry {
+                kind: HookOutputKind::Warning,
+                text: "hook cancelled by turn or session cancellation".to_owned(),
+            }],
+            None,
+        ),
+        Err(error) => (
+            HookRunStatus::Failed,
+            vec![HookOutputEntry {
+                kind: HookOutputKind::Error,
+                text: error.to_string(),
+            }],
+            None,
+        ),
+    };
+
+    HandlerRunResult {
+        handler,
+        summary: HookRunSummary {
+            status,
+            completed_at: Some(completed_at),
+            duration_ms: Some(duration_ms),
+            entries,
+            ..preview
+        },
+        output,
     }
 }
 
+#[derive(Debug)]
 enum HandlerExecution {
     Completed(Box<HookOutput>),
     Cancelled,
@@ -1271,9 +1279,14 @@ fn expand_env_placeholders(value: &str, allowed: &BTreeSet<String>) -> String {
     while let Some(dollar) = remaining.find('$') {
         expanded.push_str(&remaining[..dollar]);
         let after = &remaining[dollar + 1..];
-        if let Some(inner) = after.strip_prefix('{')
-            && let Some(close) = inner.find('}')
-        {
+        if let Some(inner) = after.strip_prefix('{') {
+            let Some(close) = inner.find('}') else {
+                // Unclosed `${` passes through literally; any later `$` in
+                // the remainder is still processed on the next iteration.
+                expanded.push('$');
+                remaining = after;
+                continue;
+            };
             let name = &inner[..close];
             expanded.push_str(&expanded_env(name, allowed));
             remaining = &inner[close + 1..];
@@ -1485,44 +1498,80 @@ mod tests {
         );
     }
 
-    /// AC1.3 / AC1.4: streamed body accumulation respects the cap.
-    #[tokio::test]
-    async fn review_hook_runtime_ac1_3_4_bounded_body_caps_at_limit() {
-        // Pure-function equivalent: verify the bound logic directly. The
-        // full streaming path is exercised via `accumulate_response_body_bounded`
-        // using a manually-constructed `reqwest::Response` is not portable;
-        // we test the size invariant with an inline accumulator that mirrors
-        // the bounded reader.
-        fn accumulate(chunks: &[&[u8]], cap: usize) -> Result<Vec<u8>, HookError> {
-            let mut body = Vec::new();
-            for chunk in chunks {
-                let observed = body.len() + chunk.len();
-                if observed > cap {
-                    return Err(HookError::ResponseTooLarge { cap, observed });
+    /// Serve `body` once over real HTTP, writing it in two flushes so the
+    /// client observes a genuinely streamed response.
+    async fn serve_fixed_body(body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test http server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            // Drain the request head.
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buf).await.expect("read request");
+                if read == 0 {
+                    break;
                 }
-                body.extend_from_slice(chunk);
+                head.extend_from_slice(&buf[..read]);
+                if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
             }
-            Ok(body)
-        }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .await
+                .expect("write header");
+            let mid = body.len() / 2;
+            stream.write_all(&body[..mid]).await.expect("write chunk");
+            stream.flush().await.expect("flush");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            stream.write_all(&body[mid..]).await.expect("write chunk");
+        });
+        format!("http://{addr}/hook")
+    }
 
-        let cap = HOOK_HTTP_RESPONSE_CAP;
-        // AC1.3: exactly at-cap succeeds.
-        let at_cap = vec![0u8; cap];
-        let body = accumulate(&[at_cap.as_slice()], cap).expect("at-cap body accepted");
-        assert_eq!(body.len(), cap);
+    /// AC1.3: the real streaming accumulator accepts a body exactly at cap.
+    #[tokio::test]
+    async fn bounded_body_accepts_streamed_body_at_cap() {
+        let cap = 64usize;
+        let url = serve_fixed_body(vec![7u8; cap]).await;
+        let response = reqwest::get(&url).await.expect("request");
 
-        // AC1.4: over-cap (split across two chunks so the guard trips mid-stream) errors.
-        let first = vec![0u8; cap - 10];
-        let second = vec![0u8; 32];
-        let error = accumulate(&[first.as_slice(), second.as_slice()], cap)
+        let body = accumulate_response_body_bounded(response, cap)
+            .await
+            .expect("at-cap body accepted");
+
+        assert_eq!(body, vec![7u8; cap]);
+    }
+
+    /// AC1.4: the real streaming accumulator rejects an over-cap body with
+    /// `HookError::ResponseTooLarge` before buffering it all.
+    #[tokio::test]
+    async fn bounded_body_rejects_streamed_body_over_cap() {
+        let cap = 64usize;
+        let url = serve_fixed_body(vec![7u8; cap + 16]).await;
+        let response = reqwest::get(&url).await.expect("request");
+
+        let error = accumulate_response_body_bounded(response, cap)
+            .await
             .expect_err("over-cap body rejected");
-        match error {
-            HookError::ResponseTooLarge {
+
+        match error.downcast_ref::<HookError>() {
+            Some(HookError::ResponseTooLarge {
                 cap: err_cap,
                 observed,
-            } => {
-                assert_eq!(err_cap, cap);
-                assert!(observed > cap);
+            }) => {
+                assert_eq!(*err_cap, cap);
+                assert!(*observed > cap);
             }
             other => panic!("expected ResponseTooLarge, got {other:?}"),
         }
@@ -1784,5 +1833,284 @@ mod tests {
         }
         // Unknown alias returns None (fail-closed).
         assert!(HookEventName::from_alias("NotAnEvent").is_none());
+    }
+
+    // === Dispatch core tests (M17 / H3) ===
+
+    fn command_fixture(
+        command: &str,
+    ) -> (
+        Arc<ConfiguredHandler>,
+        CommandHookConfig,
+        HookDispatchRequest,
+    ) {
+        use halter_hooks::{HandlerPriority, HandlerPriorityGroup};
+
+        let config = CommandHookConfig {
+            command: command.to_owned(),
+            shell: halter_hooks::HookShell::Bash,
+            env: Default::default(),
+        };
+        let handler = Arc::new(ConfiguredHandler {
+            handler_id: "test:PreToolUse:0:0:0".to_owned(),
+            plugin_id: halter_protocol::PluginId::from("test-plugin"),
+            plugin_root: PathBuf::from("."),
+            source_path: PathBuf::from("<test>"),
+            allowed_http_hosts: Vec::new(),
+            allowed_env_vars: Vec::new(),
+            event_name: HookEventName::PreToolUse,
+            handler_type: halter_protocol::HookHandlerType::Command,
+            timeout: std::time::Duration::from_secs(10),
+            status_message: None,
+            if_condition: None,
+            once: false,
+            matcher: None,
+            config: ConfiguredHandlerConfig::File(halter_hooks::HookHandlerConfig::Command(
+                config.clone(),
+            )),
+            priority: HandlerPriority {
+                group: HandlerPriorityGroup::PluginFiles,
+                plugin_load_order: 0,
+                event_declaration_index: 0,
+                matcher_group_index: 0,
+                hook_index_within_group: 0,
+            },
+        });
+        let request = HookDispatchRequest {
+            event_name: HookEventName::PreToolUse,
+            matcher_value: Some("Shell".to_owned()),
+            payload: json!({"cwd": "."}),
+            fired_hook_ids: BTreeSet::new(),
+        };
+        (handler, config, request)
+    }
+
+    fn preview_summary(handler: &ConfiguredHandler) -> HookRunSummary {
+        HookRunSummary {
+            run_id: "run-1".to_owned(),
+            event_name: handler.event_name.canonical_name().to_owned(),
+            handler_type: handler.handler_type,
+            plugin_id: handler.plugin_id.clone(),
+            plugin_root: handler.plugin_root.clone(),
+            status: HookRunStatus::Running,
+            status_message: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            duration_ms: None,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Exit 0 with JSON stdout parses into the hook output.
+    #[tokio::test]
+    async fn run_command_exit_zero_parses_stdout_json() {
+        let (handler, config, request) = command_fixture(r#"printf '{"continue": false}'"#);
+
+        let execution = run_command(&handler, &config, &request, CancellationToken::new())
+            .await
+            .expect("exit 0 succeeds");
+
+        let HandlerExecution::Completed(output) = execution else {
+            panic!("expected Completed");
+        };
+        assert_eq!(output.continue_execution, Some(false));
+    }
+
+    /// Exit 0 with empty stdout maps to the default (passthrough) output.
+    #[tokio::test]
+    async fn run_command_exit_zero_empty_stdout_is_default_output() {
+        let (handler, config, request) = command_fixture("true");
+
+        let execution = run_command(&handler, &config, &request, CancellationToken::new())
+            .await
+            .expect("exit 0 succeeds");
+
+        let HandlerExecution::Completed(output) = execution else {
+            panic!("expected Completed");
+        };
+        assert_eq!(*output, HookOutput::default());
+    }
+
+    /// Exit 2 is the block convention: decision Block, stderr as the reason.
+    #[tokio::test]
+    async fn run_command_exit_two_blocks_with_stderr_reason() {
+        let (handler, config, request) = command_fixture("echo boom >&2; exit 2");
+
+        let execution = run_command(&handler, &config, &request, CancellationToken::new())
+            .await
+            .expect("exit 2 maps to block");
+
+        let HandlerExecution::Completed(output) = execution else {
+            panic!("expected Completed");
+        };
+        assert_eq!(output.decision, Some(halter_hooks::HookDecision::Block));
+        assert_eq!(output.reason.as_deref(), Some("boom"));
+    }
+
+    /// Any other nonzero exit code surfaces as an error carrying the code
+    /// and stderr.
+    #[tokio::test]
+    async fn run_command_other_exit_codes_error() {
+        let (handler, config, request) = command_fixture("echo bad >&2; exit 3");
+
+        let error = run_command(&handler, &config, &request, CancellationToken::new())
+            .await
+            .expect_err("exit 3 must error");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("status 3"), "{rendered}");
+        assert!(rendered.contains("bad"), "{rendered}");
+    }
+
+    /// Signal termination (no exit code) surfaces as an error.
+    #[tokio::test]
+    async fn run_command_signal_termination_errors() {
+        let (handler, config, request) = command_fixture("kill -9 $$");
+
+        let error = run_command(&handler, &config, &request, CancellationToken::new())
+            .await
+            .expect_err("signal termination must error");
+
+        assert!(
+            error.to_string().contains("terminated by signal"),
+            "{error:#}"
+        );
+    }
+
+    /// Exit 0 with malformed JSON stdout is an error, not a silent default.
+    #[tokio::test]
+    async fn run_command_malformed_stdout_json_errors() {
+        let (handler, config, request) = command_fixture("printf 'not json'");
+
+        let error = run_command(&handler, &config, &request, CancellationToken::new())
+            .await
+            .expect_err("malformed stdout must error");
+
+        assert!(error.downcast_ref::<CommandOutputParseError>().is_some());
+    }
+
+    /// H3: cancelling the dispatch token mid-hook aborts the in-flight
+    /// command and surfaces `Cancelled` well before the command finishes.
+    #[tokio::test]
+    async fn run_command_cancellation_mid_hook_returns_cancelled() {
+        let (handler, config, request) = command_fixture("sleep 5");
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let execution = run_command(&handler, &config, &request, cancel)
+            .await
+            .expect("cancellation is not an error");
+
+        assert!(matches!(execution, HandlerExecution::Cancelled));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "cancellation must not wait for the command"
+        );
+    }
+
+    /// M17/M18: `handler_run_result` covers every execution outcome,
+    /// including the previously unreachable `Cancelled` arm.
+    #[test]
+    fn handler_run_result_maps_every_execution_outcome() {
+        let (handler, ..) = command_fixture("true");
+        let preview = preview_summary(&handler);
+
+        let cases: Vec<(&str, anyhow::Result<HandlerExecution>, HookRunStatus, bool)> = vec![
+            (
+                "stopped",
+                Ok(HandlerExecution::completed(HookOutput {
+                    continue_execution: Some(false),
+                    ..HookOutput::default()
+                })),
+                HookRunStatus::Stopped,
+                true,
+            ),
+            (
+                "blocked",
+                Ok(HandlerExecution::completed(HookOutput {
+                    decision: Some(halter_hooks::HookDecision::Block),
+                    ..HookOutput::default()
+                })),
+                HookRunStatus::Blocked,
+                true,
+            ),
+            (
+                "completed",
+                Ok(HandlerExecution::completed(HookOutput::default())),
+                HookRunStatus::Completed,
+                true,
+            ),
+            (
+                "cancelled",
+                Ok(HandlerExecution::Cancelled),
+                HookRunStatus::Cancelled,
+                false,
+            ),
+            (
+                "failed",
+                Err(anyhow::anyhow!("boom")),
+                HookRunStatus::Failed,
+                false,
+            ),
+        ];
+
+        for (name, execution, want_status, want_output) in cases {
+            let result = handler_run_result(Arc::clone(&handler), preview.clone(), execution);
+            assert_eq!(result.summary.status, want_status, "{name}");
+            assert_eq!(result.output.is_some(), want_output, "{name}");
+            assert!(result.summary.completed_at.is_some(), "{name}");
+            assert!(result.summary.duration_ms.is_some(), "{name}");
+        }
+
+        // Failure and cancellation surface explanatory entries.
+        let failed = handler_run_result(
+            Arc::clone(&handler),
+            preview.clone(),
+            Err(anyhow::anyhow!("boom")),
+        );
+        assert!(
+            failed
+                .summary
+                .entries
+                .iter()
+                .any(|entry| entry.text.contains("boom"))
+        );
+        let cancelled = handler_run_result(handler, preview, Ok(HandlerExecution::Cancelled));
+        assert!(
+            cancelled
+                .summary
+                .entries
+                .iter()
+                .any(|entry| entry.text.contains("cancelled"))
+        );
+    }
+
+    /// L17: an unclosed `${` passes through literally instead of dropping
+    /// the `$`.
+    #[test]
+    fn env_expansion_unclosed_brace_passes_through_literally() {
+        // SAFETY: setting env vars in tests is safe when not racing other
+        // tests that read the same vars.
+        unsafe { std::env::set_var("HALTER_TEST_L17", "OK") };
+        let allowed = allowed_set(&["HALTER_TEST_L17"]);
+
+        for (input, want) in [
+            ("${FOO", "${FOO"),
+            ("a${FOO b", "a${FOO b"),
+            ("${", "${"),
+            // A later placeholder after the unclosed brace still expands.
+            ("${FOO $HALTER_TEST_L17", "${FOO OK"),
+        ] {
+            assert_eq!(
+                expand_env_placeholders(input, &allowed),
+                want,
+                "input: {input}"
+            );
+        }
     }
 }

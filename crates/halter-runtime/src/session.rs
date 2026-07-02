@@ -842,10 +842,14 @@ impl SessionHandle {
         let mut state = stored.state;
         let mut events = Vec::new();
         let turn_id = TurnId::new();
+        // Session-level entry point with no turn token: hooks run with a
+        // token that never fires.
+        let hook_cancel = CancellationToken::new();
         let hook_ctx = HookInvocationContext {
             turn_id: &turn_id,
             model: &stored.blueprint.default_model,
             working_dir: &stored.blueprint.working_dir,
+            cancel: &hook_cancel,
         };
         let fired_hook_ids = state
             .fired_hook_ids
@@ -893,10 +897,14 @@ impl SessionHandle {
         let expected_state = stored.state.clone();
         let mut state = stored.state;
         let turn_id = TurnId::new();
+        // Session-level entry point with no turn token: hooks run with a
+        // token that never fires.
+        let hook_cancel = CancellationToken::new();
         let hook_ctx = HookInvocationContext {
             turn_id: &turn_id,
             model: &stored.blueprint.default_model,
             working_dir: &stored.blueprint.working_dir,
+            cancel: &hook_cancel,
         };
         let fired_hook_ids = state
             .fired_hook_ids
@@ -944,10 +952,14 @@ impl SessionHandle {
         let mut state = stored.state;
         let mut events = Vec::new();
         let turn_id = TurnId::new();
+        // Session-level entry point with no turn token: hooks run with a
+        // token that never fires.
+        let hook_cancel = CancellationToken::new();
         let hook_ctx = HookInvocationContext {
             turn_id: &turn_id,
             model: &stored.blueprint.default_model,
             working_dir: &stored.blueprint.working_dir,
+            cancel: &hook_cancel,
         };
         let mut fired_hook_ids = state
             .fired_hook_ids
@@ -1061,6 +1073,7 @@ impl SessionHandle {
             turn_id: &turn.id,
             model: &hook_model,
             working_dir: &stored.blueprint.working_dir,
+            cancel: &turn_cancel,
         };
 
         for warning in std::mem::take(&mut state.pending_warning_messages) {
@@ -1317,6 +1330,7 @@ impl SessionHandle {
                         turn_id: &turn.id,
                         model: &model.id,
                         working_dir: &stored.blueprint.working_dir,
+                        cancel: &turn_cancel,
                     },
                     Some(&materialized.message),
                     true,
@@ -1436,6 +1450,7 @@ impl SessionHandle {
                         turn_id,
                         model: effective_model,
                         working_dir: &blueprint.working_dir,
+                        cancel: &cancel,
                     },
                     &call,
                 )
@@ -1574,6 +1589,7 @@ impl SessionHandle {
                             turn_id,
                             model: effective_model,
                             working_dir: &blueprint.working_dir,
+                            cancel: &cancel,
                         },
                         &call,
                         &content,
@@ -1595,6 +1611,7 @@ impl SessionHandle {
                             turn_id,
                             model: effective_model,
                             working_dir: &blueprint.working_dir,
+                            cancel: &cancel,
                         },
                         &call,
                         tool_error,

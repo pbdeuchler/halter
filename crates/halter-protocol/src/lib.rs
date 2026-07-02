@@ -24,10 +24,6 @@ use uuid::Uuid;
 /// Shared string payloads stay as `String` for now; this is the swap point for any future `Arc<str>` migration.
 pub type SharedStr = String;
 
-/// Historical sampling temperature used by older config resolution. Provider
-/// requests now omit temperature unless `[providers.<name>].temperature` is
-/// configured explicitly.
-pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 /// MIME/media type label used for binary message parts.
 pub type MediaType = String;
 /// Provider-issued signature attached to replayable reasoning blocks.
@@ -1019,15 +1015,19 @@ impl ProviderErrorKind {
     }
 }
 
-#[derive(Debug, Clone, Error, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 #[error("{message}")]
 #[non_exhaustive]
 /// Error surfaced by a provider adapter.
+///
+/// Serde and `JsonSchema` are hand-written so the published schema matches
+/// the wire format exactly: serialization always emits `message`, `kind`,
+/// and the legacy `retryable` flag (derived from `kind`), plus
+/// `backoff_hint` when present; deserialization additionally accepts legacy
+/// payloads that carry only `message`/`retryable`.
 pub struct ProviderError {
     pub message: String,
-    #[serde(default)]
     pub kind: ProviderErrorKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_hint: Option<Duration>,
 }
 
@@ -1141,6 +1141,38 @@ impl<'de> Deserialize<'de> for ProviderError {
             kind,
             backoff_hint: wire.backoff_hint,
         })
+    }
+}
+
+impl JsonSchema for ProviderError {
+    fn schema_name() -> String {
+        "ProviderError".to_owned()
+    }
+
+    // Mirrors the hand-written `Serialize` impl: `retryable` is always
+    // emitted even though the struct has no such field.
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, ObjectValidation, SchemaObject};
+
+        let mut object = ObjectValidation::default();
+        for (name, schema) in [
+            ("message", generator.subschema_for::<String>()),
+            ("kind", generator.subschema_for::<ProviderErrorKind>()),
+            ("retryable", generator.subschema_for::<bool>()),
+            ("backoff_hint", generator.subschema_for::<Duration>()),
+        ] {
+            object.properties.insert(name.to_owned(), schema);
+        }
+        for required in ["message", "kind", "retryable"] {
+            object.required.insert(required.to_owned());
+        }
+
+        SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(object)),
+            ..SchemaObject::default()
+        }
+        .into()
     }
 }
 
@@ -1889,6 +1921,36 @@ mod tests {
             assert_eq!(error.kind, want_kind, "{name}");
             assert_eq!(error.retryable(), want_kind.retryable(), "{name}");
         }
+    }
+
+    #[test]
+    fn provider_error_json_schema_matches_wire_format() {
+        let schema = schemars::schema_for!(ProviderError);
+        let value = serde_json::to_value(&schema).expect("schema json");
+        let properties = value
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema properties");
+        let required: Vec<&str> = value
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("schema required")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+
+        // Every serialized key is described, and vice versa.
+        let serialized = serde_json::to_value(
+            ProviderError::with_kind("boom", ProviderErrorKind::Transient)
+                .with_backoff_hint(Some(Duration::from_secs(1))),
+        )
+        .expect("serialize provider error");
+        for key in serialized.as_object().expect("object").keys() {
+            assert!(properties.contains_key(key), "schema missing key '{key}'");
+        }
+        assert_eq!(properties.len(), 4, "schema keys: {properties:?}");
+        // `required` serializes as a sorted set.
+        assert_eq!(required, ["kind", "message", "retryable"]);
     }
 
     #[test]

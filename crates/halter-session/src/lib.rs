@@ -50,6 +50,10 @@ pub trait SessionStore: Send + Sync {
     ///
     /// When `expected_state` is supplied, the store must reject the commit with
     /// [`SessionCommitConflict`] if the currently persisted state differs.
+    /// "Differs" is defined structurally — `SessionState`'s `PartialEq`, which
+    /// is order-insensitive for its map fields — never by comparing serialized
+    /// representations. All backends must implement the same semantics; the
+    /// shared conformance suite in `tests/store_conformance.rs` locks this in.
     async fn commit(
         &self,
         session_id: &SessionId,

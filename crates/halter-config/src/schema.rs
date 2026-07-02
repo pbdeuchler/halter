@@ -134,6 +134,21 @@ impl HarnessConfig {
         self.context.validate()?;
         self.runtime.validate()?;
         self.resilience.validate("resilience")?;
+        // Provider overrides are partial, so cross-field constraints can only
+        // be checked on the effective (merged) config each provider will use.
+        for provider in [
+            ConfiguredProvider::OpenAi,
+            ConfiguredProvider::Anthropic,
+            ConfiguredProvider::OpenRouter,
+        ] {
+            if self
+                .provider_config(provider)
+                .is_some_and(|config| config.resilience.is_some())
+            {
+                self.resilience_for(provider)
+                    .validate(&format!("providers.{provider}.resilience (effective)"))?;
+            }
+        }
 
         Ok(())
     }
@@ -301,7 +316,7 @@ impl ModelsConfig {
 }
 
 /// A model slot: either an inline model or a symbolic reference.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ModelSlot {
     /// Reference to the shared `[models.model_judge]` definition via the bare
@@ -309,6 +324,53 @@ pub enum ModelSlot {
     Reference(ModelSlotRef),
     /// Inline model configuration (the historical form).
     Inline(ModelConfig),
+}
+
+// Hand-written instead of `#[serde(untagged)]` so a typo'd key inside an
+// inline model table surfaces `ModelConfig`'s own field-level error (for
+// example "unknown field `modle`") instead of serde's opaque "data did not
+// match any variant of untagged enum ModelSlot".
+impl<'de> Deserialize<'de> for ModelSlot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ModelSlotVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ModelSlotVisitor {
+            type Value = ModelSlot;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "a model reference string (\"model_judge\" or \"auto_resolve\") or an inline model table",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "model_judge" => Ok(ModelSlot::Reference(ModelSlotRef::ModelJudge)),
+                    "auto_resolve" => Ok(ModelSlot::Reference(ModelSlotRef::AutoResolve)),
+                    other => Err(E::invalid_value(
+                        serde::de::Unexpected::Str(other),
+                        &"\"model_judge\" or \"auto_resolve\"",
+                    )),
+                }
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                ModelConfig::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(ModelSlot::Inline)
+            }
+        }
+
+        deserializer.deserialize_any(ModelSlotVisitor)
+    }
 }
 
 impl ModelSlot {
@@ -472,7 +534,7 @@ impl fmt::Display for ConfiguredProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 /// Provider resilience policy shared by all provider families unless a
 /// provider-specific override is configured.
@@ -481,15 +543,6 @@ pub struct ResilienceConfig {
     pub timeouts: ResilienceTimeoutsConfig,
     #[serde(default)]
     pub request_retry: RequestRetryConfig,
-}
-
-impl Default for ResilienceConfig {
-    fn default() -> Self {
-        Self {
-            timeouts: ResilienceTimeoutsConfig::default(),
-            request_retry: RequestRetryConfig::default(),
-        }
-    }
 }
 
 impl ResilienceConfig {
@@ -569,6 +622,22 @@ impl RequestRetryConfig {
         validate_positive_u64(&format!("{path}.max_backoff_secs"), self.max_backoff_secs)?;
         if self.jitter_pct > 100 {
             anyhow::bail!("invalid configuration: {path}.jitter_pct must be in 0..=100");
+        }
+        let max_backoff_ms = self.max_backoff_secs.saturating_mul(1_000);
+        if self.base_backoff_ms > max_backoff_ms {
+            anyhow::bail!(
+                "invalid configuration: {path}.base_backoff_ms ({}ms) must not exceed {path}.max_backoff_secs ({}s)",
+                self.base_backoff_ms,
+                self.max_backoff_secs
+            );
+        }
+        let deadline_ms = self.deadline_secs.saturating_mul(1_000);
+        if self.max_attempts > 1 && self.base_backoff_ms > deadline_ms {
+            anyhow::bail!(
+                "invalid configuration: {path}.deadline_secs ({}s) must admit at least one base backoff of {path}.base_backoff_ms ({}ms)",
+                self.deadline_secs,
+                self.base_backoff_ms
+            );
         }
         Ok(())
     }
@@ -1736,6 +1805,126 @@ max_attempts = 2
         assert_eq!(
             parsed.request_retry.base_backoff_ms,
             DEFAULT_PROVIDER_RETRY_BASE_BACKOFF_MS
+        );
+    }
+
+    #[test]
+    fn request_retry_cross_field_validation() {
+        let cases = [
+            ("defaults valid", RequestRetryConfig::default(), None),
+            (
+                "base backoff above max backoff",
+                RequestRetryConfig {
+                    base_backoff_ms: 31_000,
+                    max_backoff_secs: 30,
+                    ..RequestRetryConfig::default()
+                },
+                Some("base_backoff_ms (31000ms) must not exceed"),
+            ),
+            (
+                "deadline below one base backoff",
+                RequestRetryConfig {
+                    base_backoff_ms: 2_000,
+                    deadline_secs: 1,
+                    max_attempts: 3,
+                    ..RequestRetryConfig::default()
+                },
+                Some("deadline_secs (1s) must admit at least one base backoff"),
+            ),
+            (
+                "single attempt never backs off",
+                RequestRetryConfig {
+                    base_backoff_ms: 2_000,
+                    deadline_secs: 1,
+                    max_attempts: 1,
+                    ..RequestRetryConfig::default()
+                },
+                None,
+            ),
+        ];
+
+        for (name, config, want_error) in cases {
+            let result = config.validate("resilience.request_retry");
+            match want_error {
+                Some(fragment) => {
+                    let error = result.expect_err(name).to_string();
+                    assert!(
+                        error.contains(fragment),
+                        "{name}: unexpected error: {error}"
+                    );
+                }
+                None => result.unwrap_or_else(|error| panic!("{name}: {error}")),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_provider_resilience_cross_field_conflict_rejected() {
+        // The override alone passes its positive-value checks; only the
+        // merged (global + override) config exposes the cross-field conflict.
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+
+[providers.openai.resilience.request_retry]
+base_backoff_ms = 40000
+"#,
+        )
+        .expect("parse config");
+
+        let error = parsed.validate().expect_err("effective config must fail");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("providers.openai.resilience (effective)")
+                && rendered.contains("must not exceed"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn model_slot_inline_typo_names_offending_field() {
+        let error = toml::from_str::<HarnessConfig>(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+modle = "gpt-5"
+"#,
+        )
+        .expect_err("typo'd model field must fail");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("modle"),
+            "error should name the typo'd key: {rendered}"
+        );
+    }
+
+    #[test]
+    fn model_slot_string_forms_parse_and_unknown_strings_are_rejected() {
+        for (raw, want) in [
+            ("model_judge", ModelSlotRef::ModelJudge),
+            ("auto_resolve", ModelSlotRef::AutoResolve),
+        ] {
+            let parsed: ModelsConfig =
+                toml::from_str(&format!("default = \"{raw}\"")).expect("parse reference slot");
+            assert_eq!(parsed.default, Some(ModelSlot::Reference(want)), "{raw}");
+        }
+
+        let error = toml::from_str::<ModelsConfig>("default = \"banana\"")
+            .expect_err("unknown reference string must fail");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("model_judge") && rendered.contains("auto_resolve"),
+            "error should list the accepted reference strings: {rendered}"
         );
     }
 

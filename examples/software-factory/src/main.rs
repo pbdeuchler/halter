@@ -3863,15 +3863,16 @@ impl GitHubClient {
         }
         for review in reviews {
             let key = format!("review:{}", review.id);
-            if seen.insert(key) && is_maintainer_author_association(&review.author_association) {
-                if let Some(body) = review.body.filter(|body| !body.trim().is_empty()) {
-                    review_feedback.push(format!(
-                        "Review {} by {}:\n{}",
-                        review.state,
-                        review.user.map(|user| user.login).unwrap_or_default(),
-                        body
-                    ));
-                }
+            if seen.insert(key)
+                && is_maintainer_author_association(&review.author_association)
+                && let Some(body) = review.body.filter(|body| !body.trim().is_empty())
+            {
+                review_feedback.push(format!(
+                    "Review {} by {}:\n{}",
+                    review.state,
+                    review.user.map(|user| user.login).unwrap_or_default(),
+                    body
+                ));
             }
         }
         for comment in review_comments {

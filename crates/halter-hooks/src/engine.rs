@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -30,9 +31,11 @@ pub struct HookRegistrySource {
 }
 
 #[derive(Debug, Clone, Default)]
-/// Prepared hook registry keyed by event.
+/// Prepared hook registry keyed by event. Handlers are stored behind `Arc`
+/// so per-event dispatch clones a pointer instead of deep-cloning compiled
+/// regexes and config values.
 pub struct Hooks {
-    handlers_by_event: BTreeMap<HookEventName, Vec<ConfiguredHandler>>,
+    handlers_by_event: BTreeMap<HookEventName, Vec<Arc<ConfiguredHandler>>>,
 }
 
 impl Hooks {
@@ -58,7 +61,7 @@ impl Hooks {
                         handlers_by_event
                             .entry(*event_name)
                             .or_insert_with(Vec::new)
-                            .push(ConfiguredHandler {
+                            .push(Arc::new(ConfiguredHandler {
                                 handler_id,
                                 plugin_id: source.plugin_id.clone(),
                                 plugin_root: source.plugin_root.clone(),
@@ -80,7 +83,7 @@ impl Hooks {
                                     matcher_group_index: matcher_index,
                                     hook_index_within_group: hook_index,
                                 },
-                            });
+                            }));
                     }
                 }
             }
@@ -131,7 +134,7 @@ impl Hooks {
             handlers_by_event
                 .entry(registered.hook.event)
                 .or_insert_with(Vec::new)
-                .push(ConfiguredHandler {
+                .push(Arc::new(ConfiguredHandler {
                     handler_id: format!(
                         "{}:{}:sdk:{}",
                         registered.plugin_id,
@@ -161,7 +164,7 @@ impl Hooks {
                         matcher_group_index: 0,
                         hook_index_within_group: 0,
                     },
-                });
+                }));
         }
 
         Ok(Self { handlers_by_event })
@@ -195,12 +198,15 @@ impl Hooks {
                     continue;
                 }
 
-                matched_handlers.push(handler.clone());
+                matched_handlers.push(Arc::clone(handler));
             }
         }
 
         matched_handlers.sort_by(|left, right| left.priority.cmp(&right.priority));
-        let previews = matched_handlers.iter().map(build_preview_run).collect();
+        let previews = matched_handlers
+            .iter()
+            .map(|handler| build_preview_run(handler))
+            .collect();
 
         PreparedHookDispatch {
             request,
@@ -224,7 +230,7 @@ pub struct HookDispatchRequest {
 pub struct PreparedHookDispatch {
     request: HookDispatchRequest,
     previews: Vec<HookRunSummary>,
-    matched_handlers: Vec<ConfiguredHandler>,
+    matched_handlers: Vec<Arc<ConfiguredHandler>>,
 }
 
 impl PreparedHookDispatch {
@@ -242,7 +248,7 @@ impl PreparedHookDispatch {
 
     /// Handlers that matched the request, ordered by priority.
     #[must_use]
-    pub fn matched_handlers(&self) -> &[ConfiguredHandler] {
+    pub fn matched_handlers(&self) -> &[Arc<ConfiguredHandler>] {
         &self.matched_handlers
     }
 }
