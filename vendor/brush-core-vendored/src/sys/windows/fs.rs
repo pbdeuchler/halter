@@ -54,12 +54,10 @@ impl crate::sys::fs::PathExt for std::path::Path {
     }
 
     fn get_device_and_inode(&self) -> Result<(u64, u64), crate::error::Error> {
-        let metadata = self.metadata()?;
-        let volume_serial_number = u64::from(
-            std::os::windows::fs::MetadataExt::volume_serial_number(&metadata).unwrap_or(0),
-        );
-        let file_index = std::os::windows::fs::MetadataExt::file_index(&metadata).unwrap_or(0);
-        Ok((volume_serial_number, file_index))
+        // Mirrors upstream brush-core (which dropped the nightly-only `windows_by_handle`
+        // feature this previously relied on).
+        // TODO(windows): implement using file index / volume serial number.
+        Err(error::ErrorKind::NotSupportedOnThisPlatform("get_device_and_inode").into())
     }
 }
 
