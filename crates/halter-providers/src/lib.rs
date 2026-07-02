@@ -32,6 +32,8 @@ mod responses_provider;
 mod responses_transport;
 mod retry;
 mod secret;
+#[cfg(test)]
+pub(crate) mod test_http;
 mod unsupported;
 
 use async_trait::async_trait;

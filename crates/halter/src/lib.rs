@@ -80,13 +80,12 @@ pub mod prelude {
     pub use halter_protocol::{
         Message, ResourceSnapshot, SessionEvent, SessionEventPayload, SessionId, Turn,
     };
-    pub use halter_providers::{
-        DefaultProviderErrorClassifier, ProviderErrorClassifier, ProviderErrorKind,
-        ProviderTimeouts, ResiliencePolicy, RetryPolicy,
-    };
     pub use halter_runtime::{HalterSession, SessionInit, SessionRuntime, SubagentEventForwarding};
 
     pub use crate::prompts;
     pub use crate::providers;
+    // Re-exported from the `providers` module so the flattened names have a
+    // single maintenance point.
+    pub use crate::providers::*;
     pub use crate::{Halter, HalterBuilder, PluginLoader, ResourceCompiler, SkillLoader};
 }

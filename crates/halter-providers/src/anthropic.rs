@@ -1,5 +1,7 @@
 // pattern: Imperative Shell
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use halter_protocol::{
@@ -13,20 +15,21 @@ use tracing::{debug, info};
 use crate::Provider;
 use crate::anthropic_codec;
 use crate::header_overrides::HeaderOverrides;
-use crate::http_client::{JsonHttpClient, JsonRequest};
-use crate::resilience::ProviderTimeouts;
+use crate::http_client::{JsonHttpClient, JsonRequest, join_url, provider_error_from_anyhow};
+use crate::resilience::{ProviderErrorClassifier, ResiliencePolicy, ResilientProvider};
 use crate::secret::SecretString;
 
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 
 #[derive(Debug, Clone)]
 /// Anthropic Messages API provider.
+///
+/// Like [`crate::OpenAiProvider`] and [`crate::OpenRouterProvider`], the
+/// transport core is wrapped in a [`ResilientProvider`], so every constructor
+/// yields bounded retries with backoff for transient failures (429/529,
+/// overload, network faults) on both `stream` and `compact`.
 pub struct AnthropicProvider {
-    api_key: SecretString,
-    base_url: String,
-    client: JsonHttpClient,
-    header_overrides: HeaderOverrides,
-    temperature: Option<f32>,
+    inner: ResilientProvider<AnthropicMessagesProvider>,
 }
 
 impl AnthropicProvider {
@@ -49,34 +52,124 @@ impl AnthropicProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_headers_and_timeouts(
+        Self::new_with_headers_and_resilience(
             api_key,
             base_url,
             header_overrides,
             temperature,
-            ProviderTimeouts::default(),
+            ResiliencePolicy::default(),
+            Arc::new(crate::DefaultProviderErrorClassifier),
         )
     }
 
-    pub fn new_with_headers_and_timeouts(
+    /// Same as [`AnthropicProvider::new_with_headers`] with an explicit
+    /// provider-request resilience policy and error classifier.
+    pub fn new_with_headers_and_resilience(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
-        timeouts: ProviderTimeouts,
+        resilience_policy: ResiliencePolicy,
+        classifier: Arc<dyn ProviderErrorClassifier>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            api_key: api_key.into(),
-            base_url: base_url.into(),
-            client: JsonHttpClient::try_new_with_timeouts(timeouts)?,
-            header_overrides: HeaderOverrides::new(header_overrides)?,
-            temperature,
+            inner: ResilientProvider::new_with_classifier(
+                "anthropic",
+                AnthropicMessagesProvider::try_new(
+                    api_key,
+                    base_url,
+                    header_overrides,
+                    temperature,
+                    resilience_policy,
+                )?,
+                resilience_policy,
+                classifier,
+            ),
         })
     }
 }
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
+        self.inner.compaction_window(messages)
+    }
+
+    async fn stream(
+        &self,
+        request: ProviderRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+        if request.model.api_kind != ApiKind::AnthropicMessages {
+            anyhow::bail!(
+                "failed to execute provider request: anthropic provider requires anthropic_messages api kind"
+            );
+        }
+        self.inner.stream(request, cancel).await
+    }
+
+    async fn compact(
+        &self,
+        request: ProviderCompactionRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<ProviderCompactionResponse> {
+        self.inner.compact(request, cancel).await
+    }
+}
+
+/// Transport core for the Anthropic Messages API. Owns only transport-level
+/// concerns (HTTP client, encode/decode); retry, backoff, and error
+/// classification live in the [`ResilientProvider`] wrapper.
+#[derive(Debug, Clone)]
+struct AnthropicMessagesProvider {
+    api_key: SecretString,
+    base_url: String,
+    client: JsonHttpClient,
+    header_overrides: HeaderOverrides,
+    temperature: Option<f32>,
+}
+
+impl AnthropicMessagesProvider {
+    fn try_new(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+        header_overrides: &[(String, String)],
+        temperature: Option<f32>,
+        resilience_policy: ResiliencePolicy,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            api_key: api_key.into(),
+            base_url: base_url.into(),
+            client: JsonHttpClient::try_new_with_timeouts(resilience_policy.timeouts)?,
+            header_overrides: HeaderOverrides::new(header_overrides)?,
+            temperature,
+        })
+    }
+
+    fn default_headers(&self, enable_interleaved_thinking: bool) -> Vec<(String, String)> {
+        let mut headers = vec![
+            (
+                "x-api-key".to_owned(),
+                self.api_key.expose_secret().to_owned(),
+            ),
+            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+        ];
+        if enable_interleaved_thinking {
+            headers.push((
+                "anthropic-beta".to_owned(),
+                "interleaved-thinking-2025-05-14".to_owned(),
+            ));
+        }
+        headers
+    }
+}
+
+#[async_trait]
+impl Provider for AnthropicMessagesProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_tools: true,
@@ -105,11 +198,6 @@ impl Provider for AnthropicProvider {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
-        if request.model.api_kind != ApiKind::AnthropicMessages {
-            anyhow::bail!(
-                "failed to execute provider request: anthropic provider requires anthropic_messages api kind"
-            );
-        }
         info!(
             provider = "anthropic",
             session_id = %request.session_id,
@@ -120,15 +208,25 @@ impl Provider for AnthropicProvider {
             "starting anthropic request"
         );
 
-        let body = anthropic_codec::encode_stream_request(&request, self.temperature)?;
+        // Deterministic encode failures are Fatal so the resilience wrapper
+        // short-circuits instead of burning the retry budget (H4).
+        let body = match anthropic_codec::encode_stream_request(&request, self.temperature) {
+            Ok(body) => body,
+            Err(error) => {
+                return Ok(single_error_stream(ProviderError::with_kind(
+                    format!("failed to encode anthropic request: {error:#}"),
+                    ProviderErrorKind::Fatal,
+                )));
+            }
+        };
         let enable_interleaved_thinking =
             request.model.reasoning.is_some() && !request.tools.is_empty();
-        let raw_stream = self
+        let raw_stream = match self
             .client
             .post_json_event_stream(
                 JsonRequest {
                     provider_label: "anthropic",
-                    url: provider_url(&self.base_url, ANTHROPIC_MESSAGES_PATH),
+                    url: join_url(&self.base_url, ANTHROPIC_MESSAGES_PATH),
                     headers: self
                         .header_overrides
                         .merge_string_pairs(self.default_headers(enable_interleaved_thinking)),
@@ -136,7 +234,15 @@ impl Provider for AnthropicProvider {
                 },
                 cancel,
             )
-            .await?;
+            .await
+        {
+            Ok(raw_stream) => raw_stream,
+            // Transport failures carry their status/tag classification from
+            // the shared classifier (429 → RateLimited with Retry-After
+            // hint, 5xx → Transient, other 4xx → Fatal), so the resilience
+            // wrapper sees the same taxonomy as the OpenAI-family providers.
+            Err(error) => return Ok(single_error_stream(provider_error_from_anyhow(error))),
+        };
         let mut decoder = anthropic_codec::AnthropicStreamDecoder::new(&request);
         Ok(raw_stream
             .flat_map(move |item| {
@@ -158,6 +264,9 @@ impl Provider for AnthropicProvider {
                                 ProviderErrorKind::Fatal,
                             ))]
                         }),
+                    // Mid-stream SSE read failures are connection faults —
+                    // inherently transient, mirroring the OpenAI-family
+                    // treatment of stream/network errors.
                     Err(error) => vec![Err(ProviderError::with_kind(
                         format!("{error:#}"),
                         ProviderErrorKind::Transient,
@@ -194,7 +303,7 @@ impl Provider for AnthropicProvider {
             .post_json(
                 JsonRequest {
                     provider_label: "anthropic",
-                    url: provider_url(&self.base_url, ANTHROPIC_MESSAGES_PATH),
+                    url: join_url(&self.base_url, ANTHROPIC_MESSAGES_PATH),
                     headers: self
                         .header_overrides
                         .merge_string_pairs(self.default_headers(false)),
@@ -207,31 +316,16 @@ impl Provider for AnthropicProvider {
     }
 }
 
-impl AnthropicProvider {
-    fn default_headers(&self, enable_interleaved_thinking: bool) -> Vec<(String, String)> {
-        let mut headers = vec![
-            (
-                "x-api-key".to_owned(),
-                self.api_key.expose_secret().to_owned(),
-            ),
-            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
-        ];
-        if enable_interleaved_thinking {
-            headers.push((
-                "anthropic-beta".to_owned(),
-                "interleaved-thinking-2025-05-14".to_owned(),
-            ));
-        }
-        headers
-    }
-}
-
-fn provider_url(base_url: &str, path: &str) -> String {
-    format!("{}{}", base_url.trim_end_matches('/'), path)
+fn single_error_stream(
+    error: ProviderError,
+) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+    stream::iter([Err(error)]).boxed()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use chrono::Utc;
     use futures::StreamExt;
     use halter_protocol::{
@@ -242,10 +336,13 @@ mod tests {
     };
     use indexmap::IndexMap;
     use serde_json::{Value, json};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::RetryPolicy;
+    use crate::resilience::ProviderTimeouts;
+    use crate::test_http::{find_headers_end, read_http_request};
 
     #[test]
     fn anthropic_provider_reports_current_feature_support() {
@@ -261,6 +358,25 @@ mod tests {
             Some(ProviderCompactionStrategy::Inline)
         );
         assert!(capabilities.supports_interleaved_reasoning);
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_rejects_non_messages_api_kind() {
+        let provider = AnthropicProvider::new("test-key", "https://api.anthropic.com")
+            .expect("anthropic provider");
+        let mut request = sample_request();
+        request.model.api_kind = ApiKind::OpenAiResponses;
+
+        let error = match provider.stream(request, CancellationToken::new()).await {
+            Ok(_) => panic!("anthropic provider should reject non-messages requests"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("anthropic provider requires anthropic_messages api kind")
+        );
     }
 
     #[test]
@@ -349,6 +465,122 @@ mod tests {
         assert_eq!(body["stream"], true);
     }
 
+    /// Anthropic now shares the resilience wrapper: an HTTP 429 with a
+    /// Retry-After hint must be retried, matching the OpenAI treatment.
+    /// Previously the direct constructor issued exactly one request and
+    /// surfaced a non-retryable error.
+    #[tokio::test]
+    async fn anthropic_provider_retries_rate_limited_requests() {
+        let attempts = std::sync::Arc::new(tokio::sync::Mutex::new(0u32));
+        let base_url = spawn_rate_limited_then_success_server(attempts.clone()).await;
+        let provider = AnthropicProvider::new_with_headers_and_resilience(
+            "test-key",
+            base_url,
+            &[],
+            None,
+            test_policy(3),
+            std::sync::Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+        .expect("anthropic provider");
+
+        let mut stream = provider
+            .stream(sample_request(), CancellationToken::new())
+            .await
+            .expect("provider stream");
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream should recover after retry");
+            let done = matches!(event, StreamEvent::MessageEnd { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        assert_eq!(*attempts.lock().await, 2, "429 must trigger one retry");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "hello"
+        )));
+    }
+
+    /// A 4xx client error must stay fatal: exactly one request, no retry.
+    #[tokio::test]
+    async fn anthropic_provider_does_not_retry_invalid_requests() {
+        let attempts = std::sync::Arc::new(tokio::sync::Mutex::new(0u32));
+        let base_url = spawn_invalid_request_server(attempts.clone()).await;
+        let provider = AnthropicProvider::new_with_headers_and_resilience(
+            "test-key",
+            base_url,
+            &[],
+            None,
+            test_policy(3),
+            std::sync::Arc::new(crate::DefaultProviderErrorClassifier),
+        )
+        .expect("anthropic provider");
+
+        let mut stream = provider
+            .stream(sample_request(), CancellationToken::new())
+            .await
+            .expect("provider stream");
+        let mut errors = Vec::new();
+        while let Some(item) = stream.next().await {
+            errors.push(item.expect_err("invalid request should surface an error"));
+        }
+
+        assert_eq!(*attempts.lock().await, 1, "4xx must not be retried");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, ProviderErrorKind::Fatal);
+        assert!(errors[0].message.contains("max_tokens"));
+    }
+
+    fn test_policy(max_attempts: u32) -> ResiliencePolicy {
+        ResiliencePolicy {
+            timeouts: ProviderTimeouts {
+                connect: Duration::from_secs(1),
+                request: Duration::from_secs(5),
+                stream_idle: Duration::from_secs(5),
+            },
+            request_retry: RetryPolicy {
+                max_attempts,
+                base_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(5),
+                deadline: Duration::from_secs(10),
+                jitter_pct: 0,
+            },
+        }
+    }
+
+    fn sse_success_response() -> String {
+        let body = [
+            r#"event: message_start"#,
+            r#"data: {"type":"message_start","message":{"id":"msg_123","usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            "",
+            r#"event: content_block_start"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "",
+            r#"event: content_block_delta"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+            "",
+            r#"event: content_block_stop"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "",
+            r#"event: message_delta"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+            "",
+            r#"event: message_stop"#,
+            r#"data: {"type":"message_stop"}"#,
+            "",
+            "",
+        ]
+        .join("\n");
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
     async fn spawn_stream_server(captured: std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -359,37 +591,69 @@ mod tests {
             let request = read_http_request(&mut socket).await.expect("read request");
             *captured.lock().await = request;
 
-            let body = [
-                r#"event: message_start"#,
-                r#"data: {"type":"message_start","message":{"id":"msg_123","usage":{"input_tokens":1,"output_tokens":0}}}"#,
-                "",
-                r#"event: content_block_start"#,
-                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
-                "",
-                r#"event: content_block_delta"#,
-                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
-                "",
-                r#"event: content_block_stop"#,
-                r#"data: {"type":"content_block_stop","index":0}"#,
-                "",
-                r#"event: message_delta"#,
-                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
-                "",
-                r#"event: message_stop"#,
-                r#"data: {"type":"message_stop"}"#,
-                "",
-                "",
-            ]
-            .join("\n");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
             socket
-                .write_all(response.as_bytes())
+                .write_all(sse_success_response().as_bytes())
                 .await
                 .expect("write response");
+        });
+        format!("http://{address}")
+    }
+
+    async fn spawn_rate_limited_then_success_server(
+        attempts: std::sync::Arc<tokio::sync::Mutex<u32>>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept socket");
+                read_http_request(&mut socket).await.expect("read request");
+                *attempts.lock().await += 1;
+                let response = if attempt == 0 {
+                    let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests exceeded your rate limit"}}"#;
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 0\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    sse_success_response()
+                };
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    async fn spawn_invalid_request_server(
+        attempts: std::sync::Arc<tokio::sync::Mutex<u32>>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                if read_http_request(&mut socket).await.is_err() {
+                    return;
+                }
+                *attempts.lock().await += 1;
+                let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens too large"}}"#;
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
         });
         format!("http://{address}")
     }
@@ -455,39 +719,6 @@ mod tests {
             stop_reason: None,
             usage: None,
             replay_meta: Default::default(),
-        })
-    }
-
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
-        let mut request = Vec::new();
-        let mut buf = [0_u8; 1024];
-        loop {
-            let read = socket.read(&mut buf).await?;
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buf[..read]);
-            if let Some(headers_end) = find_headers_end(&request) {
-                let content_length = content_length(&request[..headers_end]).unwrap_or_default();
-                if request.len() >= headers_end + 4 + content_length {
-                    break;
-                }
-            }
-        }
-        Ok(request)
-    }
-
-    fn find_headers_end(bytes: &[u8]) -> Option<usize> {
-        bytes.windows(4).position(|window| window == b"\r\n\r\n")
-    }
-
-    fn content_length(headers: &[u8]) -> Option<usize> {
-        let text = String::from_utf8_lossy(headers);
-        text.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().ok())
-                .flatten()
         })
     }
 }

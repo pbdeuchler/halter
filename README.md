@@ -359,10 +359,17 @@ refresh_token = "..."
 Halter reads process environment variables. It does not parse `.env` files directly; if you use a `.env` file, load it into the process environment before starting the CLI or SDK process.
 
 Provider request resilience is configured globally under `[resilience]` and can
-be partially overridden per provider. For streaming calls, `request_secs` bounds
-request setup through response headers and `stream_idle_secs` bounds the idle
-gap between stream items; it is not a total stream lifetime cap. `max_attempts`
-includes the initial request:
+be partially overridden per provider. The same retry policy applies uniformly to
+Anthropic, OpenAI, and OpenRouter, and covers both streaming turns and
+compaction requests. Only failures classified retryable (rate limits,
+5xx/overload, network faults) are retried — deterministic failures such as
+invalid requests fail immediately — and server-supplied backoff hints
+(`Retry-After`, "try again in …") are honored. Retry jitter is applied within
+`max_backoff_secs`; a computed delay never exceeds it. For streaming calls,
+`request_secs` bounds request setup through response headers and
+`stream_idle_secs` bounds the idle gap between stream items; it is not a total
+stream lifetime cap. Once a stream has emitted content, that request is never
+retried. `max_attempts` includes the initial request:
 
 ```toml
 [resilience.timeouts]

@@ -22,7 +22,7 @@ use halter_providers::{
     AnthropicProvider, DefaultProviderErrorClassifier, FullTurnJudgePlan, FullTurnPanelist,
     ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials, OpenAiProvider,
     OpenRouterProvider, Provider, ProviderErrorClassifier, ProviderTimeouts, ResiliencePolicy,
-    ResilientProvider, RetryPolicy,
+    RetryPolicy,
 };
 use halter_runtime::{
     DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
@@ -917,19 +917,20 @@ fn build_provider(
         header_overrides = provider.headers.len(),
         "constructing provider client"
     );
+    // One integration strategy for every family: each provider constructor
+    // wraps its transport core in `ResilientProvider` internally; the builder
+    // only supplies the policy and classifier.
     let provider: Arc<dyn halter_providers::Provider> = match provider.provider {
-        ConfiguredProvider::Anthropic => Arc::new(ResilientProvider::new_with_classifier(
-            "anthropic",
-            AnthropicProvider::new_with_headers_and_timeouts(
+        ConfiguredProvider::Anthropic => {
+            Arc::new(AnthropicProvider::new_with_headers_and_resilience(
                 api_key_auth(provider)?,
                 provider.base_url.clone(),
                 &provider.headers,
                 provider.temperature,
-                resilience_policy.timeouts,
-            )?,
-            resilience_policy,
-            classifier,
-        )),
+                resilience_policy,
+                classifier,
+            )?)
+        }
         ConfiguredProvider::OpenAi => match &provider.auth {
             ResolvedProviderAuth::ApiKey(api_key) => {
                 Arc::new(OpenAiProvider::new_with_headers_and_resilience(

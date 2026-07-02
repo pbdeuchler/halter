@@ -720,11 +720,20 @@ impl AnthropicStreamDecoder {
                     .pointer("/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("anthropic stream error");
+                // Route in-band errors through the shared classifier so
+                // rate-limit/overloaded events are retryable with backoff
+                // hints, matching the OpenAI-family treatment (H6).
+                let retryability = crate::openai_error::classify_error_payload(
+                    None,
+                    event.pointer("/error/type").and_then(Value::as_str),
+                    message,
+                );
                 Ok(vec![StreamEvent::Error {
-                    error: halter_protocol::ProviderError::new(
+                    error: halter_protocol::ProviderError::with_kind(
                         format!("failed to execute provider request: {message}"),
-                        false,
-                    ),
+                        retryability.kind,
+                    )
+                    .with_backoff_hint(retryability.backoff_hint),
                 }])
             }
             _ => Ok(Vec::new()),
@@ -1294,6 +1303,74 @@ mod tests {
             event,
             StreamEvent::MessageEnd { stop_reason, .. } if *stop_reason == StopReason::ToolUse
         )));
+    }
+
+    /// In-band `error` events must carry the shared retryability
+    /// classification: rate-limit/overload retryable (previously every
+    /// in-band error was hardcoded non-retryable), request errors fatal.
+    #[test]
+    fn stream_decoder_classifies_in_band_error_events() {
+        use halter_protocol::ProviderErrorKind;
+
+        let cases: &[(&str, &str, ProviderErrorKind, bool)] = &[
+            (
+                "rate_limit_error",
+                "Number of requests exceeded your rate limit",
+                ProviderErrorKind::RateLimited,
+                false,
+            ),
+            (
+                "overloaded_error",
+                "Overloaded",
+                ProviderErrorKind::Transient,
+                true,
+            ),
+            (
+                "api_error",
+                "internal server error",
+                ProviderErrorKind::Transient,
+                false,
+            ),
+            (
+                "invalid_request_error",
+                "max_tokens too large",
+                ProviderErrorKind::Fatal,
+                false,
+            ),
+        ];
+
+        let request = sample_request(Vec::new());
+        for (error_type, message, want_kind, want_hint) in cases {
+            let mut decoder = AnthropicStreamDecoder::new(&request);
+            let events = decoder
+                .decode(&json!({
+                    "type": "error",
+                    "error": { "type": error_type, "message": message }
+                }))
+                .expect("decode error event");
+
+            let [StreamEvent::Error { error }] = events.as_slice() else {
+                panic!("{error_type}: expected a single error event, got {events:?}");
+            };
+            assert_eq!(error.kind, *want_kind, "{error_type}");
+            assert_eq!(error.backoff_hint.is_some(), *want_hint, "{error_type}");
+            assert!(error.message.contains(message), "{error_type}");
+        }
+    }
+
+    #[test]
+    fn stream_decoder_defaults_malformed_error_events_to_fatal() {
+        let request = sample_request(Vec::new());
+        let mut decoder = AnthropicStreamDecoder::new(&request);
+        let events = decoder
+            .decode(&json!({"type": "error"}))
+            .expect("decode error event");
+
+        let [StreamEvent::Error { error }] = events.as_slice() else {
+            panic!("expected a single error event, got {events:?}");
+        };
+        assert_eq!(error.kind, halter_protocol::ProviderErrorKind::Fatal);
+        assert!(error.message.contains("anthropic stream error"));
     }
 
     #[test]

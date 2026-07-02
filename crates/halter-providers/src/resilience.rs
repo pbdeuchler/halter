@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, channel::mpsc, stream::BoxStream};
+use futures::{SinkExt, Stream, StreamExt, channel::mpsc, stream::BoxStream};
 use halter_protocol::{
     CompactionWindow, Message, MessageId, ProviderCapabilities, ProviderCompactionRequest,
     ProviderCompactionResponse, ProviderError, ProviderErrorKind, ProviderRequest, StreamEvent,
@@ -19,6 +19,11 @@ use tracing::{debug, info, warn};
 
 use crate::Provider;
 use crate::retry::{RetryGate, RetryPolicy};
+
+/// Bound on events buffered between the retry worker and a slow consumer.
+/// Small power of two: enough to smooth bursts, small enough that a stalled
+/// consumer exerts backpressure instead of accumulating a whole stream.
+const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderTimeouts {
@@ -37,19 +42,10 @@ impl Default for ProviderTimeouts {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResiliencePolicy {
     pub timeouts: ProviderTimeouts,
     pub request_retry: RetryPolicy,
-}
-
-impl Default for ResiliencePolicy {
-    fn default() -> Self {
-        Self {
-            timeouts: ProviderTimeouts::default(),
-            request_retry: RetryPolicy::default(),
-        }
-    }
 }
 
 pub trait ProviderErrorClassifier: Send + Sync {
@@ -65,6 +61,19 @@ impl ProviderErrorClassifier for DefaultProviderErrorClassifier {
     }
 }
 
+/// Decorator that adds bounded retries with backoff to an inner [`Provider`].
+///
+/// `stream` retries pre-commit retryable failures (transport faults, rate
+/// limits, in-band error events) and never retries once user-visible content
+/// has been emitted. `compact` is unary and gets the same retry/timeout
+/// treatment: attempts whose error carries a retryable [`ProviderError`]
+/// (attached by the built-in transports) are retried; untyped errors are
+/// treated as fatal so capability errors like "provider does not support
+/// compaction" are not retry-looped.
+///
+/// All built-in providers ([`crate::AnthropicProvider`],
+/// [`crate::OpenAiProvider`], [`crate::OpenRouterProvider`]) construct this
+/// wrapper internally; the higher-level builder only supplies the policy.
 #[derive(Clone)]
 pub struct ResilientProvider<P> {
     label: &'static str,
@@ -125,7 +134,7 @@ where
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
-        let (tx, rx) = mpsc::unbounded();
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let stream_cancel = cancel.child_token();
         let task_cancel = stream_cancel.clone();
         let inner = self.inner.clone();
@@ -135,6 +144,7 @@ where
 
         tokio::spawn(async move {
             let cancel = task_cancel;
+            let mut tx = tx;
             let mut gate = RetryGate::new(policy.request_retry);
             let mut commit_dedup = CommitDedup::default();
 
@@ -149,17 +159,17 @@ where
                 {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(error)) => {
-                        let error = classifier.classify(ProviderError::with_kind(
-                            format!("{error:#}"),
-                            ProviderErrorKind::Transient,
-                        ));
+                        // Recover the typed classification when the provider
+                        // attached one (deterministic setup failures are
+                        // Fatal); only untyped errors default to Transient.
+                        let error = classifier.classify(setup_provider_error(error));
                         attempt_cancel.cancel();
                         if !retry_or_emit(
                             RetryContext {
                                 label,
                                 attempt_id,
                                 gate: &mut gate,
-                                tx: &tx,
+                                tx: &mut tx,
                                 cancel: &cancel,
                             },
                             error,
@@ -184,7 +194,7 @@ where
                                 label,
                                 attempt_id,
                                 gate: &mut gate,
-                                tx: &tx,
+                                tx: &mut tx,
                                 cancel: &cancel,
                             },
                             error,
@@ -203,7 +213,7 @@ where
                 loop {
                     let item = select! {
                         _ = cancel.cancelled() => {
-                            let _ = tx.unbounded_send(Err(ProviderError::cancelled()));
+                            let _ = tx.try_send(Err(ProviderError::cancelled()));
                             return;
                         }
                         item = tokio::time::timeout(policy.timeouts.stream_idle, attempt_stream.next()) => item,
@@ -231,7 +241,7 @@ where
                                         label,
                                         attempt_id,
                                         gate: &mut gate,
-                                        tx: &tx,
+                                        tx: &mut tx,
                                         cancel: &cancel,
                                     },
                                     error,
@@ -242,7 +252,7 @@ where
                                 }
                                 return;
                             }
-                            let _ = tx.unbounded_send(Err(error));
+                            let _ = forward(&mut tx, &cancel, Err(error)).await;
                             return;
                         }
                         Ok(Some(Ok(StreamEvent::Error { error }))) => {
@@ -261,7 +271,7 @@ where
                                         label,
                                         attempt_id,
                                         gate: &mut gate,
-                                        tx: &tx,
+                                        tx: &mut tx,
                                         cancel: &cancel,
                                     },
                                     error,
@@ -272,13 +282,13 @@ where
                                 }
                                 return;
                             }
-                            let _ = tx.unbounded_send(Err(error));
+                            let _ = forward(&mut tx, &cancel, Err(error)).await;
                             return;
                         }
                         Ok(Some(Ok(event))) => {
                             if committed {
                                 if commit_dedup.allow(&event)
-                                    && tx.unbounded_send(Ok(event)).is_err()
+                                    && !forward(&mut tx, &cancel, Ok(event)).await
                                 {
                                     return;
                                 }
@@ -295,7 +305,7 @@ where
                                     if !commit_dedup.allow(&event) {
                                         continue;
                                     }
-                                    if tx.unbounded_send(Ok(event)).is_err() {
+                                    if !forward(&mut tx, &cancel, Ok(event)).await {
                                         return;
                                     }
                                 }
@@ -317,7 +327,7 @@ where
                                         label,
                                         attempt_id,
                                         gate: &mut gate,
-                                        tx: &tx,
+                                        tx: &mut tx,
                                         cancel: &cancel,
                                     },
                                     error,
@@ -328,18 +338,16 @@ where
                                 }
                                 return;
                             }
-                            let _ = tx.unbounded_send(Err(error));
+                            let _ = forward(&mut tx, &cancel, Err(error)).await;
                             return;
                         }
                         Ok(None) => {
-                            if !pending_events.is_empty() {
-                                for event in pending_events.drain(..) {
-                                    if !commit_dedup.allow(&event) {
-                                        continue;
-                                    }
-                                    if tx.unbounded_send(Ok(event)).is_err() {
-                                        return;
-                                    }
+                            for event in pending_events.drain(..) {
+                                if !commit_dedup.allow(&event) {
+                                    continue;
+                                }
+                                if !forward(&mut tx, &cancel, Ok(event)).await {
+                                    return;
                                 }
                             }
                             debug!(provider = label, "provider stream completed");
@@ -350,7 +358,7 @@ where
             }
         });
 
-        Ok(CancelOnDrop::new(rx.boxed(), stream_cancel).boxed())
+        Ok(CancelOnDrop::new(rx, stream_cancel).boxed())
     }
 
     async fn compact(
@@ -358,7 +366,98 @@ where
         request: ProviderCompactionRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<ProviderCompactionResponse> {
-        self.inner.compact(request, cancel).await
+        let mut gate = RetryGate::new(self.policy.request_retry);
+        loop {
+            let attempt_id = gate.next_attempt_id();
+            let attempt = select! {
+                biased;
+                _ = cancel.cancelled() => return Err(anyhow::Error::new(ProviderError::cancelled())),
+                attempt = tokio::time::timeout(
+                    self.policy.timeouts.request,
+                    self.inner.compact(request.clone(), cancel.child_token()),
+                ) => attempt,
+            };
+            let error = match attempt {
+                Ok(Ok(response)) => return Ok(response),
+                // Untyped errors default to Fatal here (unlike stream setup):
+                // the trait's own compact fallback rejects unsupported
+                // compaction with an untyped error, which must not be
+                // retry-looped. Built-in transports attach typed errors.
+                Ok(Err(error)) => self.classifier.classify(compact_provider_error(error)),
+                Err(_) => provider_timeout_error(
+                    format!(
+                        "failed to compact session: request timed out after {}s",
+                        self.policy.timeouts.request.as_secs()
+                    ),
+                    None,
+                ),
+            };
+            if !error.retryable() {
+                return Err(anyhow::Error::new(error));
+            }
+            match gate.record_failure_and_next_backoff(error.backoff_hint) {
+                Some(delay) => {
+                    info!(
+                        provider = self.label,
+                        attempt = attempt_id,
+                        retry_in_ms = delay.as_millis() as u64,
+                        "retrying provider compaction request"
+                    );
+                    select! {
+                        _ = cancel.cancelled() => {
+                            return Err(anyhow::Error::new(ProviderError::cancelled()));
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                None => {
+                    warn!(
+                        provider = self.label,
+                        attempt = attempt_id,
+                        kind = ?error.kind,
+                        "provider compaction retry budget exhausted"
+                    );
+                    return Err(anyhow::Error::new(error));
+                }
+            }
+        }
+    }
+}
+
+/// Classify a stream-setup failure: prefer the typed [`ProviderError`]
+/// attached by the provider, default the rest to `Transient` (network-layer
+/// failures from foreign `Provider` impls are more often recoverable).
+fn setup_provider_error(error: anyhow::Error) -> ProviderError {
+    match error.downcast::<ProviderError>() {
+        Ok(provider_error) => provider_error,
+        Err(error) => ProviderError::with_kind(format!("{error:#}"), ProviderErrorKind::Transient),
+    }
+}
+
+/// Classify a compaction failure: prefer the typed [`ProviderError`],
+/// default the rest to `Fatal` so untyped capability errors short-circuit.
+fn compact_provider_error(error: anyhow::Error) -> ProviderError {
+    match error.downcast::<ProviderError>() {
+        Ok(provider_error) => provider_error,
+        Err(error) => ProviderError::with_kind(format!("{error:#}"), ProviderErrorKind::Fatal),
+    }
+}
+
+/// Send an item to the consumer, racing the cancellation token so a stalled
+/// consumer cannot wedge the worker past cancellation. Returns `false` when
+/// the worker should stop (consumer dropped or stream cancelled); a
+/// best-effort cancellation marker is queued in the cancel case.
+async fn forward(
+    tx: &mut mpsc::Sender<Result<StreamEvent, ProviderError>>,
+    cancel: &CancellationToken,
+    item: Result<StreamEvent, ProviderError>,
+) -> bool {
+    select! {
+        _ = cancel.cancelled() => {
+            let _ = tx.try_send(Err(ProviderError::cancelled()));
+            false
+        }
+        result = tx.send(item) => result.is_ok(),
     }
 }
 
@@ -366,13 +465,13 @@ struct RetryContext<'a> {
     label: &'static str,
     attempt_id: u32,
     gate: &'a mut RetryGate,
-    tx: &'a mpsc::UnboundedSender<Result<StreamEvent, ProviderError>>,
+    tx: &'a mut mpsc::Sender<Result<StreamEvent, ProviderError>>,
     cancel: &'a CancellationToken,
 }
 
 async fn retry_or_emit(context: RetryContext<'_>, error: ProviderError) -> bool {
     if !error.retryable() {
-        let _ = context.tx.unbounded_send(Err(error));
+        let _ = forward(context.tx, context.cancel, Err(error)).await;
         return false;
     }
 
@@ -389,7 +488,7 @@ async fn retry_or_emit(context: RetryContext<'_>, error: ProviderError) -> bool 
             );
             select! {
                 _ = context.cancel.cancelled() => {
-                    let _ = context.tx.unbounded_send(Err(ProviderError::cancelled()));
+                    let _ = context.tx.try_send(Err(ProviderError::cancelled()));
                     false
                 }
                 _ = tokio::time::sleep(delay) => true,
@@ -402,7 +501,7 @@ async fn retry_or_emit(context: RetryContext<'_>, error: ProviderError) -> bool 
                 kind = ?error.kind,
                 "provider retry budget exhausted"
             );
-            let _ = context.tx.unbounded_send(Err(error));
+            let _ = forward(context.tx, context.cancel, Err(error)).await;
             false
         }
     }
@@ -439,7 +538,10 @@ impl<S> Drop for CancelOnDrop<S> {
     }
 }
 
-/// Dedup for repeated commit-eligible boundary events within a committed stream.
+/// Suppresses duplicate `MessageStart` events *within a single committed
+/// stream* — a defensive guard against upstreams that replay the boundary
+/// event. Retries never cross the commit boundary, so this never has to (and
+/// does not) dedup across attempts.
 #[derive(Debug, Default)]
 struct CommitDedup {
     seen_message_starts: HashSet<MessageId>,
@@ -454,6 +556,10 @@ impl CommitDedup {
     }
 }
 
+/// Whether an event represents real generated content that forecloses
+/// retrying the attempt. `ProviderWarning` is deliberately excluded: an
+/// early warning is diagnostic, not user-visible content, and must not
+/// spend the retry budget before anything was delivered.
 fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
     matches!(
         event,
@@ -463,7 +569,6 @@ fn stream_event_commits_attempt(event: &StreamEvent) -> bool {
             | StreamEvent::ToolArgsDelta { .. }
             | StreamEvent::ToolCallEnd { .. }
             | StreamEvent::MessageEnd { .. }
-            | StreamEvent::ProviderWarning { .. }
     )
 }
 
@@ -483,22 +588,32 @@ mod tests {
 
     use super::*;
 
+    type Script = Vec<Result<StreamEvent, ProviderError>>;
+
     #[derive(Debug)]
     struct ScriptedProvider {
         attempts: Arc<AtomicUsize>,
-        scripts: Arc<Mutex<VecDeque<Vec<Result<StreamEvent, ProviderError>>>>>,
+        produced: Arc<AtomicUsize>,
+        scripts: Arc<Mutex<VecDeque<Script>>>,
     }
 
     impl ScriptedProvider {
-        fn new(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Self {
+        fn new(scripts: Vec<Script>) -> Self {
             Self {
                 attempts: Arc::new(AtomicUsize::new(0)),
+                produced: Arc::new(AtomicUsize::new(0)),
                 scripts: Arc::new(Mutex::new(scripts.into())),
             }
         }
 
         fn attempts(&self) -> Arc<AtomicUsize> {
             self.attempts.clone()
+        }
+
+        /// Count of items the resilience worker has pulled off the inner
+        /// stream — the observable for backpressure assertions.
+        fn produced_events(&self) -> Arc<AtomicUsize> {
+            self.produced.clone()
         }
     }
 
@@ -520,7 +635,12 @@ mod tests {
                 .expect("script mutex")
                 .pop_front()
                 .unwrap_or_default();
-            Ok(stream::iter(script).boxed())
+            let produced = self.produced.clone();
+            Ok(stream::iter(script)
+                .inspect(move |_| {
+                    produced.fetch_add(1, Ordering::SeqCst);
+                })
+                .boxed())
         }
     }
 
@@ -678,6 +798,50 @@ mod tests {
         )));
     }
 
+    #[derive(Debug)]
+    struct TypedFatalStartupProvider {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for TypedFatalStartupProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(ProviderError::with_kind(
+                "failed to encode request",
+                ProviderErrorKind::Fatal,
+            )))
+        }
+    }
+
+    /// A setup `Err` carrying a typed Fatal `ProviderError` must
+    /// short-circuit: previously every setup error was rewrapped as
+    /// `Transient` and burned the whole retry budget.
+    #[tokio::test]
+    async fn typed_fatal_startup_error_short_circuits_retry_budget() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let provider = TypedFatalStartupProvider {
+            attempts: attempts.clone(),
+        };
+        let resilient = ResilientProvider::new("test", provider, test_policy(5));
+
+        let items = collect_items(resilient, CancellationToken::new()).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(items.len(), 1);
+        let error = items[0].as_ref().expect_err("fatal setup error");
+        assert_eq!(error.kind, ProviderErrorKind::Fatal);
+        assert_eq!(error.message, "failed to encode request");
+    }
+
     #[tokio::test]
     async fn retries_startup_errors_by_default() {
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -820,6 +984,323 @@ mod tests {
                 .is_cancelled()
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// L6: a `ProviderWarning` before any content must not commit the
+    /// attempt — a subsequent transient failure is still retried. Under the
+    /// old behavior the warning committed, attempts stayed at 1, and the
+    /// error was surfaced instead of retried.
+    #[tokio::test]
+    async fn provider_warning_does_not_commit_attempt() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                Ok(StreamEvent::ProviderWarning {
+                    message: "provider degraded".into(),
+                }),
+                Err(transient_error("upstream reset")),
+            ],
+            success_events("msg_after_warning", "done"),
+        ]);
+        let attempts = provider.attempts();
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        let events = collect_events(resilient).await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "warning must not foreclose the retry"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "done"
+        )));
+    }
+
+    /// M13: the worker-to-consumer channel is bounded. A consumer that never
+    /// polls must stall the worker after roughly the channel capacity, not
+    /// let it drain (and buffer) the entire upstream.
+    #[tokio::test]
+    async fn bounded_channel_applies_backpressure_to_stalled_consumer() {
+        let total_events = 1_000usize;
+        let mut script: Vec<Result<StreamEvent, ProviderError>> =
+            vec![Ok(StreamEvent::MessageStart {
+                id: MessageId::from("msg_backpressure"),
+            })];
+        script.extend((0..total_events).map(|index| {
+            Ok(StreamEvent::TextDelta {
+                id: BlockId::from("text_backpressure"),
+                delta: format!("chunk {index}"),
+            })
+        }));
+        let provider = ScriptedProvider::new(vec![script]);
+        let produced = provider.produced_events();
+        let resilient = ResilientProvider::new("test", provider, test_policy(1));
+
+        let stream = resilient
+            .stream(sample_request(), CancellationToken::new())
+            .await
+            .expect("stream");
+
+        // Give the worker ample time to pull as much as the channel allows
+        // while the consumer never polls.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pulled = produced.load(Ordering::SeqCst);
+        assert!(
+            pulled <= EVENT_CHANNEL_CAPACITY + 8,
+            "worker pulled {pulled} events despite a stalled consumer"
+        );
+
+        // Draining the consumer must release the backpressure and deliver
+        // every event without loss.
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(events.len(), total_events + 1);
+    }
+
+    /// M13: a stalled consumer must not wedge the worker past cancellation —
+    /// the blocked send races the token and the stream terminates.
+    #[tokio::test]
+    async fn cancellation_unblocks_worker_wedged_on_stalled_consumer() {
+        let mut script: Vec<Result<StreamEvent, ProviderError>> =
+            vec![Ok(StreamEvent::MessageStart {
+                id: MessageId::from("msg_wedged"),
+            })];
+        script.extend((0..1_000).map(|index| {
+            Ok(StreamEvent::TextDelta {
+                id: BlockId::from("text_wedged"),
+                delta: format!("chunk {index}"),
+            })
+        }));
+        let provider = ScriptedProvider::new(vec![script]);
+        let resilient = ResilientProvider::new("test", provider, test_policy(1));
+        let cancel = CancellationToken::new();
+
+        let stream = resilient
+            .stream(sample_request(), cancel.clone())
+            .await
+            .expect("stream");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        // The worker must exit (dropping its sender), so draining the
+        // buffered items terminates promptly instead of hanging.
+        let drained = tokio::time::timeout(Duration::from_secs(1), stream.collect::<Vec<_>>())
+            .await
+            .expect("worker must exit after cancellation");
+        assert!(drained.len() <= EVENT_CHANNEL_CAPACITY + 8);
+    }
+
+    #[derive(Debug)]
+    struct ScriptedCompactProvider {
+        attempts: Arc<AtomicUsize>,
+        results: Arc<Mutex<VecDeque<anyhow::Result<ProviderCompactionResponse>>>>,
+    }
+
+    impl ScriptedCompactProvider {
+        fn new(results: Vec<anyhow::Result<ProviderCompactionResponse>>) -> Self {
+            Self {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                results: Arc::new(Mutex::new(results.into())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedCompactProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            Ok(stream::empty().boxed())
+        }
+
+        async fn compact(
+            &self,
+            _request: ProviderCompactionRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<ProviderCompactionResponse> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.results
+                .lock()
+                .expect("results mutex")
+                .pop_front()
+                .unwrap_or_else(|| anyhow::bail!("script exhausted"))
+        }
+    }
+
+    fn compaction_response() -> ProviderCompactionResponse {
+        ProviderCompactionResponse {
+            output: Vec::new(),
+            usage: Default::default(),
+        }
+    }
+
+    fn sample_compaction_request() -> ProviderCompactionRequest {
+        ProviderCompactionRequest {
+            session_id: SessionId::new(),
+            model: sample_request().model,
+            compacted_prefix: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            instructions: "Summarize".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_returns_first_success() {
+        let provider = ScriptedCompactProvider::new(vec![Ok(compaction_response())]);
+        let attempts = provider.attempts.clone();
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        resilient
+            .compact(sample_compaction_request(), CancellationToken::new())
+            .await
+            .expect("compaction succeeds");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// M11: `compact` now gets the same retry treatment as `stream` — a
+    /// typed retryable failure is retried. Previously compact delegated
+    /// directly and any failure was final.
+    #[tokio::test]
+    async fn compact_retries_typed_retryable_failures() {
+        let provider = ScriptedCompactProvider::new(vec![
+            Err(anyhow::Error::new(ProviderError::with_kind(
+                "rate limited",
+                ProviderErrorKind::RateLimited,
+            ))),
+            Ok(compaction_response()),
+        ]);
+        let attempts = provider.attempts.clone();
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        resilient
+            .compact(sample_compaction_request(), CancellationToken::new())
+            .await
+            .expect("compaction succeeds after retry");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn compact_exhausts_retry_budget_and_returns_typed_error() {
+        let provider = ScriptedCompactProvider::new(vec![
+            Err(anyhow::Error::new(ProviderError::with_kind(
+                "first",
+                ProviderErrorKind::Transient,
+            ))),
+            Err(anyhow::Error::new(ProviderError::with_kind(
+                "final",
+                ProviderErrorKind::Transient,
+            ))),
+        ]);
+        let attempts = provider.attempts.clone();
+        let resilient = ResilientProvider::new("test", provider, test_policy(2));
+
+        let error = resilient
+            .compact(sample_compaction_request(), CancellationToken::new())
+            .await
+            .expect_err("budget exhaustion should fail");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let provider_error = error
+            .downcast::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.message, "final");
+    }
+
+    /// Untyped compact failures (e.g. the trait's own "does not support
+    /// compaction" fallback) must not be retry-looped.
+    #[tokio::test]
+    async fn compact_does_not_retry_untyped_or_fatal_failures() {
+        for scripted in [
+            anyhow::anyhow!("failed to compact session: provider does not support compaction"),
+            anyhow::Error::new(ProviderError::with_kind(
+                "bad request",
+                ProviderErrorKind::Fatal,
+            )),
+        ] {
+            let provider = ScriptedCompactProvider::new(vec![Err(scripted)]);
+            let attempts = provider.attempts.clone();
+            let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+            let error = resilient
+                .compact(sample_compaction_request(), CancellationToken::new())
+                .await
+                .expect_err("fatal compaction should fail");
+
+            assert_eq!(attempts.load(Ordering::SeqCst), 1, "{error:#}");
+        }
+    }
+
+    #[derive(Debug)]
+    struct HangingCompactProvider;
+
+    #[async_trait]
+    impl Provider for HangingCompactProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            Ok(stream::empty().boxed())
+        }
+
+        async fn compact(
+            &self,
+            _request: ProviderCompactionRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<ProviderCompactionResponse> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_times_out_hanging_requests() {
+        let resilient = ResilientProvider::new("test", HangingCompactProvider, timeout_policy());
+
+        let error = resilient
+            .compact(sample_compaction_request(), CancellationToken::new())
+            .await
+            .expect_err("hanging compaction should time out");
+
+        let provider_error = error
+            .downcast::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind, ProviderErrorKind::Transient);
+        assert!(provider_error.message.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn compact_honors_pre_cancelled_token() {
+        let provider = ScriptedCompactProvider::new(vec![Ok(compaction_response())]);
+        let attempts = provider.attempts.clone();
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = resilient
+            .compact(sample_compaction_request(), cancel)
+            .await
+            .expect_err("cancelled compaction should fail");
+
+        assert!(
+            error
+                .downcast::<ProviderError>()
+                .expect("typed provider error")
+                .is_cancelled()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
     }
 
     #[test]

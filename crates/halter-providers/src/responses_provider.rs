@@ -14,12 +14,11 @@ use tracing::{debug, error, info};
 
 use crate::Provider;
 use crate::openai_codec::{self, ResponsesInstructionMode, ResponsesRequestOptions};
-use crate::openai_error::classify;
 use crate::openai_rate_limit_policy::estimate_openai_request_cost;
 use crate::resilience::ResiliencePolicy;
 use crate::responses_transport::{
     ResponsesEndpointMode, ResponsesRateLimitStrategy, ResponsesTransport,
-    ResponsesTransportRequest, TransportError,
+    ResponsesTransportRequest, provider_error_from_openai, provider_error_from_transport,
 };
 use crate::secret::SecretString;
 
@@ -53,6 +52,9 @@ pub(crate) struct ResponsesProviderConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesProvider {
     config: ResponsesProviderConfig,
+    /// Effective capabilities, precomputed once so `capabilities()` does not
+    /// rebuild the compaction fields on every call.
+    capabilities: ProviderCapabilities,
     transport: ResponsesTransport,
     temperature: Option<f32>,
 }
@@ -65,17 +67,14 @@ impl ResponsesProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
     ) -> anyhow::Result<Self> {
-        let timeouts = config.resilience_policy.timeouts;
-        Ok(Self {
-            transport: ResponsesTransport::try_new_with_timeouts(
-                bearer_token,
-                base_url,
-                header_overrides,
-                timeouts,
-            )?,
+        Self::try_new_with_endpoint_mode(
             config,
+            bearer_token,
+            base_url,
+            header_overrides,
             temperature,
-        })
+            ResponsesEndpointMode::PublicApi,
+        )
     }
 
     pub(crate) fn try_new_with_endpoint_mode(
@@ -95,41 +94,24 @@ impl ResponsesProvider {
                 endpoint_mode,
                 timeouts,
             )?,
+            capabilities: effective_capabilities(&config),
             config,
             temperature,
         })
     }
 
-    #[must_use]
-    pub(crate) fn capabilities(&self) -> ProviderCapabilities {
-        let mut capabilities = self.config.capabilities.clone();
-        capabilities.supports_compaction = self.config.compact_strategy.is_some();
-        capabilities.compaction_strategy =
-            self.config.compact_strategy.map(|strategy| match strategy {
-                CompactStrategy::DedicatedEndpoint => ProviderCompactionStrategy::Dedicated,
-                CompactStrategy::InlineResponses => ProviderCompactionStrategy::Inline,
-            });
-        capabilities
-    }
-
-    pub(crate) fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
-        match self.config.compact_strategy {
-            Some(CompactStrategy::DedicatedEndpoint) => Some(
-                CompactionWindow::preserve_latest_assistant_response_block(messages),
-            ),
-            Some(CompactStrategy::InlineResponses) => {
-                Some(CompactionWindow::preserve_through_latest_user(messages))
-            }
-            None => None,
-        }
-    }
-
-    pub(crate) async fn stream(
+    async fn stream_inner(
         &self,
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
-        validate_responses_request(self.config.label, &request)?;
+        // Deterministic setup failures (wrong api kind, unencodable request)
+        // surface as a single Fatal in-stream error so the resilience layer
+        // short-circuits instead of burning its retry budget on a request
+        // that fails identically every attempt.
+        if let Err(error) = validate_responses_request(self.config.label, &request) {
+            return Ok(fatal_setup_stream(error));
+        }
         info!(
             provider = self.config.label,
             session_id = %request.session_id,
@@ -140,7 +122,7 @@ impl ResponsesProvider {
             "starting responses request"
         );
 
-        let request_body = openai_codec::encode_responses_request(
+        let request_body = match openai_codec::encode_responses_request(
             &request,
             ResponsesRequestOptions {
                 stream: true,
@@ -155,7 +137,10 @@ impl ResponsesProvider {
                 instruction_mode: self.config.request.instruction_mode,
                 temperature: self.temperature,
             },
-        )?;
+        ) {
+            Ok(request_body) => request_body,
+            Err(error) => return Ok(fatal_setup_stream(error)),
+        };
         let request_bytes = request_body.to_string().len();
         debug!(
             provider = self.config.label,
@@ -208,7 +193,7 @@ impl ResponsesProvider {
             .boxed())
     }
 
-    pub(crate) async fn compact(
+    async fn compact_inner(
         &self,
         request: ProviderCompactionRequest,
         cancel: CancellationToken,
@@ -296,11 +281,19 @@ impl ResponsesProvider {
 #[async_trait::async_trait]
 impl Provider for ResponsesProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        Self::capabilities(self)
+        self.capabilities.clone()
     }
 
     fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
-        Self::compaction_window(self, messages)
+        match self.config.compact_strategy {
+            Some(CompactStrategy::DedicatedEndpoint) => Some(
+                CompactionWindow::preserve_latest_assistant_response_block(messages),
+            ),
+            Some(CompactStrategy::InlineResponses) => {
+                Some(CompactionWindow::preserve_through_latest_user(messages))
+            }
+            None => None,
+        }
     }
 
     async fn stream(
@@ -308,7 +301,7 @@ impl Provider for ResponsesProvider {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
-        Self::stream(self, request, cancel).await
+        self.stream_inner(request, cancel).await
     }
 
     async fn compact(
@@ -316,8 +309,30 @@ impl Provider for ResponsesProvider {
         request: ProviderCompactionRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<ProviderCompactionResponse> {
-        Self::compact(self, request, cancel).await
+        self.compact_inner(request, cancel).await
     }
+}
+
+fn effective_capabilities(config: &ResponsesProviderConfig) -> ProviderCapabilities {
+    let mut capabilities = config.capabilities.clone();
+    capabilities.supports_compaction = config.compact_strategy.is_some();
+    capabilities.compaction_strategy = config.compact_strategy.map(|strategy| match strategy {
+        CompactStrategy::DedicatedEndpoint => ProviderCompactionStrategy::Dedicated,
+        CompactStrategy::InlineResponses => ProviderCompactionStrategy::Inline,
+    });
+    capabilities
+}
+
+/// A stream whose only item is a `Fatal` provider error, used for
+/// deterministic request-setup failures.
+fn fatal_setup_stream(
+    error: anyhow::Error,
+) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+    stream::iter([Err(ProviderError::with_kind(
+        format!("{error:#}"),
+        ProviderErrorKind::Fatal,
+    ))])
+    .boxed()
 }
 
 fn validate_responses_request(label: &str, request: &ProviderRequest) -> anyhow::Result<()> {
@@ -347,34 +362,6 @@ fn validate_responses_compaction_request(
     Ok(())
 }
 
-fn provider_error_from_transport(error: TransportError) -> ProviderError {
-    match error {
-        TransportError::Cancelled => ProviderError::cancelled(),
-        TransportError::Retryable {
-            source,
-            backoff_hint,
-        } => provider_error_from_openai(source).with_backoff_hint(backoff_hint),
-        TransportError::Fatal { source } => provider_error_from_openai(source),
-    }
-}
-
-/// Convert an `OpenAIError` to a typed `ProviderError`. Centralizing the
-/// formatting here ensures every error string has the same prefix.
-fn provider_error_from_openai(error: async_openai::error::OpenAIError) -> ProviderError {
-    let retryability = classify(&error);
-    let message = match &error {
-        async_openai::error::OpenAIError::ApiError(api_error) => {
-            format!("failed to execute provider request: {}", api_error.message)
-        }
-        async_openai::error::OpenAIError::JSONDeserialize(json_error, content) => format!(
-            "failed to execute provider request: failed to deserialize api response: error:{json_error} content:{content}"
-        ),
-        other => format!("failed to execute provider request: {other}"),
-    };
-    ProviderError::with_kind(message, retryability.kind)
-        .with_backoff_hint(retryability.backoff_hint)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -386,11 +373,110 @@ mod tests {
         TurnId,
     };
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::openai_error::classify;
+    use crate::test_http::read_http_request;
     use crate::{ResilientProvider, RetryPolicy};
+
+    fn sample_config(label: &'static str, policy: ResiliencePolicy) -> ResponsesProviderConfig {
+        ResponsesProviderConfig {
+            label,
+            capabilities: ProviderCapabilities::default(),
+            request: ResponsesProviderRequestConfig {
+                store: Some(false),
+                include_prompt_cache_key: false,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
+            },
+            compact_strategy: None,
+            rate_limit_strategy: None,
+            resilience_policy: policy,
+        }
+    }
+
+    /// Deterministic setup failures must surface as a single in-stream
+    /// `Fatal` error, not a stream-construction `Err` that the resilience
+    /// layer would previously retry as `Transient` (H4).
+    #[tokio::test]
+    async fn responses_provider_surfaces_wrong_api_kind_as_fatal_stream_error() {
+        let provider = ResponsesProvider::try_new(
+            sample_config("responses-test", ResiliencePolicy::default()),
+            "test-key",
+            "http://127.0.0.1:1",
+            &[],
+            None,
+        )
+        .expect("responses provider");
+        let mut request = sample_responses_request();
+        request.model.api_kind = ApiKind::OpenAiChat;
+
+        let mut stream = provider
+            .stream(request, CancellationToken::new())
+            .await
+            .expect("setup failures must be in-stream errors");
+        let error = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("item should be the setup error");
+
+        assert_eq!(error.kind, ProviderErrorKind::Fatal);
+        assert!(error.message.contains("openai_responses api kind"));
+        assert!(stream.next().await.is_none());
+    }
+
+    /// The old bad behavior: a validation failure burned the full retry
+    /// budget as `Transient`. Now the resilience wrapper must observe the
+    /// `Fatal` classification and stop after one attempt.
+    #[tokio::test]
+    async fn resilient_wrapper_does_not_retry_setup_validation_failures() {
+        let policy = ResiliencePolicy {
+            request_retry: RetryPolicy {
+                max_attempts: 5,
+                base_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                deadline: Duration::from_secs(5),
+                jitter_pct: 0,
+            },
+            ..ResiliencePolicy::default()
+        };
+        let provider = ResilientProvider::new(
+            "responses-test",
+            ResponsesProvider::try_new(
+                sample_config("responses-test", policy),
+                "test-key",
+                "http://127.0.0.1:1",
+                &[],
+                None,
+            )
+            .expect("responses provider"),
+            policy,
+        );
+        let mut request = sample_responses_request();
+        request.model.api_kind = ApiKind::OpenAiChat;
+
+        let started = std::time::Instant::now();
+        let mut stream = provider
+            .stream(request, CancellationToken::new())
+            .await
+            .expect("provider stream");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+
+        assert_eq!(items.len(), 1, "fatal setup error must not be retried");
+        let error = items[0].as_ref().expect_err("setup error");
+        assert_eq!(error.kind, ProviderErrorKind::Fatal);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must short-circuit without a retry budget"
+        );
+    }
 
     #[tokio::test]
     async fn responses_provider_without_compaction_strategy_rejects_compaction() {
@@ -688,42 +774,5 @@ mod tests {
         });
 
         format!("http://{address}")
-    }
-
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<()> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
-
-        loop {
-            let read = socket.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(headers_end) = find_headers_end(&buffer) {
-                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    })
-                    .unwrap_or(0);
-                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
-                if body_bytes >= content_length {
-                    return Ok(());
-                }
-            }
-        }
-
-        anyhow::bail!("incomplete http request")
-    }
-
-    fn find_headers_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n")
     }
 }

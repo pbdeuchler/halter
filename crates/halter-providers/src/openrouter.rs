@@ -157,11 +157,12 @@ mod tests {
     };
     use indexmap::IndexMap;
     use serde_json::{Value, json};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
     use crate::Provider;
+    use crate::test_http::{find_headers_end, read_http_request};
 
     #[tokio::test]
     async fn openrouter_provider_rejects_chat_api_kind() {
@@ -458,42 +459,5 @@ mod tests {
             }],
             instructions: "Summarize the session".to_owned(),
         }
-    }
-
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
-
-        loop {
-            let read = socket.read(&mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(headers_end) = find_headers_end(&buffer) {
-                let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    })
-                    .unwrap_or(0);
-                let body_bytes = buffer.len().saturating_sub(headers_end + 4);
-                if body_bytes >= content_length {
-                    return Ok(buffer);
-                }
-            }
-        }
-
-        anyhow::bail!("incomplete http request")
-    }
-
-    fn find_headers_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n")
     }
 }
