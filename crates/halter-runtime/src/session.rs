@@ -49,11 +49,21 @@ const PROVIDER_STREAM_EVENT_CAP: usize = 8_192;
 const TOOL_RUNTIME_EVENT_CAP: usize = 4_096;
 const TOOL_RUNTIME_EVENT_BYTES_CAP: usize = 1024 * 1024;
 
+/// Per-session entry in the runtime hook store: the [`Hooks`] instance
+/// shared by every live handle for one session, plus a weak reference to
+/// the single [`EvictionGuard`] those handles share. The weak reference is
+/// what makes eviction session-scoped — the entry is removed only when the
+/// guard it points at has no live owners left.
+pub struct SessionHookEntry {
+    pub(crate) hooks: Arc<Hooks>,
+    pub(crate) guard: Weak<EvictionGuard>,
+}
+
 /// Shared dependencies used by session handles and spawned turn tasks.
 pub struct RuntimeServices {
     pub resources: Arc<ResourceHandle>,
     pub registered_hooks: Arc<RegisteredHooks>,
-    pub session_hook_store: Arc<Mutex<HashMap<SessionId, Arc<Hooks>>>>,
+    pub session_hook_store: Arc<Mutex<HashMap<SessionId, SessionHookEntry>>>,
     pub models: Arc<ModelRegistry>,
     pub tools: Arc<ToolRuntime>,
     pub path_locks: Arc<PathLockMap>,
@@ -221,20 +231,23 @@ impl SessionInit {
     }
 }
 
-/// Drop-time hook eviction guard. Held inside an `Arc` on the session
-/// handle so eviction fires only when the *last* clone of the handle is
-/// dropped. Pre-Phase-3 code put `Drop` on `HalterSession` itself, which
-/// meant any short-lived clone (e.g. a clone moved into a `tokio::spawn`
-/// turn loop) would evict the hooks for the still-live original handle.
+/// Drop-time hook eviction guard, scoped to a *session*, not a handle:
+/// every live [`SessionHandle`] for a session id shares the same guard
+/// (clones share it via `Arc`, and separately-constructed handles find it
+/// through the [`SessionHookEntry`] weak reference), so the session's hook
+/// store entry is evicted only when the last handle for that session —
+/// however it was constructed — is dropped. Pre-Phase-3 code put `Drop` on
+/// `HalterSession` itself, which meant any short-lived clone would evict
+/// the hooks for the still-live original handle; per-handle guards had the
+/// same bug for the temporary parent handles built during subagent hook
+/// dispatch.
 ///
-/// The trace recorder is intentionally *not* closed here. Calls to
-/// `HalterSession::new` for an already-live session (e.g. the parent's
-/// short-lived handle constructed inside subagent hook dispatch) yield
-/// independent `EvictionGuard`s; closing the trace on a temporary handle's
-/// drop would silently remove the parent's writer entry while real work was
-/// still streaming events under that session id. The recorder flushes per
-/// line and is cleaned up when the runtime drops it.
-struct EvictionGuard {
+/// The trace recorder is intentionally *not* closed here: gaps with zero
+/// live handles are legitimate for a session that keeps tracing (between
+/// subagent turns, before a `resume`), and the recorder has no re-open
+/// path that preserves an existing trace file. It flushes per line and is
+/// cleaned up when the runtime drops it.
+pub(crate) struct EvictionGuard {
     services: Arc<RuntimeServices>,
     session_id: SessionId,
 }
@@ -247,14 +260,15 @@ impl Drop for EvictionGuard {
 
 /// Cheaply-cloneable handle to a halter session. Cloning bumps the inner
 /// `Arc`s; the session's hooks are only evicted from the runtime store
-/// when every clone of the handle has been dropped.
+/// when every handle for the session — clones and independently
+/// constructed handles alike — has been dropped.
 #[derive(Clone)]
 pub struct SessionHandle {
     services: Arc<RuntimeServices>,
     session_id: SessionId,
     session_hooks: Arc<Hooks>,
-    /// Held only for its `Drop` side-effect on the last clone — see
-    /// `EvictionGuard`.
+    /// Held only for its `Drop` side-effect on the session's last handle —
+    /// see `EvictionGuard`.
     #[allow(dead_code)]
     eviction: Arc<EvictionGuard>,
 }
@@ -603,11 +617,7 @@ impl SessionHandle {
         services: Arc<RuntimeServices>,
         session_id: SessionId,
     ) -> anyhow::Result<Self> {
-        let session_hooks = lookup_or_create_session_hooks(&services, &session_id)?;
-        let eviction = Arc::new(EvictionGuard {
-            services: services.clone(),
-            session_id: session_id.clone(),
-        });
+        let (session_hooks, eviction) = lookup_or_create_session_hooks(&services, &session_id)?;
         Ok(Self {
             services,
             session_id,
@@ -707,12 +717,14 @@ impl SessionHandle {
             };
             let _parent_stream_registration = parent_stream_registration;
 
+            let blueprint = stored.blueprint.clone();
             let expected_state = stored.state.clone();
             let started = session.make_event(SessionEventPayload::TurnStarted {
                 turn_id: turn.id.clone(),
             });
             if let Err(error) = session
                 .commit_and_publish(
+                    &blueprint,
                     None,
                     Some(expected_state),
                     None,
@@ -738,6 +750,7 @@ impl SessionHandle {
                 Ok(turn_commit) => {
                     if let Err(error) = session
                         .commit_and_publish(
+                            &blueprint,
                             Some(turn_commit.snapshot),
                             Some(turn_commit.expected_state),
                             Some(turn_commit.state),
@@ -849,9 +862,18 @@ impl SessionHandle {
         }
         self.push_event(&mut events, SessionEventPayload::SessionShutdownComplete);
         let _ = self
-            .commit_and_publish(None, Some(expected_state), Some(state), events, None)
+            .commit_and_publish(
+                &stored.blueprint,
+                None,
+                Some(expected_state),
+                Some(state),
+                events,
+                None,
+            )
             .await?;
-        evict_session_hooks(&self.services, &self.session_id);
+        // Hook eviction is owned by the session-scoped `EvictionGuard` and
+        // fires when the last handle drops; an eager evict here would race
+        // other live handles for this session.
         Ok(())
     }
 
@@ -889,7 +911,14 @@ impl SessionHandle {
             self.push_event(&mut events, SessionEventPayload::MessageItem { message });
         }
         let _ = self
-            .commit_and_publish(None, Some(expected_state), Some(state), events, None)
+            .commit_and_publish(
+                &stored.blueprint,
+                None,
+                Some(expected_state),
+                Some(state),
+                events,
+                None,
+            )
             .await?;
         Ok(())
     }
@@ -940,12 +969,22 @@ impl SessionHandle {
         }
         if pre_dispatch.merged.block_reason.is_some() {
             let _ = self
-                .commit_and_publish(None, Some(expected_state), Some(state), events, None)
+                .commit_and_publish(
+                    &stored.blueprint,
+                    None,
+                    Some(expected_state),
+                    Some(state),
+                    events,
+                    None,
+                )
                 .await?;
             return Ok(());
         }
 
-        let observed = observe_state(stored.blueprint.working_dir.clone());
+        let observed = observe_state(
+            stored.blueprint.working_dir.clone(),
+            probe_git(stored.blueprint.working_dir.clone()).await,
+        );
         let compaction_model = self
             .services
             .models
@@ -984,7 +1023,14 @@ impl SessionHandle {
         }
 
         let _ = self
-            .commit_and_publish(None, Some(expected_state), Some(state), events, None)
+            .commit_and_publish(
+                &stored.blueprint,
+                None,
+                Some(expected_state),
+                Some(state),
+                events,
+                None,
+            )
             .await?;
         Ok(())
     }
@@ -1099,6 +1145,7 @@ impl SessionHandle {
             },
         );
         self.flush_turn_progress(
+            &stored.blueprint,
             snapshot.clone(),
             &mut expected_state,
             &state,
@@ -1106,6 +1153,11 @@ impl SessionHandle {
             live,
         )
         .await?;
+
+        // Probed once per turn: the git subprocess probe is comparatively
+        // expensive and the branch/dirty facts are stable enough for the
+        // provider iterations of a single turn.
+        let git_probe = probe_git(stored.blueprint.working_dir.clone()).await;
 
         loop {
             ensure_provider_iteration_allowed(stored.blueprint.max_turns, provider_iterations)?;
@@ -1116,7 +1168,7 @@ impl SessionHandle {
                 .models
                 .model(&stored.blueprint.default_model)?;
             let compaction_provider = self.services.models.provider(&compaction_model.provider)?;
-            let observed = observe_state(stored.blueprint.working_dir.clone());
+            let observed = observe_state(stored.blueprint.working_dir.clone(), git_probe.clone());
             let plan = self
                 .services
                 .context_manager
@@ -1227,6 +1279,7 @@ impl SessionHandle {
 
             let (deduped_parts, duplicate_tool_calls) =
                 dedupe_assistant_tool_call_parts(std::mem::take(&mut materialized.message.parts));
+            materialized.message.parts = deduped_parts;
             if duplicate_tool_calls > 0 {
                 warn!(
                     session_id = %self.session_id,
@@ -1234,9 +1287,6 @@ impl SessionHandle {
                     duplicate_tool_call_count = duplicate_tool_calls,
                     "deduped duplicate tool calls from provider output"
                 );
-                materialized.message.parts = deduped_parts;
-            } else {
-                materialized.message.parts = deduped_parts;
             }
 
             let assistant_message = Message::Assistant(materialized.message.clone());
@@ -1293,6 +1343,7 @@ impl SessionHandle {
                         },
                     );
                     self.flush_turn_progress(
+                        &stored.blueprint,
                         snapshot.clone(),
                         &mut expected_state,
                         &state,
@@ -1344,6 +1395,7 @@ impl SessionHandle {
                 .await?;
             events.extend(tool_events);
             self.flush_turn_progress(
+                &stored.blueprint,
                 snapshot.clone(),
                 &mut expected_state,
                 &state,
@@ -1579,8 +1631,14 @@ impl SessionHandle {
         Ok(events)
     }
 
+    /// Commit events and fan them out to the live stream, ancestor streams,
+    /// event bus, and trace recorder. `blueprint` is the committing session's
+    /// own blueprint, passed in so the hot path does no session-store reads:
+    /// when subagent event forwarding is off (the default) the ancestor
+    /// lookup short-circuits before any I/O.
     async fn commit_and_publish(
         &self,
+        blueprint: &SessionBlueprint,
         snapshot: Option<Arc<ResourceSnapshot>>,
         expected_state: Option<SessionState>,
         state: Option<SessionState>,
@@ -1601,7 +1659,7 @@ impl SessionHandle {
             .commit(&self.session_id, snapshot, expected_state, state, events)
             .await?;
         let forwarding_ancestors =
-            forwarding_ancestors_for_session(&self.services, &self.session_id).await;
+            forwarding_ancestors_for_blueprint(&self.services, blueprint).await;
         // Single commit-then-publish point. Events fan out to both sinks, but
         // only *after* the store has assigned monotonic sequences; there is no
         // pre-commit emission path that could race with the real sequence or
@@ -1623,6 +1681,7 @@ impl SessionHandle {
 
     async fn flush_turn_progress(
         &self,
+        blueprint: &SessionBlueprint,
         snapshot: Arc<ResourceSnapshot>,
         expected_state: &mut SessionState,
         state: &SessionState,
@@ -1634,6 +1693,7 @@ impl SessionHandle {
         }
 
         self.commit_and_publish(
+            blueprint,
             Some(snapshot),
             Some(expected_state.clone()),
             Some(state.clone()),
@@ -1662,8 +1722,15 @@ impl SessionHandle {
                     self.session_id.0
                 )
             })?;
-        self.commit_and_publish(None, Some(stored.state), None, failure_events, Some(live))
-            .await?;
+        self.commit_and_publish(
+            &stored.blueprint,
+            None,
+            Some(stored.state),
+            None,
+            failure_events,
+            Some(live),
+        )
+        .await?;
         Ok(())
     }
 
@@ -2140,26 +2207,6 @@ fn tool_result_from_hook_value(value: serde_json::Value) -> ToolResult {
     }
 }
 
-async fn forwarding_ancestors_for_session(
-    services: &Arc<RuntimeServices>,
-    session_id: &SessionId,
-) -> Vec<SessionId> {
-    let stored = match services.sessions.load_session(session_id).await {
-        Ok(Some(stored)) => stored,
-        Ok(None) => return Vec::new(),
-        Err(error) => {
-            warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to load session for subagent event forwarding"
-            );
-            return Vec::new();
-        }
-    };
-
-    forwarding_ancestors_for_blueprint(services, &stored.blueprint).await
-}
-
 async fn forwarding_ancestors_for_blueprint(
     services: &Arc<RuntimeServices>,
     blueprint: &SessionBlueprint,
@@ -2297,25 +2344,50 @@ pub(crate) async fn create_session_seeded(
     HalterSession::new(services, session_id)
 }
 
+/// Look up the session's shared hooks and eviction guard, creating both when
+/// the session has no live handles. Handles constructed while another handle
+/// is alive share that handle's `Hooks` *and* its guard, so accumulated
+/// per-session hook state survives any individual handle's drop and eviction
+/// fires exactly once, on the session's last drop.
 fn lookup_or_create_session_hooks(
     services: &Arc<RuntimeServices>,
     session_id: &SessionId,
-) -> anyhow::Result<Arc<Hooks>> {
+) -> anyhow::Result<(Arc<Hooks>, Arc<EvictionGuard>)> {
     let hooks = Arc::new(services.registered_hooks.instantiate()?);
     match services.session_hook_store.lock() {
         Ok(mut store) => {
-            if let Some(existing) = store.get(session_id) {
-                return Ok(existing.clone());
+            if let Some(entry) = store.get(session_id)
+                && let Some(guard) = entry.guard.upgrade()
+            {
+                return Ok((entry.hooks.clone(), guard));
             }
-            store.insert(session_id.clone(), hooks.clone());
-            Ok(hooks)
+            // No live guard: either a fresh session or the previous guard is
+            // mid-drop (its eviction skips entries owned by a newer guard).
+            let guard = Arc::new(EvictionGuard {
+                services: services.clone(),
+                session_id: session_id.clone(),
+            });
+            store.insert(
+                session_id.clone(),
+                SessionHookEntry {
+                    hooks: hooks.clone(),
+                    guard: Arc::downgrade(&guard),
+                },
+            );
+            Ok((hooks, guard))
         }
         Err(_) => {
             error!(
                 session_id = %session_id,
                 "session hook store lock poisoned; rebuilding uncached session hooks"
             );
-            Ok(hooks)
+            Ok((
+                hooks,
+                Arc::new(EvictionGuard {
+                    services: services.clone(),
+                    session_id: session_id.clone(),
+                }),
+            ))
         }
     }
 }
@@ -2323,7 +2395,15 @@ fn lookup_or_create_session_hooks(
 fn evict_session_hooks(services: &Arc<RuntimeServices>, session_id: &SessionId) {
     match services.session_hook_store.lock() {
         Ok(mut store) => {
-            store.remove(session_id);
+            // Remove the entry only when its guard has no live owners: a
+            // dying guard racing a freshly constructed handle (which installs
+            // a new guard) must not evict the new handle's entry.
+            if store
+                .get(session_id)
+                .is_some_and(|entry| entry.guard.strong_count() == 0)
+            {
+                store.remove(session_id);
+            }
         }
         Err(_) => {
             error!(
@@ -2349,8 +2429,13 @@ fn format_hook_warning(warning: &HookWarning) -> String {
     format!("{prefix}: {}", warning.message)
 }
 
-fn observe_state(working_dir: PathBuf) -> ObservedState {
-    let (git_branch, git_dirty) = probe_git(&working_dir);
+/// Build an [`ObservedState`] from a previously taken git probe. The probe is
+/// passed in (rather than taken here) so `run_turn` can probe once per turn
+/// and reuse the result across provider iterations.
+fn observe_state(
+    working_dir: PathBuf,
+    (git_branch, git_dirty): (Option<String>, Option<bool>),
+) -> ObservedState {
     ObservedState {
         cwd: working_dir,
         git_branch,
@@ -2407,19 +2492,55 @@ fn batch_tool_calls_by_concurrency(
     batches
 }
 
-/// Probe the git branch and dirty flag for `working_dir`.
+/// Probe the git branch and dirty flag for `working_dir` without blocking
+/// the async executor: the synchronous `git` subprocess calls run on the
+/// blocking thread pool.
+async fn probe_git(working_dir: PathBuf) -> (Option<String>, Option<bool>) {
+    tokio::task::spawn_blocking(move || probe_git_blocking(&working_dir))
+        .await
+        .unwrap_or((None, None))
+}
+
+/// Build a `git` invocation hardened against hostile repo configuration.
+///
+/// Threat: the harness runs in untrusted checkouts, and git executes
+/// config-driven commands during otherwise read-only operations —
+/// `core.fsmonitor` runs an arbitrary command during `git status`, and
+/// `core.hooksPath` redirects hook lookup. The `-c` overrides neutralize
+/// both (command-line config outranks every config file), and the scrubbed
+/// environment (no `HOME`/`XDG_*`, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
+/// pinned to the null device) keeps user- and system-level config from
+/// reintroducing them.
+fn hardened_git_command(working_dir: &std::path::Path, args: &[&str]) -> std::process::Command {
+    #[cfg(windows)]
+    const NULL_DEVICE: &str = "NUL";
+    #[cfg(not(windows))]
+    const NULL_DEVICE: &str = "/dev/null";
+
+    let mut command = std::process::Command::new("git");
+    command
+        .args(["-c", "core.fsmonitor=", "-c", "core.hooksPath="])
+        .args(args)
+        .current_dir(working_dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+        .env("GIT_CONFIG_SYSTEM", NULL_DEVICE)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
+
+/// Synchronous core of [`probe_git`]; call it via the async wrapper (or
+/// directly from tests).
 ///
 /// Returns `(None, None)` when the directory is not a git working tree or
 /// `git` is not available. A detached HEAD returns the abbreviated commit as
 /// the branch name. `git_dirty` is `Some(false)` for a clean tree, `Some(true)`
 /// when any tracked or untracked change is present.
-fn probe_git(working_dir: &std::path::Path) -> (Option<String>, Option<bool>) {
-    use std::process::Command;
-
-    let branch_output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(working_dir)
-        .output();
+fn probe_git_blocking(working_dir: &std::path::Path) -> (Option<String>, Option<bool>) {
+    let branch_output =
+        hardened_git_command(working_dir, &["rev-parse", "--abbrev-ref", "HEAD"]).output();
     let branch = match branch_output {
         Ok(out) if out.status.success() => {
             let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -2428,9 +2549,7 @@ fn probe_git(working_dir: &std::path::Path) -> (Option<String>, Option<bool>) {
             }
             if name == "HEAD" {
                 // detached HEAD — resolve to short commit
-                Command::new("git")
-                    .args(["rev-parse", "--short", "HEAD"])
-                    .current_dir(working_dir)
+                hardened_git_command(working_dir, &["rev-parse", "--short", "HEAD"])
                     .output()
                     .ok()
                     .filter(|out| out.status.success())
@@ -2443,9 +2562,7 @@ fn probe_git(working_dir: &std::path::Path) -> (Option<String>, Option<bool>) {
         _ => return (None, None),
     };
 
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(working_dir)
+    let dirty = hardened_git_command(working_dir, &["status", "--porcelain"])
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -2886,16 +3003,13 @@ mod tests {
     #[test]
     fn probe_git_returns_none_outside_working_tree() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (branch, dirty) = super::probe_git(tmp.path());
+        let (branch, dirty) = super::probe_git_blocking(tmp.path());
         assert_eq!(branch, None);
         assert_eq!(dirty, None);
     }
 
-    #[test]
-    fn probe_git_reports_branch_and_dirty_flag() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        let git = |args: &[&str]| {
+    fn init_test_repo(root: &std::path::Path) -> impl Fn(&[&str]) + '_ {
+        let git = move |args: &[&str]| {
             let status = std::process::Command::new("git")
                 .args(args)
                 .current_dir(root)
@@ -2903,22 +3017,73 @@ mod tests {
                 .expect("git command");
             assert!(status.status.success(), "git {:?} failed", args);
         };
-
         git(&["init", "--initial-branch=trunk"]);
         git(&["config", "user.email", "test@example.com"]);
         git(&["config", "user.name", "Test User"]);
         std::fs::write(root.join("seed.txt"), b"initial").expect("write seed");
         git(&["add", "seed.txt"]);
         git(&["commit", "-m", "seed"]);
+        git
+    }
 
-        let (branch, dirty) = super::probe_git(root);
+    #[test]
+    fn probe_git_reports_branch_and_dirty_flag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let _git = init_test_repo(root);
+
+        let (branch, dirty) = super::probe_git_blocking(root);
         assert_eq!(branch.as_deref(), Some("trunk"));
         assert_eq!(dirty, Some(false));
 
         std::fs::write(root.join("dirty.txt"), b"unstaged").expect("write dirty");
-        let (branch, dirty) = super::probe_git(root);
+        let (branch, dirty) = super::probe_git_blocking(root);
         assert_eq!(branch.as_deref(), Some("trunk"));
         assert_eq!(dirty, Some(true));
+    }
+
+    /// The async wrapper must agree with the blocking core (it only moves the
+    /// subprocess work off the executor).
+    #[tokio::test]
+    async fn probe_git_async_wrapper_matches_blocking_probe() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let _git = init_test_repo(root);
+
+        assert_eq!(
+            super::probe_git(root.to_path_buf()).await,
+            super::probe_git_blocking(root)
+        );
+        let outside = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            super::probe_git(outside.path().to_path_buf()).await,
+            (None, None)
+        );
+    }
+
+    /// Hostile repo config must not execute commands during the probe:
+    /// `core.fsmonitor` runs an arbitrary command on `git status` unless
+    /// neutralized (see `hardened_git_command`).
+    #[test]
+    fn probe_git_neutralizes_command_executing_repo_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let git = init_test_repo(root);
+        let marker = root.join("fsmonitor-ran");
+        git(&[
+            "config",
+            "core.fsmonitor",
+            &format!("touch {}", marker.display()),
+        ]);
+
+        let (branch, dirty) = super::probe_git_blocking(root);
+
+        assert_eq!(branch.as_deref(), Some("trunk"), "probe must still work");
+        assert!(dirty.is_some(), "probe must still report dirtiness");
+        assert!(
+            !marker.exists(),
+            "repo-config fsmonitor command was executed by the probe"
+        );
     }
 
     mod test_support {
@@ -3315,6 +3480,150 @@ mod tests {
                 "session hooks should be evicted once the last handle is dropped"
             );
         }
+    }
+
+    /// Regression (H1): subagent hook dispatch constructs *independent*
+    /// handles (not clones) for the still-live parent session and drops them
+    /// after each dispatch. Eviction must be session-scoped: dropping such a
+    /// handle must preserve the store entry — and the accumulated hook state
+    /// it carries — while any other handle for the session is alive; only
+    /// the last drop evicts.
+    #[tokio::test]
+    async fn dropping_separately_constructed_handle_preserves_session_hook_state() {
+        let services = Arc::new(RuntimeServices::default());
+        let session_id = halter_protocol::SessionId::from("shared-hooks");
+
+        let primary =
+            HalterSession::new(services.clone(), session_id.clone()).expect("primary handle");
+
+        {
+            let temporary =
+                HalterSession::new(services.clone(), session_id.clone()).expect("temporary handle");
+            // Independent handles share one hooks instance (the state carrier).
+            assert!(Arc::ptr_eq(
+                temporary.session_hooks(),
+                primary.session_hooks()
+            ));
+        } // temporary dropped here
+
+        {
+            let store = services
+                .session_hook_store
+                .lock()
+                .expect("session hook store lock");
+            let entry = store.get(&session_id).expect("session hook entry present");
+            // Entry survived the temporary's drop, and it is still the
+            // primary handle's instance — accumulated hook state preserved.
+            assert!(
+                Arc::ptr_eq(&entry.hooks, primary.session_hooks()),
+                "temporary handle drop replaced or evicted the live session's hooks"
+            );
+        }
+
+        drop(primary);
+
+        let store = services
+            .session_hook_store
+            .lock()
+            .expect("session hook store lock");
+        assert!(
+            !store.contains_key(&session_id),
+            "last handle drop must evict the session hook entry"
+        );
+    }
+
+    /// Regression (H7): `commit_and_publish` used to call `load_session` on
+    /// every commit just to discover forwarding ancestors, deserializing the
+    /// full transcript multiple times per turn. With forwarding off (the
+    /// default) the commit path must do no session-store reads at all.
+    #[tokio::test]
+    async fn commit_hot_path_does_not_reload_session_when_forwarding_off() {
+        struct CountingStore {
+            inner: halter_session::InMemorySessionStore,
+            loads: Arc<Mutex<usize>>,
+        }
+
+        #[async_trait]
+        impl halter_session::SessionStore for CountingStore {
+            async fn create_session(
+                &self,
+                session: halter_session::StoredSession,
+            ) -> anyhow::Result<()> {
+                self.inner.create_session(session).await
+            }
+
+            async fn load_session(
+                &self,
+                session_id: &halter_protocol::SessionId,
+            ) -> anyhow::Result<Option<halter_session::StoredSession>> {
+                *self.loads.lock().expect("loads") += 1;
+                self.inner.load_session(session_id).await
+            }
+
+            async fn commit(
+                &self,
+                session_id: &halter_protocol::SessionId,
+                snapshot: Option<Arc<ResourceSnapshot>>,
+                expected_state: Option<halter_protocol::SessionState>,
+                state: Option<halter_protocol::SessionState>,
+                events: Vec<halter_protocol::PendingEvent>,
+            ) -> anyhow::Result<Vec<SessionEvent>> {
+                self.inner
+                    .commit(session_id, snapshot, expected_state, state, events)
+                    .await
+            }
+
+            async fn replay(
+                &self,
+                session_id: &halter_protocol::SessionId,
+            ) -> anyhow::Result<Vec<SessionEvent>> {
+                self.inner.replay(session_id).await
+            }
+
+            async fn list_sessions(&self) -> anyhow::Result<Vec<SessionBlueprint>> {
+                self.inner.list_sessions().await
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let loads = Arc::new(Mutex::new(0usize));
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .sessions = Arc::new(CountingStore {
+            inner: halter_session::InMemorySessionStore::default(),
+            loads: loads.clone(),
+        });
+
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        assert_eq!(
+            *loads.lock().expect("loads"),
+            0,
+            "session creation must not load the session"
+        );
+
+        let events = session
+            .submit_turn(Turn::user("hello"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. })),
+            "turn should complete"
+        );
+
+        // The turn performs several commits (turn start, user-message flush,
+        // final commit); only `submit_turn`'s single upfront read may load.
+        assert_eq!(
+            *loads.lock().expect("loads"),
+            1,
+            "commit hot path reloaded the session"
+        );
     }
 
     #[tokio::test]

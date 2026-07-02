@@ -172,11 +172,14 @@ The top-level `halter` crate wraps this with simpler convenience APIs.
 `HalterSession` is a backwards-compatible alias for `SessionHandle`.
 
 The handle is cheaply cloneable: each clone is an `Arc` bump on the
-shared session state. Hooks registered for the session are evicted from
-the runtime store only when the *last* clone of the handle is dropped,
-not when an arbitrary clone goes out of scope (this is the AC2.1
-guarantee — pre-Phase-3 a clone moved into the spawned turn loop would
-evict hooks under the still-live caller handle).
+shared session state. Hook eviction is *session*-scoped: hooks
+registered for the session are evicted from the runtime store only when
+the last live handle for that session id — clones and independently
+constructed handles alike — is dropped, not when an arbitrary handle
+goes out of scope (this is the AC2.1 guarantee — pre-Phase-3 a clone
+moved into the spawned turn loop would evict hooks under the still-live
+caller handle, and per-handle guards later reintroduced the same bug for
+the temporary parent handles built during subagent hook dispatch).
 
 Important methods:
 

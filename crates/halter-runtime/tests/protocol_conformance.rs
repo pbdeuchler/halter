@@ -31,15 +31,12 @@ fn tool_concurrency_variants_have_runtime_meaning() {
         ToolConcurrency::ReadOnly,
         ToolConcurrency::ParallelSafe,
     ] {
-        let is_exclusive = match variant {
+        // The exhaustive match is the test: a new variant fails compilation
+        // here until the author classifies it as exclusive or shareable.
+        let _is_exclusive = match variant {
             ToolConcurrency::Exclusive => true,
             ToolConcurrency::ReadOnly | ToolConcurrency::ParallelSafe => false,
         };
-        assert_eq!(
-            is_exclusive,
-            matches!(variant, ToolConcurrency::Exclusive),
-            "classification regressed for {variant:?}",
-        );
     }
 }
 
