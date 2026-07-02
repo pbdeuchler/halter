@@ -7,6 +7,7 @@ impl builtins::SimpleCommand for ColonCommand {
     fn get_content(
         _name: &str,
         content_type: builtins::ContentType,
+        _options: &builtins::ContentOptions,
     ) -> Result<String, brush_core::Error> {
         match content_type {
             builtins::ContentType::DetailedHelp => {
@@ -18,8 +19,8 @@ impl builtins::SimpleCommand for ColonCommand {
         }
     }
 
-    fn execute<I: Iterator<Item = S>, S: AsRef<str>>(
-        _context: brush_core::ExecutionContext<'_>,
+    fn execute<SE: brush_core::ShellExtensions, I: Iterator<Item = S>, S: AsRef<str>>(
+        _context: brush_core::ExecutionContext<'_, SE>,
         _args: I,
     ) -> Result<ExecutionResult, brush_core::Error> {
         Ok(ExecutionResult::success())

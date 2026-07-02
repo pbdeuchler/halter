@@ -2,13 +2,15 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt::{Display, Write};
 
-use crate::shell::Shell;
-use crate::{error, escape};
+use crate::shell::{Shell, ShellState};
+use crate::{error, escape, extensions};
 
 /// A shell variable.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShellVariable {
     /// The value currently associated with the variable.
     value: ShellValue,
@@ -30,6 +32,7 @@ pub struct ShellVariable {
 
 /// Kind of transformation to apply to a variable's value when it is updated.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ShellVariableUpdateTransform {
     /// No transformation.
     None,
@@ -228,7 +231,7 @@ impl ShellVariable {
     ///
     /// * `value` - The value to assign to the variable.
     /// * `append` - Whether or not to append the value to the preexisting value.
-
+    #[expect(clippy::too_many_lines)]
     pub fn assign(&mut self, value: ShellValueLiteral, append: bool) -> Result<(), error::Error> {
         if self.is_readonly() {
             return Err(error::ErrorKind::ReadonlyVariable.into());
@@ -392,7 +395,7 @@ impl ShellVariable {
 
         match &mut self.value {
             ShellValue::IndexedArray(arr) => {
-                let key: u64 = array_index.parse().unwrap_or(0);
+                let key = get_key_for_indexed_array(arr, array_index.as_str())?;
 
                 if append {
                     let existing_value = arr.get(&key).map_or_else(|| "", |v| v.as_str());
@@ -508,7 +511,7 @@ impl ShellVariable {
             ShellValue::String(_) => Err(error::ErrorKind::NotArray.into()),
             ShellValue::AssociativeArray(values) => Ok(values.remove(index).is_some()),
             ShellValue::IndexedArray(values) => {
-                let key = index.parse::<u64>().unwrap_or(0);
+                let key = get_key_for_indexed_array(values, index)?;
                 Ok(values.remove(&key).is_some())
             }
             ShellValue::Dynamic { .. } => Ok(false),
@@ -520,7 +523,7 @@ impl ShellVariable {
     /// # Arguments
     ///
     /// * `shell` - The shell in which the variable is being resolved.
-    pub fn resolve_value(&self, shell: &Shell) -> ShellValue {
+    pub fn resolve_value(&self, shell: &Shell<impl extensions::ShellExtensions>) -> ShellValue {
         // N.B. We do *not* specially handle a dynamic value that resolves to a dynamic value.
         match &self.value {
             ShellValue::Dynamic { getter, .. } => getter(shell),
@@ -529,7 +532,7 @@ impl ShellVariable {
     }
 
     /// Returns the canonical attribute flag string for this variable.
-    pub fn attribute_flags(&self, shell: &Shell) -> String {
+    pub fn attribute_flags(&self, shell: &Shell<impl extensions::ShellExtensions>) -> String {
         let value = self.resolve_value(shell);
 
         let mut result = String::new();
@@ -585,11 +588,12 @@ impl ShellVariable {
     }
 }
 
-type DynamicValueGetter = fn(&Shell) -> ShellValue;
-type DynamicValueSetter = fn(&Shell) -> ();
+type DynamicValueGetter = fn(&dyn ShellState) -> ShellValue;
+type DynamicValueSetter = fn(&dyn ShellState) -> ();
 
 /// A shell value.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ShellValue {
     /// A value that has been typed but not yet set.
     Unset(ShellValueUnsetType),
@@ -602,14 +606,35 @@ pub enum ShellValue {
     /// A value that is dynamically computed.
     Dynamic {
         /// Function that can query the value.
+        /// TODO(serde): figure out how to serialize/deserialize dynamic values.
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip, default = "default_dynamic_value_getter")
+        )]
         getter: DynamicValueGetter,
         /// Function that receives value update requests.
+        /// TODO(serde): figure out how to serialize/deserialize dynamic values.
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip, default = "default_dynamic_value_setter")
+        )]
         setter: DynamicValueSetter,
     },
 }
 
+#[cfg(feature = "serde")]
+fn default_dynamic_value_getter() -> DynamicValueGetter {
+    |_shell: &dyn ShellState| ShellValue::String(String::new())
+}
+
+#[cfg(feature = "serde")]
+fn default_dynamic_value_setter() -> DynamicValueSetter {
+    |_shell: &dyn ShellState| {}
+}
+
 /// The type of an unset shell value.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ShellValueUnsetType {
     /// The value is untyped.
     Untyped,
@@ -819,7 +844,11 @@ impl ShellValue {
     /// # Arguments
     ///
     /// * `style` - The style to use for formatting the value.
-    pub fn format(&self, style: FormatStyle, shell: &Shell) -> Result<Cow<'_, str>, error::Error> {
+    pub fn format(
+        &self,
+        style: FormatStyle,
+        shell: &Shell<impl extensions::ShellExtensions>,
+    ) -> Result<Cow<'_, str>, error::Error> {
         match self {
             Self::Unset(_) => Ok("".into()),
             Self::String(s) => match style {
@@ -880,7 +909,11 @@ impl ShellValue {
     /// # Arguments
     ///
     /// * `index` - The index at which to retrieve the value.
-    pub fn get_at(&self, index: &str, shell: &Shell) -> Result<Option<Cow<'_, str>>, error::Error> {
+    pub fn get_at(
+        &self,
+        index: &str,
+        shell: &Shell<impl extensions::ShellExtensions>,
+    ) -> Result<Option<Cow<'_, str>>, error::Error> {
         match self {
             Self::Unset(_) => Ok(None),
             Self::String(s) => {
@@ -894,22 +927,8 @@ impl ShellValue {
                 Ok(values.get(index).map(|s| Cow::Borrowed(s.as_str())))
             }
             Self::IndexedArray(values) => {
-                let mut index_value = index.parse::<i64>().unwrap_or(0);
-
-                #[expect(clippy::cast_possible_wrap)]
-                if index_value < 0 {
-                    index_value += values.len() as i64;
-                    if index_value < 0 {
-                        return Err(error::ErrorKind::ArrayIndexOutOfRange(index_value).into());
-                    }
-                }
-
-                // Now that we've confirmed that the index is non-negative, we can safely convert it
-                // to a u64 without any fuss.
-                #[expect(clippy::cast_sign_loss)]
-                let index_value = index_value as u64;
-
-                Ok(values.get(&index_value).map(|s| Cow::Borrowed(s.as_str())))
+                let key = get_key_for_indexed_array(values, index)?;
+                Ok(values.get(&key).map(|s| Cow::Borrowed(s.as_str())))
             }
             Self::Dynamic { getter, .. } => {
                 let dynamic_value = getter(shell);
@@ -920,7 +939,7 @@ impl ShellValue {
     }
 
     /// Returns the keys of the elements in this variable.
-    pub fn element_keys(&self, shell: &Shell) -> Vec<String> {
+    pub fn element_keys(&self, shell: &Shell<impl extensions::ShellExtensions>) -> Vec<String> {
         match self {
             Self::Unset(_) => vec![],
             Self::String(_) => vec!["0".to_owned()],
@@ -931,7 +950,7 @@ impl ShellValue {
     }
 
     /// Returns the values of the elements in this variable.
-    pub fn element_values(&self, shell: &Shell) -> Vec<String> {
+    pub fn element_values(&self, shell: &Shell<impl extensions::ShellExtensions>) -> Vec<String> {
         match self {
             Self::Unset(_) => vec![],
             Self::String(s) => vec![s.to_owned()],
@@ -942,7 +961,7 @@ impl ShellValue {
     }
 
     /// Converts this value to a string.
-    pub fn to_cow_str(&self, shell: &Shell) -> Cow<'_, str> {
+    pub fn to_cow_str(&self, shell: &Shell<impl extensions::ShellExtensions>) -> Cow<'_, str> {
         self.try_get_cow_str(shell).unwrap_or(Cow::Borrowed(""))
     }
 
@@ -953,7 +972,10 @@ impl ShellValue {
 
     /// Tries to convert this value to a string; returns `None` if the value is unset
     /// or otherwise doesn't exist.
-    pub fn try_get_cow_str(&self, shell: &Shell) -> Option<Cow<'_, str>> {
+    pub fn try_get_cow_str(
+        &self,
+        shell: &Shell<impl extensions::ShellExtensions>,
+    ) -> Option<Cow<'_, str>> {
         match self {
             Self::Dynamic { getter, .. } => {
                 let dynamic_value = getter(shell);
@@ -980,26 +1002,55 @@ impl ShellValue {
     /// # Arguments
     ///
     /// * `index` - The index at which to retrieve the value, if indexing is to be performed.
-    pub fn to_assignable_str(&self, index: Option<&str>, shell: &Shell) -> String {
+    pub fn to_assignable_str(
+        &self,
+        index: Option<&str>,
+        shell: &Shell<impl extensions::ShellExtensions>,
+    ) -> Result<String, error::Error> {
         match self {
-            Self::Unset(_) => String::new(),
-            Self::String(s) => escape::force_quote(s.as_str(), escape::QuoteMode::SingleQuote),
+            Self::Unset(_) => Ok(String::new()),
+            Self::String(s) => Ok(escape::force_quote(
+                s.as_str(),
+                escape::QuoteMode::SingleQuote,
+            )),
             Self::AssociativeArray(_) | Self::IndexedArray(_) => {
                 if let Some(index) = index {
                     if let Ok(Some(value)) = self.get_at(index, shell) {
-                        escape::force_quote(value.as_ref(), escape::QuoteMode::SingleQuote)
+                        Ok(escape::force_quote(
+                            value.as_ref(),
+                            escape::QuoteMode::SingleQuote,
+                        ))
                     } else {
-                        String::new()
+                        Ok(String::new())
                     }
                 } else {
-                    self.format(FormatStyle::DeclarePrint, shell)
-                        .unwrap()
-                        .into_owned()
+                    Ok(self.format(FormatStyle::DeclarePrint, shell)?.into_owned())
                 }
             }
             Self::Dynamic { getter, .. } => getter(shell).to_assignable_str(index, shell),
         }
     }
+}
+
+fn get_key_for_indexed_array(
+    values: &BTreeMap<u64, String>,
+    index_str: &str,
+) -> Result<u64, error::Error> {
+    let mut index_value = index_str.parse::<i64>().unwrap_or(0);
+
+    // Handle negative indices, but check for out-of-range values.
+    #[expect(clippy::cast_possible_wrap)]
+    if index_value < 0 {
+        index_value += values.len() as i64;
+        if index_value < 0 {
+            return Err(error::ErrorKind::ArrayIndexOutOfRange(index_str.to_owned()).into());
+        }
+    }
+
+    // Now that we've confirmed that the index is non-negative, we can safely convert it
+    // to a u64 without any fuss.
+    #[expect(clippy::cast_sign_loss)]
+    Ok(index_value as u64)
 }
 
 impl From<&str> for ShellValue {
@@ -1017,6 +1068,12 @@ impl From<&String> for ShellValue {
 impl From<String> for ShellValue {
     fn from(value: String) -> Self {
         Self::String(value)
+    }
+}
+
+impl From<OsString> for ShellValue {
+    fn from(value: OsString) -> Self {
+        Self::String(value.to_string_lossy().into_owned())
     }
 }
 

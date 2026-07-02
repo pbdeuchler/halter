@@ -8,7 +8,7 @@ use itertools::Itertools as _;
 use crate::{error, sys};
 
 /// Type of signal that can be trapped in the shell.
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TrapSignal {
     /// A system signal.
     Signal(sys::signal::Signal),
@@ -20,6 +20,27 @@ pub enum TrapSignal {
     Exit,
     /// The `RETURN` trp.
     Return,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for TrapSignal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for TrapSignal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::try_from(s.as_str()).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Display for TrapSignal {
@@ -141,21 +162,30 @@ impl TryFrom<TrapSignal> for i32 {
     }
 }
 
+/// A handler for a trap signal.
+#[derive(Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TrapHandler {
+    /// The source text of the command to invoke.
+    pub command: String,
+    /// Source information for where the trap handler was defined.
+    pub source_info: crate::SourceInfo,
+}
+
 /// Configuration for trap handlers in the shell.
 #[derive(Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TrapHandlerConfig {
     /// Registered handlers for traps; maps signal type to command.
-    pub(crate) handlers: HashMap<TrapSignal, String>,
-    /// Current depth of the handler stack.
-    pub(crate) handler_depth: i32,
+    handlers: HashMap<TrapSignal, TrapHandler>,
 }
 
 impl TrapHandlerConfig {
     /// Iterates over the registered handlers for trap signals.
-    pub fn iter_handlers(&self) -> impl Iterator<Item = (TrapSignal, &str)> {
+    pub fn iter_handlers(&self) -> impl Iterator<Item = (TrapSignal, &TrapHandler)> {
         self.handlers
             .iter()
-            .map(|(signal, cmd)| (*signal, cmd.as_str()))
+            .map(|(signal, handler)| (*signal, handler))
     }
 
     /// Tries to find the handler associated with the given signal.
@@ -163,8 +193,13 @@ impl TrapHandlerConfig {
     /// # Arguments
     ///
     /// * `signal_type` - The type of signal to get the handler for.
-    pub fn get_handler(&self, signal_type: TrapSignal) -> Option<&str> {
-        self.handlers.get(&signal_type).map(|s| s.as_str())
+    pub fn get_handler(&self, signal_type: TrapSignal) -> Option<&TrapHandler> {
+        self.handlers.get(&signal_type)
+    }
+
+    /// Returns whether a handler is registered for the given signal.
+    pub fn handles(&self, signal_type: TrapSignal) -> bool {
+        self.handlers.contains_key(&signal_type)
     }
 
     /// Registers a handler for a trap signal.
@@ -173,8 +208,20 @@ impl TrapHandlerConfig {
     ///
     /// * `signal_type` - The type of signal to register a handler for.
     /// * `command` - The command to execute when the signal is trapped.
-    pub fn register_handler(&mut self, signal_type: TrapSignal, command: String) {
-        let _ = self.handlers.insert(signal_type, command);
+    /// * `source_info` - The source info for where the trap handler was defined.
+    pub fn register_handler(
+        &mut self,
+        signal_type: TrapSignal,
+        command: String,
+        source_info: crate::SourceInfo,
+    ) {
+        let _ = self.handlers.insert(
+            signal_type,
+            TrapHandler {
+                command,
+                source_info,
+            },
+        );
     }
 
     /// Removes handlers for a trap signal.

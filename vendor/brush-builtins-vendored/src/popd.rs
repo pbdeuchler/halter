@@ -9,17 +9,17 @@ pub(crate) struct PopdCommand {
     #[clap(short = 'n')]
     no_directory_change: bool,
     //
-    // TODO: implement +N and -N
+    // TODO(popd): implement +N and -N
 }
 
 impl builtins::Command for PopdCommand {
     type Error = crate::dirs::DirError;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        if let Some(popped) = context.shell.directory_stack.pop() {
+        if let Some(popped) = context.shell.directory_stack_mut().pop() {
             if !self.no_directory_change {
                 context.shell.set_working_dir(&popped)?;
             }

@@ -4,12 +4,14 @@ use std::{
 };
 
 /// Represents an action that can be taken in response to a key sequence.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum KeyAction {
     /// Execute a shell command.
     ShellCommand(String),
     /// Execute an input "function".
     DoInputFunction(InputFunction),
+    /// Execute a sequence of actions (in order).
+    Sequence(Vec<Self>),
 }
 
 impl Display for KeyAction {
@@ -17,12 +19,33 @@ impl Display for KeyAction {
         match self {
             Self::ShellCommand(command) => write!(f, "shell command: {command}"),
             Self::DoInputFunction(function) => function.fmt(f),
+            Self::Sequence(actions) => {
+                write!(f, "sequence[")?;
+                for (i, action) in actions.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    action.fmt(f)?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
 
-/// Defines all input functions.
-#[derive(Debug, strum_macros::EnumString, strum_macros::Display, strum_macros::EnumIter)]
+/// Defines all input functions. Based on standard `readline` functions,
+/// augmented with some `brush`-specific extensions.
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    Hash,
+    PartialEq,
+    strum_macros::EnumString,
+    strum_macros::Display,
+    strum_macros::EnumIter,
+    strum_macros::IntoStaticStr,
+)]
 #[strum(serialize_all = "kebab-case")]
 #[expect(missing_docs)]
 pub enum InputFunction {
@@ -36,9 +59,12 @@ pub enum InputFunction {
     BackwardKillLine,
     BackwardKillWord,
     BackwardWord,
+    BashViComplete,
     BeginningOfHistory,
     BeginningOfLine,
     BracketedPasteBegin,
+    BrushAcceptHint,
+    BrushAcceptHintWord,
     CallLastKbdMacro,
     CapitalizeWord,
     CharacterSearch,
@@ -73,6 +99,9 @@ pub enum InputFunction {
     EndOfHistory,
     EndOfLine,
     ExchangePointAndMark,
+    ExecuteNamedCommand,
+    ExportCompletions,
+    FetchHistory,
     ForwardBackwardDeleteChar,
     ForwardByte,
     ForwardChar,
@@ -129,6 +158,7 @@ pub enum InputFunction {
     ShellKillWord,
     ShellTransposeWords,
     SkipCsiSequence,
+    SpellCorrectWord,
     StartKbdMacro,
     TabInsert,
     TildeExpand,
@@ -144,6 +174,7 @@ pub enum InputFunction {
     ViAppendEol,
     ViAppendMode,
     ViArgDigit,
+    #[strum(serialize = "vi-bWord")]
     ViBWord,
     ViBackToIndent,
     ViBackwardBigword,
@@ -157,12 +188,15 @@ pub enum InputFunction {
     ViComplete,
     ViDelete,
     ViDeleteTo,
+    #[strum(serialize = "vi-eWord")]
     ViEWord,
+    ViEditAndExecuteCommand,
     ViEditingMode,
     ViEndBigword,
     ViEndWord,
     ViEofMaybe,
     ViEword,
+    #[strum(serialize = "vi-fWord")]
     ViFWord,
     ViFetchHistory,
     ViFirstPrint,
@@ -187,6 +221,7 @@ pub enum InputFunction {
     ViSetMark,
     ViSubst,
     ViTildeExpand,
+    ViUndo,
     ViUnixWordRubout,
     ViYankArg,
     ViYankPop,
@@ -198,17 +233,39 @@ pub enum InputFunction {
 }
 
 /// Represents a sequence of keys.
-#[derive(Debug, Eq, Hash, PartialEq)]
-pub struct KeySequence {
-    /// The strokes in the sequence.
-    pub strokes: Vec<KeyStroke>,
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum KeySequence {
+    /// Strokes that make up the sequence.
+    Strokes(Vec<KeyStroke>),
+    /// Raw bytes that were used to generate this sequence.
+    Bytes(Vec<Vec<u8>>),
 }
 
 impl Display for KeySequence {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for stroke in &self.strokes {
-            stroke.fmt(f)?;
+        match self {
+            Self::Strokes(strokes) => {
+                for stroke in strokes {
+                    stroke.fmt(f)?;
+                }
+            }
+            Self::Bytes(bytes) => {
+                for byte in bytes.iter().flatten() {
+                    if !byte.is_ascii_control() {
+                        write!(f, "{}", *byte as char)?;
+                    } else if *byte == b'\x1b' {
+                        write!(f, r"\e")?;
+                    } else if *byte >= 0x01 && *byte <= 0x1A {
+                        // Control characters: display as \C-<letter>
+                        let letter = (b'a' + (*byte - 1)) as char;
+                        write!(f, r"\C-{letter}")?;
+                    } else {
+                        write!(f, r"\x{byte:02x}")?;
+                    }
+                }
+            }
         }
+
         Ok(())
     }
 }
@@ -216,13 +273,11 @@ impl Display for KeySequence {
 impl From<KeyStroke> for KeySequence {
     /// Creates a new key sequence with a single stroke.
     fn from(value: KeyStroke) -> Self {
-        Self {
-            strokes: vec![value],
-        }
+        Self::Strokes(vec![value])
     }
 }
 
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 /// Represents a single key press.
 pub struct KeyStroke {
     /// Alt key was pressed.
@@ -244,7 +299,7 @@ impl Display for KeyStroke {
             write!(f, "\\C-")?;
         }
         if self.shift {
-            // TODO: Figure out what to do here or if the key encodes the shift in it.
+            // TODO(input): Figure out what to do here or if the key encodes the shift in it.
         }
         self.key.fmt(f)
     }
@@ -332,6 +387,34 @@ impl Display for Key {
 pub trait KeyBindings: Send {
     /// Retrieves current bindings.
     fn get_current(&self) -> HashMap<KeySequence, KeyAction>;
-    /// Updates a binding.
+
+    /// Tries to find a binding for an untranslated byte sequence.
+    fn get_untranslated(&self, bytes: &[u8]) -> Option<&KeyAction>;
+
+    /// Sets or updates a binding.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - The key sequence to bind.
+    /// * `action` - The action to bind to the sequence.
     fn bind(&mut self, seq: KeySequence, action: KeyAction) -> Result<(), std::io::Error>;
+
+    /// Unbinds a key sequence. Returns true if a binding was removed.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - The key sequence to unbind.
+    fn try_unbind(&mut self, seq: KeySequence) -> bool;
+
+    /// Defines a macro that remaps a key sequence to another key sequence.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - The key sequence to bind the macro to.
+    /// * `target` - The sequence that makes up the macro.
+    fn define_macro(&mut self, seq: KeySequence, target: KeySequence)
+    -> Result<(), std::io::Error>;
+
+    /// Retrieves all defined macros.
+    fn get_macros(&self) -> HashMap<KeySequence, KeySequence>;
 }

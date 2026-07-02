@@ -1,4 +1,3 @@
-#![allow(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic)]
 //! Standard builtins.
 
 #[cfg(feature = "builtin.alias")]
@@ -9,10 +8,10 @@ mod bg;
 mod bind;
 #[cfg(feature = "builtin.break")]
 mod break_;
-#[cfg(feature = "builtin.brushinfo")]
-mod brushinfo;
 #[cfg(feature = "builtin.builtin")]
 mod builtin_;
+#[cfg(feature = "builtin.caller")]
+mod caller;
 #[cfg(feature = "builtin.cd")]
 mod cd;
 #[cfg(feature = "builtin.colon")]

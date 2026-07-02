@@ -4,45 +4,57 @@ use std::os::fd::RawFd;
 
 use crate::{ShellFd, error, openfiles};
 
-#[cfg(target_os = "linux")]
-const FD_DIR_PATH: &str = "/proc/self/fd";
-
-#[cfg(target_os = "macos")]
-const FD_DIR_PATH: &str = "/dev/fd";
+cfg_if::cfg_if! {
+    if #[cfg(any(target_os = "linux", target_os = "android"))] {
+        const FD_DIR_PATH: &str = "/proc/self/fd";
+    } else if #[cfg(any(
+            target_os = "freebsd",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))] {
+        const FD_DIR_PATH: &str = "/dev/fd";
+    } else {
+        /// Returns an iterator over all open file descriptors for the shell.
+        pub fn iter_fds()
+        -> Result<impl Iterator<Item = (ShellFd, openfiles::OpenFile)>, error::Error> {
+            Ok(std::iter::empty())
+        }
+    }
+}
 
 /// Makes a best-effort attempt to iterate over all open file descriptors
 /// for the current process.
 ///
 /// If the platform does not support enumerating file descriptors, an empty iterator
 /// is returned. This function will skip any file descriptors that cannot be opened.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 pub fn try_iter_open_fds() -> impl Iterator<Item = (ShellFd, openfiles::OpenFile)> {
-    let mut opened_entries = vec![];
+    std::fs::read_dir(FD_DIR_PATH)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let fd: RawFd = entry.file_name().to_str()?.parse().ok()?;
 
-    if let Ok(fd_dir) = std::fs::read_dir(FD_DIR_PATH) {
-        for entry in fd_dir.into_iter().flatten() {
-            if let Ok(filename) = entry.file_name().into_string() {
-                if let Ok(fd_num) = filename.parse::<RawFd>() {
-                    // SAFETY:
-                    // We are trying to open the file descriptor we found listed
-                    // in the filesystem, but there's a risk that it's not the same one
-                    // that we enumerated or that it's since been closed. For the purposes
-                    // of this function, either of those outcomes are acceptable. We
-                    // simply skip any fds that we can't open, and the function's purpose
-                    // is to make a best-effort attempt to open all available fds.
-                    if let Ok(file) = unsafe { open_file_by_fd(fd_num) } {
-                        opened_entries.push((fd_num, file));
-                    }
-                }
-            }
-        }
-    }
+            // SAFETY:
+            // We are trying to open the file descriptor we found listed
+            // in the filesystem, but there's a risk that it's not the same one
+            // that we enumerated or that it's since been closed. For the purposes
+            // of this function, either of those outcomes are acceptable. We
+            // simply skip any fds that we can't open, and the function's purpose
+            // is to make a best-effort attempt to open all available fds.
+            let file = unsafe { open_file_by_fd(fd) }.ok()?;
 
-    opened_entries.into_iter()
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn iter_fds() -> Result<impl Iterator<Item = (ShellFd, openfiles::OpenFile)>, error::Error> {
-    Ok(std::iter::empty())
+            Some((fd, file))
+        })
 }
 
 /// Attempts to retrieve an `OpenFile` representation for the given already-open file descriptor.

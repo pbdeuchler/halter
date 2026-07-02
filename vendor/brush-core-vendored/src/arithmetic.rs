@@ -2,8 +2,12 @@
 
 use std::borrow::Cow;
 
-use crate::{ExecutionParameters, Shell, env, expansion, variables};
+use crate::{ExecutionParameters, Shell, env, expansion, extensions, variables};
 use brush_parser::ast;
+
+/// Maximum recursion depth for arithmetic variable dereference chains
+/// (e.g., a=b, b=c, c=a would cycle through variable dereferences).
+const MAX_VARIABLE_DEREF_DEPTH: u32 = 1024;
 
 /// Represents an error that occurs during evaluation of an arithmetic expression.
 #[derive(Debug, thiserror::Error)]
@@ -21,7 +25,7 @@ pub enum EvalError {
     FailedToTokenizeExpression,
 
     /// Failed to expand an arithmetic expression.
-    #[error("failed to expand expression: '{0}'")]
+    #[error("failed to expand expression: {0}")]
     FailedToExpandExpression(String),
 
     /// Failed to access an element of an array.
@@ -33,12 +37,16 @@ pub enum EvalError {
     FailedToUpdateEnvironment,
 
     /// Failed to parse an arithmetic expression.
-    #[error("failed to parse expression: '{0}'")]
+    #[error("failed to parse expression: {0}")]
     ParseError(String),
 
-    /// Failed to trace an arithmetic expression.
-    #[error("failed tracing expression")]
-    TraceError,
+    /// Error expanding an unset variable.
+    #[error("expanding unset variable: {0}")]
+    ExpandingUnsetVariable(String),
+
+    /// Expression recursion level exceeded.
+    #[error("expression recursion level exceeded")]
+    RecursionLimitExceeded,
 }
 
 /// Trait implemented by arithmetic expressions that can be evaluated.
@@ -51,7 +59,7 @@ pub(crate) trait ExpandAndEvaluate {
     /// * `trace_if_needed` - Whether to trace the evaluation.
     async fn eval(
         &self,
-        shell: &mut Shell,
+        shell: &mut Shell<impl extensions::ShellExtensions>,
         params: &ExecutionParameters,
         trace_if_needed: bool,
     ) -> Result<i64, EvalError>;
@@ -60,7 +68,7 @@ pub(crate) trait ExpandAndEvaluate {
 impl ExpandAndEvaluate for ast::UnexpandedArithmeticExpr {
     async fn eval(
         &self,
-        shell: &mut Shell,
+        shell: &mut Shell<impl extensions::ShellExtensions>,
         params: &ExecutionParameters,
         trace_if_needed: bool,
     ) -> Result<i64, EvalError> {
@@ -76,13 +84,17 @@ impl ExpandAndEvaluate for ast::UnexpandedArithmeticExpr {
 /// * `expr` - The unexpanded arithmetic expression to evaluate.
 /// * `trace_if_needed` - Whether to trace the evaluation.
 pub(crate) async fn expand_and_eval(
-    shell: &mut Shell,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
     expr: &str,
     trace_if_needed: bool,
 ) -> Result<i64, EvalError> {
     // Per documentation, first shell-expand it.
-    let expanded_self = expansion::basic_expand_str_without_tilde(shell, params, expr)
+    let options = expansion::ExpanderOptions {
+        tilde_expand: false,
+        ..Default::default()
+    };
+    let expanded_self = expansion::basic_expand_word_with_options(shell, params, expr, &options)
         .await
         .map_err(|_e| EvalError::FailedToExpandExpression(expr.to_owned()))?;
 
@@ -91,11 +103,10 @@ pub(crate) async fn expand_and_eval(
         .map_err(|_e| EvalError::ParseError(expanded_self))?;
 
     // Trace if applicable.
-    if trace_if_needed && shell.options.print_commands_and_arguments {
+    if trace_if_needed && shell.options().print_commands_and_arguments {
         shell
             .trace_command(params, std::format!("(( {expr} ))"))
-            .await
-            .map_err(|_err| EvalError::TraceError)?;
+            .await;
     }
 
     // Now evaluate.
@@ -109,49 +120,90 @@ pub trait Evaluatable {
     /// # Arguments
     ///
     /// * `shell` - The shell to use for evaluation.
-    fn eval(&self, shell: &mut Shell) -> Result<i64, EvalError>;
+    fn eval(&self, shell: &mut Shell<impl extensions::ShellExtensions>) -> Result<i64, EvalError>;
 }
 
 impl Evaluatable for ast::ArithmeticExpr {
-    fn eval(&self, shell: &mut Shell) -> Result<i64, EvalError> {
-        let value = match self {
-            Self::Literal(l) => *l,
-            Self::Reference(lvalue) => deref_lvalue(shell, lvalue)?,
-            Self::UnaryOp(op, operand) => apply_unary_op(shell, *op, operand)?,
-            Self::BinaryOp(op, left, right) => apply_binary_op(shell, *op, left, right)?,
-            Self::Conditional(condition, then_expr, else_expr) => {
-                let conditional_eval = condition.eval(shell)?;
-
-                // Ensure we only evaluate the branch indicated by the condition.
-                if conditional_eval != 0 {
-                    then_expr.eval(shell)?
-                } else {
-                    else_expr.eval(shell)?
-                }
-            }
-            Self::Assignment(lvalue, expr) => {
-                let expr_eval = expr.eval(shell)?;
-                assign(shell, lvalue, expr_eval)?
-            }
-            Self::UnaryAssignment(op, lvalue) => apply_unary_assignment_op(shell, lvalue, *op)?,
-            Self::BinaryAssignment(op, lvalue, operand) => {
-                let value = apply_binary_op(shell, *op, &Self::Reference(lvalue.clone()), operand)?;
-                assign(shell, lvalue, value)?
-            }
-        };
-
-        Ok(value)
+    fn eval(&self, shell: &mut Shell<impl extensions::ShellExtensions>) -> Result<i64, EvalError> {
+        eval_expr_impl(self, shell, 0)
     }
 }
 
-fn deref_lvalue(shell: &mut Shell, lvalue: &ast::ArithmeticTarget) -> Result<i64, EvalError> {
+fn eval_expr_impl(
+    expr: &ast::ArithmeticExpr,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    depth: u32,
+) -> Result<i64, EvalError> {
+    let value = match expr {
+        ast::ArithmeticExpr::Literal(l) => *l,
+        ast::ArithmeticExpr::Reference(lvalue) => deref_lvalue(shell, lvalue, depth)?,
+        ast::ArithmeticExpr::UnaryOp(op, operand) => apply_unary_op(shell, *op, operand, depth)?,
+        ast::ArithmeticExpr::BinaryOp(op, left, right) => {
+            apply_binary_op(shell, *op, left, right, depth)?
+        }
+        ast::ArithmeticExpr::Conditional(condition, then_expr, else_expr) => {
+            let conditional_eval = eval_expr_impl(condition, shell, depth)?;
+
+            // Ensure we only evaluate the branch indicated by the condition.
+            if conditional_eval != 0 {
+                eval_expr_impl(then_expr, shell, depth)?
+            } else {
+                eval_expr_impl(else_expr, shell, depth)?
+            }
+        }
+        ast::ArithmeticExpr::Assignment(lvalue, rhs) => {
+            let expr_eval = eval_expr_impl(rhs, shell, depth)?;
+            assign(shell, lvalue, expr_eval, depth)?
+        }
+        ast::ArithmeticExpr::UnaryAssignment(op, lvalue) => {
+            apply_unary_assignment_op(shell, lvalue, *op, depth)?
+        }
+        ast::ArithmeticExpr::BinaryAssignment(op, lvalue, operand) => {
+            let value = apply_binary_op(
+                shell,
+                *op,
+                &ast::ArithmeticExpr::Reference(lvalue.clone()),
+                operand,
+                depth,
+            )?;
+            assign(shell, lvalue, value, depth)?
+        }
+    };
+
+    Ok(value)
+}
+
+fn get_var_value<'a>(
+    shell: &'a Shell<impl extensions::ShellExtensions>,
+    name: &str,
+) -> Result<Cow<'a, str>, EvalError> {
+    let value = shell.env_var(name).map(|var| var.resolve_value(shell));
+
+    if let Some(value) = value
+        && value.is_set()
+    {
+        return Ok(value.to_cow_str(shell).to_string().into());
+    }
+
+    if shell.options().treat_unset_variables_as_error {
+        return Err(EvalError::ExpandingUnsetVariable(name.into()));
+    }
+
+    Ok("".into())
+}
+
+fn deref_lvalue(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    lvalue: &ast::ArithmeticTarget,
+    depth: u32,
+) -> Result<i64, EvalError> {
     let value_str: Cow<'_, str> = match lvalue {
-        ast::ArithmeticTarget::Variable(name) => shell.env_str(name).unwrap_or(Cow::Borrowed("")),
+        ast::ArithmeticTarget::Variable(name) => get_var_value(shell, name.as_str())?,
         ast::ArithmeticTarget::ArrayElement(name, index_expr) => {
-            let index_str = index_expr.eval(shell)?.to_string();
+            let index_str = eval_expr_impl(index_expr, shell, depth)?.to_string();
 
             shell
-                .env
+                .env()
                 .get(name)
                 .map_or_else(
                     || Ok(None),
@@ -165,29 +217,43 @@ fn deref_lvalue(shell: &mut Shell, lvalue: &ast::ArithmeticTarget) -> Result<i64
     let parsed_value = brush_parser::arithmetic::parse(value_str.as_ref())
         .map_err(|_err| EvalError::ParseError(value_str.to_string()))?;
 
-    parsed_value.eval(shell)
+    // Literals don't need depth tracking — they can't cause recursion.
+    // Only increment depth when the parsed value requires further evaluation
+    // (i.e., it references other variables), matching bash's behavior.
+    if matches!(parsed_value, ast::ArithmeticExpr::Literal(_)) {
+        return eval_expr_impl(&parsed_value, shell, depth);
+    }
+
+    let new_depth = depth + 1;
+    if new_depth > MAX_VARIABLE_DEREF_DEPTH {
+        return Err(EvalError::RecursionLimitExceeded);
+    }
+
+    eval_expr_impl(&parsed_value, shell, new_depth)
 }
 
 fn apply_unary_op(
-    shell: &mut Shell,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
     op: ast::UnaryOperator,
     operand: &ast::ArithmeticExpr,
+    depth: u32,
 ) -> Result<i64, EvalError> {
-    let operand_eval = operand.eval(shell)?;
+    let operand_eval = eval_expr_impl(operand, shell, depth)?;
 
     match op {
         ast::UnaryOperator::UnaryPlus => Ok(operand_eval),
-        ast::UnaryOperator::UnaryMinus => Ok(-operand_eval),
+        ast::UnaryOperator::UnaryMinus => Ok(operand_eval.wrapping_neg()),
         ast::UnaryOperator::BitwiseNot => Ok(!operand_eval),
         ast::UnaryOperator::LogicalNot => Ok(bool_to_i64(operand_eval == 0)),
     }
 }
 
 fn apply_binary_op(
-    shell: &mut Shell,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
     op: ast::BinaryOperator,
     left: &ast::ArithmeticExpr,
     right: &ast::ArithmeticExpr,
+    depth: u32,
 ) -> Result<i64, EvalError> {
     // First, special-case short-circuiting operators. For those, we need
     // to ensure we don't eagerly evaluate both operands. After we
@@ -195,29 +261,29 @@ fn apply_binary_op(
     // for the other operators.
     match op {
         ast::BinaryOperator::LogicalAnd => {
-            let left = left.eval(shell)?;
+            let left = eval_expr_impl(left, shell, depth)?;
             if left == 0 {
                 return Ok(bool_to_i64(false));
             }
 
-            let right = right.eval(shell)?;
+            let right = eval_expr_impl(right, shell, depth)?;
             return Ok(bool_to_i64(right != 0));
         }
         ast::BinaryOperator::LogicalOr => {
-            let left = left.eval(shell)?;
+            let left = eval_expr_impl(left, shell, depth)?;
             if left != 0 {
                 return Ok(bool_to_i64(true));
             }
 
-            let right = right.eval(shell)?;
+            let right = eval_expr_impl(right, shell, depth)?;
             return Ok(bool_to_i64(right != 0));
         }
         _ => (),
     }
 
     // The remaining operators unconditionally operate both operands.
-    let left = left.eval(shell)?;
-    let right = right.eval(shell)?;
+    let left = eval_expr_impl(left, shell, depth)?;
+    let right = eval_expr_impl(right, shell, depth)?;
 
     #[expect(clippy::cast_possible_truncation)]
     #[expect(clippy::cast_sign_loss)]
@@ -241,7 +307,7 @@ fn apply_binary_op(
             if right == 0 {
                 Err(EvalError::DivideByZero)
             } else {
-                Ok(left % right)
+                Ok(left.wrapping_rem(right))
             }
         }
         ast::BinaryOperator::Comma => Ok(right),
@@ -264,41 +330,47 @@ fn apply_binary_op(
 }
 
 fn apply_unary_assignment_op(
-    shell: &mut Shell,
+    shell: &mut Shell<impl extensions::ShellExtensions>,
     lvalue: &ast::ArithmeticTarget,
     op: ast::UnaryAssignmentOperator,
+    depth: u32,
 ) -> Result<i64, EvalError> {
-    let value = deref_lvalue(shell, lvalue)?;
+    let value = deref_lvalue(shell, lvalue, depth)?;
 
     match op {
         ast::UnaryAssignmentOperator::PrefixIncrement => {
-            let new_value = value + 1;
-            assign(shell, lvalue, new_value)?;
+            let new_value = value.wrapping_add(1);
+            assign(shell, lvalue, new_value, depth)?;
             Ok(new_value)
         }
         ast::UnaryAssignmentOperator::PrefixDecrement => {
-            let new_value = value - 1;
-            assign(shell, lvalue, new_value)?;
+            let new_value = value.wrapping_sub(1);
+            assign(shell, lvalue, new_value, depth)?;
             Ok(new_value)
         }
         ast::UnaryAssignmentOperator::PostfixIncrement => {
-            let new_value = value + 1;
-            assign(shell, lvalue, new_value)?;
+            let new_value = value.wrapping_add(1);
+            assign(shell, lvalue, new_value, depth)?;
             Ok(value)
         }
         ast::UnaryAssignmentOperator::PostfixDecrement => {
-            let new_value = value - 1;
-            assign(shell, lvalue, new_value)?;
+            let new_value = value.wrapping_sub(1);
+            assign(shell, lvalue, new_value, depth)?;
             Ok(value)
         }
     }
 }
 
-fn assign(shell: &mut Shell, lvalue: &ast::ArithmeticTarget, value: i64) -> Result<i64, EvalError> {
+fn assign(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    lvalue: &ast::ArithmeticTarget,
+    value: i64,
+    depth: u32,
+) -> Result<i64, EvalError> {
     match lvalue {
         ast::ArithmeticTarget::Variable(name) => {
             shell
-                .env
+                .env_mut()
                 .update_or_add(
                     name.as_str(),
                     variables::ShellValueLiteral::Scalar(value.to_string()),
@@ -309,10 +381,10 @@ fn assign(shell: &mut Shell, lvalue: &ast::ArithmeticTarget, value: i64) -> Resu
                 .map_err(|_err| EvalError::FailedToUpdateEnvironment)?;
         }
         ast::ArithmeticTarget::ArrayElement(name, index_expr) => {
-            let index_str = index_expr.eval(shell)?.to_string();
+            let index_str = eval_expr_impl(index_expr, shell, depth)?.to_string();
 
             shell
-                .env
+                .env_mut()
                 .update_or_add_array_element(
                     name.as_str(),
                     index_str,

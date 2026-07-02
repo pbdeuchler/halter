@@ -2,10 +2,11 @@
 
 use itertools::Itertools;
 
-use crate::{CreateOptions, namedoptions};
+use crate::{CreateOptions, extensions, namedoptions};
 
 /// Runtime changeable options for a shell instance.
 #[derive(Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[expect(clippy::module_name_repetitions)]
 pub struct RuntimeOptions {
     //
@@ -58,7 +59,7 @@ pub struct RuntimeOptions {
     /// 'ignoreeof'
     pub ignore_eof: bool,
     /// 'pipefail'
-    pub return_first_failure_from_pipeline: bool,
+    pub return_last_failure_from_pipeline: bool,
     /// 'posix'
     pub posix_mode: bool,
     /// 'vi'
@@ -66,10 +67,14 @@ pub struct RuntimeOptions {
 
     //
     // Options set through shopt.
+    /// `array_expand_once`
+    pub array_expand_once: bool,
     /// `assoc_expand_once`
     pub assoc_expand_once: bool,
     /// 'autocd'
     pub auto_cd: bool,
+    /// `bash_source_full_path`
+    pub bash_source_full_path: bool,
     /// `cdable_vars`
     pub cdable_vars: bool,
     /// 'cdspell'
@@ -120,6 +125,8 @@ pub struct RuntimeOptions {
     pub force_fignore: bool,
     /// 'globasciiranges'
     pub glob_ranges_use_c_locale: bool,
+    /// 'globskipdots'
+    pub glob_skip_dots: bool,
     /// 'globstar'
     pub enable_star_star_glob: bool,
     /// `gnu_errfmt`
@@ -156,8 +163,12 @@ pub struct RuntimeOptions {
     pub case_insensitive_pathname_expansion: bool,
     /// 'nocasematch'
     pub case_insensitive_conditionals: bool,
+    /// `noexpand_translation`
+    pub no_expand_translation: bool,
     /// 'nullglob'
     pub expand_non_matching_patterns_to_null: bool,
+    /// `patsub_replacement`
+    pub patsub_replacement: bool,
     /// 'progcomp'
     pub programmable_completion: bool,
     /// `progcomp_alias`
@@ -170,6 +181,8 @@ pub struct RuntimeOptions {
     pub shift_verbose: bool,
     /// `sourcepath`
     pub source_builtin_searches_path: bool,
+    /// `varredir_close`
+    pub var_redir_close: bool,
     /// `xpg_echo`
     pub echo_builtin_expands_escape_sequences: bool,
 
@@ -177,10 +190,14 @@ pub struct RuntimeOptions {
     // Options set by the shell.
     /// Whether or not the shell is interactive.
     pub interactive: bool,
-    /// Whether or not the shell is reading commands from standard input.
+    /// Whether commands are being read from stdin.
     pub read_commands_from_stdin: bool,
+    /// Whether the shell is in command string mode (-c).
+    pub command_string_mode: bool,
     /// Whether or not the shell is in maximal `sh` compatibility mode.    
     pub sh_mode: bool,
+    /// Whether to treat external commands as session leaders.
+    pub external_cmd_leads_session: bool,
     /// Maximum function call depth.
     pub max_function_call_depth: Option<usize>,
 }
@@ -191,7 +208,9 @@ impl RuntimeOptions {
     /// # Arguments
     ///
     /// * `create_options` - The options used to create the shell.
-    pub fn defaults_from(create_options: &CreateOptions) -> Self {
+    pub fn defaults_from<SE: extensions::ShellExtensions>(
+        create_options: &CreateOptions<SE>,
+    ) -> Self {
         // There's a set of options enabled by default for all shells.
         let mut options = Self {
             interactive: create_options.interactive,
@@ -202,15 +221,23 @@ impl RuntimeOptions {
             enable_job_control: create_options.interactive,
             exit_after_one_command: create_options.exit_after_one_command,
             read_commands_from_stdin: create_options.read_commands_from_stdin,
+            command_string_mode: create_options.command_string_mode,
             sh_mode: create_options.sh_mode,
             posix_mode: create_options.posix,
             print_commands_and_arguments: create_options.print_commands_and_arguments,
             print_shell_input_lines: create_options.verbose,
+            treat_unset_variables_as_error: create_options.treat_unset_variables_as_error,
+            exit_on_nonzero_command_exit: create_options.exit_on_nonzero_command_exit,
+            external_cmd_leads_session: create_options.external_cmd_leads_session,
+            login_shell: create_options.login,
+            disable_filename_globbing: create_options.disable_pathname_expansion,
             remember_command_locations: true,
             check_window_size_after_external_commands: true,
             save_multiline_cmds_in_history: true,
             extquote: true,
             force_fignore: true,
+            case_insensitive_pathname_expansion:
+                crate::sys::fs::default_case_insensitive_path_expansion(),
             enable_hostname_completion: true,
             interactive_comments: true,
             expand_prompt_strings: true,
@@ -219,6 +246,8 @@ impl RuntimeOptions {
             quote_all_metachars_in_completion: true,
             programmable_completion: true,
             glob_ranges_use_c_locale: true,
+            glob_skip_dots: true,
+            patsub_replacement: true,
             max_function_call_depth: create_options.max_function_call_depth,
             ..Self::default()
         };
@@ -270,27 +299,15 @@ impl RuntimeOptions {
         let mut cs = vec![];
 
         for o in namedoptions::options(namedoptions::ShellOptionKind::Set).iter() {
-            if o.definition.get(self) {
-                cs.push(o.name.chars().next().unwrap());
+            if o.definition.get(self)
+                && let Some(c) = o.name.chars().next()
+            {
+                cs.push(c);
             }
         }
 
         // Sort the flags in a way that matches what bash does.
-        cs.sort_by(|a, b| {
-            if a == b {
-                std::cmp::Ordering::Equal
-            } else if *a == 's' {
-                std::cmp::Ordering::Greater
-            } else if *b == 's' {
-                std::cmp::Ordering::Less
-            } else if a.is_ascii_lowercase() && b.is_ascii_uppercase() {
-                std::cmp::Ordering::Less
-            } else if a.is_ascii_uppercase() && b.is_ascii_lowercase() {
-                std::cmp::Ordering::Greater
-            } else {
-                a.cmp(b)
-            }
-        });
+        cs.sort_by_key(|flag| option_flag_sort_key(*flag));
 
         cs.into_iter().collect()
     }
@@ -321,5 +338,55 @@ impl RuntimeOptions {
 
         cs.sort_unstable();
         cs.into_iter().join(":")
+    }
+}
+
+/// Sort option flag character in a way that mirrors bash behavior.
+///
+/// # Arguments
+///
+/// * `ch` - The option flag character.
+const fn option_flag_sort_key(ch: char) -> (u8, char) {
+    // NOTE: bash appears to sort in 3 groups. We mimic them:
+    //    1) Lowercase letters excluding 'c' and 's' (sorted)
+    //    2) Uppercase letters (sorted)
+    //    3) All other characters (sorted)
+    let group = if ch.is_ascii_lowercase() && !matches!(ch, 'c' | 's') {
+        0
+    } else if ch.is_ascii_uppercase() {
+        1
+    } else {
+        2
+    };
+
+    (group, ch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::option_flag_sort_key;
+
+    #[test]
+    fn lowercase_excluding_c_and_s_sort_first() {
+        let mut flags = vec!['b', 'A', 'Z', 's', 'c', 'a'];
+        flags.sort_by_key(|flag| option_flag_sort_key(*flag));
+
+        assert_eq!(flags, vec!['a', 'b', 'A', 'Z', 'c', 's']);
+    }
+
+    #[test]
+    fn uppercase_sorted_before_miscellaneous() {
+        let mut flags = vec!['P', 'B', '1', 'T'];
+        flags.sort_by_key(|flag| option_flag_sort_key(*flag));
+
+        assert_eq!(flags, vec!['B', 'P', 'T', '1']);
+    }
+
+    #[test]
+    fn miscellaneous_characters_respect_ascii_order() {
+        let mut flags = vec!['s', 'c', '%', ':'];
+        flags.sort_by_key(|flag| option_flag_sort_key(*flag));
+
+        assert_eq!(flags, vec!['%', ':', 'c', 's']);
     }
 }

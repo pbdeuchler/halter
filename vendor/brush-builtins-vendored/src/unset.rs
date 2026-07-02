@@ -39,12 +39,12 @@ impl UnsetNameInterpretation {
 impl builtins::Command for UnsetCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         //
-        // TODO: implement nameref
+        // TODO(nameref): implement nameref
         //
         if self.name_interpretation.name_references {
             return brush_core::error::unimp("unset: name references are not yet implemented");
@@ -55,30 +55,33 @@ impl builtins::Command for UnsetCommand {
         #[expect(clippy::needless_continue)]
         for name in &self.names {
             if unspecified || self.name_interpretation.shell_variables {
-                let parameter =
-                    brush_parser::word::parse_parameter(name, &context.shell.parser_options())?;
+                // Try to parse the name as a parameter. If we can't, don't bail; it may not be a
+                // valid variable name/parameter but could still be a function name.
+                if let Ok(parameter) =
+                    brush_parser::word::parse_parameter(name, &context.shell.parser_options())
+                {
+                    let result = match parameter {
+                        brush_parser::word::Parameter::Positional(_) => continue,
+                        brush_parser::word::Parameter::Special(_) => continue,
+                        brush_parser::word::Parameter::Named(name) => {
+                            context.shell.env_mut().unset(name.as_str())?.is_some()
+                        }
+                        brush_parser::word::Parameter::NamedWithIndex { name, index } => {
+                            unset_array_index(context.shell, name.as_str(), index.as_str())?
+                        }
+                        brush_parser::word::Parameter::NamedWithAllIndices {
+                            name: _,
+                            concatenate: _,
+                        } => continue,
+                    };
 
-                let result = match parameter {
-                    brush_parser::word::Parameter::Positional(_) => continue,
-                    brush_parser::word::Parameter::Special(_) => continue,
-                    brush_parser::word::Parameter::Named(name) => {
-                        context.shell.env.unset(name.as_str())?.is_some()
+                    if result {
+                        continue;
                     }
-                    brush_parser::word::Parameter::NamedWithIndex { name, index } => {
-                        unset_array_index(context.shell, name.as_str(), index.as_str())?
-                    }
-                    brush_parser::word::Parameter::NamedWithAllIndices {
-                        name: _,
-                        concatenate: _,
-                    } => continue,
-                };
-
-                if result {
-                    continue;
                 }
             }
 
-            // TODO: Deal with readonly functions
+            // TODO(unset): Deal with readonly functions
             if unspecified || self.name_interpretation.shell_functions {
                 if context.shell.undefine_func(name) {
                     continue;
@@ -91,12 +94,12 @@ impl builtins::Command for UnsetCommand {
 }
 
 fn unset_array_index(
-    shell: &mut Shell,
+    shell: &mut Shell<impl brush_core::ShellExtensions>,
     name: &str,
     index: &str,
 ) -> Result<bool, brush_core::Error> {
     // First check to see if it's an associative array.
-    let is_assoc_array = if let Some((_, var)) = shell.env.get(name) {
+    let is_assoc_array = if let Some((_, var)) = shell.env().get(name) {
         matches!(
             var.value(),
             ShellValue::AssociativeArray(_)
@@ -118,5 +121,5 @@ fn unset_array_index(
     };
 
     // Now we can try to unset, and return the result.
-    shell.env.unset_index(name, index_to_use.as_ref())
+    shell.env_mut().unset_index(name, index_to_use.as_ref())
 }

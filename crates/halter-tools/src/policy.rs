@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
-use brush_parser::{Parser, ParserOptions, SourceInfo, ast};
+use brush_parser::{Parser, ParserOptions, ast};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 mod canonical;
@@ -539,11 +539,7 @@ fn extract_host_and_port(url: &str) -> Option<(String, Option<u16>)> {
 }
 
 fn parse_shell_program(command: &str) -> Result<ast::Program, PolicyError> {
-    let mut parser = Parser::new(
-        Cursor::new(command),
-        &ParserOptions::default(),
-        &SourceInfo::default(),
-    );
+    let mut parser = Parser::new(Cursor::new(command), &ParserOptions::default());
     parser
         .parse_program()
         .map_err(|e| PolicyError::ShellCommandRejected {
@@ -593,7 +589,7 @@ fn visit_command_strict(command: &ast::Command) -> Result<(), PolicyError> {
             reason: "function_definition",
             fragment: "fn() {...}".to_owned(),
         }),
-        ast::Command::ExtendedTest(_) => Ok(()),
+        ast::Command::ExtendedTest(..) => Ok(()),
     }
 }
 
@@ -631,6 +627,7 @@ fn visit_compound_strict(command: &ast::CompoundCommand) -> Result<(), PolicyErr
             visit_compound_list_strict(&cmd.0)?;
             visit_compound_list_strict(&cmd.1.list)
         }
+        ast::CompoundCommand::Coprocess(cmd) => visit_command_strict(&cmd.body),
     }
 }
 
@@ -709,7 +706,7 @@ fn visit_command_allowlist(command: &ast::Command, allowed: &[String]) -> Result
     match command {
         ast::Command::Simple(simple) => visit_simple_allowlist(simple, allowed),
         ast::Command::Compound(compound, _) => visit_compound_allowlist(compound, allowed),
-        ast::Command::Function(_) | ast::Command::ExtendedTest(_) => Ok(()),
+        ast::Command::Function(_) | ast::Command::ExtendedTest(..) => Ok(()),
     }
 }
 
@@ -752,6 +749,7 @@ fn visit_compound_allowlist(
             visit_compound_list_allowlist(&cmd.0, allowed)?;
             visit_compound_list_allowlist(&cmd.1.list, allowed)
         }
+        ast::CompoundCommand::Coprocess(cmd) => visit_command_allowlist(&cmd.body, allowed),
     }
 }
 

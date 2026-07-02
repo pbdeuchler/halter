@@ -39,11 +39,16 @@ pub enum JobTaskWaitResult {
 }
 
 impl JobTask {
+    /// Returns whether the task is an external process.
+    pub const fn is_external(&self) -> bool {
+        matches!(self, Self::External(_))
+    }
+
     /// Waits for the task to complete. Returns the result of the wait.
     pub async fn wait(&mut self) -> Result<JobTaskWaitResult, error::Error> {
         match self {
             Self::External(process) => {
-                // Background jobs don't receive cancellation tokens
+                // Background jobs are not given cancellation tokens.
                 let wait_result = process.wait(None).await?;
                 match wait_result {
                     processes::ProcessWaitResult::Completed(output) => {
@@ -51,7 +56,7 @@ impl JobTask {
                     }
                     processes::ProcessWaitResult::Stopped => Ok(JobTaskWaitResult::Stopped),
                     processes::ProcessWaitResult::Cancelled => {
-                        // Should never happen since we pass None, but handle gracefully
+                        // Unreachable without a token; treat as interrupted (128 + SIGINT).
                         Ok(JobTaskWaitResult::Completed(ExecutionResult::new(130)))
                     }
                 }
@@ -60,7 +65,10 @@ impl JobTask {
         }
     }
 
-    #[allow(clippy::unwrap_in_result)]
+    /// Polls the task for completion. Returns `Some(result)` if the task has completed,
+    /// or `None` if it is still running. The result is the execution result of the task.
+    /// Behaves in a best-effort manner; if an internal error occurs during polling,
+    /// it will return `None`.
     fn poll(&mut self) -> Option<Result<ExecutionResult, error::Error>> {
         match self {
             Self::External(process) => {
@@ -69,7 +77,7 @@ impl JobTask {
             }
             Self::Internal(handle) => {
                 let checkable_handle = handle;
-                checkable_handle.now_or_never().map(|r| r.unwrap())
+                checkable_handle.now_or_never().and_then(|r| r.ok())
             }
         }
     }
@@ -87,6 +95,10 @@ impl JobManager {
     /// # Arguments
     ///
     /// * `job` - The job to add.
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "push() guarantees the vector length is >= 1"
+    )]
     pub fn add_as_current(&mut self, mut job: Job) -> &Job {
         for j in &mut self.jobs {
             if matches!(j.annotation, JobAnnotation::Current) {
@@ -99,6 +111,8 @@ impl JobManager {
         job.id = id;
         job.annotation = JobAnnotation::Current;
         self.jobs.push(job);
+
+        #[allow(clippy::unwrap_used, reason = "we just pushed an element")]
         self.jobs.last().unwrap()
     }
 
@@ -171,8 +185,8 @@ impl JobManager {
                 let job = self.jobs.remove(i);
                 results.push((job, result));
             } else if matches!(self.jobs[i].state, JobState::Done) {
-                // TODO: This is a workaround to remove jobs that are done but for which we don't
-                // know what happened.
+                // TODO(jobs): This is a workaround to remove jobs that are done but for which we
+                // don't know what happened.
                 results.push((self.jobs.remove(i), Ok(ExecutionResult::success())));
             } else {
                 i += 1;
@@ -443,7 +457,7 @@ impl Job {
 
     /// Tries to retrieve the process group ID (PGID) of the job.
     pub fn process_group_id(&self) -> Option<sys::process::ProcessId> {
-        // TODO: Don't assume that the first PID is the PGID.
+        // TODO(jobs): Don't assume that the first PID is the PGID.
         self.pgid.or_else(|| self.representative_pid())
     }
 }

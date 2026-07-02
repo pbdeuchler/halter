@@ -17,16 +17,16 @@ pub(crate) struct PwdCommand {
 impl builtins::Command for PwdCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         let mut cwd: Cow<'_, Path> = context.shell.working_dir().into();
 
         let should_canonicalize = self.physical
             || context
                 .shell
-                .options
+                .options()
                 .do_not_resolve_symlinks_when_changing_dir;
 
         if should_canonicalize {

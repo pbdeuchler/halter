@@ -1,62 +1,46 @@
 //! Path searching utilities.
 
-use std::{collections::VecDeque, path::PathBuf};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+};
 
+use crate::sys;
 use crate::sys::fs::PathExt;
 
 /// Encapsulates the result of a path search.
-pub struct ExecutablePathSearch<PI>
-where
-    PI: AsRef<str>,
-{
+pub struct ExecutablePathSearch<PI, N> {
     paths: VecDeque<PI>,
-    filenames: Vec<String>,
+    filename: N,
 }
 
-#[cfg(windows)]
-fn candidate_filenames(filename: &str) -> Vec<String> {
-    if std::path::Path::new(filename).extension().is_some() {
-        return vec![filename.to_string()];
-    }
-
-    let mut candidates = Vec::new();
-    candidates.push(filename.to_string());
-    for ext in crate::sys::fs::executable_extensions() {
-        candidates.push(format!("{filename}{ext}"));
-    }
-    candidates
-}
-
-#[cfg(not(windows))]
-fn candidate_filenames(filename: &str) -> Vec<String> {
-    vec![filename.to_string()]
-}
-
-impl<PI> Iterator for ExecutablePathSearch<PI>
+impl<PI, N> Iterator for ExecutablePathSearch<PI, N>
 where
-    PI: AsRef<str>,
+    PI: AsRef<Path>,
+    N: AsRef<Path>,
 {
     type Item = PathBuf;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(path) = self.paths.pop_front() {
-            let base_path = PathBuf::from(path.as_ref());
-            for filename in &self.filenames {
-                let path = base_path.join(filename);
-                if path.is_file() && path.as_path().executable() {
-                    return Some(path);
-                }
+            let path = PathBuf::from(path.as_ref()).join(self.filename.as_ref());
+            // Skip directories outright, then ask the platform to resolve
+            // the path to an actual executable file (which, on Windows, may
+            // involve appending a PATHEXT extension). The helper takes
+            // ownership so Unix — where no resolution is needed — can return
+            // the path unchanged without allocating.
+            if path.is_dir() {
+                continue;
+            }
+            if let Some(resolved) = sys::fs::resolve_executable(path) {
+                return Some(resolved);
             }
         }
-
         None
     }
 }
 
-pub(crate) struct ExecutablePathPrefixSearch<PI>
-where
-    PI: AsRef<str>,
-{
+pub(crate) struct ExecutablePathPrefixSearch<PI> {
     paths: VecDeque<PI>,
     queued_items: VecDeque<PathBuf>,
     filename_prefix: String,
@@ -65,7 +49,7 @@ where
 
 impl<PI> Iterator for ExecutablePathPrefixSearch<PI>
 where
-    PI: AsRef<str>,
+    PI: AsRef<Path>,
 {
     type Item = PathBuf;
 
@@ -91,15 +75,17 @@ where
                     }
 
                     let entry_path = entry.path();
-
                     if let Ok(file_type) = entry.file_type() {
                         if file_type.is_file() && entry_path.executable() {
+                            self.queued_items.push_back(entry_path);
+                            continue;
+                        }
+                        if file_type.is_symlink() && entry_path.executable() {
                             self.queued_items.push_back(entry_path);
                         }
                     }
                 }
             }
-
             if let Some(item) = self.queued_items.pop_front() {
                 return Some(item);
             }
@@ -115,16 +101,15 @@ where
 ///
 /// * `paths` - An iterator over the paths to search.
 /// * `filename` - The name of the executable file to search for.
-pub fn search_for_executable<P, PI, N>(paths: P, filename: N) -> ExecutablePathSearch<PI>
+pub fn search_for_executable<P, PI, N>(paths: P, filename: N) -> ExecutablePathSearch<PI, N>
 where
     P: Iterator<Item = PI>,
-    PI: AsRef<str>,
-    N: AsRef<str>,
+    PI: AsRef<Path>,
+    N: AsRef<Path>,
 {
-    let filenames = candidate_filenames(filename.as_ref());
     ExecutablePathSearch {
         paths: paths.collect(),
-        filenames,
+        filename,
     }
 }
 
@@ -135,7 +120,7 @@ pub(crate) fn search_for_executable_with_prefix<P, PI>(
 ) -> ExecutablePathPrefixSearch<PI>
 where
     P: Iterator<Item = PI>,
-    PI: AsRef<str>,
+    PI: AsRef<Path>,
 {
     let stored_prefix = if case_insensitive {
         filename_prefix.to_ascii_lowercase()

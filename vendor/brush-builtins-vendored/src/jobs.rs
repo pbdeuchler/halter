@@ -27,16 +27,16 @@ pub(crate) struct JobsCommand {
     stopped_jobs_only: bool,
 
     /// Job specs to list.
-    // TODO: Add -x option
+    // TODO(jobs): Add -x option
     job_specs: Vec<String>,
 }
 
 impl builtins::Command for JobsCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
         if self.also_show_pids {
             return error::unimp("jobs -l");
@@ -46,7 +46,7 @@ impl builtins::Command for JobsCommand {
         }
 
         if self.job_specs.is_empty() {
-            for job in &context.shell.jobs.jobs {
+            for job in &context.shell.jobs().jobs {
                 self.display_job(&context, job)?;
             }
         } else {
@@ -60,7 +60,7 @@ impl builtins::Command for JobsCommand {
 impl JobsCommand {
     fn display_job(
         &self,
-        context: &brush_core::ExecutionContext<'_>,
+        context: &brush_core::ExecutionContext<'_, impl brush_core::ShellExtensions>,
         job: &jobs::Job,
     ) -> Result<(), brush_core::Error> {
         if self.running_jobs_only && !matches!(job.state, jobs::JobState::Running) {

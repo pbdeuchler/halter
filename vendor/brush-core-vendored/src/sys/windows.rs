@@ -1,17 +1,20 @@
-pub mod commands;
-pub mod fd;
-pub mod fs;
+pub use crate::sys::stubs::async_pipe;
+pub use crate::sys::stubs::commands;
+pub(crate) mod env;
+pub use crate::sys::stubs::fd;
+pub(crate) mod fs;
 pub use crate::sys::stubs::input;
 pub(crate) mod network;
+pub use crate::sys::stubs::poll;
 pub use crate::sys::stubs::resource;
 
 /// Signal processing utilities
 pub mod signal {
-    pub use crate::sys::stubs::signal::*;
+    pub(crate) use crate::sys::stubs::signal::*;
     pub(crate) use tokio::signal::ctrl_c as await_ctrl_c;
 }
 
-pub mod terminal;
+pub use crate::sys::stubs::terminal;
 pub use crate::sys::tokio_process as process;
 pub(crate) mod users;
 

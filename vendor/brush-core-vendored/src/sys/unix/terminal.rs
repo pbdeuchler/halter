@@ -1,7 +1,7 @@
 //! Terminal utilities.
 
-use crate::{error, sys, terminal};
-use std::{io::IsTerminal, os::fd::AsFd};
+use crate::{error, openfiles, sys, terminal};
+use std::{io::IsTerminal, os::fd::AsFd, path::PathBuf};
 
 /// Terminal configuration.
 #[derive(Clone, Debug)]
@@ -15,8 +15,9 @@ impl Config {
     ///
     /// # Arguments
     ///
-    /// * `fd` - The file descriptor of the terminal.
-    pub fn from_term(fd: impl AsFd) -> Result<Self, error::Error> {
+    /// * `file` - A reference to the open terminal.
+    pub fn from_term(file: &openfiles::OpenFile) -> Result<Self, error::Error> {
+        let fd = file.try_borrow_as_fd()?;
         let termios = nix::sys::termios::tcgetattr(fd)?;
         Ok(Self { termios })
     }
@@ -25,8 +26,9 @@ impl Config {
     ///
     /// # Arguments
     ///
-    /// * `fd` - The file descriptor of the terminal.
-    pub fn apply_to_term(&self, fd: impl AsFd) -> Result<(), error::Error> {
+    /// * `file` - A reference to the open terminal.
+    pub fn apply_to_term(&self, file: &openfiles::OpenFile) -> Result<(), error::Error> {
+        let fd = file.try_borrow_as_fd()?;
         nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, &self.termios)?;
         Ok(())
     }
@@ -97,14 +99,21 @@ pub fn move_to_foreground(pid: sys::process::ProcessId) -> Result<(), error::Err
 }
 
 /// Moves the current process to the foreground of the attached terminal.
-pub fn move_self_to_foreground() -> Result<(), error::Error> {
+// This function needs to return `std::io::Error` so that the OS error code can be recovered.
+pub fn move_self_to_foreground() -> Result<(), std::io::Error> {
     if std::io::stdin().is_terminal() {
         let pgid = nix::unistd::getpgid(None)?;
 
-        // TODO: jobs: This sometimes fails with ENOTTY even though we checked that stdin is a
+        // TODO(jobs): This sometimes fails with ENOTTY even though we checked that stdin is a
         // terminal. We should investigate why this is happening.
         let _ = nix::unistd::tcsetpgrp(std::io::stdin(), pgid);
     }
 
     Ok(())
+}
+
+/// Tries to get the path of the terminal device associated with the attached terminal.
+/// Returns `None` if there is no terminal attached or the lookup failed.
+pub fn try_get_terminal_device_path() -> Option<PathBuf> {
+    nix::unistd::ttyname(std::io::stdin()).ok()
 }

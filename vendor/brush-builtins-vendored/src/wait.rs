@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::io::Write;
 
-use brush_core::{ExecutionResult, builtins, error};
+use brush_core::{ExecutionExitCode, ExecutionResult, builtins, error};
 
 /// Wait for jobs to terminate.
 #[derive(Parser)]
@@ -19,16 +19,16 @@ pub(crate) struct WaitCommand {
     #[arg(short = 'p', value_name = "VAR_NAME")]
     variable_to_receive_id: Option<String>,
 
-    /// Specs of jobs to wait for.
-    job_specs: Vec<String>,
+    /// Process IDs or job specs to wait for.
+    ids: Vec<String>,
 }
 
 impl builtins::Command for WaitCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         if self.wait_for_terminate {
             return error::unimp("wait -f");
@@ -39,18 +39,41 @@ impl builtins::Command for WaitCommand {
         if self.variable_to_receive_id.is_some() {
             return error::unimp("wait -p");
         }
-        if !self.job_specs.is_empty() {
-            return error::unimp("wait with job specs");
-        }
 
-        let jobs = context.shell.jobs.wait_all().await?;
+        let mut result = ExecutionResult::success();
 
-        if context.shell.options.enable_job_control {
-            for job in jobs {
-                writeln!(context.stdout(), "{job}")?;
+        if !self.ids.is_empty() {
+            for id in &self.ids {
+                if id.starts_with('%') {
+                    // It's a job spec.
+                    if let Some(job) = context.shell.jobs_mut().resolve_job_spec(id) {
+                        job.wait().await?;
+                    } else {
+                        writeln!(
+                            context.stderr(),
+                            "{}: no such job: {}",
+                            context.command_name,
+                            id
+                        )?;
+
+                        result = ExecutionExitCode::GeneralError.into();
+                    }
+                } else {
+                    // It's a process ID.
+                    return error::unimp("wait with process IDs");
+                }
+            }
+        } else {
+            // Wait for all jobs.
+            let jobs = context.shell.jobs_mut().wait_all().await?;
+
+            if context.shell.options().enable_job_control {
+                for job in jobs {
+                    writeln!(context.stdout(), "{job}")?;
+                }
             }
         }
 
-        Ok(ExecutionResult::success())
+        Ok(result)
     }
 }

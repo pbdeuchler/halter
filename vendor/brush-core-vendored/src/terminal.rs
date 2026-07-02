@@ -10,27 +10,34 @@ pub struct TerminalControl {
 impl TerminalControl {
     /// Acquire the terminal for the shell.
     pub fn acquire() -> Result<Self, error::Error> {
+        // Mask out SIGTTOU *first*. If `lead_new_process_group` succeeds in
+        // moving us into a new process group, the subsequent `tcsetpgrp` call
+        // in `move_self_to_foreground` is a "write to the controlling
+        // terminal from a background process," which the kernel signals with
+        // SIGTTOU. The default action for SIGTTOU is to stop the process,
+        // leaving brush (and any downstream reads from the terminal) hung.
+        // Installing the SIG_IGN handler before the tcsetpgrp makes that call
+        // succeed instead of stopping us.
+        sys::signal::mask_sigttou()?;
+
         let prev_fg_pid = sys::terminal::get_foreground_pid();
 
         // Break out into new process group.
-        // TODO: jobs: Investigate why this sometimes fails with EPERM.
+        // TODO(jobs): Investigate why this sometimes fails with EPERM.
         let _ = sys::signal::lead_new_process_group();
 
         // Take ownership.
         sys::terminal::move_self_to_foreground()?;
-
-        // Mask out SIGTTOU.
-        sys::signal::mask_sigttou()?;
 
         Ok(Self { prev_fg_pid })
     }
 
     fn try_release(&mut self) {
         // Restore the previous foreground process group.
-        if let Some(pid) = self.prev_fg_pid {
-            if sys::terminal::move_to_foreground(pid).is_ok() {
-                self.prev_fg_pid = None;
-            }
+        if let Some(pid) = self.prev_fg_pid
+            && sys::terminal::move_to_foreground(pid).is_ok()
+        {
+            self.prev_fg_pid = None;
         }
     }
 }

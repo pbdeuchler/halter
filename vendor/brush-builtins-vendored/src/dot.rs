@@ -17,11 +17,11 @@ pub(crate) struct DotCommand {
 impl builtins::Command for DotCommand {
     type Error = brush_core::Error;
 
-    async fn execute(
+    async fn execute<SE: brush_core::ShellExtensions>(
         &self,
-        context: brush_core::ExecutionContext<'_>,
+        context: brush_core::ExecutionContext<'_, SE>,
     ) -> Result<brush_core::ExecutionResult, Self::Error> {
-        // TODO: Handle trap inheritance.
+        // TODO(dot): Handle trap inheritance.
         context
             .shell
             .source_script(

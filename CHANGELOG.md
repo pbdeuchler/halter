@@ -13,6 +13,13 @@ Blank-slate review fixes on top of the provider resilience primitive
 
 ### Changed
 
+- Vendored brush shell crates rebased wholesale onto upstream releases
+  (`brush-core` 0.5.0 and `brush-builtins` 0.2.0, with `brush-parser`
+  bumped to 0.4.0); the only functional divergence carried forward is
+  the cancellation plumbing, reimplemented on the new base. The
+  pre-0.5.0 fork's bespoke Windows layer and other drift are dropped
+  (upstream 0.5.0 builds for Windows on stable natively). See
+  `vendor/VENDORING.md` for the exact divergence inventory.
 - **Breaking:** `AnthropicProvider` is now built around the same
   `ResilientProvider` wrapping as the OpenAI and OpenRouter providers,
   so all provider families share one retry/backoff/classification

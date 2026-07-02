@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use brush_builtins::{BuiltinSet, default_builtins};
 use brush_core::{
-    CreateOptions, ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ProcessGroupPolicy,
-    Shell as BrushShell, ShellValue, ShellVariable,
+    ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ProcessGroupPolicy,
+    ProfileLoadBehavior, RcLoadBehavior, Shell as BrushShell, ShellValue, ShellVariable,
+    SourceInfo,
     env::EnvironmentScope,
     openfiles::{self, OpenFile, OpenFiles},
 };
@@ -159,17 +160,14 @@ async fn reset_shell_session(session: &std::sync::Arc<TokioMutex<Option<ShellSes
 }
 
 async fn create_session() -> anyhow::Result<ShellSessionCore> {
-    let create_options = CreateOptions {
-        interactive: false,
-        login: false,
-        no_profile: true,
-        no_rc: true,
-        do_not_inherit_env: true,
-        builtins: default_builtins(BuiltinSet::BashMode),
-        ..Default::default()
-    };
-
-    let mut shell = BrushShell::new(create_options)
+    let mut shell = BrushShell::builder()
+        .interactive(false)
+        .login(false)
+        .profile(ProfileLoadBehavior::Skip)
+        .rc(RcLoadBehavior::Skip)
+        .do_not_inherit_env(true)
+        .builtins(default_builtins(BuiltinSet::BashMode))
+        .build()
         .await
         .map_err(|error| anyhow::anyhow!("failed to initialize shell: {error}"))?;
 
@@ -189,13 +187,13 @@ async fn create_session() -> anyhow::Result<ShellSessionCore> {
 
         let mut variable = ShellVariable::new(ShellValue::String(value));
         variable.export();
-        shell.env.set_global(normalized_key, variable)?;
+        shell.env_mut().set_global(normalized_key, variable)?;
     }
 
     if let Some(path_value) = merged_path {
         let mut variable = ShellVariable::new(ShellValue::String(path_value));
         variable.export();
-        shell.env.set_global("PATH", variable)?;
+        shell.env_mut().set_global("PATH", variable)?;
     }
 
     Ok(ShellSessionCore { shell })
@@ -226,7 +224,10 @@ async fn run_shell_command(
 
     let mut env_scope_pushed = false;
     if let Some(env) = options.env.as_ref() {
-        session.shell.env.push_scope(EnvironmentScope::Command);
+        session
+            .shell
+            .env_mut()
+            .push_scope(EnvironmentScope::Command);
         env_scope_pushed = true;
         for (key, value) in env {
             let normalized_key = normalize_env_key(key);
@@ -237,7 +238,7 @@ async fn run_shell_command(
             variable.export();
             session
                 .shell
-                .env
+                .env_mut()
                 .add(normalized_key, variable, EnvironmentScope::Command)?;
         }
     }
@@ -261,7 +262,7 @@ async fn run_shell_command(
 
     let result = session
         .shell
-        .run_string(options.command.clone(), &params)
+        .run_string(options.command.clone(), &SourceInfo::default(), &params)
         .await;
 
     if cancel.is_cancelled() {
@@ -269,7 +270,10 @@ async fn run_shell_command(
     }
 
     if env_scope_pushed {
-        session.shell.env.pop_scope(EnvironmentScope::Command)?;
+        session
+            .shell
+            .env_mut()
+            .pop_scope(EnvironmentScope::Command)?;
     }
 
     let mut stdout_finished = false;
@@ -343,6 +347,8 @@ fn exit_code(result: &ExecutionResult) -> i32 {
         ExecutionExitCode::CannotExecute => 126,
         ExecutionExitCode::NotFound => 127,
         ExecutionExitCode::Interrupted => 130,
+        // 141 = 128 + SIGPIPE.
+        ExecutionExitCode::BrokenPipe => 141,
         ExecutionExitCode::Custom(code) => code as i32,
     }
 }
@@ -496,13 +502,13 @@ const POST_EXIT_KILL_DELAY: Duration = Duration::from_millis(500);
 
 #[cfg(unix)]
 async fn terminate_background_jobs(shell: &BrushShell) {
-    if shell.jobs.jobs.is_empty() {
+    if shell.jobs().jobs.is_empty() {
         return;
     }
 
     let mut pgids = Vec::new();
     let mut pids = Vec::new();
-    for job in &shell.jobs.jobs {
+    for job in &shell.jobs().jobs {
         if let Some(pgid) = job.process_group_id()
             && !pgids.contains(&pgid)
         {
