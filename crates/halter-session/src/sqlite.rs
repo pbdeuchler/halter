@@ -18,9 +18,10 @@ use tracing::{debug, info};
 
 use crate::{SessionCommitConflict, SessionStore, StoredSession};
 
-const MIGRATIONS: &[(u32, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(u32, &str)] = &[
+    (
+        1,
+        r#"
 CREATE TABLE sessions (
     session_id TEXT PRIMARY KEY,
     parent_session_id TEXT,
@@ -43,7 +44,23 @@ CREATE TABLE events (
     PRIMARY KEY (session_id, sequence)
 );
 "#,
-)];
+    ),
+    // state_sequence stamps the log position a state checkpoint reflects.
+    // Pre-existing sessions were written under snapshot-authoritative
+    // semantics where the state reflected everything committed, so they are
+    // backfilled to the current head of their event log.
+    (
+        2,
+        r#"
+ALTER TABLE sessions ADD COLUMN state_sequence INTEGER NOT NULL DEFAULT 0;
+UPDATE sessions
+SET state_sequence = COALESCE(
+    (SELECT MAX(sequence) FROM events WHERE events.session_id = sessions.session_id),
+    0
+);
+"#,
+    ),
+];
 
 // Compile-time guarantee that MIGRATIONS is sorted by strictly increasing
 // version. run_migrations skips any entry whose version is <= the current
@@ -216,13 +233,20 @@ impl SessionStore for SqliteSessionStore {
         &self,
         session_id: &SessionId,
         snapshot: Option<Arc<ResourceSnapshot>>,
-        expected_state: Option<SessionState>,
+        expected_head_sequence: Option<u64>,
         state: Option<SessionState>,
         events: Vec<PendingEvent>,
     ) -> Result<Vec<SessionEvent>> {
         let session_id = session_id.clone();
         self.with_conn(move |conn| {
-            commit_with_conn(conn, &session_id, snapshot, expected_state, state, events)
+            commit_with_conn(
+                conn,
+                &session_id,
+                snapshot,
+                expected_head_sequence,
+                state,
+                events,
+            )
         })
         .await
     }
@@ -237,6 +261,16 @@ impl SessionStore for SqliteSessionStore {
         Ok(events)
     }
 
+    async fn replay_after(
+        &self,
+        session_id: &SessionId,
+        after_sequence: u64,
+    ) -> Result<Vec<SessionEvent>> {
+        let session_id = session_id.clone();
+        self.with_read_conn(move |conn| replay_after_with_conn(conn, &session_id, after_sequence))
+            .await
+    }
+
     async fn list_sessions(&self) -> Result<Vec<SessionBlueprint>> {
         let sessions = self.with_read_conn(list_sessions_with_conn).await?;
         debug!(session_count = sessions.len(), "listing sqlite sessions");
@@ -246,6 +280,15 @@ impl SessionStore for SqliteSessionStore {
 
 fn create_session_with_conn(conn: &mut Connection, session: StoredSession) -> Result<()> {
     ensure_snapshot_revision_matches(&session.blueprint, session.snapshot.as_ref())?;
+    if session.state_sequence != 0 || session.head_sequence != 0 {
+        anyhow::bail!(
+            "failed to create session '{}': new sessions must start at sequence 0 \
+             (state_sequence {}, head_sequence {})",
+            session.blueprint.session_id.0,
+            session.state_sequence,
+            session.head_sequence
+        );
+    }
 
     let session_id = session.blueprint.session_id.0.clone();
     let parent_session_id = session
@@ -307,7 +350,10 @@ fn load_session_with_conn(
 ) -> Result<Option<StoredSession>> {
     let row = conn
         .query_row(
-            "SELECT s.blueprint, s.state, snap.data
+            "SELECT s.blueprint, s.state, snap.data, s.state_sequence,
+                    (SELECT COALESCE(MAX(e.sequence), 0)
+                     FROM events e
+                     WHERE e.session_id = s.session_id)
              FROM sessions s
              LEFT JOIN snapshots snap ON snap.revision = s.snapshot_revision
              WHERE s.session_id = ?1",
@@ -317,13 +363,17 @@ fn load_session_with_conn(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
         .optional()
         .with_context(|| format!("failed to load session '{}'", session_id.0))?;
 
-    let Some((blueprint_json, state_json, snapshot_json)) = row else {
+    let Some((blueprint_json, state_json, snapshot_json, raw_state_sequence, raw_head_sequence)) =
+        row
+    else {
         return Ok(None);
     };
     let snapshot_json = snapshot_json.with_context(|| {
@@ -345,6 +395,8 @@ fn load_session_with_conn(
         blueprint,
         state,
         snapshot: Arc::new(snapshot),
+        state_sequence: sequence_from_sql(raw_state_sequence)?,
+        head_sequence: sequence_from_sql(raw_head_sequence)?,
     }))
 }
 
@@ -352,7 +404,7 @@ fn commit_with_conn(
     conn: &mut Connection,
     session_id: &SessionId,
     snapshot: Option<Arc<ResourceSnapshot>>,
-    expected_state: Option<SessionState>,
+    expected_head_sequence: Option<u64>,
     state: Option<SessionState>,
     events: Vec<PendingEvent>,
 ) -> Result<Vec<SessionEvent>> {
@@ -361,11 +413,11 @@ fn commit_with_conn(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start sqlite commit transaction")?;
 
-    let (blueprint_json, current_state_json) = tx
+    let blueprint_json = tx
         .query_row(
-            "SELECT blueprint, state FROM sessions WHERE session_id = ?1",
+            "SELECT blueprint FROM sessions WHERE session_id = ?1",
             [session_id.0.as_str()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| row.get::<_, String>(0),
         )
         .optional()
         .with_context(|| format!("failed to load session '{}'", session_id.0))?
@@ -376,23 +428,20 @@ fn commit_with_conn(
             )
         })?;
 
-    if let Some(expected_state) = expected_state.as_ref() {
-        // Structural comparison, not JSON-string comparison: `SessionState`
-        // contains `IndexMap` fields whose `PartialEq` is order-insensitive
-        // while their JSON serialization is order-sensitive. Comparing
-        // deserialized values keeps this store's optimistic-concurrency
-        // semantics identical to `InMemorySessionStore` (see the
-        // `SessionStore::commit` contract and the shared conformance suite
-        // in tests/store_conformance.rs).
-        let current_state: SessionState = serde_json::from_str(&current_state_json)
-            .context("failed to deserialize current session state")?;
-        if current_state != *expected_state {
-            return Err(SessionCommitConflict {
-                session_id: session_id.clone(),
-            }
-            .into());
+    // The IMMEDIATE transaction holds the write lock, so the head read here
+    // cannot race another writer; gap-free monotonic sequences follow.
+    let current_head = current_head_sequence(&tx, session_id)?;
+    if let Some(expected) = expected_head_sequence
+        && expected != current_head
+    {
+        return Err(SessionCommitConflict {
+            session_id: session_id.clone(),
+            expected_head_sequence: expected,
+            actual_head_sequence: current_head,
         }
+        .into());
     }
+    let new_head = current_head + events.len() as u64;
 
     if let Some(snapshot) = snapshot.as_ref() {
         store_snapshot(&tx, snapshot.as_ref())?;
@@ -418,16 +467,19 @@ fn commit_with_conn(
         let state_json =
             serde_json::to_string(state).context("failed to serialize session state")?;
         tx.execute(
-            "UPDATE sessions SET state = ?2 WHERE session_id = ?1",
-            params![session_id.0.as_str(), state_json],
+            "UPDATE sessions SET state = ?2, state_sequence = ?3 WHERE session_id = ?1",
+            params![
+                session_id.0.as_str(),
+                state_json,
+                sequence_to_sql(new_head)?
+            ],
         )
         .with_context(|| format!("failed to update state for session '{}'", session_id.0))?;
     }
 
-    let starting_sequence = next_event_sequence(&tx, session_id)?;
     let mut committed = Vec::with_capacity(events.len());
     for (offset, event) in events.into_iter().enumerate() {
-        let sequence = starting_sequence + offset as u64;
+        let sequence = current_head + 1 + offset as u64;
         let payload_json = serde_json::to_string(&event.payload)
             .context("failed to serialize session event payload")?;
         tx.execute(
@@ -471,23 +523,34 @@ fn commit_with_conn(
 }
 
 fn replay_with_conn(conn: &Connection, session_id: &SessionId) -> Result<Vec<SessionEvent>> {
+    replay_after_with_conn(conn, session_id, 0)
+}
+
+fn replay_after_with_conn(
+    conn: &Connection,
+    session_id: &SessionId,
+    after_sequence: u64,
+) -> Result<Vec<SessionEvent>> {
     let mut statement = conn
         .prepare(
             "SELECT session_id, sequence, delivery, payload
              FROM events
-             WHERE session_id = ?1
+             WHERE session_id = ?1 AND sequence > ?2
              ORDER BY sequence ASC",
         )
         .context("failed to prepare sqlite replay query")?;
     let rows = statement
-        .query_map([session_id.0.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
+        .query_map(
+            params![session_id.0.as_str(), sequence_to_sql(after_sequence)?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
         .with_context(|| format!("failed to replay session '{}'", session_id.0))?;
 
     let mut events = Vec::new();
@@ -586,10 +649,10 @@ fn run_migrations(conn: &mut Connection, migrations: &[(u32, &str)]) -> Result<(
     Ok(())
 }
 
-fn next_event_sequence(conn: &Connection, session_id: &SessionId) -> Result<u64> {
-    let next_sequence = conn
+fn current_head_sequence(conn: &Connection, session_id: &SessionId) -> Result<u64> {
+    let head = conn
         .query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1
+            "SELECT COALESCE(MAX(sequence), 0)
              FROM events
              WHERE session_id = ?1",
             [session_id.0.as_str()],
@@ -597,11 +660,11 @@ fn next_event_sequence(conn: &Connection, session_id: &SessionId) -> Result<u64>
         )
         .with_context(|| {
             format!(
-                "failed to compute next event sequence for '{}'",
+                "failed to compute event log head sequence for '{}'",
                 session_id.0
             )
         })?;
-    sequence_from_sql(next_sequence)
+    sequence_from_sql(head)
 }
 
 fn store_snapshot(conn: &Connection, snapshot: &ResourceSnapshot) -> Result<()> {
@@ -1024,10 +1087,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_rejects_stale_expected_state() {
+    async fn commit_rejects_stale_expected_head() {
         let store = SqliteSessionStore::open(":memory:").expect("open sqlite store");
-        let session = test_session("stale-state", "revision-a");
-        let original_state = session.state.clone();
+        let session = test_session("stale-head", "revision-a");
 
         store
             .create_session(session.clone())
@@ -1037,7 +1099,7 @@ mod tests {
             .commit(
                 &session.blueprint.session_id,
                 None,
-                Some(original_state.clone()),
+                Some(0),
                 Some(SessionState {
                     pending_warning_messages: vec![halter_protocol::HookWarning {
                         category: "test".to_owned(),
@@ -1046,7 +1108,7 @@ mod tests {
                     }],
                     ..SessionState::default()
                 }),
-                Vec::new(),
+                vec![test_event("advance", Delivery::Lossless)],
             )
             .await
             .expect("commit updated state");
@@ -1055,14 +1117,18 @@ mod tests {
             .commit(
                 &session.blueprint.session_id,
                 None,
-                Some(original_state),
+                Some(0),
                 Some(SessionState::default()),
                 Vec::new(),
             )
             .await
             .expect_err("stale commit should fail");
 
-        assert!(error.downcast_ref::<SessionCommitConflict>().is_some());
+        let conflict = error
+            .downcast_ref::<SessionCommitConflict>()
+            .expect("conflict error");
+        assert_eq!(conflict.expected_head_sequence, 0);
+        assert_eq!(conflict.actual_head_sequence, 1);
     }
 
     #[tokio::test]
@@ -1197,6 +1263,64 @@ mod tests {
         assert!(column_exists(&conn, "demo", "note").expect("note column exists"));
     }
 
+    /// A database written under the v1 (snapshot-authoritative) schema must
+    /// come out of the v2 migration with `state_sequence` backfilled to each
+    /// session's event-log head, since v1 states reflected everything
+    /// committed.
+    #[tokio::test]
+    async fn v2_migration_backfills_state_sequence_to_log_head() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("sessions.db");
+
+        {
+            let mut conn = Connection::open(&path).expect("open v1 database");
+            run_migrations(&mut conn, &MIGRATIONS[..1]).expect("apply v1 schema");
+            conn.execute(
+                "INSERT INTO snapshots (revision, data) VALUES (?1, ?2)",
+                params![
+                    "revision-a",
+                    serde_json::to_string(&test_snapshot("revision-a")).expect("snapshot json")
+                ],
+            )
+            .expect("insert snapshot");
+            let session = test_session("v1", "revision-a");
+            conn.execute(
+                "INSERT INTO sessions (session_id, parent_session_id, blueprint, state, snapshot_revision, created_at)
+                 VALUES (?1, NULL, ?2, ?3, ?4, 0)",
+                params![
+                    session.blueprint.session_id.0.as_str(),
+                    serde_json::to_string(&session.blueprint).expect("blueprint json"),
+                    serde_json::to_string(&session.state).expect("state json"),
+                    "revision-a",
+                ],
+            )
+            .expect("insert v1 session");
+            for sequence in 1..=3i64 {
+                conn.execute(
+                    "INSERT INTO events (session_id, sequence, delivery, payload)
+                     VALUES (?1, ?2, 'lossless', ?3)",
+                    params![
+                        session.blueprint.session_id.0.as_str(),
+                        sequence,
+                        serde_json::to_string(&SessionEventPayload::SessionStarted)
+                            .expect("payload json"),
+                    ],
+                )
+                .expect("insert v1 event");
+            }
+        }
+
+        let store = SqliteSessionStore::open(&path).expect("open migrates to v2");
+        let loaded = store
+            .load_session(&SessionId::from("session-v1"))
+            .await
+            .expect("load migrated session")
+            .expect("session exists");
+
+        assert_eq!(loaded.state_sequence, 3);
+        assert_eq!(loaded.head_sequence, 3);
+    }
+
     fn latest_schema_version() -> u32 {
         MIGRATIONS.last().map(|(version, _)| *version).unwrap_or(0)
     }
@@ -1265,11 +1389,7 @@ mod tests {
             subagent_depth: 1,
         };
 
-        StoredSession {
-            blueprint,
-            state: test_state(name),
-            snapshot,
-        }
+        StoredSession::new(blueprint, test_state(name), snapshot)
     }
 
     fn test_state(name: &str) -> SessionState {
@@ -1302,6 +1422,7 @@ mod tests {
             delivery,
             SessionEventPayload::ContextCompacted {
                 summary: summary.to_owned(),
+                effects: None,
             },
         )
     }

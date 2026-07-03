@@ -138,6 +138,17 @@ That lets downstream consumers stay provider-agnostic.
 
 `halter-session` stores canonical session events rather than provider-specific payloads. That makes replay stable and runtime-independent.
 
+The event log is state-complete for a session's domain fields: the `fold`
+module (`halter_protocol::fold`) applies committed events onto a
+`SessionState`, reproducing `messages`, `compacted_prefix`, and
+`usage_so_far` from the log alone. `fold::apply_event` is the single
+transition function, `fold::fold_events` replays a slice, and
+`fold::covered_state_matches` is the conformance predicate the store suite
+uses to verify a checkpoint against its log. `ContextCompacted` events carry
+optional `CompactionEventEffects` (the post-compaction message window and
+provider-native prefix) so compaction — the one operation that rewrites
+history — is reproducible from the log too.
+
 ---
 
 ## Resource model

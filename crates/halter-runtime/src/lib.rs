@@ -16,6 +16,7 @@ mod prompt;
 mod session;
 mod subagent_session;
 mod subagents;
+mod trace_export;
 mod trace_recorder;
 mod turn_registry;
 
@@ -42,5 +43,6 @@ pub use session::{
     HalterSession, ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit,
     SessionRuntime,
 };
+pub use trace_export::export_session_trace;
 pub use trace_recorder::TraceRecorder;
 pub use turn_registry::{ShutdownReport, TurnRegistry, TurnRegistryError};

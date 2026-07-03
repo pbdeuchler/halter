@@ -52,15 +52,20 @@ This crate intentionally focuses on storage contracts and concrete persistence i
 
 ## Mental model
 
-A session store backend must support five responsibilities:
+The append-only event log is the source of truth for a session; the stored
+`SessionState` is a **checkpoint** of that log, stamped with the log position
+it reflects. A backend must support six responsibilities:
 
-1. create a new stored session
-2. load an existing stored session
-3. commit new state/events atomically
-4. replay the event stream
+1. create a new stored session (empty log, checkpoint at sequence 0)
+2. load an existing stored session (checkpoint plus its log positions)
+3. commit new events — and optionally a checkpoint — atomically
+4. replay the event stream, in full or after a given sequence
 5. list known sessions
 
-That contract is expressed by `SessionStore`.
+That contract is expressed by `SessionStore`. The runtime reproduces current
+state as `fold(checkpoint, events after checkpoint)` using
+`halter_protocol::fold`, so a checkpoint that lags the log head is closed on
+load rather than trusted blindly.
 
 ---
 
@@ -72,6 +77,7 @@ Important methods:
 - `load_session`
 - `commit`
 - `replay`
+- `replay_after` (default filters `replay`; backends should push the bound into the query)
 - `list_sessions`
 - `transcript_path` (default returns `None`)
 
@@ -91,11 +97,16 @@ Whether events are stored:
 
 ## `StoredSession`
 
-`StoredSession` is the persisted state envelope loaded from a backend.
+`StoredSession` is the persisted state envelope loaded from a backend: the
+blueprint, the resource snapshot, the `SessionState` checkpoint, and two log
+positions:
 
-At a high level, it includes the metadata and session snapshot needed to resume and continue execution safely.
+- `state_sequence` — the highest event sequence the checkpoint reflects
+- `head_sequence` — the highest committed sequence at load time
 
-You will most often encounter it when:
+Construct new records with `StoredSession::new` (both sequences start at 0;
+`create_session` rejects anything else). You will most often encounter it
+when:
 
 - resuming a session
 - writing your own backend
@@ -109,18 +120,24 @@ You will most often encounter it when:
 
 Error message:
 
-> `failed to commit session '{session_id}': session state changed concurrently`
+> `failed to commit session '{session_id}': event log advanced concurrently (expected head {expected}, found {actual})`
 
 This is exactly the right failure mode for multi-writer hazards.
 
 ### Conflict semantics
 
-Staleness is decided **structurally**: the persisted state is compared to
-`expected_state` with `SessionState`'s `PartialEq`, which is order-insensitive
-for its map fields. Backends must never compare serialized representations
-(JSON key order is not significant). Both built-in backends implement this
-contract, locked in by the shared conformance suite in
-`tests/store_conformance.rs` — run it against any custom backend too.
+Staleness is decided by the **event-log head**: a commit that supplies
+`expected_head_sequence` fails unless it equals the highest committed
+sequence at commit time. Every state-changing runtime commit also appends at
+least one event, so any concurrent writer moves the head and the loser
+conflicts instead of silently clobbering the checkpoint. Events receive
+gap-free monotonic sequences starting at the head + 1, and a checkpoint
+supplied with the commit is stamped with the post-append head. Both built-in
+backends implement this contract, locked in by the shared conformance suite
+in `tests/store_conformance.rs` — run it against any custom backend too. The
+suite also locks in the fold invariant: replaying the full log through
+`halter_protocol::fold` must agree with the checkpoint on every fold-covered
+field.
 
 ### Practical interpretation
 

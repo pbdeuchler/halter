@@ -2449,7 +2449,7 @@ async fn run_session_turn(
                     "tool approval requested"
                 );
             }
-            SessionEventPayload::ContextCompacted { summary } => {
+            SessionEventPayload::ContextCompacted { summary, .. } => {
                 info!(
                     stage = label,
                     summary_bytes = summary.len(),

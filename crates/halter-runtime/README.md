@@ -205,7 +205,7 @@ Conceptually, submitting a turn causes the runtime to:
 
 ### `replay()`
 
-Reconstructs the event timeline from persisted state.
+Returns the session's committed event log in sequence order.
 
 This is useful for:
 
@@ -213,6 +213,19 @@ This is useful for:
 - testing
 - UI hydration after reconnect
 - postmortem debugging
+
+The log is the session's source of truth: on load, the runtime folds any
+events past the persisted state checkpoint back onto it
+(`halter_protocol::fold`), so replay and resumed state cannot drift apart.
+
+### `export_trace()`
+
+Serializes the session's trace — including subagent sessions — from the
+committed event log, in the same JSONL format the live `TraceRecorder`
+writes (minus the pre-commit `pending_event` preview lines). Because it is
+derived from the store, it works for any persisted session whether or not
+`traces_dir` was configured while it ran. Also available store-level as
+`export_session_trace(store, session_id)`.
 
 ### `notify(...)`
 

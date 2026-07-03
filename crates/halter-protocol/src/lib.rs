@@ -21,6 +21,8 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod fold;
+
 /// Shared string payloads stay as `String` for now; this is the swap point for any future `Arc<str>` migration.
 pub type SharedStr = String;
 
@@ -316,6 +318,23 @@ pub struct Usage {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+}
+
+impl Usage {
+    /// Accumulate `delta` into `self`, saturating at `u64::MAX` so lifetime
+    /// counters can never overflow. Both the session runtime and the event
+    /// fold ([`fold::apply_event`]) use this, keeping the persisted
+    /// accumulator and the log-derived view arithmetically identical.
+    pub fn saturating_accumulate(&mut self, delta: &Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(delta.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(delta.output_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(delta.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(delta.cache_read_input_tokens);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -794,10 +813,28 @@ pub struct HookRunSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// State-complete effects of a compaction pass, carried on
+/// [`SessionEventPayload::ContextCompacted`] so the committed event log alone
+/// can reproduce the post-compaction context (see [`fold::apply_event`]).
+/// Absent on events recorded before this field existed and on "nothing to
+/// compact" marker events, where the fold treats the event as a no-op.
+pub struct CompactionEventEffects {
+    /// Message window that replaces [`SessionState::messages`].
+    pub messages: Vec<Message>,
+    /// Provider-native compacted items that replace
+    /// [`SessionState::compacted_prefix`].
+    pub compacted_prefix: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 /// Event payload emitted by the session runtime.
 pub enum SessionEventPayload {
     SessionStarted,
+    /// The session was resumed from the store. Emitted so state-changing
+    /// resume commits always advance the event log (head-sequence
+    /// concurrency control relies on every mutation appending an event).
+    SessionResumed,
     Warning {
         message: String,
     },
@@ -833,6 +870,11 @@ pub enum SessionEventPayload {
     },
     ContextCompacted {
         summary: String,
+        /// State-complete compaction effects. `None` on legacy events and on
+        /// "nothing to compact" markers; `Some` whenever compaction actually
+        /// rewrote session state, so the log can reproduce the rewrite.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effects: Option<Box<CompactionEventEffects>>,
     },
     TurnCompleted {
         turn_id: TurnId,
@@ -1971,6 +2013,7 @@ mod tests {
         let session_id = SessionId::from("session-42");
         let payload = SessionEventPayload::ContextCompacted {
             summary: "summary".to_owned(),
+            effects: None,
         };
         let pending = PendingEvent::new(session_id.clone(), Delivery::Lossless, payload.clone());
 
@@ -1985,6 +2028,27 @@ mod tests {
         // committed events by keeping the sequence field crate-private.
         let encoded = serde_json::to_string(&pending).expect("serialize pending");
         assert!(!encoded.contains("sequence"));
+    }
+
+    #[test]
+    fn legacy_context_compacted_event_without_effects_deserializes() {
+        let payload: SessionEventPayload = serde_json::from_value(serde_json::json!({
+            "kind": "context_compacted",
+            "summary": "squashed"
+        }))
+        .expect("deserialize legacy context_compacted payload");
+
+        assert_eq!(
+            payload,
+            SessionEventPayload::ContextCompacted {
+                summary: "squashed".to_owned(),
+                effects: None,
+            }
+        );
+
+        // Effect-less events keep the legacy wire shape on the way out too.
+        let encoded = serde_json::to_value(&payload).expect("serialize payload");
+        assert!(encoded.get("effects").is_none());
     }
 
     #[test]

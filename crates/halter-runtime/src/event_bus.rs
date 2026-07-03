@@ -101,6 +101,7 @@ mod tests {
             Delivery::Lossless,
             SessionEventPayload::ContextCompacted {
                 summary: format!("summary-{sequence}"),
+                effects: None,
             },
         )
         .into_committed(sequence)

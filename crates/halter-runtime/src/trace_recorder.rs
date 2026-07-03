@@ -30,8 +30,9 @@ pub struct TraceRecorder {
 }
 
 /// Trace stream format identifier; bumped only when readers must be taught a
-/// new on-disk shape.
-const TRACE_FORMAT_VERSION: u32 = 1;
+/// new on-disk shape. Shared with `trace_export`, which derives the same
+/// format from the session store's event log.
+pub(crate) const TRACE_FORMAT_VERSION: u32 = 1;
 
 impl TraceRecorder {
     /// Creates the trace directory if it does not already exist and returns a

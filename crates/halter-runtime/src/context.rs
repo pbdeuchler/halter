@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 use halter_protocol::{
-    CompactedContext, CompactionResult, ContextPlan, FileViewSlice, HookSessionStartSource,
-    Message, ObservedState, PromptSegment, ProviderCompactionRequest, ResolvedModel,
-    ResourceSnapshot, SessionBlueprint, SessionState, ToolSpec, TranscriptWindow,
+    CompactedContext, CompactionEventEffects, CompactionResult, ContextPlan, FileViewSlice,
+    HookSessionStartSource, Message, ObservedState, PromptSegment, ProviderCompactionRequest,
+    ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionState, ToolSpec, TranscriptWindow,
 };
 use halter_providers::Provider;
 use serde_json::Value;
@@ -88,6 +88,21 @@ impl CompactionOutcome {
     /// nothing to compact and the state was left untouched.
     pub fn apply(self, state: &mut SessionState) -> Option<CompactionResult> {
         self.into_effects().apply(state)
+    }
+
+    /// Apply the outcome and, when compaction fired, also return the
+    /// state-complete [`CompactionEventEffects`] the `ContextCompacted`
+    /// event must carry so the event log alone can reproduce the rewrite.
+    pub fn apply_with_effects(
+        self,
+        state: &mut SessionState,
+    ) -> Option<(CompactionResult, CompactionEventEffects)> {
+        let effects = self.into_effects();
+        let record = CompactionEventEffects {
+            messages: effects.messages.clone(),
+            compacted_prefix: effects.compacted_context.items().to_vec(),
+        };
+        effects.apply(state).map(|result| (result, record))
     }
 
     fn into_effects(self) -> CompactionEffects {
@@ -593,6 +608,61 @@ mod tests {
                 usage: Usage::default(),
             })
         }
+    }
+
+    #[test]
+    fn apply_with_effects_returns_event_record_matching_applied_state() {
+        let mut state = SessionState {
+            messages: vec![
+                Message::User(halter_protocol::UserMessage::text("old-1")),
+                Message::User(halter_protocol::UserMessage::text("old-2")),
+            ],
+            last_response_id: Some("resp-1".to_owned()),
+            messages_seen_by_provider: 2,
+            ..SessionState::default()
+        };
+        let window = vec![Message::User(halter_protocol::UserMessage::text("kept"))];
+        let prefix = vec![serde_json::json!({"kind": "compacted"})];
+        let outcome = CompactionOutcome {
+            messages: window.clone(),
+            compacted_prefix: prefix.clone(),
+            compaction: Some(CompactionResult {
+                compacted_count: 2,
+                summary: "squashed".to_owned(),
+            }),
+            session_start_latch: None,
+        };
+
+        let (result, effects) = outcome
+            .apply_with_effects(&mut state)
+            .expect("compaction fired");
+
+        assert_eq!(result.summary, "squashed");
+        assert_eq!(effects.messages, state.messages);
+        assert_eq!(effects.compacted_prefix, state.compacted_prefix);
+        assert_eq!(state.messages, window);
+        assert_eq!(state.compacted_prefix, prefix);
+        assert_eq!(state.last_response_id, None);
+        assert_eq!(state.messages_seen_by_provider, 0);
+    }
+
+    #[test]
+    fn apply_with_effects_without_compaction_leaves_state_untouched() {
+        let original = SessionState {
+            messages: vec![Message::User(halter_protocol::UserMessage::text("kept"))],
+            last_response_id: Some("resp-1".to_owned()),
+            ..SessionState::default()
+        };
+        let mut state = original.clone();
+        let outcome = CompactionOutcome {
+            messages: Vec::new(),
+            compacted_prefix: Vec::new(),
+            compaction: None,
+            session_start_latch: None,
+        };
+
+        assert!(outcome.apply_with_effects(&mut state).is_none());
+        assert_eq!(state, original);
     }
 
     #[test]

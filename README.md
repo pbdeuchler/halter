@@ -536,8 +536,10 @@ backend = "memory"
 
 [runtime]
 # Optional. When set, halter writes a `<session_id>.txt` JSONL trace per session
-# into this directory: one header line followed by every committed SessionEvent.
-# Useful for offline debugging and replay tooling.
+# into this directory: one header line followed by every committed SessionEvent,
+# tailed live as the session runs (plus pre-commit `pending_event` preview lines).
+# The same committed-line view is always available after the fact from the
+# session store via `session.export_trace()`, with or without this setting.
 # traces_dir = "/tmp/halter/traces"
 
 # Optional. Keep off unless the caller wants the parent turn stream to include
@@ -929,6 +931,14 @@ let _builder = HalterBuilder::new()
 ### halter-session
 
 `halter-session` provides persistence and replay.
+
+Sessions are stored **log-first**: every committed `SessionEvent` lands in an
+append-only, per-session sequenced log, and the persisted `SessionState` is a
+checkpoint of that log stamped with the sequence it reflects. Loaders fold
+any log tail past the checkpoint back onto it (`halter::session::fold`), the
+store's optimistic concurrency is an expected-head-sequence check, and
+`session.export_trace()` serializes the log (including subagent sessions) in
+the trace-file format — no `traces_dir` required.
 
 Built-in backends:
 

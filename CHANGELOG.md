@@ -8,6 +8,56 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Event-log-unified sessions
+
+Sessions are now **log-authoritative with checkpoints** (see
+`docs/event-log-unification.md`): the append-only per-session event log is
+the source of truth, the persisted `SessionState` is a checkpoint stamped
+with the log position it reflects, and traces/telemetry derive from the same
+log.
+
+#### Added
+
+- `halter_protocol::fold` — the pure fold from committed events onto
+  `SessionState` (`apply_event`, `fold_events`, `covered_state_matches`),
+  covering `messages`, `compacted_prefix`, and `usage_so_far`. The store
+  conformance suite now verifies `fold(replay()) == checkpoint` on the
+  covered fields for every backend.
+- `SessionEventPayload::ContextCompacted` carries optional
+  `CompactionEventEffects` (post-compaction message window + provider-native
+  prefix), making compaction — the one operation that rewrites history —
+  reproducible from the log. Legacy effect-less events still deserialize.
+- `SessionEventPayload::SessionResumed`, appended by
+  `SessionRuntime::resume` so every state mutation advances the log.
+- `SessionStore::replay_after(session_id, after_sequence)` (default filters
+  `replay`; SQLite pushes the bound into the query), and
+  `StoredSession::{state_sequence, head_sequence}` plus
+  `StoredSession::new`. Loaders hydrate a lagging checkpoint by folding the
+  log tail.
+- `HalterSession::export_trace()` / `halter_runtime::export_session_trace`:
+  serialize a session's trace (including subagent sessions) from the store's
+  event log in the trace-file format, available with or without a configured
+  `traces_dir`. (A `halter trace` CLI subcommand over this is follow-up
+  work.)
+- `Usage::saturating_accumulate`, used by both the runtime and the fold so
+  lifetime token counters cannot overflow and the two accumulations cannot
+  diverge.
+
+#### Changed
+
+- **Breaking (custom `SessionStore` impls):** `commit` takes
+  `expected_head_sequence: Option<u64>` instead of
+  `expected_state: Option<SessionState>`; optimistic concurrency is now an
+  event-log head check (`SessionCommitConflict` reports expected/actual
+  heads) rather than a structural state comparison. `create_session`
+  rejects records with non-zero sequences.
+- SQLite schema migration v2 adds `sessions.state_sequence`, backfilled to
+  each session's log head (v1 states reflected everything committed).
+- Mid-turn flushes no longer clone-and-compare the entire expected
+  `SessionState` per commit; the turn loop threads a `u64` head instead,
+  and state-only intermediate changes ride the next event-ful flush or the
+  final turn commit.
+
 Blank-slate review fixes on top of the provider resilience primitive
 (issue #183). Highlights:
 
