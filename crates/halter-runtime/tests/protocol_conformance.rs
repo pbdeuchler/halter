@@ -118,6 +118,7 @@ fn session_event_payload_variants_have_stable_kind() {
 
     let payloads: Vec<SessionEventPayload> = vec![
         SessionEventPayload::SessionStarted,
+        SessionEventPayload::SessionResumed,
         SessionEventPayload::Warning {
             message: "w".into(),
         },
@@ -158,6 +159,7 @@ fn session_event_payload_variants_have_stable_kind() {
         },
         SessionEventPayload::ContextCompacted {
             summary: "s".into(),
+            effects: None,
         },
         SessionEventPayload::TurnCompleted {
             turn_id: TurnId::from("t1"),
@@ -178,6 +180,7 @@ fn session_event_payload_variants_have_stable_kind() {
             SessionEvent::new_committed(SessionId::new(), 1, Delivery::Lossless, payload.clone());
         let kind = match &event.payload {
             SessionEventPayload::SessionStarted => "session_started",
+            SessionEventPayload::SessionResumed => "session_resumed",
             SessionEventPayload::Warning { .. } => "warning",
             SessionEventPayload::TurnStarted { .. } => "turn_started",
             SessionEventPayload::MessageItem { .. } => "message_item",

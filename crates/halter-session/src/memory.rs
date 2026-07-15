@@ -28,6 +28,15 @@ impl SessionStore for InMemorySessionStore {
     async fn create_session(&self, session: StoredSession) -> anyhow::Result<()> {
         let session_id = session.blueprint.session_id.0.clone();
         debug!(session_id = %session_id, "creating in-memory session");
+        if session.state_sequence != 0 || session.head_sequence != 0 {
+            anyhow::bail!(
+                "failed to create session '{}': new sessions must start at sequence 0 \
+                 (state_sequence {}, head_sequence {})",
+                session_id,
+                session.state_sequence,
+                session.head_sequence
+            );
+        }
         let mut state = self.state.write().await;
         if state.sessions.contains_key(&session_id) {
             anyhow::bail!(
@@ -50,7 +59,7 @@ impl SessionStore for InMemorySessionStore {
         &self,
         session_id: &SessionId,
         snapshot: Option<Arc<halter_protocol::ResourceSnapshot>>,
-        expected_state: Option<SessionState>,
+        expected_head_sequence: Option<u64>,
         state: Option<SessionState>,
         events: Vec<PendingEvent>,
     ) -> anyhow::Result<Vec<SessionEvent>> {
@@ -58,7 +67,7 @@ impl SessionStore for InMemorySessionStore {
             session_id = %session_id,
             event_count = events.len(),
             replace_snapshot = snapshot.is_some(),
-            check_expected_state = expected_state.is_some(),
+            expected_head_sequence = ?expected_head_sequence,
             replace_state = state.is_some(),
             "committing in-memory session state"
         );
@@ -70,11 +79,17 @@ impl SessionStore for InMemorySessionStore {
             )
         })?;
 
-        if let Some(expected_state) = expected_state.as_ref()
-            && session.state != *expected_state
+        // The session record tracks the head directly (rather than deriving
+        // it from the events map) so gap-free monotonicity survives even if
+        // a future feature prunes committed events from the in-memory store.
+        let current_head = session.head_sequence;
+        if let Some(expected) = expected_head_sequence
+            && expected != current_head
         {
             return Err(SessionCommitConflict {
                 session_id: session_id.clone(),
+                expected_head_sequence: expected,
+                actual_head_sequence: current_head,
             }
             .into());
         }
@@ -84,20 +99,6 @@ impl SessionStore for InMemorySessionStore {
             session.snapshot = snapshot;
         }
 
-        if let Some(state) = state {
-            session.state = state;
-        }
-
-        let existing = store.events.entry(session_id.0.clone()).or_default();
-        // Base sequences on the max previously-assigned sequence rather than
-        // on existing.len(). Parity with sqlite's COALESCE(MAX(sequence), 0) + 1;
-        // preserves gap-free monotonicity even if a future feature prunes
-        // committed events from the in-memory store.
-        let starting_sequence = existing
-            .iter()
-            .map(SessionEvent::sequence)
-            .max()
-            .map_or(1, |max| max + 1);
         let committed: Vec<SessionEvent> = events
             .into_iter()
             .enumerate()
@@ -106,10 +107,24 @@ impl SessionStore for InMemorySessionStore {
                     session_id: session_id.clone(),
                     ..pending
                 }
-                .into_committed(starting_sequence + offset as u64)
+                .into_committed(current_head + 1 + offset as u64)
             })
             .collect();
-        existing.extend(committed.iter().cloned());
+        let new_head = committed
+            .last()
+            .map_or(current_head, SessionEvent::sequence);
+        session.head_sequence = new_head;
+
+        if let Some(state) = state {
+            session.state = state;
+            session.state_sequence = new_head;
+        }
+
+        store
+            .events
+            .entry(session_id.0.clone())
+            .or_default()
+            .extend(committed.iter().cloned());
         Ok(committed)
     }
 
@@ -160,11 +175,11 @@ mod tests {
         };
 
         store
-            .create_session(StoredSession {
-                blueprint: blueprint.clone(),
-                state: SessionState::default(),
-                snapshot: Arc::new(ResourceSnapshot::empty()),
-            })
+            .create_session(StoredSession::new(
+                blueprint.clone(),
+                SessionState::default(),
+                Arc::new(ResourceSnapshot::empty()),
+            ))
             .await
             .expect("create session");
 
@@ -175,10 +190,12 @@ mod tests {
             .expect("session exists");
 
         assert_eq!(loaded.blueprint, blueprint);
+        assert_eq!(loaded.state_sequence, 0);
+        assert_eq!(loaded.head_sequence, 0);
     }
 
     #[tokio::test]
-    async fn memory_store_rejects_stale_state_commit() {
+    async fn memory_store_rejects_nonzero_sequences_on_create() {
         let store = InMemorySessionStore::default();
         let blueprint = SessionBlueprint {
             session_id: SessionId::new(),
@@ -192,14 +209,45 @@ mod tests {
             max_turns: None,
             subagent_depth: 0,
         };
-        let original_state = SessionState::default();
+        let mut session = StoredSession::new(
+            blueprint,
+            SessionState::default(),
+            Arc::new(ResourceSnapshot::empty()),
+        );
+        session.head_sequence = 3;
+
+        let error = store
+            .create_session(session)
+            .await
+            .expect_err("nonzero sequences must be rejected");
+        assert!(
+            error.to_string().contains("must start at sequence 0"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_store_rejects_stale_head_commit() {
+        let store = InMemorySessionStore::default();
+        let blueprint = SessionBlueprint {
+            session_id: SessionId::new(),
+            parent_session_id: None,
+            default_model: ModelId::from("default"),
+            subagent_model: ModelId::from("subagent"),
+            subagent_event_forwarding: SubagentEventForwarding::Off,
+            snapshot_revision: Revision::from("revision-1"),
+            working_dir: PathBuf::from("."),
+            system_prompt_seed: Vec::new(),
+            max_turns: None,
+            subagent_depth: 0,
+        };
 
         store
-            .create_session(StoredSession {
-                blueprint: blueprint.clone(),
-                state: original_state.clone(),
-                snapshot: Arc::new(ResourceSnapshot::empty()),
-            })
+            .create_session(StoredSession::new(
+                blueprint.clone(),
+                SessionState::default(),
+                Arc::new(ResourceSnapshot::empty()),
+            ))
             .await
             .expect("create session");
 
@@ -215,9 +263,13 @@ mod tests {
             .commit(
                 &blueprint.session_id,
                 None,
-                Some(original_state.clone()),
+                Some(0),
                 Some(updated_state.clone()),
-                Vec::new(),
+                vec![PendingEvent::new(
+                    blueprint.session_id.clone(),
+                    halter_protocol::Delivery::Lossless,
+                    halter_protocol::SessionEventPayload::SessionStarted,
+                )],
             )
             .await
             .expect("commit updated state");
@@ -226,13 +278,17 @@ mod tests {
             .commit(
                 &blueprint.session_id,
                 None,
-                Some(original_state),
+                Some(0),
                 Some(SessionState::default()),
                 Vec::new(),
             )
             .await
             .expect_err("stale commit should fail");
-        assert!(error.downcast_ref::<SessionCommitConflict>().is_some());
+        let conflict = error
+            .downcast_ref::<SessionCommitConflict>()
+            .expect("conflict error");
+        assert_eq!(conflict.expected_head_sequence, 0);
+        assert_eq!(conflict.actual_head_sequence, 1);
 
         let reloaded = store
             .load_session(&blueprint.session_id)
@@ -240,5 +296,7 @@ mod tests {
             .expect("load session")
             .expect("session exists");
         assert_eq!(reloaded.state, updated_state);
+        assert_eq!(reloaded.state_sequence, 1);
+        assert_eq!(reloaded.head_sequence, 1);
     }
 }

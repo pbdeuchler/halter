@@ -553,18 +553,40 @@ impl SessionRuntime {
         let existing = self.services.sessions.load_session(session_id).await?;
         debug!(session_id = %session_id, found = existing.is_some(), "resuming session");
         if let Some(mut stored) = existing {
-            let expected_state = stored.state.clone();
+            hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
+            let expected_head = stored.head_sequence;
             stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
-            self.services
+            // The resume commit both persists the latch and appends
+            // `SessionResumed`, so head-sequence concurrency control sees the
+            // mutation: a racing writer conflicts instead of silently losing
+            // its checkpoint.
+            let resumed = PendingEvent::new(
+                session_id.clone(),
+                Delivery::Lossless,
+                SessionEventPayload::SessionResumed,
+            );
+            let committed = self
+                .services
                 .sessions
                 .commit(
                     session_id,
                     None,
-                    Some(expected_state),
+                    Some(expected_head),
                     Some(stored.state),
-                    Vec::new(),
+                    vec![resumed],
                 )
                 .await?;
+            let forwarding_ancestors =
+                forwarding_ancestors_for_blueprint(&self.services, &stored.blueprint).await;
+            for event in committed {
+                if let Some(recorder) = &self.services.trace_recorder {
+                    recorder.record(&event);
+                }
+                self.services
+                    .parent_streams
+                    .forward_to_ancestors(&forwarding_ancestors, &event);
+                self.services.event_bus.publish(event);
+            }
             return Ok(Some(HalterSession::new(
                 self.services.clone(),
                 session_id.clone(),
@@ -657,7 +679,7 @@ impl SessionHandle {
             user_part_count = turn.user_message.parts.len(),
             "submitting turn"
         );
-        let stored = self
+        let mut stored = self
             .services
             .sessions
             .load_session(&self.session_id)
@@ -668,6 +690,7 @@ impl SessionHandle {
                     self.session_id.0
                 )
             })?;
+        hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
         // Reject new turns once the runtime is shutting down so callers
         // get a structured error instead of a turn that gets aborted
         // mid-flight.
@@ -718,33 +741,37 @@ impl SessionHandle {
             let _parent_stream_registration = parent_stream_registration;
 
             let blueprint = stored.blueprint.clone();
-            let expected_state = stored.state.clone();
             let started = session.make_event(SessionEventPayload::TurnStarted {
                 turn_id: turn.id.clone(),
             });
-            if let Err(error) = session
+            let start_head = match session
                 .commit_and_publish(
                     &blueprint,
                     None,
-                    Some(expected_state),
+                    Some(stored.head_sequence),
                     None,
                     vec![started],
                     Some(live.as_ref()),
                 )
                 .await
             {
-                error!(
-                    session_id = %session.session_id,
-                    turn_id = %turn.id,
-                    error = %error,
-                    "failed to commit turn start"
-                );
-                live.emit_error(error);
-                return;
-            }
+                Ok(committed) => committed
+                    .last()
+                    .map_or(stored.head_sequence, SessionEvent::sequence),
+                Err(error) => {
+                    error!(
+                        session_id = %session.session_id,
+                        turn_id = %turn.id,
+                        error = %error,
+                        "failed to commit turn start"
+                    );
+                    live.emit_error(error);
+                    return;
+                }
+            };
 
             match session
-                .run_turn(stored, turn.clone(), task_cancel, live.as_ref())
+                .run_turn(stored, turn.clone(), start_head, task_cancel, live.as_ref())
                 .await
             {
                 Ok(turn_commit) => {
@@ -752,7 +779,7 @@ impl SessionHandle {
                         .commit_and_publish(
                             &blueprint,
                             Some(turn_commit.snapshot),
-                            Some(turn_commit.expected_state),
+                            Some(turn_commit.expected_head),
                             Some(turn_commit.state),
                             turn_commit.events,
                             Some(live.as_ref()),
@@ -825,9 +852,16 @@ impl SessionHandle {
         self.services.sessions.replay(&self.session_id).await
     }
 
+    /// Serialize this session's trace (including subagent sessions) from the
+    /// committed event log. See [`crate::export_session_trace`].
+    pub async fn export_trace(&self) -> anyhow::Result<String> {
+        crate::trace_export::export_session_trace(self.services.sessions.as_ref(), &self.session_id)
+            .await
+    }
+
     /// Shut down this session and run session-end hooks.
     pub async fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
-        let stored = self
+        let mut stored = self
             .services
             .sessions
             .load_session(&self.session_id)
@@ -838,7 +872,8 @@ impl SessionHandle {
                     self.session_id.0
                 )
             })?;
-        let expected_state = stored.state.clone();
+        hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
+        let expected_head = stored.head_sequence;
         let mut state = stored.state;
         let mut events = Vec::new();
         let turn_id = TurnId::new();
@@ -869,7 +904,7 @@ impl SessionHandle {
             .commit_and_publish(
                 &stored.blueprint,
                 None,
-                Some(expected_state),
+                Some(expected_head),
                 Some(state),
                 events,
                 None,
@@ -883,7 +918,7 @@ impl SessionHandle {
 
     /// Emit a notification event through notification hooks.
     pub async fn notify(&self, notification_type: &str, message: &str) -> anyhow::Result<()> {
-        let stored = self
+        let mut stored = self
             .services
             .sessions
             .load_session(&self.session_id)
@@ -894,7 +929,8 @@ impl SessionHandle {
                     self.session_id.0
                 )
             })?;
-        let expected_state = stored.state.clone();
+        hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
+        let expected_head = stored.head_sequence;
         let mut state = stored.state;
         let turn_id = TurnId::new();
         // Session-level entry point with no turn token: hooks run with a
@@ -922,7 +958,7 @@ impl SessionHandle {
             .commit_and_publish(
                 &stored.blueprint,
                 None,
-                Some(expected_state),
+                Some(expected_head),
                 Some(state),
                 events,
                 None,
@@ -937,7 +973,7 @@ impl SessionHandle {
         trigger: &str,
         custom_instructions: Option<&str>,
     ) -> anyhow::Result<()> {
-        let stored = self
+        let mut stored = self
             .services
             .sessions
             .load_session(&self.session_id)
@@ -948,7 +984,8 @@ impl SessionHandle {
                     self.session_id.0
                 )
             })?;
-        let expected_state = stored.state.clone();
+        hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
+        let expected_head = stored.head_sequence;
         let mut state = stored.state;
         let mut events = Vec::new();
         let turn_id = TurnId::new();
@@ -984,7 +1021,7 @@ impl SessionHandle {
                 .commit_and_publish(
                     &stored.blueprint,
                     None,
-                    Some(expected_state),
+                    Some(expected_head),
                     Some(state),
                     events,
                     None,
@@ -1016,14 +1053,15 @@ impl SessionHandle {
                 custom_instructions,
             )
             .await?;
-        let summary = match outcome.apply(&mut state) {
-            Some(result) => result.summary,
-            None => "No compaction needed.".to_owned(),
+        let (summary, effects) = match outcome.apply_with_effects(&mut state) {
+            Some((result, effects)) => (result.summary, Some(Box::new(effects))),
+            None => ("No compaction needed.".to_owned(), None),
         };
         self.push_event(
             &mut events,
             SessionEventPayload::ContextCompacted {
                 summary: summary.clone(),
+                effects,
             },
         );
 
@@ -1038,7 +1076,7 @@ impl SessionHandle {
             .commit_and_publish(
                 &stored.blueprint,
                 None,
-                Some(expected_state),
+                Some(expected_head),
                 Some(state),
                 events,
                 None,
@@ -1051,11 +1089,12 @@ impl SessionHandle {
         &self,
         stored: StoredSession,
         turn: Turn,
+        start_head: u64,
         turn_cancel: CancellationToken,
         live: &LiveTurnStream,
     ) -> anyhow::Result<TurnCommit> {
         let snapshot = self.services.resources.snapshot();
-        let mut expected_state = stored.state.clone();
+        let mut expected_head = start_head;
         let mut state = stored.state;
         let mut events = Vec::new();
         let mut turn_usage = Usage::default();
@@ -1137,7 +1176,7 @@ impl SessionHandle {
                 usage: turn_usage,
             }));
             return Ok(TurnCommit {
-                expected_state,
+                expected_head,
                 snapshot,
                 state,
                 events,
@@ -1160,7 +1199,7 @@ impl SessionHandle {
         self.flush_turn_progress(
             &stored.blueprint,
             snapshot.clone(),
-            &mut expected_state,
+            &mut expected_head,
             &state,
             &mut events,
             live,
@@ -1202,11 +1241,12 @@ impl SessionHandle {
                 compaction: plan.compaction.clone(),
                 session_start_latch: None,
             };
-            if let Some(result) = plan_outcome.apply(&mut state) {
+            if let Some((result, effects)) = plan_outcome.apply_with_effects(&mut state) {
                 self.push_event(
                     &mut events,
                     SessionEventPayload::ContextCompacted {
                         summary: result.summary,
+                        effects: Some(Box::new(effects)),
                     },
                 );
             }
@@ -1276,8 +1316,10 @@ impl SessionHandle {
 
             let provider_stream = provider.stream(request, turn_cancel.child_token()).await?;
             let mut materialized = materialize_assistant_message(provider_stream, &model).await?;
-            accumulate_usage(&mut state.usage_so_far, &materialized.usage);
-            accumulate_usage(&mut turn_usage, &materialized.usage);
+            state
+                .usage_so_far
+                .saturating_accumulate(&materialized.usage);
+            turn_usage.saturating_accumulate(&materialized.usage);
             debug!(
                 session_id = %self.session_id,
                 turn_id = %turn.id,
@@ -1359,7 +1401,7 @@ impl SessionHandle {
                     self.flush_turn_progress(
                         &stored.blueprint,
                         snapshot.clone(),
-                        &mut expected_state,
+                        &mut expected_head,
                         &state,
                         &mut events,
                         live,
@@ -1380,7 +1422,7 @@ impl SessionHandle {
                     usage: turn_usage,
                 }));
                 return Ok(TurnCommit {
-                    expected_state,
+                    expected_head,
                     snapshot,
                     state,
                     events,
@@ -1411,7 +1453,7 @@ impl SessionHandle {
             self.flush_turn_progress(
                 &stored.blueprint,
                 snapshot.clone(),
-                &mut expected_state,
+                &mut expected_head,
                 &state,
                 &mut events,
                 live,
@@ -1657,7 +1699,7 @@ impl SessionHandle {
         &self,
         blueprint: &SessionBlueprint,
         snapshot: Option<Arc<ResourceSnapshot>>,
-        expected_state: Option<SessionState>,
+        expected_head_sequence: Option<u64>,
         state: Option<SessionState>,
         events: Vec<PendingEvent>,
         live: Option<&LiveTurnStream>,
@@ -1666,14 +1708,20 @@ impl SessionHandle {
             session_id = %self.session_id,
             event_count = events.len(),
             replace_snapshot = snapshot.is_some(),
-            check_expected_state = expected_state.is_some(),
+            expected_head_sequence = ?expected_head_sequence,
             replace_state = state.is_some(),
             "committing session events"
         );
         let committed = self
             .services
             .sessions
-            .commit(&self.session_id, snapshot, expected_state, state, events)
+            .commit(
+                &self.session_id,
+                snapshot,
+                expected_head_sequence,
+                state,
+                events,
+            )
             .await?;
         let forwarding_ancestors =
             forwarding_ancestors_for_blueprint(&self.services, blueprint).await;
@@ -1696,30 +1744,38 @@ impl SessionHandle {
         Ok(committed)
     }
 
+    /// Commit the batched events plus a state checkpoint, then advance the
+    /// caller's expected head to the last committed sequence. State-only
+    /// changes intentionally do not flush on their own: every state mutation
+    /// mid-turn is accompanied by events, and the final turn commit persists
+    /// state unconditionally.
     async fn flush_turn_progress(
         &self,
         blueprint: &SessionBlueprint,
         snapshot: Arc<ResourceSnapshot>,
-        expected_state: &mut SessionState,
+        expected_head: &mut u64,
         state: &SessionState,
         events: &mut Vec<PendingEvent>,
         live: &LiveTurnStream,
     ) -> anyhow::Result<()> {
-        if events.is_empty() && state == expected_state {
+        if events.is_empty() {
             return Ok(());
         }
 
-        self.commit_and_publish(
-            blueprint,
-            Some(snapshot),
-            Some(expected_state.clone()),
-            Some(state.clone()),
-            events.clone(),
-            Some(live),
-        )
-        .await?;
+        let committed = self
+            .commit_and_publish(
+                blueprint,
+                Some(snapshot),
+                Some(*expected_head),
+                Some(state.clone()),
+                events.clone(),
+                Some(live),
+            )
+            .await?;
         events.clear();
-        *expected_state = state.clone();
+        if let Some(last) = committed.last() {
+            *expected_head = last.sequence();
+        }
         Ok(())
     }
 
@@ -1742,7 +1798,7 @@ impl SessionHandle {
         self.commit_and_publish(
             &stored.blueprint,
             None,
-            Some(stored.state),
+            Some(stored.head_sequence),
             None,
             failure_events,
             Some(live),
@@ -1832,7 +1888,10 @@ fn tool_runtime_event_bytes(event: &ToolRuntimeEvent) -> usize {
 
 #[derive(Debug)]
 struct TurnCommit {
-    expected_state: SessionState,
+    /// Event-log head the final commit expects; the last sequence this turn
+    /// committed via `flush_turn_progress` (or the `TurnStarted` sequence
+    /// when nothing has flushed yet).
+    expected_head: u64,
     snapshot: Arc<ResourceSnapshot>,
     state: SessionState,
     events: Vec<PendingEvent>,
@@ -2150,13 +2209,6 @@ fn ensure_provider_iteration_allowed(
     Ok(())
 }
 
-fn accumulate_usage(total: &mut Usage, delta: &Usage) {
-    total.input_tokens += delta.input_tokens;
-    total.output_tokens += delta.output_tokens;
-    total.cache_creation_input_tokens += delta.cache_creation_input_tokens;
-    total.cache_read_input_tokens += delta.cache_read_input_tokens;
-}
-
 fn tool_result_kind(result: &ToolResult) -> &'static str {
     match result {
         ToolResult::Empty => "empty",
@@ -2271,6 +2323,96 @@ async fn forwarding_ancestors_for_blueprint(
     ancestors
 }
 
+/// Close the gap between a session's state checkpoint and its event-log head
+/// by folding the tail of committed events onto the checkpoint
+/// (`halter_protocol::fold`). The log is the source of truth; the checkpoint
+/// is a cache of it, and every loader that acts on `state` goes through this.
+pub(crate) async fn hydrate_stored_session(
+    store: &dyn SessionStore,
+    stored: &mut StoredSession,
+) -> anyhow::Result<()> {
+    if stored.head_sequence < stored.state_sequence {
+        anyhow::bail!(
+            "failed to hydrate session '{}': checkpoint sequence {} is ahead of event-log head {}",
+            stored.blueprint.session_id.0,
+            stored.state_sequence,
+            stored.head_sequence
+        );
+    }
+    if stored.head_sequence == stored.state_sequence {
+        return Ok(());
+    }
+    let tail = store
+        .replay_after(&stored.blueprint.session_id, stored.state_sequence)
+        .await?;
+    validate_replay_tail(stored, &tail)?;
+    debug!(
+        session_id = %stored.blueprint.session_id,
+        state_sequence = stored.state_sequence,
+        head_sequence = stored.head_sequence,
+        tail_events = tail.len(),
+        "hydrating session state from event log tail"
+    );
+    for event in &tail {
+        halter_protocol::fold::apply_event(&mut stored.state, &event.payload);
+    }
+    stored.state_sequence = stored.head_sequence;
+    Ok(())
+}
+
+/// Validate the storage boundary before replay can mutate a checkpoint. A
+/// malformed backend response must fail closed: applying a partial tail and
+/// then stamping it at the advertised head would permanently bless stale
+/// state as current.
+fn validate_replay_tail(stored: &StoredSession, tail: &[SessionEvent]) -> anyhow::Result<()> {
+    let session_id = &stored.blueprint.session_id;
+    let mut last_sequence = stored.state_sequence;
+
+    for event in tail {
+        if event.session_id != *session_id {
+            anyhow::bail!(
+                "failed to hydrate session '{}': replay tail contains event for session '{}'",
+                session_id.0,
+                event.session_id.0
+            );
+        }
+        let expected_sequence = last_sequence.checked_add(1).with_context(|| {
+            format!(
+                "failed to hydrate session '{}': event sequence overflow after {}",
+                session_id.0, last_sequence
+            )
+        })?;
+        if event.sequence() != expected_sequence {
+            anyhow::bail!(
+                "failed to hydrate session '{}': expected replay sequence {}, found {}",
+                session_id.0,
+                expected_sequence,
+                event.sequence()
+            );
+        }
+        if event.sequence() > stored.head_sequence {
+            anyhow::bail!(
+                "failed to hydrate session '{}': replay sequence {} exceeds advertised head {}",
+                session_id.0,
+                event.sequence(),
+                stored.head_sequence
+            );
+        }
+        last_sequence = event.sequence();
+    }
+
+    if last_sequence != stored.head_sequence {
+        anyhow::bail!(
+            "failed to hydrate session '{}': replay tail ended at sequence {}, expected head {}",
+            session_id.0,
+            last_sequence,
+            stored.head_sequence
+        );
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn create_session_seeded(
     services: Arc<RuntimeServices>,
     init: SessionInit,
@@ -2323,11 +2465,11 @@ pub(crate) async fn create_session_seeded(
 
     services
         .sessions
-        .create_session(StoredSession {
-            blueprint: blueprint.clone(),
-            state: initial_state,
+        .create_session(StoredSession::new(
+            blueprint.clone(),
+            initial_state,
             snapshot,
-        })
+        ))
         .await?;
 
     if let Some(recorder) = &services.trace_recorder {
@@ -3103,6 +3245,323 @@ mod tests {
         );
     }
 
+    /// A checkpoint that lags the event-log head must come out of
+    /// `hydrate_stored_session` with the tail folded in; an up-to-date
+    /// checkpoint must pass through untouched.
+    #[tokio::test]
+    async fn hydrate_folds_event_log_tail_onto_checkpoint() {
+        use halter_protocol::{Delivery, Message, PendingEvent, UserMessage};
+
+        let store = halter_session::InMemorySessionStore::default();
+        let session_id = SessionId::from("hydrates");
+        let snapshot = Arc::new(ResourceSnapshot::empty());
+        let blueprint = SessionBlueprint {
+            session_id: session_id.clone(),
+            parent_session_id: None,
+            default_model: ModelId::from("default"),
+            subagent_model: ModelId::from("subagent"),
+            subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
+            snapshot_revision: snapshot.revision.clone(),
+            working_dir: std::path::PathBuf::from("."),
+            system_prompt_seed: Vec::new(),
+            max_turns: None,
+            subagent_depth: 0,
+        };
+        store
+            .create_session(halter_session::StoredSession::new(
+                blueprint,
+                SessionState::default(),
+                snapshot,
+            ))
+            .await
+            .expect("create session");
+
+        // Event-only commit: the head advances past the state checkpoint.
+        store
+            .commit(
+                &session_id,
+                None,
+                Some(0),
+                None,
+                vec![PendingEvent::new(
+                    session_id.clone(),
+                    Delivery::Lossless,
+                    SessionEventPayload::MessageItem {
+                        message: Message::User(UserMessage::text("tail message")),
+                    },
+                )],
+            )
+            .await
+            .expect("commit event without state");
+
+        let mut stored = store
+            .load_session(&session_id)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert_eq!(stored.state_sequence, 0);
+        assert_eq!(stored.head_sequence, 1);
+        assert!(stored.state.messages.is_empty());
+
+        super::hydrate_stored_session(&store, &mut stored)
+            .await
+            .expect("hydrate");
+        assert_eq!(stored.state.messages.len(), 1);
+        assert_eq!(stored.state_sequence, 1);
+
+        // Already-hydrated state is a no-op.
+        let before = stored.state.clone();
+        super::hydrate_stored_session(&store, &mut stored)
+            .await
+            .expect("hydrate again");
+        assert_eq!(stored.state, before);
+    }
+
+    #[test]
+    fn replay_tail_validation_accepts_only_complete_gap_free_session_history() {
+        use halter_protocol::{Delivery, PendingEvent};
+
+        fn stored_session(state_sequence: u64, head_sequence: u64) -> StoredSession {
+            let session_id = SessionId::from("validated-session");
+            let snapshot = Arc::new(ResourceSnapshot::empty());
+            let mut stored = StoredSession::new(
+                SessionBlueprint {
+                    session_id,
+                    parent_session_id: None,
+                    default_model: ModelId::from("default"),
+                    subagent_model: ModelId::from("subagent"),
+                    subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
+                    snapshot_revision: snapshot.revision.clone(),
+                    working_dir: std::path::PathBuf::from("."),
+                    system_prompt_seed: Vec::new(),
+                    max_turns: None,
+                    subagent_depth: 0,
+                },
+                SessionState::default(),
+                snapshot,
+            );
+            stored.state_sequence = state_sequence;
+            stored.head_sequence = head_sequence;
+            stored
+        }
+
+        fn event(session_id: &str, sequence: u64) -> SessionEvent {
+            PendingEvent::new(
+                SessionId::from(session_id),
+                Delivery::Lossless,
+                SessionEventPayload::Warning {
+                    message: format!("event-{sequence}"),
+                },
+            )
+            .into_committed(sequence)
+        }
+
+        struct Case {
+            name: &'static str,
+            state_sequence: u64,
+            head_sequence: u64,
+            tail: Vec<SessionEvent>,
+            expected_error: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                name: "complete tail",
+                state_sequence: 1,
+                head_sequence: 3,
+                tail: vec![event("validated-session", 2), event("validated-session", 3)],
+                expected_error: None,
+            },
+            Case {
+                name: "empty incomplete tail",
+                state_sequence: 1,
+                head_sequence: 2,
+                tail: Vec::new(),
+                expected_error: Some("ended at sequence 1, expected head 2"),
+            },
+            Case {
+                name: "gap",
+                state_sequence: 1,
+                head_sequence: 3,
+                tail: vec![event("validated-session", 3)],
+                expected_error: Some("expected replay sequence 2, found 3"),
+            },
+            Case {
+                name: "duplicate or out of order",
+                state_sequence: 1,
+                head_sequence: 2,
+                tail: vec![event("validated-session", 1)],
+                expected_error: Some("expected replay sequence 2, found 1"),
+            },
+            Case {
+                name: "past advertised head",
+                state_sequence: 1,
+                head_sequence: 2,
+                tail: vec![event("validated-session", 2), event("validated-session", 3)],
+                expected_error: Some("exceeds advertised head 2"),
+            },
+            Case {
+                name: "foreign session",
+                state_sequence: 1,
+                head_sequence: 2,
+                tail: vec![event("other-session", 2)],
+                expected_error: Some("event for session 'other-session'"),
+            },
+            Case {
+                name: "sequence overflow",
+                state_sequence: u64::MAX,
+                head_sequence: u64::MAX,
+                tail: vec![event("validated-session", u64::MAX)],
+                expected_error: Some("event sequence overflow after 18446744073709551615"),
+            },
+        ];
+
+        for case in cases {
+            let stored = stored_session(case.state_sequence, case.head_sequence);
+            let result = super::validate_replay_tail(&stored, &case.tail);
+            match case.expected_error {
+                None => assert!(result.is_ok(), "{}: {result:?}", case.name),
+                Some(expected) => {
+                    let error = result.expect_err(case.name);
+                    assert!(
+                        error.to_string().contains(expected),
+                        "{}: expected {expected:?}, got {error:#}",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_checkpoint_ahead_of_log_head() {
+        let store = halter_session::InMemorySessionStore::default();
+        let mut stored = {
+            let session_id = SessionId::from("checkpoint-ahead");
+            let snapshot = Arc::new(ResourceSnapshot::empty());
+            StoredSession::new(
+                SessionBlueprint {
+                    session_id,
+                    parent_session_id: None,
+                    default_model: ModelId::from("default"),
+                    subagent_model: ModelId::from("subagent"),
+                    subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
+                    snapshot_revision: snapshot.revision.clone(),
+                    working_dir: std::path::PathBuf::from("."),
+                    system_prompt_seed: Vec::new(),
+                    max_turns: None,
+                    subagent_depth: 0,
+                },
+                SessionState::default(),
+                snapshot,
+            )
+        };
+        stored.state_sequence = 2;
+        stored.head_sequence = 1;
+
+        let error = super::hydrate_stored_session(&store, &mut stored)
+            .await
+            .expect_err("checkpoint ahead of the log must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint sequence 2 is ahead of event-log head 1"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(stored.state_sequence, 2, "failed hydration must not mutate");
+    }
+
+    /// Resume must append a `SessionResumed` event alongside the latch
+    /// checkpoint so the mutation is visible to head-sequence concurrency
+    /// control and to log consumers.
+    #[tokio::test]
+    async fn resume_appends_session_resumed_event_with_checkpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let session_id = session.session_id().clone();
+
+        runtime
+            .resume(&session_id)
+            .await
+            .expect("resume")
+            .expect("session exists");
+
+        let replayed = services.sessions.replay(&session_id).await.expect("replay");
+        assert!(
+            matches!(
+                replayed.last().map(|event| &event.payload),
+                Some(SessionEventPayload::SessionResumed)
+            ),
+            "last event must be SessionResumed: {replayed:?}"
+        );
+
+        let stored = services
+            .sessions
+            .load_session(&session_id)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert_eq!(
+            stored.state.pending_session_start_source,
+            Some(halter_protocol::HookSessionStartSource::Resume)
+        );
+        assert_eq!(stored.state_sequence, stored.head_sequence);
+
+        let missing = runtime
+            .resume(&SessionId::from("no-such-session"))
+            .await
+            .expect("resume missing session");
+        assert!(missing.is_none());
+    }
+
+    /// The log/checkpoint invariant end-to-end: after real turns through the
+    /// runtime, folding the committed event log over a default state must
+    /// agree with the persisted checkpoint on every fold-covered field.
+    #[tokio::test]
+    async fn turn_commits_keep_fold_and_checkpoint_in_agreement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        for prompt in ["hello", "and again"] {
+            session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+        }
+
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load")
+            .expect("exists");
+        let replayed = services
+            .sessions
+            .replay(session.session_id())
+            .await
+            .expect("replay");
+        let folded = halter_protocol::fold::fold_events(SessionState::default(), &replayed);
+
+        assert!(
+            !stored.state.messages.is_empty(),
+            "turns must have produced messages"
+        );
+        assert!(
+            halter_protocol::fold::covered_state_matches(&folded, &stored.state),
+            "folded log diverged from checkpoint\nfolded: {folded:?}\ncheckpoint: {:?}",
+            stored.state
+        );
+        assert_eq!(stored.state_sequence, stored.head_sequence);
+    }
+
     mod test_support {
         use std::path::Path;
         use std::sync::Arc;
@@ -3581,12 +4040,12 @@ mod tests {
                 &self,
                 session_id: &halter_protocol::SessionId,
                 snapshot: Option<Arc<ResourceSnapshot>>,
-                expected_state: Option<halter_protocol::SessionState>,
+                expected_head_sequence: Option<u64>,
                 state: Option<halter_protocol::SessionState>,
                 events: Vec<halter_protocol::PendingEvent>,
             ) -> anyhow::Result<Vec<SessionEvent>> {
                 self.inner
-                    .commit(session_id, snapshot, expected_state, state, events)
+                    .commit(session_id, snapshot, expected_head_sequence, state, events)
                     .await
             }
 

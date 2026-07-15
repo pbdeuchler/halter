@@ -47,7 +47,11 @@ pub use halter_config::{
 pub use resources::{CompiledResources, ResourceCompiler};
 
 pub mod session {
-    pub use halter_session::{InMemorySessionStore, SessionStore, StoredSession};
+    pub use halter_protocol::fold;
+    pub use halter_runtime::export_session_trace;
+    pub use halter_session::{
+        InMemorySessionStore, SessionCommitConflict, SessionStore, StoredSession,
+    };
 
     #[cfg(feature = "sqlite")]
     pub use halter_session::SqliteSessionStore;

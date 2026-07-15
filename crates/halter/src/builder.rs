@@ -1734,13 +1734,13 @@ mod tests {
             &self,
             session_id: &halter_protocol::SessionId,
             snapshot: Option<Arc<halter_protocol::ResourceSnapshot>>,
-            expected_state: Option<halter_protocol::SessionState>,
+            expected_head_sequence: Option<u64>,
             state: Option<halter_protocol::SessionState>,
             events: Vec<halter_protocol::PendingEvent>,
         ) -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
             self.commit_calls.fetch_add(1, Ordering::SeqCst);
             self.inner
-                .commit(session_id, snapshot, expected_state, state, events)
+                .commit(session_id, snapshot, expected_head_sequence, state, events)
                 .await
         }
 

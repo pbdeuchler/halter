@@ -397,7 +397,7 @@ impl RuntimeSubagentControl {
         block_is_ignored: bool,
     ) -> anyhow::Result<Option<String>> {
         for attempt in 0..=PARENT_HOOK_DISPATCH_MAX_RETRIES {
-            let Some(stored) = self
+            let Some(mut stored) = self
                 .inner
                 .services
                 .sessions
@@ -406,9 +406,14 @@ impl RuntimeSubagentControl {
             else {
                 return Ok(None);
             };
+            crate::session::hydrate_stored_session(
+                self.inner.services.sessions.as_ref(),
+                &mut stored,
+            )
+            .await?;
 
-            let expected_state = stored.state.clone();
-            let mut next_state = expected_state.clone();
+            let expected_head = stored.head_sequence;
+            let mut next_state = stored.state;
             let mut events = Vec::new();
             events.extend(dispatch.preview_runs.iter().cloned().map(|run| {
                 PendingEvent::new(
@@ -439,7 +444,7 @@ impl RuntimeSubagentControl {
                 .commit(
                     parent_session_id,
                     None,
-                    Some(expected_state),
+                    Some(expected_head),
                     Some(next_state),
                     events,
                 )
@@ -1222,11 +1227,11 @@ mod tests {
     async fn store_parent_session(services: &Arc<RuntimeServices>, parent: &SubagentParentContext) {
         services
             .sessions
-            .create_session(halter_session::StoredSession {
-                blueprint: parent.blueprint.clone(),
-                state: parent.state.clone(),
-                snapshot: parent.snapshot.clone(),
-            })
+            .create_session(halter_session::StoredSession::new(
+                parent.blueprint.clone(),
+                parent.state.clone(),
+                parent.snapshot.clone(),
+            ))
             .await
             .expect("store parent session");
     }

@@ -12,6 +12,8 @@ use halter_protocol::{PendingEvent, SessionBlueprint, SessionEvent, SessionId};
 use serde_json::json;
 use tracing::{debug, warn};
 
+use crate::trace_format::{RootTraceHeader, SubagentTraceHeader};
+
 /// Writes a per-root-session JSONL trace into a configured directory. Each
 /// root session gets one `<session_id>.txt` file containing a header line
 /// followed by interleaved `pending_event` lines (each event as it is
@@ -28,10 +30,6 @@ pub struct TraceRecorder {
     dir: PathBuf,
     writers: Mutex<HashMap<SessionId, Arc<Mutex<LineWriter<File>>>>>,
 }
-
-/// Trace stream format identifier; bumped only when readers must be taught a
-/// new on-disk shape.
-const TRACE_FORMAT_VERSION: u32 = 1;
 
 impl TraceRecorder {
     /// Creates the trace directory if it does not already exist and returns a
@@ -90,14 +88,7 @@ impl TraceRecorder {
                 );
                 return Ok(());
             };
-            let header = json!({
-                "kind": "subagent_header",
-                "trace_version": TRACE_FORMAT_VERSION,
-                "session_id": session_id.0,
-                "parent_session_id": parent_id.0,
-                "started_at": Utc::now().to_rfc3339(),
-                "blueprint": blueprint,
-            });
+            let header = SubagentTraceHeader::new(session_id, parent_id, blueprint);
             let mut line =
                 serde_json::to_vec(&header).context("failed to serialize subagent trace header")?;
             line.push(b'\n');
@@ -129,13 +120,7 @@ impl TraceRecorder {
         let file = File::create(&path)
             .with_context(|| format!("failed to create trace file {}", path.display()))?;
         let mut writer = LineWriter::new(file);
-        let header = json!({
-            "kind": "trace_header",
-            "trace_version": TRACE_FORMAT_VERSION,
-            "session_id": session_id.0,
-            "started_at": Utc::now().to_rfc3339(),
-            "blueprint": blueprint,
-        });
+        let header = RootTraceHeader::new(session_id, blueprint);
         let mut line = serde_json::to_vec(&header).context("failed to serialize trace header")?;
         line.push(b'\n');
         writer
@@ -359,8 +344,11 @@ mod tests {
         let header: serde_json::Value =
             serde_json::from_str(lines.next().expect("header line")).expect("header json");
         assert_eq!(header["kind"], "trace_header");
-        assert_eq!(header["trace_version"], 1);
+        assert_eq!(header["trace_version"], 2);
         assert_eq!(header["session_id"], "session-abc");
+        assert!(header["generated_at"].is_string());
+        assert!(header.get("started_at").is_none());
+        assert!(header.get("exported_at").is_none());
         assert_eq!(header["blueprint"]["session_id"], "session-abc");
 
         let event_one: halter_protocol::SessionEvent =
