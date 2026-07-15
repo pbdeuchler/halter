@@ -462,37 +462,34 @@ impl<'a> Iterator for Search<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(index) = self.next_index {
-                // Make sure we haven't hit the end of the history.
-                if index >= self.history.items.len() {
+            let index = self.next_index?;
+            // Make sure we haven't hit the end of the history.
+            if index >= self.history.items.len() {
+                return None;
+            }
+
+            let id = self.history.items[index];
+            self.increment_next_index();
+
+            if let Some(item) = self.history.id_map.get(&id) {
+                // Filter based on max_items. Once we hit the limit,
+                // we stop searching.
+                #[expect(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_sign_loss)]
+                if self
+                    .query
+                    .max_items
+                    .is_some_and(|max_items| self.count >= max_items as usize)
+                {
                     return None;
                 }
 
-                let id = self.history.items[index];
-                self.increment_next_index();
-
-                if let Some(item) = self.history.id_map.get(&id) {
-                    // Filter based on max_items. Once we hit the limit,
-                    // we stop searching.
-                    #[expect(clippy::cast_possible_truncation)]
-                    #[expect(clippy::cast_sign_loss)]
-                    if self
-                        .query
-                        .max_items
-                        .is_some_and(|max_items| self.count >= max_items as usize)
-                    {
-                        return None;
-                    }
-
-                    // Check other filters. If they don't match, then we
-                    // skip but keep searching.
-                    if self.query.includes(item) {
-                        self.count += 1;
-                        return Some(item);
-                    }
+                // Check other filters. If they don't match, then we
+                // skip but keep searching.
+                if self.query.includes(item) {
+                    self.count += 1;
+                    return Some(item);
                 }
-            } else {
-                return None;
             }
         }
     }
