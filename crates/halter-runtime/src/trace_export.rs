@@ -9,12 +9,10 @@
 //! preview lines, which exist only for live tailing).
 
 use anyhow::Context;
-use chrono::Utc;
 use halter_protocol::{SessionBlueprint, SessionId};
 use halter_session::SessionStore;
-use serde_json::json;
 
-use crate::trace_recorder::TRACE_FORMAT_VERSION;
+use crate::trace_format::{RootTraceHeader, SubagentTraceHeader};
 
 /// Serialize the full trace of `session_id` and every subagent session
 /// descended from it, as JSONL matching the live trace-file format: a
@@ -52,27 +50,32 @@ pub async fn export_session_trace(
 
     let mut lines = Vec::new();
     lines.push(
-        serde_json::to_string(&json!({
-            "kind": "trace_header",
-            "trace_version": TRACE_FORMAT_VERSION,
-            "session_id": session_id.0,
-            "exported_at": Utc::now().to_rfc3339(),
-            "blueprint": root.blueprint,
-        }))
-        .context("failed to serialize trace header")?,
+        serde_json::to_string(&RootTraceHeader::new(session_id, &root.blueprint))
+            .context("failed to serialize trace header")?,
     );
     append_session_events(store, session_id, &mut lines).await?;
 
+    let mut visited = std::collections::BTreeSet::from([session_id.clone()]);
     let mut stack: Vec<&SessionBlueprint> = children_of(&children_by_parent, session_id);
     while let Some(blueprint) = stack.pop() {
+        if !visited.insert(blueprint.session_id.clone()) {
+            anyhow::bail!(
+                "failed to export trace: session ancestry contains a cycle or duplicate session '{}'",
+                blueprint.session_id.0
+            );
+        }
+        let parent_session_id = blueprint.parent_session_id.as_ref().with_context(|| {
+            format!(
+                "failed to export trace: descendant session '{}' has no parent",
+                blueprint.session_id.0
+            )
+        })?;
         lines.push(
-            serde_json::to_string(&json!({
-                "kind": "subagent_header",
-                "trace_version": TRACE_FORMAT_VERSION,
-                "session_id": blueprint.session_id.0,
-                "parent_session_id": blueprint.parent_session_id.as_ref().map(|id| id.0.as_str()),
-                "blueprint": blueprint,
-            }))
+            serde_json::to_string(&SubagentTraceHeader::new(
+                &blueprint.session_id,
+                parent_session_id,
+                blueprint,
+            ))
             .context("failed to serialize subagent trace header")?,
         );
         append_session_events(store, &blueprint.session_id, &mut lines).await?;
@@ -187,8 +190,11 @@ mod tests {
             .collect();
 
         assert_eq!(lines[0]["kind"], "trace_header");
-        assert_eq!(lines[0]["trace_version"], 1);
+        assert_eq!(lines[0]["trace_version"], 2);
         assert_eq!(lines[0]["session_id"], "root");
+        assert!(lines[0]["generated_at"].is_string());
+        assert!(lines[0].get("started_at").is_none());
+        assert!(lines[0].get("exported_at").is_none());
         assert_eq!(lines[0]["blueprint"]["session_id"], "root");
 
         // Root events precede any subagent header; each session contributes
@@ -237,6 +243,26 @@ mod tests {
         assert!(
             error.to_string().contains("unknown session"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_rejects_cyclic_session_ancestry() {
+        let store = InMemorySessionStore::default();
+        seed_session(&store, "session-a", Some("session-b")).await;
+        seed_session(&store, "session-b", Some("session-a")).await;
+
+        let error = export_session_trace(&store, &SessionId::from("session-a"))
+            .await
+            .expect_err("cyclic ancestry must fail");
+
+        assert!(
+            error.to_string().contains("cycle or duplicate session"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("session-a"),
+            "error must identify the repeated session: {error:#}"
         );
     }
 }

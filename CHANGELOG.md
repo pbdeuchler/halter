@@ -22,7 +22,8 @@ log.
   `SessionState` (`apply_event`, `fold_events`, `covered_state_matches`),
   covering `messages`, `compacted_prefix`, and `usage_so_far`. The store
   conformance suite now verifies `fold(replay()) == checkpoint` on the
-  covered fields for every backend.
+  covered fields for every backend, while property tests exercise ordered
+  replay and re-folding from arbitrary checkpoint boundaries.
 - `SessionEventPayload::ContextCompacted` carries optional
   `CompactionEventEffects` (post-compaction message window + provider-native
   prefix), making compaction — the one operation that rewrites history —
@@ -33,12 +34,14 @@ log.
   `replay`; SQLite pushes the bound into the query), and
   `StoredSession::{state_sequence, head_sequence}` plus
   `StoredSession::new`. Loaders hydrate a lagging checkpoint by folding the
-  log tail.
+  log tail and reject inconsistent positions, gaps, reordered events, and
+  cross-session tails before mutating the checkpoint.
 - `HalterSession::export_trace()` / `halter_runtime::export_session_trace`:
   serialize a session's trace (including subagent sessions) from the store's
   event log in the trace-file format, available with or without a configured
-  `traces_dir`. (A `halter trace` CLI subcommand over this is follow-up
-  work.)
+  `traces_dir`. Live and exported traces share the version-2 header schema
+  (`generated_at`), and export rejects cyclic or duplicate ancestry. (A
+  `halter trace` CLI subcommand over this is follow-up work.)
 - `Usage::saturating_accumulate`, used by both the runtime and the fold so
   lifetime token counters cannot overflow and the two accumulations cannot
   diverge.

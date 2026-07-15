@@ -32,6 +32,7 @@ halter-session = { path = "../halter-session", version = "0.2.0" }
 halter-tools = { path = "../halter-tools", version = "0.2.0" }
 lru.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

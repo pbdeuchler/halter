@@ -17,6 +17,7 @@ mod session;
 mod subagent_session;
 mod subagents;
 mod trace_export;
+mod trace_format;
 mod trace_recorder;
 mod turn_registry;
 

@@ -2331,12 +2331,21 @@ pub(crate) async fn hydrate_stored_session(
     store: &dyn SessionStore,
     stored: &mut StoredSession,
 ) -> anyhow::Result<()> {
-    if stored.head_sequence <= stored.state_sequence {
+    if stored.head_sequence < stored.state_sequence {
+        anyhow::bail!(
+            "failed to hydrate session '{}': checkpoint sequence {} is ahead of event-log head {}",
+            stored.blueprint.session_id.0,
+            stored.state_sequence,
+            stored.head_sequence
+        );
+    }
+    if stored.head_sequence == stored.state_sequence {
         return Ok(());
     }
     let tail = store
         .replay_after(&stored.blueprint.session_id, stored.state_sequence)
         .await?;
+    validate_replay_tail(stored, &tail)?;
     debug!(
         session_id = %stored.blueprint.session_id,
         state_sequence = stored.state_sequence,
@@ -2348,6 +2357,59 @@ pub(crate) async fn hydrate_stored_session(
         halter_protocol::fold::apply_event(&mut stored.state, &event.payload);
     }
     stored.state_sequence = stored.head_sequence;
+    Ok(())
+}
+
+/// Validate the storage boundary before replay can mutate a checkpoint. A
+/// malformed backend response must fail closed: applying a partial tail and
+/// then stamping it at the advertised head would permanently bless stale
+/// state as current.
+fn validate_replay_tail(stored: &StoredSession, tail: &[SessionEvent]) -> anyhow::Result<()> {
+    let session_id = &stored.blueprint.session_id;
+    let mut last_sequence = stored.state_sequence;
+
+    for event in tail {
+        if event.session_id != *session_id {
+            anyhow::bail!(
+                "failed to hydrate session '{}': replay tail contains event for session '{}'",
+                session_id.0,
+                event.session_id.0
+            );
+        }
+        let expected_sequence = last_sequence.checked_add(1).with_context(|| {
+            format!(
+                "failed to hydrate session '{}': event sequence overflow after {}",
+                session_id.0, last_sequence
+            )
+        })?;
+        if event.sequence() != expected_sequence {
+            anyhow::bail!(
+                "failed to hydrate session '{}': expected replay sequence {}, found {}",
+                session_id.0,
+                expected_sequence,
+                event.sequence()
+            );
+        }
+        if event.sequence() > stored.head_sequence {
+            anyhow::bail!(
+                "failed to hydrate session '{}': replay sequence {} exceeds advertised head {}",
+                session_id.0,
+                event.sequence(),
+                stored.head_sequence
+            );
+        }
+        last_sequence = event.sequence();
+    }
+
+    if last_sequence != stored.head_sequence {
+        anyhow::bail!(
+            "failed to hydrate session '{}': replay tail ended at sequence {}, expected head {}",
+            session_id.0,
+            last_sequence,
+            stored.head_sequence
+        );
+    }
+
     Ok(())
 }
 
@@ -3253,6 +3315,161 @@ mod tests {
             .await
             .expect("hydrate again");
         assert_eq!(stored.state, before);
+    }
+
+    #[test]
+    fn replay_tail_validation_accepts_only_complete_gap_free_session_history() {
+        use halter_protocol::{Delivery, PendingEvent};
+
+        fn stored_session(state_sequence: u64, head_sequence: u64) -> StoredSession {
+            let session_id = SessionId::from("validated-session");
+            let snapshot = Arc::new(ResourceSnapshot::empty());
+            let mut stored = StoredSession::new(
+                SessionBlueprint {
+                    session_id,
+                    parent_session_id: None,
+                    default_model: ModelId::from("default"),
+                    subagent_model: ModelId::from("subagent"),
+                    subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
+                    snapshot_revision: snapshot.revision.clone(),
+                    working_dir: std::path::PathBuf::from("."),
+                    system_prompt_seed: Vec::new(),
+                    max_turns: None,
+                    subagent_depth: 0,
+                },
+                SessionState::default(),
+                snapshot,
+            );
+            stored.state_sequence = state_sequence;
+            stored.head_sequence = head_sequence;
+            stored
+        }
+
+        fn event(session_id: &str, sequence: u64) -> SessionEvent {
+            PendingEvent::new(
+                SessionId::from(session_id),
+                Delivery::Lossless,
+                SessionEventPayload::Warning {
+                    message: format!("event-{sequence}"),
+                },
+            )
+            .into_committed(sequence)
+        }
+
+        struct Case {
+            name: &'static str,
+            state_sequence: u64,
+            head_sequence: u64,
+            tail: Vec<SessionEvent>,
+            expected_error: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                name: "complete tail",
+                state_sequence: 1,
+                head_sequence: 3,
+                tail: vec![event("validated-session", 2), event("validated-session", 3)],
+                expected_error: None,
+            },
+            Case {
+                name: "empty incomplete tail",
+                state_sequence: 1,
+                head_sequence: 2,
+                tail: Vec::new(),
+                expected_error: Some("ended at sequence 1, expected head 2"),
+            },
+            Case {
+                name: "gap",
+                state_sequence: 1,
+                head_sequence: 3,
+                tail: vec![event("validated-session", 3)],
+                expected_error: Some("expected replay sequence 2, found 3"),
+            },
+            Case {
+                name: "duplicate or out of order",
+                state_sequence: 1,
+                head_sequence: 2,
+                tail: vec![event("validated-session", 1)],
+                expected_error: Some("expected replay sequence 2, found 1"),
+            },
+            Case {
+                name: "past advertised head",
+                state_sequence: 1,
+                head_sequence: 2,
+                tail: vec![event("validated-session", 2), event("validated-session", 3)],
+                expected_error: Some("exceeds advertised head 2"),
+            },
+            Case {
+                name: "foreign session",
+                state_sequence: 1,
+                head_sequence: 2,
+                tail: vec![event("other-session", 2)],
+                expected_error: Some("event for session 'other-session'"),
+            },
+            Case {
+                name: "sequence overflow",
+                state_sequence: u64::MAX,
+                head_sequence: u64::MAX,
+                tail: vec![event("validated-session", u64::MAX)],
+                expected_error: Some("event sequence overflow after 18446744073709551615"),
+            },
+        ];
+
+        for case in cases {
+            let stored = stored_session(case.state_sequence, case.head_sequence);
+            let result = super::validate_replay_tail(&stored, &case.tail);
+            match case.expected_error {
+                None => assert!(result.is_ok(), "{}: {result:?}", case.name),
+                Some(expected) => {
+                    let error = result.expect_err(case.name);
+                    assert!(
+                        error.to_string().contains(expected),
+                        "{}: expected {expected:?}, got {error:#}",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_checkpoint_ahead_of_log_head() {
+        let store = halter_session::InMemorySessionStore::default();
+        let mut stored = {
+            let session_id = SessionId::from("checkpoint-ahead");
+            let snapshot = Arc::new(ResourceSnapshot::empty());
+            StoredSession::new(
+                SessionBlueprint {
+                    session_id,
+                    parent_session_id: None,
+                    default_model: ModelId::from("default"),
+                    subagent_model: ModelId::from("subagent"),
+                    subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
+                    snapshot_revision: snapshot.revision.clone(),
+                    working_dir: std::path::PathBuf::from("."),
+                    system_prompt_seed: Vec::new(),
+                    max_turns: None,
+                    subagent_depth: 0,
+                },
+                SessionState::default(),
+                snapshot,
+            )
+        };
+        stored.state_sequence = 2;
+        stored.head_sequence = 1;
+
+        let error = super::hydrate_stored_session(&store, &mut stored)
+            .await
+            .expect_err("checkpoint ahead of the log must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint sequence 2 is ahead of event-log head 1"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(stored.state_sequence, 2, "failed hydration must not mutate");
     }
 
     /// Resume must append a `SessionResumed` event alongside the latch

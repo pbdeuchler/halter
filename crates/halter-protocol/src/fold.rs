@@ -102,6 +102,7 @@ pub fn covered_state_matches(a: &SessionState, b: &SessionState) -> bool {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use proptest::prelude::*;
     use serde_json::json;
 
     use super::*;
@@ -332,5 +333,101 @@ mod tests {
             ..base.clone()
         };
         assert!(!covered_state_matches(&base, &messages_differ));
+    }
+
+    fn fold_payload_strategy() -> impl Strategy<Value = SessionEventPayload> {
+        let user_message = "[a-zA-Z0-9 ]{0,32}".prop_map(|text| SessionEventPayload::MessageItem {
+            message: Message::User(UserMessage::text(text)),
+        });
+        let assistant_message = (
+            "[a-zA-Z0-9 ]{0,32}",
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+        )
+            .prop_map(|(text, input, output, cache_creation, cache_read)| {
+                SessionEventPayload::MessageItem {
+                    message: assistant_message(
+                        &text,
+                        Some(Usage {
+                            input_tokens: input,
+                            output_tokens: output,
+                            cache_creation_input_tokens: cache_creation,
+                            cache_read_input_tokens: cache_read,
+                        }),
+                    ),
+                }
+            });
+        let compaction = (
+            prop::collection::vec("[a-zA-Z0-9 ]{0,24}", 0..6),
+            prop::collection::vec(any::<u8>(), 0..6),
+        )
+            .prop_map(|(messages, prefix)| SessionEventPayload::ContextCompacted {
+                summary: "generated compaction".to_owned(),
+                effects: Some(Box::new(CompactionEventEffects {
+                    messages: messages
+                        .into_iter()
+                        .map(|text| Message::User(UserMessage::text(text)))
+                        .collect(),
+                    compacted_prefix: prefix.into_iter().map(|value| json!(value)).collect(),
+                })),
+            });
+
+        prop_oneof![
+            4 => user_message,
+            4 => assistant_message,
+            2 => compaction,
+            1 => Just(SessionEventPayload::SessionStarted),
+            1 => Just(SessionEventPayload::SessionResumed),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn refolding_from_any_checkpoint_matches_full_replay(
+            payloads in prop::collection::vec(fold_payload_strategy(), 0..40),
+            split_seed in any::<usize>(),
+        ) {
+            let events: Vec<_> = payloads
+                .into_iter()
+                .enumerate()
+                .map(|(offset, payload)| committed(offset as u64 + 1, payload))
+                .collect();
+            let split = split_seed % (events.len() + 1);
+
+            let full = fold_events(SessionState::default(), &events);
+            let checkpoint = fold_events(SessionState::default(), &events[..split]);
+            let resumed = fold_events(checkpoint, &events[split..]);
+
+            prop_assert_eq!(resumed, full);
+        }
+
+        #[test]
+        fn message_replay_preserves_supplied_order(
+            texts in prop::collection::vec("[a-zA-Z0-9 ]{0,32}", 0..40),
+        ) {
+            let expected: Vec<_> = texts
+                .into_iter()
+                .map(|text| Message::User(UserMessage::text(text)))
+                .collect();
+            let events: Vec<_> = expected
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(offset, message)| {
+                    committed(
+                        offset as u64 + 1,
+                        SessionEventPayload::MessageItem { message },
+                    )
+                })
+                .collect();
+
+            let folded = fold_events(SessionState::default(), &events);
+
+            prop_assert_eq!(folded.messages, expected);
+        }
     }
 }
