@@ -279,6 +279,10 @@ pub enum ApiKind {
 #[serde(rename_all = "snake_case")]
 /// Provider reasoning budget requested for a model.
 pub enum ReasoningEffort {
+    /// Disable reasoning when the provider exposes an explicit off value.
+    None,
+    /// Smallest non-zero reasoning budget exposed by some providers.
+    Minimal,
     /// Low reasoning budget.
     Low,
     /// Medium reasoning budget.
@@ -287,6 +291,8 @@ pub enum ReasoningEffort {
     High,
     /// Extra-high reasoning budget, for providers that expose it.
     Xhigh,
+    /// Provider-defined maximum reasoning budget beyond extra-high.
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]

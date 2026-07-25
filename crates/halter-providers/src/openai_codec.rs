@@ -1392,10 +1392,13 @@ fn encode_openai_reasoning(
     summary: Option<&str>,
 ) -> Option<Value> {
     let effort = match reasoning? {
+        ReasoningEffort::None => "none",
+        ReasoningEffort::Minimal => "minimal",
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
         ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max => "max",
     };
     let mut body = Map::new();
     body.insert("effort".to_owned(), json!(effort));
@@ -1670,6 +1673,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn reasoning_efforts_preserve_every_openai_wire_value() {
+        let cases = [
+            (ReasoningEffort::None, "none"),
+            (ReasoningEffort::Minimal, "minimal"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Xhigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ];
+        for (effort, expected) in cases {
+            let encoded = encode_openai_reasoning(Some(effort), None).expect("reasoning");
+            assert_eq!(encoded["effort"], expected);
+        }
+        assert_eq!(encode_openai_reasoning(None, None), None);
+    }
 
     #[test]
     fn is_responses_message_item_id_rejects_cross_provider_shapes() {

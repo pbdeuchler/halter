@@ -571,6 +571,9 @@ fn encode_thinking(
     max_output_tokens: Option<u32>,
 ) -> Option<EncodedThinking> {
     let reasoning = reasoning?;
+    if reasoning == ReasoningEffort::None {
+        return None;
+    }
     if prefers_adaptive_thinking(model) {
         let mut output_config = Map::new();
         output_config.insert(
@@ -598,10 +601,11 @@ fn encode_thinking(
     }
 
     let desired_budget = match reasoning {
-        ReasoningEffort::Low => 1_024,
+        ReasoningEffort::None => return None,
+        ReasoningEffort::Minimal | ReasoningEffort::Low => 1_024,
         ReasoningEffort::Medium => 4_096,
         ReasoningEffort::High => 8_192,
-        ReasoningEffort::Xhigh => 8_192,
+        ReasoningEffort::Xhigh | ReasoningEffort::Max => 8_192,
     };
     let budget_tokens = desired_budget.min(max_output_tokens.saturating_sub(1));
     if budget_tokens < 1_024 {
@@ -627,11 +631,15 @@ fn prefers_adaptive_thinking(model: &str) -> bool {
 
 fn adaptive_effort_for_model(model: &str, reasoning: ReasoningEffort) -> &'static str {
     match reasoning {
-        ReasoningEffort::Low => "low",
+        // `None` is removed before adaptive encoding. Keep this arm total so
+        // the wire mapping remains a plain, auditable function.
+        ReasoningEffort::None => "low",
+        ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
         ReasoningEffort::Xhigh if model.to_ascii_lowercase().contains("claude-opus-4-7") => "xhigh",
         ReasoningEffort::Xhigh => "high",
+        ReasoningEffort::Max => "max",
     }
 }
 
@@ -1074,6 +1082,46 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn adaptive_reasoning_efforts_preserve_disable_and_provider_extremes() {
+        let cases = [
+            (ReasoningEffort::None, None),
+            (ReasoningEffort::Minimal, Some("low")),
+            (ReasoningEffort::Low, Some("low")),
+            (ReasoningEffort::Medium, Some("medium")),
+            (ReasoningEffort::High, Some("high")),
+            (ReasoningEffort::Xhigh, Some("xhigh")),
+            (ReasoningEffort::Max, Some("max")),
+        ];
+        for (effort, expected) in cases {
+            let encoded = encode_thinking("claude-opus-4-7-latest", Some(effort), Some(16_384));
+            assert_eq!(
+                encoded
+                    .as_ref()
+                    .and_then(|thinking| thinking.output_config.as_ref())
+                    .and_then(|config| config.get("effort"))
+                    .and_then(Value::as_str),
+                expected,
+                "effort: {effort:?}"
+            );
+        }
+        assert!(encode_thinking("claude-opus-4-7-latest", None, Some(16_384)).is_none());
+    }
+
+    #[test]
+    fn legacy_reasoning_efforts_bound_minimal_and_maximum_budgets() {
+        let cases = [
+            (ReasoningEffort::Minimal, 1_024),
+            (ReasoningEffort::Max, 8_192),
+        ];
+        for (effort, expected) in cases {
+            let encoded =
+                encode_thinking("claude-legacy", Some(effort), Some(16_384)).expect("thinking");
+            assert_eq!(encoded.thinking["budget_tokens"], expected);
+            assert_eq!(encoded.output_config, None);
+        }
+    }
 
     #[test]
     fn request_hoists_system_and_groups_tool_results() {
