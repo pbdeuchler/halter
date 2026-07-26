@@ -645,24 +645,29 @@ fn decode_stop_reason(response: &Value) -> StopReason {
     )
 }
 
+/// Anthropic reports `input_tokens` *excluding* cache traffic, with cache
+/// reads and writes as separate sibling counters. [`Usage::input_tokens`] is
+/// defined as the total including cache traffic (OpenAI's convention), so
+/// fold the cache counters in here and keep them as breakdown fields. Without
+/// this, a mostly-cached prompt reports a tiny `input_tokens` and context
+/// budgeting badly under-counts the live context.
 fn decode_usage(response: &Value) -> Usage {
+    let field = |name: &str| {
+        response
+            .pointer(&format!("/usage/{name}"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    };
+    let cache_creation_input_tokens = field("cache_creation_input_tokens");
+    let cache_read_input_tokens = field("cache_read_input_tokens");
+
     Usage {
-        input_tokens: response
-            .pointer("/usage/input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        output_tokens: response
-            .pointer("/usage/output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cache_creation_input_tokens: response
-            .pointer("/usage/cache_creation_input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cache_read_input_tokens: response
-            .pointer("/usage/cache_read_input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
+        input_tokens: field("input_tokens")
+            .saturating_add(cache_creation_input_tokens)
+            .saturating_add(cache_read_input_tokens),
+        output_tokens: field("output_tokens"),
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
     }
 }
 
@@ -1295,9 +1300,14 @@ mod tests {
             event,
             StreamEvent::ToolArgsDelta { delta, .. } if delta.contains("README.md")
         )));
+        // input_tokens folds in cache traffic: 11 uncached + 2 written + 3 read.
         assert!(events.iter().any(|event| matches!(
             event,
-            StreamEvent::UsageUpdate { usage } if usage.input_tokens == 11 && usage.output_tokens == 7
+            StreamEvent::UsageUpdate { usage }
+                if usage.input_tokens == 16
+                    && usage.output_tokens == 7
+                    && usage.cache_creation_input_tokens == 2
+                    && usage.cache_read_input_tokens == 3
         )));
         assert!(events.iter().any(|event| matches!(
             event,

@@ -314,13 +314,31 @@ pub enum PanelIsolation {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 /// Token accounting reported by providers and accumulated by sessions.
 pub struct Usage {
+    /// Total input tokens for the request, **including** tokens served from
+    /// or written to the prompt cache. Provider codecs normalize to this
+    /// convention: OpenAI already reports the total, while Anthropic reports
+    /// cache traffic separately and its decoder folds it in.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Portion of `input_tokens` written to the prompt cache. A breakdown of
+    /// `input_tokens`, not an addition to it.
     pub cache_creation_input_tokens: u64,
+    /// Portion of `input_tokens` served from the prompt cache. A breakdown of
+    /// `input_tokens`, not an addition to it.
     pub cache_read_input_tokens: u64,
 }
 
 impl Usage {
+    /// Total tokens the model had in context when it produced this response:
+    /// everything it read plus everything it wrote. This is the size the
+    /// *next* request's input starts from, which is what context budgeting
+    /// needs — as opposed to the per-request cost, which is what the
+    /// individual fields report.
+    #[must_use]
+    pub const fn context_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
     /// Accumulate `delta` into `self`, saturating at `u64::MAX` so lifetime
     /// counters can never overflow. Both the session runtime and the event
     /// fold ([`fold::apply_event`]) use this, keeping the persisted
@@ -1534,6 +1552,14 @@ pub struct SessionState {
     /// Messages at indices `[0..messages_seen_by_provider)` don't need re-sending.
     #[serde(default)]
     pub messages_seen_by_provider: usize,
+    /// Index into `messages` before which reported `Usage` no longer
+    /// describes the live context. Compaction rewrites history but preserves
+    /// a tail of real messages, and any assistant message in that tail still
+    /// carries the usage from *before* the rewrite. Anchoring context
+    /// estimates on that stale figure would re-trigger compaction every turn,
+    /// so compaction moves this floor past the preserved tail.
+    #[serde(default)]
+    pub usage_anchor_floor: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1768,6 +1794,11 @@ pub struct ContextPlan {
     /// If the planner compacted messages this turn, the result is here.
     /// The caller should apply it to `SessionState` after using the plan.
     pub compaction: Option<CompactionResult>,
+    /// Set when automatic compaction was due but could not run. The plan is
+    /// still valid and uncompacted, so the turn proceeds; the caller should
+    /// surface this so a degraded context does not look like a healthy one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_warning: Option<String>,
     /// When set, the codec should chain via `previous_response_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,

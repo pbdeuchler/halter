@@ -1921,6 +1921,72 @@ mod tests {
         assert!(body.get("temperature").is_none());
     }
 
+    /// The dedicated `/v1/responses/compact` endpoint takes the compaction
+    /// input shape only. `store` and `stream` belong to the streaming turn
+    /// endpoint and must stay absent here, matching the reference Codex
+    /// client's compaction payload.
+    #[test]
+    fn openai_compaction_request_uses_compact_endpoint_shape() {
+        let request = sample_compaction_request(ProviderKind::OpenAi);
+        let body = encode_responses_compact_request(&request).expect("encode compaction request");
+        let input = body["input"].as_array().expect("input");
+
+        assert_eq!(body["model"], "gpt-5");
+        assert_eq!(body["instructions"], "Summarize the session");
+        assert!(body.get("store").is_none());
+        assert!(body.get("stream").is_none());
+        // The carried compacted prefix leads the input so successive
+        // compactions fold into one another instead of restarting.
+        assert_eq!(input[0]["role"], "developer");
+        assert!(
+            input[0]["content"][0]["text"]
+                .as_str()
+                .expect("prefix text")
+                .contains("Earlier summary")
+        );
+        assert!(input.iter().any(|item| item["role"] == "user"));
+        assert!(input.iter().any(|item| item["type"] == "function_call"));
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+        );
+    }
+
+    #[test]
+    fn openai_compaction_request_rejects_non_responses_api_kind() {
+        let mut request = sample_compaction_request(ProviderKind::OpenAi);
+        request.model.api_kind = ApiKind::OpenAiChat;
+
+        let error =
+            encode_responses_compact_request(&request).expect_err("chat api kind must not encode");
+
+        assert!(error.to_string().contains("unsupported api kind"));
+    }
+
+    #[test]
+    fn openai_compaction_response_decodes_output_items() {
+        let response = json!({
+            "output": [{"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque"}],
+            "usage": {"input_tokens": 120, "output_tokens": 30},
+        });
+
+        let decoded = decode_responses_compact_response(&response).expect("decode compaction");
+
+        assert_eq!(decoded.output.len(), 1);
+        assert_eq!(decoded.output[0]["type"], "compaction");
+        assert_eq!(decoded.usage.input_tokens, 120);
+        assert_eq!(decoded.usage.output_tokens, 30);
+    }
+
+    #[test]
+    fn openai_compaction_response_without_output_array_is_an_error() {
+        let error = decode_responses_compact_response(&json!({"usage": {}}))
+            .expect_err("missing output must fail");
+
+        assert!(error.to_string().contains("missing output array"));
+    }
+
     #[test]
     fn openrouter_compaction_request_uses_responses_shape() {
         let request = sample_compaction_request(ProviderKind::OpenRouter);

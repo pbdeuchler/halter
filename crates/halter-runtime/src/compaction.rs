@@ -86,18 +86,80 @@ pub fn prepare_compaction(
     }
 }
 
+/// Estimate total context tokens for prompt, summaries, compacted prefix, and
+/// messages.
+///
+/// Prefers ground truth over the character heuristic. Providers report the
+/// exact context size with every assistant response, so when the transcript
+/// contains a usable report this anchors on it and estimates only the
+/// messages that arrived afterwards — bounding heuristic error to one turn's
+/// tail instead of letting it compound across the whole transcript. The
+/// reported figure already accounts for the prompt, summaries, and compacted
+/// prefix, so those are *not* added on top of an anchor.
+///
+/// Falls back to estimating everything when no usable report exists: a fresh
+/// session, a transcript whose assistant turns all failed, or one whose
+/// reports predate the last compaction (see
+/// [`SessionState::usage_anchor_floor`](halter_protocol::SessionState)).
 #[must_use]
-/// Estimate total context tokens for prompt, summaries, compacted prefix, and messages.
 pub fn estimate_context_tokens(
     prompt_segments: &[PromptSegment],
     summaries: &[SummarySlice],
     compacted_prefix: &[Value],
     messages: &[Message],
+    usage_anchor_floor: usize,
 ) -> u64 {
-    estimate_segment_tokens(prompt_segments)
-        + estimate_summary_tokens(summaries)
-        + estimate_compacted_prefix_tokens(compacted_prefix)
-        + estimate_messages_tokens(messages)
+    match find_usage_anchor(messages, usage_anchor_floor) {
+        Some(anchor) => anchor
+            .context_tokens
+            .saturating_add(estimate_messages_tokens(&messages[anchor.index + 1..])),
+        None => {
+            estimate_segment_tokens(prompt_segments)
+                + estimate_summary_tokens(summaries)
+                + estimate_compacted_prefix_tokens(compacted_prefix)
+                + estimate_messages_tokens(messages)
+        }
+    }
+}
+
+/// A provider-reported context measurement usable as an estimation anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageAnchor {
+    /// Index in `messages` of the assistant message that reported it.
+    pub index: usize,
+    /// Context size the provider reported at that point.
+    pub context_tokens: u64,
+}
+
+/// Find the most recent assistant message at or after `floor` carrying a
+/// usable context report.
+///
+/// A report is usable only if the turn actually completed: interrupted and
+/// errored turns can report partial or zero usage, which would anchor the
+/// whole estimate to a figure far below the real context.
+#[must_use]
+pub fn find_usage_anchor(messages: &[Message], floor: usize) -> Option<UsageAnchor> {
+    messages
+        .iter()
+        .enumerate()
+        .skip(floor)
+        .rev()
+        .find_map(|(index, message)| {
+            let Message::Assistant(assistant) = message else {
+                return None;
+            };
+            if matches!(
+                assistant.stop_reason,
+                Some(halter_protocol::StopReason::Interrupted | halter_protocol::StopReason::Error)
+            ) {
+                return None;
+            }
+            let context_tokens = assistant.usage.as_ref()?.context_tokens();
+            (context_tokens > 0).then_some(UsageAnchor {
+                index,
+                context_tokens,
+            })
+        })
 }
 
 #[must_use]
@@ -416,6 +478,177 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn assistant(
+        text: &str,
+        stop_reason: Option<halter_protocol::StopReason>,
+        usage: Option<halter_protocol::Usage>,
+    ) -> Message {
+        Message::Assistant(AssistantMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            parts: vec![AssistantPart::Text {
+                text: text.to_owned(),
+            }],
+            stop_reason,
+            usage,
+            replay_meta: Default::default(),
+        })
+    }
+
+    fn reported(input_tokens: u64, output_tokens: u64) -> Option<halter_protocol::Usage> {
+        Some(halter_protocol::Usage {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        })
+    }
+
+    /// The whole point of anchoring: a provider report replaces the heuristic
+    /// for everything up to and including the reporting message, and the
+    /// prompt/summaries/prefix are not re-added on top because the report
+    /// already covered them.
+    #[test]
+    fn estimate_context_tokens_anchors_on_reported_usage() {
+        let messages = vec![
+            Message::User(UserMessage::text("x".repeat(4_000).as_str())),
+            assistant(
+                "done",
+                Some(halter_protocol::StopReason::EndTurn),
+                reported(50_000, 200),
+            ),
+            Message::User(UserMessage::text("follow up")),
+        ];
+        let summaries = vec![SummarySlice {
+            id: "s".to_owned(),
+            text: "y".repeat(4_000),
+        }];
+
+        let estimated = estimate_context_tokens(&[], &summaries, &[], &messages, 0);
+
+        // 50_000 + 200 reported, plus only the trailing user message.
+        assert_eq!(
+            estimated,
+            50_200 + estimate_message_tokens(&messages[2]),
+            "anchor must exclude everything the report already covered"
+        );
+    }
+
+    #[test]
+    fn estimate_context_tokens_falls_back_to_heuristic_without_usage() {
+        let messages = vec![
+            Message::User(UserMessage::text("hello")),
+            assistant("done", Some(halter_protocol::StopReason::EndTurn), None),
+        ];
+
+        let estimated = estimate_context_tokens(&[], &[], &[], &messages, 0);
+
+        assert_eq!(estimated, estimate_messages_tokens(&messages));
+    }
+
+    /// Interrupted and errored turns report partial or zero usage. Anchoring
+    /// on those would peg the estimate far below the real context and stop
+    /// compaction from ever firing.
+    #[test]
+    fn find_usage_anchor_rejects_unusable_reports() {
+        struct Case {
+            name: &'static str,
+            message: Message,
+        }
+
+        let cases = [
+            Case {
+                name: "interrupted",
+                message: assistant(
+                    "partial",
+                    Some(halter_protocol::StopReason::Interrupted),
+                    reported(50_000, 10),
+                ),
+            },
+            Case {
+                name: "error",
+                message: assistant(
+                    "boom",
+                    Some(halter_protocol::StopReason::Error),
+                    reported(50_000, 10),
+                ),
+            },
+            Case {
+                name: "zero usage",
+                message: assistant(
+                    "empty",
+                    Some(halter_protocol::StopReason::EndTurn),
+                    reported(0, 0),
+                ),
+            },
+            Case {
+                name: "no usage",
+                message: assistant("none", Some(halter_protocol::StopReason::EndTurn), None),
+            },
+            Case {
+                name: "not an assistant message",
+                message: Message::User(UserMessage::text("user")),
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                find_usage_anchor(std::slice::from_ref(&case.message), 0),
+                None,
+                "{}: must not anchor",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn find_usage_anchor_picks_the_most_recent_usable_report() {
+        let messages = vec![
+            assistant(
+                "first",
+                Some(halter_protocol::StopReason::EndTurn),
+                reported(10, 1),
+            ),
+            assistant(
+                "second",
+                Some(halter_protocol::StopReason::EndTurn),
+                reported(20, 2),
+            ),
+            assistant(
+                "third",
+                Some(halter_protocol::StopReason::Error),
+                reported(999, 0),
+            ),
+        ];
+
+        let anchor = find_usage_anchor(&messages, 0).expect("anchor");
+
+        assert_eq!(anchor.index, 1);
+        assert_eq!(anchor.context_tokens, 22);
+    }
+
+    /// Compaction preserves a message tail whose usage describes the
+    /// pre-compaction context. Without the floor, that stale figure would
+    /// re-trigger compaction on every following turn.
+    #[test]
+    fn find_usage_anchor_ignores_reports_below_the_floor() {
+        let messages = vec![
+            assistant(
+                "pre-compaction",
+                Some(halter_protocol::StopReason::EndTurn),
+                reported(80_000, 500),
+            ),
+            Message::User(UserMessage::text("after compaction")),
+        ];
+
+        assert_eq!(find_usage_anchor(&messages, 1), None);
+
+        // ...and the estimate falls back to the heuristic rather than 80_500.
+        let estimated = estimate_context_tokens(&[], &[], &[], &messages, 1);
+        assert_eq!(estimated, estimate_messages_tokens(&messages));
+        assert!(estimated < 1_000);
+    }
 
     #[test]
     fn estimate_text_tokens_uses_character_count() {
