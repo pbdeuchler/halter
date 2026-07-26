@@ -9,7 +9,7 @@ use halter_protocol::{
 use halter_providers::Provider;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::compaction::{
     ContextSettings, estimate_context_tokens, prepare_compaction, render_compaction_event_summary,
@@ -40,6 +40,10 @@ pub struct CompactionOutcome {
     pub messages: Vec<Message>,
     pub compacted_prefix: Vec<Value>,
     pub compaction: Option<CompactionResult>,
+    /// Why automatic compaction did not run, when it was due but failed.
+    /// Always `None` for manual compaction, which propagates its errors
+    /// instead.
+    pub compaction_error: Option<String>,
     pub session_start_latch: Option<HookSessionStartSource>,
 }
 
@@ -110,6 +114,7 @@ impl CompactionOutcome {
             messages,
             compacted_prefix,
             compaction,
+            compaction_error: _,
             session_start_latch,
         } = self;
         CompactionEffects {
@@ -234,48 +239,38 @@ impl DefaultContextManager {
             &state.messages,
         );
         if !mode.is_forced() && !should_trigger_compaction(estimated_tokens, &self.settings) {
-            return Ok(CompactionOutcome {
-                messages: state.messages.clone(),
-                compacted_prefix: state.compacted_prefix.clone(),
-                compaction: None,
-                session_start_latch: mode.session_start_latch(),
-            });
+            return Ok(uncompacted_outcome(state, mode, None));
         }
 
         let capabilities = compaction_provider.capabilities();
         if !capabilities.supports_compaction {
-            anyhow::bail!(
-                "failed to compact session: provider '{}' does not support compaction",
-                compaction_model.provider
+            return degrade_or_fail(
+                state,
+                mode,
+                format!(
+                    "failed to compact session: provider '{}' does not support compaction",
+                    compaction_model.provider
+                ),
             );
         }
 
         let Some(window) = compaction_provider.compaction_window(&state.messages) else {
-            if mode.is_forced() {
-                anyhow::bail!(
+            return degrade_or_fail(
+                state,
+                mode,
+                format!(
                     "failed to compact session: provider '{}' did not provide a compaction window",
                     compaction_model.provider
-                );
-            }
-            return Ok(CompactionOutcome {
-                messages: state.messages.clone(),
-                compacted_prefix: state.compacted_prefix.clone(),
-                compaction: None,
-                session_start_latch: mode.session_start_latch(),
-            });
+                ),
+            );
         };
         let compacted_context = CompactedContext::from(state.compacted_prefix.clone());
         let preparation = prepare_compaction(&self.settings, &compacted_context, window);
         if compacted_context.is_empty() && preparation.compact_messages.is_empty() {
-            return Ok(CompactionOutcome {
-                messages: state.messages.clone(),
-                compacted_prefix: state.compacted_prefix.clone(),
-                compaction: None,
-                session_start_latch: mode.session_start_latch(),
-            });
+            return Ok(uncompacted_outcome(state, mode, None));
         }
 
-        let response = compaction_provider
+        let response = match compaction_provider
             .compact(
                 ProviderCompactionRequest {
                     session_id: blueprint.session_id.clone(),
@@ -287,7 +282,11 @@ impl DefaultContextManager {
                 },
                 tokio_util::sync::CancellationToken::new(),
             )
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return degrade_or_fail(state, mode, format!("{error:#}")),
+        };
         let summary = render_compaction_event_summary(
             preparation.compacted_message_count,
             response.output.len(),
@@ -302,8 +301,42 @@ impl DefaultContextManager {
                 compacted_count: preparation.compacted_message_count,
                 summary,
             }),
+            compaction_error: None,
             session_start_latch: mode.session_start_latch(),
         })
+    }
+}
+
+/// Automatic compaction is best-effort: a provider that cannot compact must
+/// degrade the turn to an uncompacted context rather than fail it, because
+/// the alternative is that every turn past the threshold becomes unrecoverable.
+/// Manual compaction propagates instead — the caller asked for compaction
+/// explicitly and needs to know it did not happen.
+fn degrade_or_fail(
+    state: &SessionState,
+    mode: CompactionMode<'_>,
+    error: String,
+) -> anyhow::Result<CompactionOutcome> {
+    if mode.is_forced() {
+        anyhow::bail!(error);
+    }
+    warn!(error, "automatic compaction failed; continuing uncompacted");
+    Ok(uncompacted_outcome(state, mode, Some(error)))
+}
+
+/// The turn's state left exactly as it was, carrying any reason compaction
+/// did not run.
+fn uncompacted_outcome(
+    state: &SessionState,
+    mode: CompactionMode<'_>,
+    compaction_error: Option<String>,
+) -> CompactionOutcome {
+    CompactionOutcome {
+        messages: state.messages.clone(),
+        compacted_prefix: state.compacted_prefix.clone(),
+        compaction: None,
+        compaction_error,
+        session_start_latch: mode.session_start_latch(),
     }
 }
 
@@ -393,6 +426,7 @@ impl ContextManager for DefaultContextManager {
             messages: outcome.messages,
             estimated_tokens,
             compaction: outcome.compaction,
+            compaction_warning: outcome.compaction_error,
             previous_response_id,
             new_messages_start,
         })
@@ -508,77 +542,298 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn plan_disables_previous_response_chaining_when_compacted_prefix_exists() {
-        let manager = DefaultContextManager::default();
-        let outcome = manager
+    fn sample_blueprint() -> SessionBlueprint {
+        SessionBlueprint {
+            session_id: SessionId::new(),
+            parent_session_id: None,
+            default_model: "default".into(),
+            subagent_model: "subagent".into(),
+            subagent_event_forwarding: SubagentEventForwarding::Off,
+            snapshot_revision: "r1".into(),
+            working_dir: ".".into(),
+            system_prompt_seed: Vec::new(),
+            max_turns: None,
+            subagent_depth: 0,
+        }
+    }
+
+    fn sample_observed() -> ObservedState {
+        ObservedState {
+            cwd: ".".into(),
+            git_branch: None,
+            git_dirty: None,
+            now_utc: Utc::now(),
+            env_facts: Default::default(),
+        }
+    }
+
+    fn sample_model() -> ResolvedModel {
+        ResolvedModel {
+            role: ModelRole::default(),
+            id: ModelId::from("default"),
+            provider: ProviderName::from("fake"),
+            provider_kind: ProviderKind::Fake,
+            api_kind: halter_protocol::ApiKind::Fake,
+            model: "fake".to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tokens_per_minute: None,
+        }
+    }
+
+    /// A manager whose threshold is low enough that every plan compacts.
+    fn always_compacting_manager() -> DefaultContextManager {
+        DefaultContextManager::new(1, 0, halter_protocol::PruneSignalThreshold::Normal)
+    }
+
+    async fn plan_with(
+        manager: &DefaultContextManager,
+        state: &SessionState,
+        provider: &StubProvider,
+    ) -> anyhow::Result<ContextPlan> {
+        manager
             .plan(
-                &SessionBlueprint {
-                    session_id: SessionId::new(),
-                    parent_session_id: None,
-                    default_model: "default".into(),
-                    subagent_model: "subagent".into(),
-                    subagent_event_forwarding: SubagentEventForwarding::Off,
-                    snapshot_revision: "r1".into(),
-                    working_dir: ".".into(),
-                    system_prompt_seed: Vec::new(),
-                    max_turns: None,
-                    subagent_depth: 0,
-                },
-                &SessionState {
-                    compacted_prefix: vec![serde_json::json!({
-                        "type": "compaction",
-                        "id": "cmp_1",
-                        "encrypted_content": "x",
-                    })],
-                    summaries: vec![SummarySlice {
-                        id: "summary-1".to_owned(),
-                        text: "summary".to_owned(),
-                    }],
-                    messages: vec![Message::User(UserMessage::text("hello"))],
-                    last_response_id: Some("resp_1".to_owned()),
-                    messages_seen_by_provider: 1,
-                    ..SessionState::default()
-                },
-                &ObservedState {
-                    cwd: ".".into(),
-                    git_branch: None,
-                    git_dirty: None,
-                    now_utc: Utc::now(),
-                    env_facts: Default::default(),
-                },
+                &sample_blueprint(),
+                state,
+                &sample_observed(),
                 &ResourceSnapshot::empty(),
                 &[],
-                &ResolvedModel {
-                    role: ModelRole::default(),
-                    id: ModelId::from("default"),
-                    provider: ProviderName::from("fake"),
-                    provider_kind: ProviderKind::Fake,
-                    api_kind: halter_protocol::ApiKind::Fake,
-                    model: "fake".to_owned(),
-                    max_input_tokens: None,
-                    max_output_tokens: None,
-                    reasoning: None,
-                    tokens_per_minute: None,
-                },
-                &NoopProvider,
+                &sample_model(),
+                provider,
             )
             .await
-            .expect("plan");
+    }
+
+    #[tokio::test]
+    async fn plan_disables_previous_response_chaining_when_compacted_prefix_exists() {
+        let outcome = plan_with(
+            &DefaultContextManager::default(),
+            &SessionState {
+                compacted_prefix: vec![serde_json::json!({
+                    "type": "compaction",
+                    "id": "cmp_1",
+                    "encrypted_content": "x",
+                })],
+                summaries: vec![SummarySlice {
+                    id: "summary-1".to_owned(),
+                    text: "summary".to_owned(),
+                }],
+                messages: vec![Message::User(UserMessage::text("hello"))],
+                last_response_id: Some("resp_1".to_owned()),
+                messages_seen_by_provider: 1,
+                ..SessionState::default()
+            },
+            &StubProvider::working(),
+        )
+        .await
+        .expect("plan");
 
         assert!(outcome.previous_response_id.is_none());
     }
 
-    struct NoopProvider;
+    /// A provider that cannot compact must not take the turn down with it.
+    /// Before this, `plan()` propagated the error and every turn past the
+    /// compaction threshold failed with no way to recover.
+    #[tokio::test]
+    async fn plan_degrades_to_uncompacted_context_when_compaction_fails() {
+        let state = SessionState {
+            messages: vec![Message::User(UserMessage::text("hello"))],
+            ..SessionState::default()
+        };
+
+        let plan = plan_with(
+            &always_compacting_manager(),
+            &state,
+            &StubProvider::failing("compaction endpoint exploded"),
+        )
+        .await
+        .expect("plan must survive a failed compaction");
+
+        assert!(plan.compaction.is_none());
+        assert_eq!(plan.messages, state.messages);
+        assert!(
+            plan.compaction_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("compaction endpoint exploded")),
+            "expected the provider error to be carried out, got {:?}",
+            plan.compaction_warning
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_degrades_when_provider_does_not_support_compaction() {
+        let plan = plan_with(
+            &always_compacting_manager(),
+            &SessionState {
+                messages: vec![Message::User(UserMessage::text("hello"))],
+                ..SessionState::default()
+            },
+            &StubProvider::without_compaction(),
+        )
+        .await
+        .expect("plan must survive a provider that cannot compact");
+
+        assert!(plan.compaction.is_none());
+        assert!(
+            plan.compaction_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("does not support compaction")),
+            "got {:?}",
+            plan.compaction_warning
+        );
+    }
+
+    /// A provider advertising compaction but yielding no window used to
+    /// disable compaction silently on the auto path. It is a misconfiguration,
+    /// so it must be reported rather than swallowed.
+    #[tokio::test]
+    async fn plan_degrades_when_provider_yields_no_compaction_window() {
+        let plan = plan_with(
+            &always_compacting_manager(),
+            &SessionState {
+                messages: vec![Message::User(UserMessage::text("hello"))],
+                ..SessionState::default()
+            },
+            &StubProvider::without_window(),
+        )
+        .await
+        .expect("plan must survive a provider that yields no window");
+
+        assert!(plan.compaction.is_none());
+        assert!(
+            plan.compaction_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("did not provide a compaction window")),
+            "got {:?}",
+            plan.compaction_warning
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_reports_no_warning_when_compaction_succeeds() {
+        let plan = plan_with(
+            &always_compacting_manager(),
+            &SessionState {
+                messages: vec![Message::User(UserMessage::text("hello"))],
+                ..SessionState::default()
+            },
+            &StubProvider::working(),
+        )
+        .await
+        .expect("plan");
+
+        assert!(plan.compaction.is_some());
+        assert_eq!(plan.compaction_warning, None);
+    }
+
+    /// Manual compaction keeps propagating: the caller asked for it
+    /// explicitly and a silent no-op would be a lie.
+    #[tokio::test]
+    async fn compact_now_propagates_provider_failures() {
+        let error = always_compacting_manager()
+            .compact_now(
+                &sample_blueprint(),
+                &SessionState {
+                    messages: vec![Message::User(UserMessage::text("hello"))],
+                    ..SessionState::default()
+                },
+                &sample_observed(),
+                &ResourceSnapshot::empty(),
+                &[],
+                &sample_model(),
+                &StubProvider::failing("compaction endpoint exploded"),
+                None,
+            )
+            .await
+            .expect_err("manual compaction must surface provider failures");
+
+        assert!(error.to_string().contains("compaction endpoint exploded"));
+    }
+
+    #[tokio::test]
+    async fn compact_now_propagates_unsupported_compaction() {
+        let error = always_compacting_manager()
+            .compact_now(
+                &sample_blueprint(),
+                &SessionState {
+                    messages: vec![Message::User(UserMessage::text("hello"))],
+                    ..SessionState::default()
+                },
+                &sample_observed(),
+                &ResourceSnapshot::empty(),
+                &[],
+                &sample_model(),
+                &StubProvider::without_compaction(),
+                None,
+            )
+            .await
+            .expect_err("manual compaction must surface unsupported providers");
+
+        assert!(error.to_string().contains("does not support compaction"));
+    }
+
+    /// Compaction provider stub. `supports_compaction` drives the advertised
+    /// capability, `offers_window` whether a compaction window is produced,
+    /// and `compact_error` makes the compaction call fail.
+    struct StubProvider {
+        supports_compaction: bool,
+        offers_window: bool,
+        compact_error: Option<&'static str>,
+    }
+
+    impl StubProvider {
+        fn working() -> Self {
+            Self {
+                supports_compaction: true,
+                offers_window: true,
+                compact_error: None,
+            }
+        }
+
+        fn failing(error: &'static str) -> Self {
+            Self {
+                compact_error: Some(error),
+                ..Self::working()
+            }
+        }
+
+        fn without_compaction() -> Self {
+            Self {
+                supports_compaction: false,
+                ..Self::working()
+            }
+        }
+
+        /// Advertises compaction but never yields a window — the shape a
+        /// provider takes when it forgets to override `compaction_window`.
+        fn without_window() -> Self {
+            Self {
+                offers_window: false,
+                ..Self::working()
+            }
+        }
+    }
 
     #[async_trait]
-    impl Provider for NoopProvider {
+    impl Provider for StubProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
-                supports_compaction: true,
+                supports_compaction: self.supports_compaction,
                 tool_call_id_policy: ToolCallIdPolicy::ProviderSupplied,
                 ..ProviderCapabilities::default()
             }
+        }
+
+        fn compaction_window(
+            &self,
+            messages: &[Message],
+        ) -> Option<halter_protocol::CompactionWindow> {
+            self.offers_window.then(|| {
+                halter_protocol::CompactionWindow::preserve_latest_assistant_response_block(
+                    messages,
+                )
+            })
         }
 
         async fn stream(
@@ -599,6 +854,9 @@ mod tests {
             _request: ProviderCompactionRequest,
             _cancel: tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<halter_protocol::ProviderCompactionResponse> {
+            if let Some(error) = self.compact_error {
+                anyhow::bail!(error);
+            }
             Ok(halter_protocol::ProviderCompactionResponse {
                 output: vec![serde_json::json!({
                     "type": "compaction",
@@ -630,6 +888,7 @@ mod tests {
                 compacted_count: 2,
                 summary: "squashed".to_owned(),
             }),
+            compaction_error: None,
             session_start_latch: None,
         };
 
@@ -658,6 +917,7 @@ mod tests {
             messages: Vec::new(),
             compacted_prefix: Vec::new(),
             compaction: None,
+            compaction_error: None,
             session_start_latch: None,
         };
 

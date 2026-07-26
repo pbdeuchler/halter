@@ -1768,6 +1768,11 @@ pub struct ContextPlan {
     /// If the planner compacted messages this turn, the result is here.
     /// The caller should apply it to `SessionState` after using the plan.
     pub compaction: Option<CompactionResult>,
+    /// Set when automatic compaction was due but could not run. The plan is
+    /// still valid and uncompacted, so the turn proceeds; the caller should
+    /// surface this so a degraded context does not look like a healthy one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_warning: Option<String>,
     /// When set, the codec should chain via `previous_response_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,

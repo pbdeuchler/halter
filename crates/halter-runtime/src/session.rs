@@ -1235,10 +1235,22 @@ impl SessionHandle {
                 )
                 .await?;
 
+            if let Some(warning) = plan.compaction_warning.as_ref() {
+                self.push_event(
+                    &mut events,
+                    SessionEventPayload::Warning {
+                        message: format!(
+                            "automatic compaction did not run; continuing with an uncompacted context: {warning}"
+                        ),
+                    },
+                );
+            }
+
             let plan_outcome = crate::CompactionOutcome {
                 messages: plan.messages.clone(),
                 compacted_prefix: plan.compacted_prefix.clone(),
                 compaction: plan.compaction.clone(),
+                compaction_error: None,
                 session_start_latch: None,
             };
             if let Some((result, effects)) = plan_outcome.apply_with_effects(&mut state) {

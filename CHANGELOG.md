@@ -72,7 +72,18 @@ log.
   `Store must be set to false`. Each ChatGPT-served endpoint now keeps its
   own path, matching the reference Codex client
   (`.../codex/responses/compact`). Automatic compaction was therefore
-  unreachable for OAuth sessions.
+  unreachable for OAuth sessions, which combined with the issue below made
+  every turn past the compaction threshold fail outright.
+
+#### Changed
+
+- Automatic compaction is now best-effort. A provider that cannot compact —
+  failing endpoint, missing capability, or no compaction window — degrades
+  the turn to an uncompacted context and emits
+  `SessionEventPayload::Warning` instead of failing the turn. `ContextPlan`
+  gained `compaction_warning` to carry the reason. Manual `compact()` is
+  unchanged and still propagates its errors, since the caller asked for
+  compaction explicitly.
 
 Blank-slate review fixes on top of the provider resilience primitive
 (issue #183). Highlights:

@@ -400,6 +400,7 @@ mod tests {
             messages: vec![Message::User(UserMessage::text("hello"))],
             estimated_tokens: 10,
             compaction: None,
+            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
@@ -459,6 +460,7 @@ mod tests {
             messages: vec![Message::User(UserMessage::text("hello"))],
             estimated_tokens: 10,
             compaction: None,
+            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
@@ -523,6 +525,7 @@ mod tests {
             messages: vec![Message::User(UserMessage::text("hello"))],
             estimated_tokens: 10,
             compaction: None,
+            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
@@ -603,6 +606,7 @@ mod tests {
             messages: vec![Message::User(UserMessage::text("hi"))],
             estimated_tokens: 0,
             compaction: None,
+            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
@@ -665,6 +669,7 @@ mod tests {
             messages: vec![Message::User(UserMessage::text("hi"))],
             estimated_tokens: 0,
             compaction: None,
+            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
