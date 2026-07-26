@@ -279,6 +279,10 @@ pub enum ApiKind {
 #[serde(rename_all = "snake_case")]
 /// Provider reasoning budget requested for a model.
 pub enum ReasoningEffort {
+    /// Disable reasoning when the provider exposes an explicit off value.
+    None,
+    /// Smallest non-zero reasoning budget exposed by some providers.
+    Minimal,
     /// Low reasoning budget.
     Low,
     /// Medium reasoning budget.
@@ -287,6 +291,8 @@ pub enum ReasoningEffort {
     High,
     /// Extra-high reasoning budget, for providers that expose it.
     Xhigh,
+    /// Provider-defined maximum reasoning budget beyond extra-high.
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -1915,6 +1921,53 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+
+    #[test]
+    fn reasoning_effort_wire_values_roundtrip_and_match_schema() {
+        let cases = [
+            (ReasoningEffort::None, "none"),
+            (ReasoningEffort::Minimal, "minimal"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Xhigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ];
+
+        for (effort, wire_value) in cases {
+            let encoded = serde_json::to_value(effort).expect("serialize reasoning effort");
+            assert_eq!(encoded, wire_value);
+
+            let decoded: ReasoningEffort =
+                serde_json::from_value(encoded).expect("deserialize reasoning effort");
+            assert_eq!(decoded, effort);
+        }
+
+        let schema = schemars::schema_for!(ReasoningEffort);
+        let schema = serde_json::to_value(schema).expect("serialize reasoning effort schema");
+        let schema_values = schema["oneOf"]
+            .as_array()
+            .expect("reasoning effort schema variants")
+            .iter()
+            .map(|variant| {
+                variant["enum"][0]
+                    .as_str()
+                    .expect("reasoning effort schema wire value")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            schema_values,
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_rejects_unknown_wire_values() {
+        let error = serde_json::from_str::<ReasoningEffort>(r#""non""#)
+            .expect_err("unknown reasoning effort should fail");
+
+        assert!(error.to_string().contains("unknown variant `non`"));
+    }
 
     #[test]
     fn message_roundtrip() {

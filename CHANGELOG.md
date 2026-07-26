@@ -8,6 +8,32 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-26
+
+This release expands the public `ReasoningEffort` enum, which requires a
+minor release on the pre-1.0 line because downstream exhaustive matches must
+handle the new variants.
+
+Published crates: `halter`, `halter-config`, `halter-hooks`,
+`halter-protocol`, `halter-providers`, `halter-runtime`, `halter-session`,
+and `halter-tools`. `halter-cli` also moves to `0.4.0` but remains
+`publish = false`.
+
+### Added
+
+- `ReasoningEffort::{None, Minimal, Max}`, serialized as `"none"`,
+  `"minimal"`, and `"max"`. OpenAI-compatible requests preserve these wire
+  values. Anthropic requests disable thinking for `None`, normalize
+  `Minimal` to its lowest supported effort, preserve `Max` for adaptive
+  thinking, and cap `Max` at the existing 8,192-token legacy budget.
+
+### Upgrading from 0.3
+
+- Exhaustive matches on `ReasoningEffort` must add the three new variants.
+- Use `reasoning = "none"` (not `"non"`) to explicitly disable reasoning in
+  configuration. Omitting `reasoning` still leaves provider behavior
+  unspecified.
+
 ## [0.3.0] - 2026-07-26
 
 This release cuts the `0.3` line. The minor bump is required: public

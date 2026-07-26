@@ -76,6 +76,9 @@ Compiled repo-local assets like skills, plugins, prompts, and instructions.
 
 The metadata needed to route requests to providers and interpret capabilities.
 
+`ReasoningEffort` represents explicit provider reasoning levels and serializes
+as `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`.
+
 `halter-protocol` gives these concepts stable shapes.
 
 ---

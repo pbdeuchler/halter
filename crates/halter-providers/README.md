@@ -95,6 +95,14 @@ The runtime should not need to know whether the backend is OpenAI, Anthropic, or
 
 That is the core abstraction boundary.
 
+### Reasoning effort mapping
+
+The canonical reasoning levels are `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, and `max`. OpenAI-compatible request bodies preserve the
+configured value. Anthropic disables thinking for `none`, maps `minimal` to
+`low`, preserves `max` for adaptive-thinking models, and caps `max` at the
+legacy 8,192-token budget for older models.
+
 ---
 
 ## The `Provider` trait

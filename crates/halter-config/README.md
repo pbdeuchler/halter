@@ -322,7 +322,8 @@ re-entering the global `model_judge` slot.
 - `"auto_resolve"` is valid only for `models.subagent`
 - `models.small` is always a single inline model (it does not fan out); when
   unset it falls back to the default slot's representative leaf model
-- `reasoning` is optional
+- `reasoning` is optional and accepts `none`, `minimal`, `low`, `medium`,
+  `high`, `xhigh`, and `max`; provider/model support varies
 - `tokens_per_minute` defaults to `500_000` and must be positive when set
 - `max_input_tokens` / `max_output_tokens` must be positive when set
 - the provider choice also determines the provider kind and API kind used elsewhere in the workspace

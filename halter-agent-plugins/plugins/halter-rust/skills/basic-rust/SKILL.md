@@ -129,7 +129,8 @@ exclusive. Halter does not parse `.env` files.
 ## Config details that matter
 
 - `models.default` is required. `models.small` and `models.subagent` fall back to `default` when omitted.
-- `reasoning` accepts `low`, `medium`, `high`, and `xhigh`.
+- `reasoning` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+  and `max`.
 - `tokens_per_minute` defaults to `500_000`; use it for proactive rate limiting.
 - `providers.<name>.base_url`, `api_key`, `headers`, and `temperature` are provider-level, not role-level. OpenAI also accepts provider-level `oauth`.
 - Environment overrides include `HALTER_TOOLS_ENABLED`, `HALTER_SKILL_ROOTS`, `HALTER_PLUGIN_ROOTS`, `HALTER_POLICY_SHELL_ALLOW`, `HALTER_POLICY_SHELL_ENABLED`, `HALTER_POLICY_NETWORK_ENABLED`, `HALTER_POLICY_ALLOWED_HOSTS`, and `HALTER_SESSION_BACKEND`.

@@ -549,6 +549,11 @@ backend = "memory"
 # subagent_event_forwarding_cap = 100_000 # 0 = unbounded
 ```
 
+`reasoning` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and
+`max`. Provider/model support varies; Halter preserves explicit
+OpenAI-compatible values and maps them to the nearest supported Anthropic
+thinking mode where necessary.
+
 #### Model Judge
 
 The `models.default` and `models.subagent` slots accept either an inline model

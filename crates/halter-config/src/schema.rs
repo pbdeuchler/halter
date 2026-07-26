@@ -1487,6 +1487,46 @@ api_key = "test-key"
     }
 
     #[test]
+    fn reasoning_efforts_parse_from_toml() {
+        let cases = [
+            ("none", ReasoningEffort::None),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("max", ReasoningEffort::Max),
+        ];
+
+        for (wire_value, expected) in cases {
+            let model: ModelConfig = toml::from_str(&format!(
+                r#"
+provider = "openai"
+model = "gpt-5"
+reasoning = "{wire_value}"
+"#
+            ))
+            .expect("parse model reasoning effort");
+
+            assert_eq!(model.reasoning, Some(expected), "{wire_value}");
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_rejects_unknown_toml_value() {
+        let error = toml::from_str::<ModelConfig>(
+            r#"
+provider = "openai"
+model = "gpt-5"
+reasoning = "non"
+"#,
+        )
+        .expect_err("unknown reasoning effort should fail");
+
+        assert!(error.to_string().contains("unknown variant `non`"));
+    }
+
+    #[test]
     fn model_judge_model_slot_round_trips_through_toml() {
         let parsed: HarnessConfig = toml::from_str(
             r#"
