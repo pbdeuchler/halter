@@ -8,6 +8,37 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-26
+
+This release cuts the `0.3` line. The minor bump is required: public
+protocol and runtime types gained fields and `estimate_context_tokens`
+gained a parameter, so `0.2` struct literals and call sites do not
+compile against it.
+
+Published crates: `halter`, `halter-config`, `halter-hooks`,
+`halter-protocol`, `halter-providers`, `halter-runtime`,
+`halter-session`, `halter-tools`. `halter-cli` also moves to `0.3.0` but
+remains `publish = false`.
+
+This release also carries the first publish of the rebased vendored
+shell crates — `halter-brush-core` `0.4.0` → `0.5.0` and
+`halter-brush-builtins` `0.1.0` → `0.2.0` — whose version bumps landed
+with the brush rebase below and have not shipped before.
+
+### Upgrading from 0.2
+
+- `ContextPlan`, `SessionState`, and `CompactionOutcome` each gained a
+  public field. Struct literals need the new field; `..Default::default()`
+  construction is unaffected.
+- `estimate_context_tokens` takes a trailing `usage_anchor_floor: usize`.
+  Pass `SessionState::usage_anchor_floor`, or `0` to keep the previous
+  whole-transcript behavior.
+- `Usage::input_tokens` from the Anthropic provider now includes cache
+  traffic, so reported input totals for Anthropic turns increase. Code
+  that summed `input_tokens + cache_read_input_tokens +
+  cache_creation_input_tokens` to get a total should now read
+  `input_tokens` alone, or `Usage::context_tokens()` for input+output.
+
 ### Event-log-unified sessions
 
 Sessions are now **log-authoritative with checkpoints** (see
