@@ -82,6 +82,11 @@ pub fn build_subagent_state(
         pending_warning_messages: parent.state.pending_warning_messages.clone(),
         last_response_id: None,
         messages_seen_by_provider: 0,
+        // The forked transcript carries the parent's usage reports, but the
+        // child runs a different system prompt and tool set, so those figures
+        // do not describe its context. Start with no anchor and let the
+        // child's first response supply one.
+        usage_anchor_floor: parent.state.messages.len(),
     }
 }
 

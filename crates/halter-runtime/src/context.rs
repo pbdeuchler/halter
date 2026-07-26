@@ -73,6 +73,10 @@ impl CompactionEffects {
             // injected, so the next request must replay everything.
             state.last_response_id = None;
             state.messages_seen_by_provider = 0;
+            // Every usage report in the preserved tail describes the
+            // pre-compaction context and would re-trigger compaction on the
+            // very next turn.
+            state.usage_anchor_floor = state.messages.len();
         }
         if let Some(source) = session_start_latch {
             state.pending_session_start_source = Some(source);
@@ -107,6 +111,17 @@ impl CompactionOutcome {
             compacted_prefix: effects.compacted_context.items().to_vec(),
         };
         effects.apply(state).map(|result| (result, record))
+    }
+
+    /// Usage-anchor floor this outcome implies. Compaction invalidates every
+    /// report in the tail it preserved; otherwise the session's existing
+    /// floor still stands.
+    fn usage_anchor_floor(&self, state: &SessionState) -> usize {
+        if self.compaction.is_some() {
+            self.messages.len()
+        } else {
+            state.usage_anchor_floor
+        }
     }
 
     fn into_effects(self) -> CompactionEffects {
@@ -237,6 +252,7 @@ impl DefaultContextManager {
             &state.summaries,
             &state.compacted_prefix,
             &state.messages,
+            state.usage_anchor_floor,
         );
         if !mode.is_forced() && !should_trigger_compaction(estimated_tokens, &self.settings) {
             return Ok(uncompacted_outcome(state, mode, None));
@@ -384,6 +400,7 @@ impl ContextManager for DefaultContextManager {
             &state.summaries,
             &outcome.compacted_prefix,
             &outcome.messages,
+            outcome.usage_anchor_floor(state),
         );
 
         if let Some(compaction) = outcome.compaction.as_ref() {
@@ -707,6 +724,68 @@ mod tests {
                 .is_some_and(|warning| warning.contains("did not provide a compaction window")),
             "got {:?}",
             plan.compaction_warning
+        );
+    }
+
+    /// Regression guard for a compaction loop. Compaction preserves a tail of
+    /// real messages, and the assistant message in that tail still reports the
+    /// pre-compaction context size. If the estimator kept anchoring on it,
+    /// every subsequent turn would see the old (large) figure and compact
+    /// again — forever. The floor advance is what stops that.
+    #[tokio::test]
+    async fn compaction_does_not_retrigger_on_the_following_turn() {
+        let manager = DefaultContextManager::new(
+            /*compaction_threshold*/ 1_000,
+            /*pre_compaction_target*/ 500,
+            halter_protocol::PruneSignalThreshold::Normal,
+        );
+        let mut state = SessionState {
+            messages: vec![
+                Message::User(UserMessage::text("hello")),
+                Message::Assistant(halter_protocol::AssistantMessage {
+                    id: halter_protocol::MessageId::new(),
+                    created_at: Utc::now(),
+                    parts: vec![halter_protocol::AssistantPart::Text {
+                        text: "done".to_owned(),
+                    }],
+                    stop_reason: Some(halter_protocol::StopReason::EndTurn),
+                    usage: Some(Usage {
+                        input_tokens: 80_000,
+                        output_tokens: 500,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    replay_meta: Default::default(),
+                }),
+            ],
+            ..SessionState::default()
+        };
+
+        let first = plan_with(&manager, &state, &StubProvider::working())
+            .await
+            .expect("first plan");
+        assert!(
+            first.compaction.is_some(),
+            "80_500 reported tokens must exceed the 1_000 threshold"
+        );
+
+        let outcome = CompactionOutcome {
+            messages: first.messages.clone(),
+            compacted_prefix: first.compacted_prefix.clone(),
+            compaction: first.compaction.clone(),
+            compaction_error: None,
+            session_start_latch: None,
+        };
+        outcome.apply(&mut state);
+        assert_eq!(state.usage_anchor_floor, state.messages.len());
+
+        let second = plan_with(&manager, &state, &StubProvider::working())
+            .await
+            .expect("second plan");
+
+        assert!(
+            second.compaction.is_none(),
+            "stale pre-compaction usage must not re-trigger compaction"
         );
     }
 

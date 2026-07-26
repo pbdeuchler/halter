@@ -77,6 +77,31 @@ log.
 
 #### Changed
 
+- Context estimation now anchors on provider-reported usage instead of
+  estimating the whole transcript with a character heuristic. When the
+  transcript contains a usable report from a completed assistant turn,
+  `estimate_context_tokens` takes that figure as ground truth and estimates
+  only the messages after it, bounding heuristic error (documented at ±20%
+  for code-heavy text) to one turn's tail rather than letting it compound
+  across the entire context. Interrupted turns, errored turns, and zero-usage
+  reports are rejected as anchors, and a session with none falls back to the
+  previous whole-transcript estimate.
+- `SessionState` gained `usage_anchor_floor`. Compaction preserves a tail of
+  real messages whose usage describes the *pre*-compaction context; without a
+  floor, that stale figure re-triggers compaction on every following turn
+  indefinitely. Compaction advances the floor past the preserved tail, in
+  both the runtime (`CompactionEffects::apply`) and the event fold, so
+  replayed and resumed sessions agree. Forked subagents start with no anchor,
+  since the parent's reports describe a different system prompt and tool set.
+- **`Usage::input_tokens` now uniformly means total input including cache
+  traffic.** OpenAI already reported it that way; Anthropic reports cache
+  reads and writes as separate counters, and its decoder now folds them in,
+  keeping `cache_read_input_tokens` / `cache_creation_input_tokens` as
+  breakdown fields. Without this, a mostly-cached Anthropic prompt reported a
+  small `input_tokens` and context budgeting under-counted the live context.
+  This changes reported Anthropic input totals — including the accumulated
+  `usage_so_far` — for turns recorded after the upgrade; historical values in
+  existing sessions are unaffected.
 - Automatic compaction is now best-effort. A provider that cannot compact —
   failing endpoint, missing capability, or no compaction window — degrades
   the turn to an uncompacted context and emits

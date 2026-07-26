@@ -24,9 +24,10 @@
 //! provider-chaining fields) are deliberately *not* event-covered: they are
 //! carried by the checkpoint, which the runtime writes on every
 //! state-changing commit. The one exception is that `ContextCompacted`
-//! effects also reset `last_response_id` / `messages_seen_by_provider`,
-//! mirroring the runtime's compaction rules so a mid-replay view is not left
-//! pointing at a provider response chain that predates the rewrite.
+//! effects also reset `last_response_id` / `messages_seen_by_provider` and
+//! advance `usage_anchor_floor`, mirroring the runtime's compaction rules so
+//! a mid-replay view is not left pointing at a provider response chain — or
+//! at reported token usage — that predates the rewrite.
 //!
 //! The store conformance suite locks the invariant in: after any sequence of
 //! commits, folding the full log over a default state must agree with the
@@ -58,6 +59,8 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
             // runtime so replayed views never chain onto pre-rewrite context.
             state.last_response_id = None;
             state.messages_seen_by_provider = 0;
+            // Usage reported by the preserved tail predates this rewrite.
+            state.usage_anchor_floor = state.messages.len();
         }
         SessionEventPayload::ContextCompacted { effects: None, .. }
         | SessionEventPayload::SessionStarted
@@ -216,6 +219,9 @@ mod tests {
         assert_eq!(state.compacted_prefix, vec![json!({"kind": "prefix"})]);
         assert_eq!(state.last_response_id, None);
         assert_eq!(state.messages_seen_by_provider, 0);
+        // Replay must reach the same anchor floor the runtime sets, or a
+        // resumed session would re-anchor on pre-compaction usage.
+        assert_eq!(state.usage_anchor_floor, window.len());
     }
 
     #[test]
