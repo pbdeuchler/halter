@@ -61,6 +61,19 @@ log.
   and state-only intermediate changes ride the next event-ful flush or the
   final turn commit.
 
+### Compaction
+
+#### Fixed
+
+- OpenAI OAuth (ChatGPT Codex) compaction reached the wrong endpoint. The
+  OAuth URL rewrite collapsed every Responses-shaped path onto a single
+  constant, so `/v1/responses/compact` resolved to `.../codex/responses` —
+  the streaming turn endpoint — which rejects compaction bodies with
+  `Store must be set to false`. Each ChatGPT-served endpoint now keeps its
+  own path, matching the reference Codex client
+  (`.../codex/responses/compact`). Automatic compaction was therefore
+  unreachable for OAuth sessions.
+
 Blank-slate review fixes on top of the provider resilience primitive
 (issue #183). Highlights:
 

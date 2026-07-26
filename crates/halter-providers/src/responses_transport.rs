@@ -122,7 +122,9 @@ pub(crate) fn provider_error_from_openai(error: OpenAIError) -> ProviderError {
 const RESPONSES_PATH: &str = "/v1/responses";
 const RESPONSES_COMPACT_PATH: &str = "/v1/responses/compact";
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
-const CHATGPT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CHATGPT_CODEX_RESPONSES_PATH: &str = "/responses";
+const CHATGPT_CODEX_RESPONSES_COMPACT_PATH: &str = "/responses/compact";
 
 /// An event sent by the OpenAI Responses streaming API that the `async-openai`
 /// SDK does not yet model (e.g. `keepalive` heartbeat pings).
@@ -414,34 +416,28 @@ fn transport_error_to_anyhow(error: TransportError) -> anyhow::Error {
     anyhow::Error::new(provider_error_from_transport(error))
 }
 
+/// ChatGPT-issued OAuth tokens are not accepted by OpenAI's public Platform
+/// API, so OAuth mode intentionally ignores the configured `base_url` for the
+/// endpoints the ChatGPT Codex backend serves. That backend exposes each
+/// endpoint at its own path — dedicated compaction lives at
+/// `/responses/compact`, not `/responses` — so the mapping must preserve the
+/// suffix rather than collapsing every Responses-shaped path onto one URL.
+/// Chat Completions-shaped payloads are the exception: the backend accepts
+/// them at the plain `/responses` endpoint. This is private ChatGPT routing,
+/// not public OpenAI Platform API behavior.
 fn provider_url(base_url: &str, path: &str, endpoint_mode: ResponsesEndpointMode) -> String {
     match endpoint_mode {
         ResponsesEndpointMode::PublicApi => join_url(base_url, path),
-        ResponsesEndpointMode::ChatGptCodexOAuth => {
-            if is_chatgpt_codex_rewrite_path(path) {
-                // ChatGPT-issued OAuth tokens are not accepted by OpenAI's
-                // public Platform API. The ChatGPT Codex backend currently
-                // accepts Responses-shaped requests, including dedicated
-                // compaction under `/v1/responses/...`, plus Chat
-                // Completions-shaped payloads at this single private endpoint.
-                // OAuth mode therefore intentionally ignores configured
-                // base_url for that prefix. This is private ChatGPT routing,
-                // not public OpenAI Platform API behavior.
-                CHATGPT_CODEX_RESPONSES_URL.to_owned()
-            } else {
-                join_url(base_url, path)
+        ResponsesEndpointMode::ChatGptCodexOAuth => match path {
+            RESPONSES_PATH | CHAT_COMPLETIONS_PATH => {
+                join_url(CHATGPT_CODEX_BASE_URL, CHATGPT_CODEX_RESPONSES_PATH)
             }
-        }
+            RESPONSES_COMPACT_PATH => {
+                join_url(CHATGPT_CODEX_BASE_URL, CHATGPT_CODEX_RESPONSES_COMPACT_PATH)
+            }
+            _ => join_url(base_url, path),
+        },
     }
-}
-
-fn is_chatgpt_codex_rewrite_path(path: &str) -> bool {
-    path == CHAT_COMPLETIONS_PATH || is_responses_path_or_child(path)
-}
-
-fn is_responses_path_or_child(path: &str) -> bool {
-    path.strip_prefix(RESPONSES_PATH)
-        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
 }
 
 #[derive(Debug, Clone)]
@@ -656,23 +652,52 @@ mod tests {
         }
     }
 
+    /// Each ChatGPT-served endpoint must keep its own path. Collapsing
+    /// `/v1/responses/compact` onto `/responses` sent dedicated compaction
+    /// bodies to the streaming turn endpoint, which rejects them with
+    /// "Store must be set to false".
     #[test]
     fn provider_url_rewrites_chatgpt_codex_oauth_paths() {
         let cases = [
-            ("responses", RESPONSES_PATH),
-            ("responses_compact", RESPONSES_COMPACT_PATH),
-            ("responses_child", "/v1/responses/child/path"),
-            ("chat_completions", CHAT_COMPLETIONS_PATH),
+            (
+                "responses",
+                RESPONSES_PATH,
+                "https://chatgpt.com/backend-api/codex/responses",
+            ),
+            (
+                "responses_compact",
+                RESPONSES_COMPACT_PATH,
+                "https://chatgpt.com/backend-api/codex/responses/compact",
+            ),
+            (
+                "chat_completions",
+                CHAT_COMPLETIONS_PATH,
+                "https://chatgpt.com/backend-api/codex/responses",
+            ),
         ];
 
-        for (name, path) in cases {
+        for (name, path, want) in cases {
             let got = provider_url(
                 "https://api.openai.com",
                 path,
                 ResponsesEndpointMode::ChatGptCodexOAuth,
             );
-            assert_eq!(got, CHATGPT_CODEX_RESPONSES_URL, "{name}");
+            assert_eq!(got, want, "{name}");
         }
+    }
+
+    /// Responses-prefixed paths the ChatGPT backend does not serve must fall
+    /// through to the configured base URL rather than being silently
+    /// rewritten onto an unrelated endpoint.
+    #[test]
+    fn provider_url_leaves_unmapped_oauth_responses_children_on_base_url() {
+        let got = provider_url(
+            "https://api.openai.com",
+            "/v1/responses/child/path",
+            ResponsesEndpointMode::ChatGptCodexOAuth,
+        );
+
+        assert_eq!(got, "https://api.openai.com/v1/responses/child/path");
     }
 
     #[test]
