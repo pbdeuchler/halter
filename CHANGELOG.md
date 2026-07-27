@@ -8,6 +8,18 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-27
+
+The OpenAI Responses adapter no longer fails a turn when the upstream sends a
+stream event it does not model. This requires a minor release on the pre-1.0
+line because surfacing the event's payload adds a variant to two public
+exhaustive enums, which breaks downstream exhaustive matches.
+
+Published crates: `halter`, `halter-config`, `halter-hooks`,
+`halter-protocol`, `halter-providers`, `halter-runtime`, `halter-session`,
+and `halter-tools`. `halter-cli` also moves to `0.5.0` but remains
+`publish = false`.
+
 ### Added
 
 - `StreamEvent::ProviderMetadata` and `SessionEventPayload::ProviderMetadata`,
