@@ -61,6 +61,9 @@ pub struct PolicySettings {
     pub shell_mode: ShellMode,
     /// Program names allowed through the shell tool. An empty list denies every
     /// external command. Shell assignments without a command are still allowed.
+    /// A single `*` entry is short-circuited to allow, mirroring
+    /// [`Self::allowed_hosts`]: every program passes the allowlist gate, and
+    /// [`ShellMode`] remains the only shell restriction.
     pub allowed_shell_commands: Vec<String>,
     pub shell_timeout_secs: u64,
     pub network_enabled: bool,
@@ -661,6 +664,12 @@ fn reject_unallowed_shell_commands(
     program: &ast::Program,
     allowed: &[String],
 ) -> Result<(), PolicyError> {
+    // `*` allows every program, exactly as it does for `allowed_hosts`.
+    // Strict mode's construct rejection still runs; only per-program
+    // enforcement is waived, and it needs an explicit list to come back.
+    if allowed.iter().any(|entry| entry == "*") {
+        return Ok(());
+    }
     for command in &program.complete_commands {
         visit_compound_list_allowlist(command, allowed)?;
     }

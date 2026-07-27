@@ -518,6 +518,12 @@ prune_signal_threshold = "low"
 
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
+# Optional. Empty keeps the built-in read roots (working directory + temp
+# directory); an explicit list replaces them. Write roots stay readable either way.
+# allowed_read_roots = ["/srv/checkouts"]
+# Optional. Absent keeps the built-in globs denied to every file tool; an
+# explicit list replaces them and `[]` disables the check entirely.
+# sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.secrets", "/etc/shadow", "/etc/shadow.*"]
 max_read_bytes = 1048576
 max_subagent_depth = 3
 max_concurrent_subagents = 8
@@ -528,7 +534,10 @@ allowed_hosts = []
 
 [policy.shell]
 enabled = true
+# `["*"]` allows every program; `[]` denies every external command.
 allow = ["git", "cargo", "rg", "ls", "find", "true", "cd", "python", "pwd", "cwd", "echo"]
+# "strict" (default) also rejects function definitions and eval/exec/source/.
+mode = "strict"
 timeout_secs = 30
 
 [sessions]

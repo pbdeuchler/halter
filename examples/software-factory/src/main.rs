@@ -20,7 +20,7 @@ use halter::prelude::*;
 use halter_config::{
     ContextConfig, HarnessConfig, ModelConfig, ModelSlot, ModelSlotRef, ModelsConfig,
     NetworkPolicyConfig, PolicyConfig, ProviderConfig, ProvidersConfig, ResourcesConfig,
-    RuntimeConfig, SearchRoots, SessionsConfig, ShellPolicyConfig, ToolsConfig,
+    RuntimeConfig, SearchRoots, SessionsConfig, ShellModeConfig, ShellPolicyConfig, ToolsConfig,
 };
 use halter_protocol::{
     AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
@@ -1119,6 +1119,8 @@ fn default_factory_config() -> HarnessConfig {
         },
         policy: PolicyConfig {
             allowed_write_roots: vec![PathBuf::from("./"), PathBuf::from("/tmp/halter")],
+            allowed_read_roots: Vec::new(),
+            sensitive_path_patterns: None,
             max_read_bytes: 1_048_576,
             max_subagent_depth: 3,
             max_concurrent_subagents: 8,
@@ -1128,6 +1130,7 @@ fn default_factory_config() -> HarnessConfig {
                     .into_iter()
                     .map(ToOwned::to_owned)
                     .collect(),
+                mode: ShellModeConfig::Strict,
                 timeout_secs: 30,
             },
             network: NetworkPolicyConfig {

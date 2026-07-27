@@ -10,8 +10,8 @@ use halter_config::{
     ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelJudgeConfig,
     ModelJudgeMode, ModelSlot, ModelSlotRef, OpenAiOAuthConfig, PolicyConfig, PromptsConfig,
     ResilienceConfig, ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID,
-    SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, SystemPromptPreset, expand_path, load_path,
-    resolve_provider_runtime_config,
+    SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, ShellModeConfig, SystemPromptPreset,
+    expand_path, load_path, resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
@@ -30,7 +30,7 @@ use halter_runtime::{
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
-    DefaultToolPolicy, LoopbackAllow, PathLockMap, PolicySettings, Tool, ToolRuntime,
+    DefaultToolPolicy, LoopbackAllow, PathLockMap, PolicySettings, ShellMode, Tool, ToolRuntime,
     ToolSessionStore, register_builtin_tools, register_subagent_tools,
 };
 use tracing::{debug, info};
@@ -1041,12 +1041,13 @@ where
     resolve_provider_runtime_config(provider, config.provider_config(provider), lookup_env)
 }
 
+/// Every `PolicySettings` field comes from configuration now; `defaults`
+/// supplies the fallbacks for the fields whose "unset" form means "keep the
+/// built-in value".
 fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
     // `process_tree_root` is anchored to the live halter PID at builder
     // time so process-signal checks (AC1.6 / AC1.7) can reject signals
-    // aimed at PIDs that aren't descendants of this process. Other newer
-    // fields (`sensitive_path_patterns`, `shell_mode`) still inherit from
-    // `PolicySettings::default()` until the surface lands in user config.
+    // aimed at PIDs that aren't descendants of this process.
     let defaults = PolicySettings::default();
     let allowed_hosts = if config.network.allowed_hosts.is_empty() {
         defaults.allowed_hosts.clone()
@@ -1056,8 +1057,16 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
     PolicySettings {
         allowed_write_roots: config.allowed_write_roots.clone(),
         allowed_read_roots: allowed_read_roots_from_config(config, &defaults),
+        sensitive_path_patterns: config
+            .sensitive_path_patterns
+            .clone()
+            .unwrap_or_else(|| defaults.sensitive_path_patterns.clone()),
         max_read_bytes: config.max_read_bytes,
         shell_enabled: config.shell.enabled,
+        shell_mode: match config.shell.mode {
+            ShellModeConfig::Strict => ShellMode::Strict,
+            ShellModeConfig::Relaxed => ShellMode::Relaxed,
+        },
         allowed_shell_commands: config.shell.allow.clone(),
         shell_timeout_secs: config.shell.timeout_secs,
         network_enabled: config.network.enabled,
@@ -1074,15 +1083,21 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
         max_subagent_depth: config.max_subagent_depth,
         max_concurrent_subagents: config.max_concurrent_subagents,
         process_tree_root: Some(std::process::id() as i32),
-        ..defaults
     }
 }
 
+/// Configured read roots, or the built-in ones when none are configured.
+/// Either way every write root is also readable: an agent allowed to modify a
+/// tree can inspect it.
 fn allowed_read_roots_from_config(
     config: &PolicyConfig,
     defaults: &PolicySettings,
 ) -> Vec<PathBuf> {
-    let mut roots = defaults.allowed_read_roots.clone();
+    let mut roots = if config.allowed_read_roots.is_empty() {
+        defaults.allowed_read_roots.clone()
+    } else {
+        config.allowed_read_roots.clone()
+    };
     for root in &config.allowed_write_roots {
         if !roots.iter().any(|existing| existing == root) {
             roots.push(root.clone());
@@ -1263,6 +1278,83 @@ mod tests {
             1,
             "configured write roots should be added to read roots once"
         );
+    }
+
+    #[test]
+    fn policy_from_config_maps_read_roots_sensitive_patterns_and_shell_mode() {
+        type Case = (
+            &'static str,
+            fn(&mut PolicyConfig),
+            fn(&PolicySettings, &PolicySettings),
+        );
+        let cases: &[Case] = &[
+            (
+                "unset_read_roots_keep_defaults",
+                |config| config.allowed_write_roots = vec![PathBuf::from("/srv/work")],
+                |settings, defaults| {
+                    let mut expected = defaults.allowed_read_roots.clone();
+                    expected.push(PathBuf::from("/srv/work"));
+                    assert_eq!(settings.allowed_read_roots, expected);
+                },
+            ),
+            (
+                "configured_read_roots_replace_defaults",
+                |config| {
+                    config.allowed_write_roots = vec![PathBuf::from("/srv/work")];
+                    config.allowed_read_roots = vec![PathBuf::from("/srv")];
+                },
+                |settings, _| {
+                    assert_eq!(
+                        settings.allowed_read_roots,
+                        vec![PathBuf::from("/srv"), PathBuf::from("/srv/work")],
+                        "configured roots replace the built-ins and keep write roots readable"
+                    );
+                },
+            ),
+            (
+                "unset_sensitive_patterns_keep_defaults",
+                |_| {},
+                |settings, defaults| {
+                    assert_eq!(
+                        settings.sensitive_path_patterns,
+                        defaults.sensitive_path_patterns
+                    );
+                },
+            ),
+            (
+                "empty_sensitive_patterns_disable_the_check",
+                |config| config.sensitive_path_patterns = Some(Vec::new()),
+                |settings, _| assert!(settings.sensitive_path_patterns.is_empty()),
+            ),
+            (
+                "configured_sensitive_patterns_replace_defaults",
+                |config| config.sensitive_path_patterns = Some(vec!["**/*.pem".to_owned()]),
+                |settings, _| assert_eq!(settings.sensitive_path_patterns, vec!["**/*.pem"]),
+            ),
+            (
+                "default_shell_mode_is_strict",
+                |_| {},
+                |settings, _| assert_eq!(settings.shell_mode, ShellMode::Strict),
+            ),
+            (
+                "relaxed_shell_mode_maps_through",
+                |config| config.shell.mode = ShellModeConfig::Relaxed,
+                |settings, _| assert_eq!(settings.shell_mode, ShellMode::Relaxed),
+            ),
+            (
+                "wildcard_allowlist_maps_through",
+                |config| config.shell.allow = vec!["*".to_owned()],
+                |settings, _| assert_eq!(settings.allowed_shell_commands, vec!["*"]),
+            ),
+        ];
+
+        let defaults = PolicySettings::default();
+        for (name, mutate, check) in cases {
+            let mut config = openai_config(Some("test-key")).policy.clone();
+            mutate(&mut config);
+            println!("case: {name}");
+            check(&policy_from_config(&config), &defaults);
+        }
     }
 
     #[tokio::test]

@@ -142,11 +142,14 @@ Defaults:
 
 - `allowed_write_roots = [".", "/tmp/halter"]`
 - `allowed_read_roots = [".", $TMPDIR | "/tmp"]`
-- `sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.env", "**/.env.*", "/etc/shadow", "/etc/shadow.*"]`
+- `sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.secrets", "/etc/shadow", "/etc/shadow.*"]`
 - `max_read_bytes = 1_048_576`
 - shell enabled = `true`
 - `shell_mode = Strict` (rejects `eval`, `exec`, `source`, `.`, and function definitions at the AST level)
-- shell allowlist = `git`, `cargo`, `rg`, `ls`, `find`, `true`, `cd`
+- shell allowlist = `git`, `cargo`, `rg`, `ls`, `find`, `true`, `cd`. A single
+  `*` entry short-circuits to allow — like `allowed_hosts`, it leaves
+  `shell_mode` as the only shell restriction — and an empty list denies every
+  external command
 - shell timeout = `30`
 - network enabled = `false`
 - `allowed_loopback = []` (loopback addresses require an explicit entry to be reached)
@@ -158,7 +161,8 @@ Defaults:
 When the high-level `halter` builder constructs policy from `PolicyConfig`, it
 also adds configured `allowed_write_roots` to the runtime read roots. This lets
 agents inspect files under any root they are allowed to modify, including
-generated worktrees.
+generated worktrees. Configuring `policy.allowed_read_roots` replaces the
+built-in read roots above; leaving it empty keeps them.
 
 This is the main security and operability boundary for tool use.
 

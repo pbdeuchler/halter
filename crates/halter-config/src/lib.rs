@@ -31,8 +31,8 @@ pub use schema::{
     RequestRetryConfig, RequestRetryOverrideConfig, ResilienceConfig, ResilienceOverrideConfig,
     ResilienceTimeoutsConfig, ResilienceTimeoutsOverrideConfig, ResolvedProviderAuth,
     ResolvedProviderConfig, ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID,
-    SearchRoots, SessionBackend, SessionsConfig, ShellPolicyConfig, SystemPromptPreset,
-    ToolsConfig, resolve_provider_runtime_config,
+    SearchRoots, SessionBackend, SessionsConfig, ShellModeConfig, ShellPolicyConfig,
+    SystemPromptPreset, ToolsConfig, resolve_provider_runtime_config,
 };
 
 #[cfg(feature = "remote-plugins")]

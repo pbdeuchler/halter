@@ -435,13 +435,16 @@ Example:
 ```toml
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
+allowed_read_roots = []       # empty keeps the built-in read roots
 max_read_bytes = 1048576
 max_subagent_depth = 3
 max_concurrent_subagents = 8
+# sensitive_path_patterns = ["**/.ssh/**"]   # absent keeps the built-in globs
 
 [policy.shell]
 enabled = true
 allow = ["git", "cargo", "rg", "ls", "find", "true", "cd"]
+mode = "strict"
 timeout_secs = 30
 
 [policy.network]
@@ -452,13 +455,21 @@ allowed_hosts = []
 Defaults:
 
 - `allowed_write_roots = [".", "/tmp/halter"]`
-- runtime read roots start from `[ ".", $TMPDIR | "/tmp" ]` and also include
-  configured `allowed_write_roots`
+- `allowed_read_roots = []` — runtime read roots then start from
+  `[ ".", $TMPDIR | "/tmp" ]`. A non-empty list replaces those built-ins.
+  Either way the runtime also reads under every configured
+  `allowed_write_roots` entry
+- `sensitive_path_patterns` unset — the runtime denies the built-in globs
+  (`**/.ssh/**`, `**/.aws/**`, `**/.secrets`, `/etc/shadow`, `/etc/shadow.*`)
+  to every file tool. An explicit list replaces them; `[]` disables the check
 - `max_read_bytes = 1_048_576`
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
 - shell enabled by default
-- shell allowlist defaults to `git`, `cargo`, `rg`, `ls`, `find`, `true`, `cd`
+- shell allowlist defaults to `git`, `cargo`, `rg`, `ls`, `find`, `true`, `cd`.
+  `["*"]` allows every program; `[]` denies every external command
+- `policy.shell.mode = "strict"` — also rejects function definitions and
+  `eval`/`exec`/`source`/`.`. `"relaxed"` applies only the allowlist
 - network disabled by default
 
 Validation rules include:

@@ -1232,6 +1232,18 @@ pub struct ToolsConfig {
 pub struct PolicyConfig {
     #[serde(default = "default_write_roots")]
     pub allowed_write_roots: Vec<PathBuf>,
+    /// Roots the read tools may resolve under. Empty (the default) keeps the
+    /// built-in roots — the working directory and the temporary directory —
+    /// and an explicit list replaces them. Either way the runtime also reads
+    /// under every entry in `allowed_write_roots`.
+    #[serde(default)]
+    pub allowed_read_roots: Vec<PathBuf>,
+    /// Globs denied to both read and write tools regardless of the configured
+    /// roots. `None` keeps the built-in patterns (`**/.ssh/**`, `**/.aws/**`,
+    /// `**/.secrets`, `/etc/shadow*`); an explicit list replaces them, and an
+    /// empty list disables the check for deliberately unguarded deployments.
+    #[serde(default)]
+    pub sensitive_path_patterns: Option<Vec<String>>,
     #[serde(default = "default_max_read_bytes")]
     pub max_read_bytes: usize,
     #[serde(default = "default_max_subagent_depth")]
@@ -1248,6 +1260,8 @@ impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             allowed_write_roots: default_write_roots(),
+            allowed_read_roots: Vec::new(),
+            sensitive_path_patterns: None,
             max_read_bytes: default_max_read_bytes(),
             max_subagent_depth: default_max_subagent_depth(),
             max_concurrent_subagents: default_max_concurrent_subagents(),
@@ -1279,8 +1293,12 @@ const fn default_max_concurrent_subagents() -> usize {
 pub struct ShellPolicyConfig {
     #[serde(default = "default_shell_enabled")]
     pub enabled: bool,
+    /// Program names the shell tool may run. A single `*` entry allows every
+    /// program; an empty list denies every external command.
     #[serde(default = "default_shell_allowlist")]
     pub allow: Vec<String>,
+    #[serde(default)]
+    pub mode: ShellModeConfig,
     #[serde(default = "default_shell_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -1290,9 +1308,23 @@ impl Default for ShellPolicyConfig {
         Self {
             enabled: default_shell_enabled(),
             allow: default_shell_allowlist(),
+            mode: ShellModeConfig::default(),
             timeout_secs: default_shell_timeout_secs(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+/// How strictly the shell tool parses commands before the allowlist applies.
+pub enum ShellModeConfig {
+    /// Reject function definitions and `eval`/`exec`/`source`/`.` commands,
+    /// then apply the allowlist.
+    #[default]
+    Strict,
+    /// Apply only the allowlist. Documented as *not* a complete isolation
+    /// boundary; for workflows that need function definitions or `eval`.
+    Relaxed,
 }
 
 const fn default_shell_enabled() -> bool {
