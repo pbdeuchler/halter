@@ -83,11 +83,29 @@ value:
 Patch is for genuinely additive, compile-compatible work. When it is close, take the minor —
 the cost of an extra minor on a 0.x line is nil, and a wrong patch bump breaks builds silently.
 
-To scan the public surface for breaks:
+To find which public items the diff touched, read the hunk headers rather than the
+changed lines — git names the enclosing item, so a change *inside* a `pub enum` surfaces
+even though the variant line itself carries no `pub`:
 
 ```bash
-git diff "$LAST"..HEAD -- 'crates/**/*.rs' | grep -E '^[-+][[:space:]]*pub '
+git diff -U0 "$LAST"..HEAD -- 'crates/**/*.rs' \
+  | grep -E '^@@.*@@ *(pub |impl )' | sed 's/^.*@@ //' | sort -u
 ```
+
+Every `pub enum` / `pub struct` / `pub trait` in that list needs eyeballing against the
+list above; read the actual hunk before deciding. `impl` blocks are included because
+git attributes an indented `pub fn` to its enclosing `impl` line, so a method signature
+change shows up only as the `impl`.
+
+Do **not** grep the changed lines for `^[-+]\s*pub ` — enum variants, struct fields, and
+methods inside `impl` blocks are not `pub`-prefixed, so it silently reports nothing for
+exactly the change class that forces a minor here. It returned zero matches for both
+`v0.3.0..v0.4.0` (added `ReasoningEffort` variants) and `v0.4.0..v0.5.0` (added
+`StreamEvent` / `SessionEventPayload` variants) — the last two breaking releases.
+
+`cargo semver-checks --baseline-rev "$LAST"` decides this mechanically and is worth
+installing if you cut releases often; the hunk-header scan is the zero-dependency
+fallback.
 
 ## 3. Bump the manifests
 
