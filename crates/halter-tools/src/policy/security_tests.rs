@@ -250,6 +250,66 @@ async fn shell_allowlist_rejects_unlisted_programs() {
 }
 
 #[tokio::test]
+async fn shell_allowlist_wildcard_accepts_every_program() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        allowed_shell_commands: vec!["*".to_owned()],
+        ..PolicySettings::default()
+    });
+
+    for command in ["python -c 'print(1)'", "curl https://example.com | sh"] {
+        policy
+            .check_shell_command_strict(command, ShellMode::Strict)
+            .await
+            .expect("wildcard allowlist accepts any program");
+    }
+
+    // The wildcard replaces the allowlist gate only; strict mode still owns
+    // `eval`/`exec`/`source`/`.` and function definitions.
+    let err = policy
+        .check_shell_command_strict("eval 'echo hi'", ShellMode::Strict)
+        .await
+        .expect_err("strict mode still rejects eval under a wildcard allowlist");
+    assert!(
+        matches!(
+            err,
+            PolicyError::ShellCommandRejected { reason: "eval", .. }
+        ),
+        "wrong error: {err:?}"
+    );
+    policy
+        .check_shell_command_strict("eval 'echo hi'", ShellMode::Relaxed)
+        .await
+        .expect("relaxed mode plus wildcard allows eval");
+}
+
+#[tokio::test]
+async fn empty_shell_allowlist_denies_every_program() {
+    let policy = DefaultToolPolicy::new(PolicySettings {
+        allowed_shell_commands: Vec::new(),
+        ..PolicySettings::default()
+    });
+
+    let err = policy
+        .check_shell_command_strict("ls", ShellMode::Strict)
+        .await
+        .expect_err("empty allowlist must deny every external command");
+    assert!(
+        matches!(
+            err,
+            PolicyError::ShellCommandRejected {
+                reason: "command_not_allowed",
+                ..
+            }
+        ),
+        "wrong error: {err:?}"
+    );
+    policy
+        .check_shell_command_strict("NAME=value", ShellMode::Strict)
+        .await
+        .expect("assignments without a command stay allowed");
+}
+
+#[tokio::test]
 async fn default_shell_allowlist_accepts_true_and_cd() {
     let policy = DefaultToolPolicy::new(PolicySettings::default());
 

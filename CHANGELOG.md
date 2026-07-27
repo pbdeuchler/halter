@@ -8,6 +8,22 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Added
+
+- `policy.shell.allow = ["*"]` allows every program, mirroring the wildcard
+  `policy.network.allowed_hosts` already accepts. Deployments that want
+  arbitrary shell execution no longer have to allowlist `bash` and route every
+  command through `bash -c`. `policy.shell.mode` remains the only shell
+  restriction under a wildcard, and an empty list still denies everything.
+- `policy.allowed_read_roots`, `policy.sensitive_path_patterns`, and
+  `policy.shell.mode` — the last `PolicySettings` fields the builder pinned to
+  their defaults — are now configurable. Unset read roots keep the built-in
+  working-directory and temporary-directory roots; an explicit list replaces
+  them, and configured `allowed_write_roots` stay readable either way. Unset
+  sensitive patterns keep the built-in globs; an explicit list replaces them
+  and an empty list disables the check. `mode` is `"strict"` (default) or
+  `"relaxed"`.
+
 ## [0.5.0] - 2026-07-27
 
 The OpenAI Responses adapter no longer fails a turn when the upstream sends a

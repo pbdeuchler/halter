@@ -156,7 +156,10 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
+# `["*"]` allows every program; `[]` denies every external command.
 allow = ["git", "cargo", "rg", "ls", "find", "true", "cd"]
+# "strict" also rejects function definitions and eval/exec/source/.
+mode = "strict"
 timeout_secs = 30
 
 [policy.network]
