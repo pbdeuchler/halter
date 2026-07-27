@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use async_openai::{
     error::{ApiError, OpenAIError, StreamError},
-    types::responses::{ResponseStream, ResponseStreamEvent},
+    types::responses::ResponseStreamEvent,
 };
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -18,7 +18,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::header_overrides::HeaderOverrides;
 use crate::http_client::{join_url, provider_http_clients};
@@ -130,7 +130,15 @@ const CHATGPT_CODEX_RESPONSES_COMPACT_PATH: &str = "/responses/compact";
 /// SDK does not yet model (e.g. `keepalive` heartbeat pings).
 #[derive(Debug, Clone)]
 enum NonStandardStreamEvent {
-    Keepalive { sequence_number: u64 },
+    Keepalive {
+        sequence_number: u64,
+    },
+    /// `response.metadata`: out-of-band annotations (moderation scores,
+    /// verification recommendations) the upstream attaches to a response.
+    /// `None` when the frame carries no payload to forward.
+    Metadata {
+        metadata: Option<Value>,
+    },
 }
 
 impl NonStandardStreamEvent {
@@ -139,10 +147,30 @@ impl NonStandardStreamEvent {
             "keepalive" => Some(Self::Keepalive {
                 sequence_number: data.get("sequence_number")?.as_u64()?,
             }),
+            "response.metadata" => Some(Self::Metadata {
+                metadata: data.get("metadata").cloned(),
+            }),
             _ => None,
         }
     }
 }
+
+/// One frame of a Responses SSE stream. `ResponseStreamEvent` is a closed
+/// enum, so events the upstream schema does not model need their own carrier
+/// rather than a deserialization failure.
+// `Event` dwarfs `Metadata`, but it is the variant every text delta travels
+// in; boxing it to even the enum out would trade one allocation per stream
+// frame for a saving on the one or two metadata frames in a turn.
+#[expect(clippy::large_enum_variant, reason = "hot variant, cold alternative")]
+#[derive(Debug, Clone)]
+pub(crate) enum ResponsesFrame {
+    Event(ResponseStreamEvent),
+    /// Payload of a `response.metadata` event, forwarded to consumers as-is.
+    Metadata(Value),
+}
+
+pub(crate) type ResponsesFrameStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<ResponsesFrame, OpenAIError>> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResponsesRateLimitStrategy {
@@ -218,7 +246,7 @@ impl ResponsesTransport {
         request: Value,
         request_meta: ResponsesTransportRequest,
         cancel: CancellationToken,
-    ) -> Result<ResponseStream, TransportError> {
+    ) -> Result<ResponsesFrameStream, TransportError> {
         let response = self
             .send_json_request(
                 &self.streaming_client,
@@ -464,7 +492,7 @@ fn stream_response(
     response: Response,
     rate_limits: OpenAiStreamRateLimitObserver,
     cancel: CancellationToken,
-) -> ResponseStream {
+) -> ResponsesFrameStream {
     let stream = response.bytes_stream().eventsource();
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -520,7 +548,7 @@ fn stream_response(
 fn decode_stream_event(
     data: &str,
     rate_limits: &OpenAiStreamRateLimitObserver,
-) -> Result<Option<ResponseStreamEvent>, OpenAIError> {
+) -> Result<Option<ResponsesFrame>, OpenAIError> {
     if let Some(api_error) = parse_openai_stream_error(data) {
         rate_limits.record_api_error(&api_error);
         return Err(OpenAIError::ApiError(api_error));
@@ -530,19 +558,30 @@ fn decode_stream_event(
         .map_err(|error| OpenAIError::JSONDeserialize(error, data.to_owned()))?;
 
     if let Some(event) = NonStandardStreamEvent::parse(&raw) {
-        match event {
+        return Ok(match event {
             NonStandardStreamEvent::Keepalive { sequence_number } => {
                 info!(sequence_number, "received keepalive from responses stream");
+                None
             }
-        }
-        return Ok(None);
+            NonStandardStreamEvent::Metadata { metadata } => metadata.map(ResponsesFrame::Metadata),
+        });
     }
 
     patch_missing_output_tokens_details(&mut raw);
 
-    serde_json::from_value::<ResponseStreamEvent>(raw)
-        .map(Some)
-        .map_err(|error| OpenAIError::JSONDeserialize(error, data.to_owned()))
+    match serde_json::from_value::<ResponseStreamEvent>(raw) {
+        Ok(event) => Ok(Some(ResponsesFrame::Event(event))),
+        // The upstream ships new `response.*` event types faster than the SDK
+        // models them, and every unmodelled type fails to deserialize here.
+        // Dropping the frame costs at most one event; propagating the error
+        // costs the whole turn, including text already streamed to the user.
+        // This mirrors the reference Codex CLI, which skips SSE frames it
+        // cannot parse.
+        Err(error) => {
+            warn!(%error, event = %data, "skipping unrecognized responses stream event");
+            Ok(None)
+        }
+    }
 }
 
 // Some upstreams (e.g. OpenRouter proxying Fireworks) omit
@@ -1095,7 +1134,7 @@ mod tests {
             .expect("decode succeeds")
             .expect("event present");
         match decoded {
-            ResponseStreamEvent::ResponseCompleted(event) => {
+            ResponsesFrame::Event(ResponseStreamEvent::ResponseCompleted(event)) => {
                 let usage = event.response.usage.expect("usage parsed");
                 assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
             }
@@ -1131,12 +1170,98 @@ mod tests {
             .expect("decode succeeds")
             .expect("event present");
         match decoded {
-            ResponseStreamEvent::ResponseCompleted(event) => {
+            ResponsesFrame::Event(ResponseStreamEvent::ResponseCompleted(event)) => {
                 let usage = event.response.usage.expect("usage parsed");
                 assert_eq!(usage.output_tokens_details.reasoning_tokens, 3);
             }
             other => panic!("expected ResponseCompleted, got {other:?}"),
         }
+    }
+
+    /// The ChatGPT/Codex backend interleaves `response.metadata` frames
+    /// carrying moderation scores. `async-openai` does not model the type, so
+    /// this used to abort the turn; it must now surface as a metadata frame
+    /// with the payload intact.
+    #[test]
+    fn decode_stream_event_forwards_response_metadata() {
+        let data = json!({
+            "type": "response.metadata",
+            "response_id": "resp_08a0",
+            "sequence_number": 26,
+            "metadata": {
+                "openai_chatgpt_moderation_metadata": {
+                    "prompt": { "omnimod": { "outputs": [{ "is_blocked": false }] } }
+                }
+            }
+        })
+        .to_string();
+
+        let decoded = decode_stream_event(&data, &observer())
+            .expect("decode succeeds")
+            .expect("frame present");
+        match decoded {
+            ResponsesFrame::Metadata(metadata) => {
+                assert_eq!(
+                    metadata.pointer(
+                        "/openai_chatgpt_moderation_metadata/prompt/omnimod/outputs/0/is_blocked"
+                    ),
+                    Some(&Value::Bool(false)),
+                    "metadata payload forwarded verbatim"
+                );
+                assert!(
+                    metadata.get("sequence_number").is_none(),
+                    "only the metadata object is forwarded, not the envelope"
+                );
+            }
+            other => panic!("expected Metadata frame, got {other:?}"),
+        }
+    }
+
+    /// A `response.metadata` frame with nothing to forward is dropped rather
+    /// than surfaced as an empty payload.
+    #[test]
+    fn decode_stream_event_drops_response_metadata_without_payload() {
+        let data = json!({
+            "type": "response.metadata",
+            "sequence_number": 26
+        })
+        .to_string();
+
+        assert!(
+            decode_stream_event(&data, &observer())
+                .expect("decode succeeds")
+                .is_none()
+        );
+    }
+
+    /// Any `response.*` type the SDK has not modelled yet must be skipped, not
+    /// propagated as a stream error that kills the turn.
+    #[test]
+    fn decode_stream_event_skips_unmodelled_event_type() {
+        let data = json!({
+            "type": "response.some_future_event",
+            "sequence_number": 7,
+            "payload": { "anything": true }
+        })
+        .to_string();
+
+        assert!(
+            decode_stream_event(&data, &observer())
+                .expect("decode succeeds")
+                .is_none()
+        );
+    }
+
+    /// Skipping applies to unparseable frames, not to unparseable *bytes* — a
+    /// non-JSON SSE payload still fails loudly.
+    #[test]
+    fn decode_stream_event_rejects_non_json_payload() {
+        let error = decode_stream_event("not json at all", &observer())
+            .expect_err("decode fails on malformed json");
+        assert!(
+            matches!(error, OpenAIError::JSONDeserialize(..)),
+            "expected JSONDeserialize, got {error:?}"
+        );
     }
 
     /// OpenRouter returns `{"error":{"message":"Missing Authentication header","code":401}}`

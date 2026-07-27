@@ -2062,6 +2062,13 @@ pub(crate) async fn materialize_assistant_message(
             Ok(StreamEvent::ProviderWarning { message }) => {
                 warn!(provider = %model.provider, message = %message, "provider emitted warning");
             }
+            Ok(StreamEvent::ProviderMetadata { metadata }) => {
+                // Non-essential annotation: drop rather than fail the turn once
+                // the event budget is spoken for by actual model output.
+                if delta_events.len() < PROVIDER_STREAM_EVENT_CAP {
+                    delta_events.push(SessionEventPayload::ProviderMetadata { metadata });
+                }
+            }
             Ok(StreamEvent::Error { error }) | Err(error) => {
                 error!(provider = %model.provider, error = %error.message, "provider stream failed");
                 return Err(anyhow::Error::new(error));
@@ -3092,6 +3099,69 @@ mod tests {
         assert_eq!(tool_calls[0].id, tool_call_id);
         assert_eq!(tool_calls[0].name.0, "write");
         assert_eq!(tool_calls[0].arguments, serde_json::json!({}));
+    }
+
+    /// Provider metadata is a passthrough: it reaches the consumer event
+    /// stream verbatim without contributing to the assistant message.
+    #[tokio::test]
+    async fn materialize_forwards_provider_metadata_to_consumer_events() {
+        let model = resolved_test_model("default", "fake", "halter/fake");
+        let block_id = BlockId::new();
+        let metadata = r#"{"openai_chatgpt_moderation_metadata":{"prompt":{}}}"#;
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> = stream::iter(vec![
+            Ok(StreamEvent::MessageStart {
+                id: halter_protocol::MessageId::new(),
+            }),
+            Ok(StreamEvent::ProviderMetadata {
+                metadata: metadata.to_owned(),
+            }),
+            Ok(StreamEvent::TextStart {
+                id: block_id.clone(),
+            }),
+            Ok(StreamEvent::TextDelta {
+                id: block_id,
+                delta: "hi".to_owned(),
+            }),
+        ])
+        .boxed();
+
+        let materialized = super::materialize_assistant_message(stream, &model)
+            .await
+            .expect("materialize succeeds");
+        assert!(
+            materialized.events.iter().any(|event| matches!(
+                event,
+                SessionEventPayload::ProviderMetadata { metadata: forwarded } if forwarded == metadata
+            )),
+            "metadata must reach the consumer event stream: {:?}",
+            materialized.events
+        );
+        assert_eq!(
+            materialized.message.parts,
+            vec![AssistantPart::Text {
+                text: "hi".to_owned()
+            }],
+            "metadata must not leak into the assistant message"
+        );
+    }
+
+    /// Metadata is non-essential, so a flood of it degrades to dropped events
+    /// rather than aborting the turn the way oversized model output does.
+    #[tokio::test]
+    async fn materialize_drops_provider_metadata_beyond_the_event_cap() {
+        let model = resolved_test_model("default", "fake", "halter/fake");
+        let events = (0..PROVIDER_STREAM_EVENT_CAP + 10).map(|index| {
+            Ok(StreamEvent::ProviderMetadata {
+                metadata: format!(r#"{{"seq":{index}}}"#),
+            })
+        });
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> =
+            stream::iter(events.collect::<Vec<_>>()).boxed();
+
+        let materialized = super::materialize_assistant_message(stream, &model)
+            .await
+            .expect("metadata flood must not fail the turn");
+        assert_eq!(materialized.events.len(), PROVIDER_STREAM_EVENT_CAP);
     }
 
     #[tokio::test]

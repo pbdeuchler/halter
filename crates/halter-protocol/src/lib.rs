@@ -570,6 +570,12 @@ pub enum StreamEvent {
     },
     /// Non-fatal warning surfaced by the provider adapter.
     ProviderWarning { message: SharedStr },
+    /// Out-of-band annotations the provider attaches to the response —
+    /// currently the OpenAI Responses `response.metadata` event, whose payload
+    /// carries moderation scores and verification recommendations. Held as
+    /// verbatim JSON text because nothing in the runtime interprets it;
+    /// consumers that care parse it themselves.
+    ProviderMetadata { metadata: SharedStr },
     /// Provider error surfaced through the stream.
     Error { error: ProviderError },
 }
@@ -870,6 +876,11 @@ pub enum SessionEventPayload {
     },
     DeltaItem {
         delta: DeltaItem,
+    },
+    /// Provider-emitted out-of-band annotations, forwarded verbatim as JSON
+    /// text. See [`StreamEvent::ProviderMetadata`].
+    ProviderMetadata {
+        metadata: SharedStr,
     },
     ToolExecutionStarted {
         call: ToolCall,

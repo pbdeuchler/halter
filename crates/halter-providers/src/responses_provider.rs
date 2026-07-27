@@ -17,7 +17,7 @@ use crate::openai_codec::{self, ResponsesInstructionMode, ResponsesRequestOption
 use crate::openai_rate_limit_policy::estimate_openai_request_cost;
 use crate::resilience::ResiliencePolicy;
 use crate::responses_transport::{
-    ResponsesEndpointMode, ResponsesRateLimitStrategy, ResponsesTransport,
+    ResponsesEndpointMode, ResponsesFrame, ResponsesRateLimitStrategy, ResponsesTransport,
     ResponsesTransportRequest, provider_error_from_openai, provider_error_from_transport,
 };
 use crate::secret::SecretString;
@@ -172,7 +172,12 @@ impl ResponsesProvider {
         Ok(response_stream
             .flat_map(move |item| {
                 let events = match item {
-                    Ok(event) => match decoder.decode(event) {
+                    Ok(ResponsesFrame::Metadata(metadata)) => {
+                        vec![Ok(StreamEvent::ProviderMetadata {
+                            metadata: metadata.to_string(),
+                        })]
+                    }
+                    Ok(ResponsesFrame::Event(event)) => match decoder.decode(event) {
                         Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
                         Err(error) => {
                             error!(

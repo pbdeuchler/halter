@@ -68,6 +68,7 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         | SessionEventPayload::Warning { .. }
         | SessionEventPayload::TurnStarted { .. }
         | SessionEventPayload::DeltaItem { .. }
+        | SessionEventPayload::ProviderMetadata { .. }
         | SessionEventPayload::ToolExecutionStarted { .. }
         | SessionEventPayload::ToolOutput { .. }
         | SessionEventPayload::HookStarted { .. }

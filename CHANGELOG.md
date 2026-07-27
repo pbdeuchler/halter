@@ -8,6 +8,30 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Added
+
+- `StreamEvent::ProviderMetadata` and `SessionEventPayload::ProviderMetadata`,
+  carrying out-of-band annotations a provider attaches to a response as
+  verbatim JSON text. The OpenAI Responses adapter populates them from
+  `response.metadata` events, whose payload carries moderation scores and
+  verification recommendations. The runtime forwards them to the consumer
+  event stream and does not otherwise interpret them.
+
+### Fixed
+
+- The OpenAI Responses stream no longer fails the turn on an event type the
+  `async-openai` schema does not model. `response.metadata` — emitted by the
+  ChatGPT/Codex backend — aborted the turn with a deserialization error;
+  unrecognized `response.*` frames are now logged and skipped, so a single
+  unmodelled frame costs one event rather than the whole turn.
+
+### Upgrading from 0.4
+
+- `StreamEvent` and `SessionEventPayload` each gained a variant. Exhaustive
+  matches over either enum need a `ProviderMetadata { metadata }` arm;
+  consumers with nothing to do with provider annotations can ignore it
+  alongside their existing catch-all.
+
 ## [0.4.0] - 2026-07-26
 
 This release expands the public `ReasoningEffort` enum, which requires a

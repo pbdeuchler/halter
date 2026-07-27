@@ -140,6 +140,9 @@ fn session_event_payload_variants_have_stable_kind() {
                 text: "d".to_owned(),
             },
         },
+        SessionEventPayload::ProviderMetadata {
+            metadata: r#"{"openai_chatgpt_moderation_metadata":{}}"#.to_owned(),
+        },
         SessionEventPayload::ToolExecutionStarted { call: call.clone() },
         SessionEventPayload::ToolOutput {
             call_id: call.id.clone(),
@@ -185,6 +188,7 @@ fn session_event_payload_variants_have_stable_kind() {
             SessionEventPayload::TurnStarted { .. } => "turn_started",
             SessionEventPayload::MessageItem { .. } => "message_item",
             SessionEventPayload::DeltaItem { .. } => "delta_item",
+            SessionEventPayload::ProviderMetadata { .. } => "provider_metadata",
             SessionEventPayload::ToolExecutionStarted { .. } => "tool_execution_started",
             SessionEventPayload::ToolOutput { .. } => "tool_output",
             SessionEventPayload::HookStarted { .. } => "hook_started",
