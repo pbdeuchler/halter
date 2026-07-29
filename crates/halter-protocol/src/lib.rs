@@ -275,6 +275,38 @@ pub enum ApiKind {
     Fake,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+/// Preference for which upstream provider OpenRouter routes a request to.
+///
+/// OpenRouter serves most models from several upstream providers and picks one
+/// per request. This type is the `provider` object of an OpenRouter request
+/// body verbatim: its serde form *is* the wire form, so the same value
+/// configures a provider and is sent on every request it makes.
+pub struct OpenRouterRouting {
+    /// Upstream provider slugs to try, most preferred first (for example
+    /// `"anthropic"`, `"openai"`, `"google-vertex"`). Slugs are OpenRouter's,
+    /// not Halter's provider names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    /// Whether OpenRouter may fall back to an upstream provider outside
+    /// [`Self::order`]. `None` defers to OpenRouter's own default (`true`);
+    /// `Some(false)` makes [`Self::order`] an exact allowlist and fails the
+    /// request when none of its providers can serve the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_fallbacks: Option<bool>,
+}
+
+impl OpenRouterRouting {
+    /// Whether this preference would change routing at all. An empty
+    /// preference is a configuration mistake rather than a no-op default,
+    /// because callers only construct one to pin routing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty() && self.allow_fallbacks.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 /// Provider reasoning budget requested for a model.
@@ -1978,6 +2010,69 @@ mod tests {
             .expect_err("unknown reasoning effort should fail");
 
         assert!(error.to_string().contains("unknown variant `non`"));
+    }
+
+    /// The serde form is the OpenRouter `provider` object, so unset fields
+    /// must disappear rather than serialize as `[]`/`null` — OpenRouter reads
+    /// an explicit `allow_fallbacks: null` differently from an absent key.
+    #[test]
+    fn openrouter_routing_wire_form_matches_openrouter_provider_object() {
+        let cases = [
+            (OpenRouterRouting::default(), serde_json::json!({})),
+            (
+                OpenRouterRouting {
+                    order: vec!["anthropic".to_owned(), "google-vertex".to_owned()],
+                    allow_fallbacks: None,
+                },
+                serde_json::json!({"order": ["anthropic", "google-vertex"]}),
+            ),
+            (
+                OpenRouterRouting {
+                    order: vec!["anthropic".to_owned()],
+                    allow_fallbacks: Some(false),
+                },
+                serde_json::json!({"order": ["anthropic"], "allow_fallbacks": false}),
+            ),
+            (
+                OpenRouterRouting {
+                    order: Vec::new(),
+                    allow_fallbacks: Some(true),
+                },
+                serde_json::json!({"allow_fallbacks": true}),
+            ),
+        ];
+
+        for (routing, wire_value) in cases {
+            let encoded = serde_json::to_value(&routing).expect("serialize routing");
+            assert_eq!(encoded, wire_value);
+
+            let decoded: OpenRouterRouting =
+                serde_json::from_value(encoded).expect("deserialize routing");
+            assert_eq!(decoded, routing);
+        }
+    }
+
+    #[test]
+    fn openrouter_routing_reports_empty_and_rejects_unknown_fields() {
+        assert!(OpenRouterRouting::default().is_empty());
+        assert!(
+            !OpenRouterRouting {
+                order: vec!["anthropic".to_owned()],
+                allow_fallbacks: None,
+            }
+            .is_empty()
+        );
+        assert!(
+            !OpenRouterRouting {
+                order: Vec::new(),
+                allow_fallbacks: Some(false),
+            }
+            .is_empty()
+        );
+
+        let error = serde_json::from_str::<OpenRouterRouting>(r#"{"sort":"price"}"#)
+            .expect_err("unknown routing field should fail");
+        assert!(error.to_string().contains("unknown field `sort`"));
     }
 
     #[test]

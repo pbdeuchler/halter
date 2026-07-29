@@ -314,8 +314,9 @@ If you switch a session to Anthropic, parts of your assumptions may need to chan
 
 All three built-in providers expose a
 `new_with_headers(api_key, base_url, &[(name, value)], temperature)`
-constructor. OpenAI also exposes `new_with_oauth_and_headers(...)` for OAuth
-credentials. The supplied overrides are applied per request with insert
+constructor — OpenRouter's takes one further `Option<OpenRouterRouting>`
+argument (see [Upstream routing](#upstream-routing-openrouter)). OpenAI also
+exposes `new_with_oauth_and_headers(...)` for OAuth credentials. The supplied overrides are applied per request with insert
 semantics: entries replace any default or hardcoded header (`Authorization`,
 `x-api-key`, `anthropic-version`, `Content-Type`) case-insensitively, and any
 unrelated header names are forwarded as-is.
@@ -335,6 +336,38 @@ let provider = OpenAiProvider::new_with_headers(
 ```
 
 Config-driven use goes through `[providers.<name>.headers]` in `halter-config`.
+
+---
+
+## Upstream routing (OpenRouter)
+
+OpenRouter serves most models from several upstream providers and picks one per
+request. `OpenRouterRouting` states a preference; it is sent verbatim as the
+`provider` object of every request body the provider emits, streaming turns and
+compaction alike. `None` leaves the choice to OpenRouter.
+
+```rust
+use halter_protocol::OpenRouterRouting;
+use halter_providers::OpenRouterProvider;
+
+let provider = OpenRouterProvider::new_with_headers(
+    std::env::var("OPENROUTER_API_KEY")?,
+    "https://openrouter.ai/api",
+    &[],
+    None,
+    Some(OpenRouterRouting {
+        // Most preferred upstream first; slugs are OpenRouter's.
+        order: vec!["anthropic".into(), "google-vertex".into()],
+        // `None` lets OpenRouter fall back to any other upstream. `Some(false)`
+        // makes `order` an exact allowlist and fails the request otherwise.
+        allow_fallbacks: Some(false),
+    }),
+)?;
+```
+
+Config-driven use goes through `[providers.openrouter.routing]` in
+`halter-config`, which trims the slugs and rejects preferences that would do
+nothing.
 
 ---
 

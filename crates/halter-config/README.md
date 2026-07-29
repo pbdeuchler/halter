@@ -157,7 +157,19 @@ api_key = "..."
 [providers.openrouter]
 base_url = "https://openrouter.ai/api"
 api_key = "..."
+
+# OpenRouter only: which upstream provider should serve the model. Sent as the
+# `provider` object of every OpenRouter request body, compaction included.
+[providers.openrouter.routing]
+order = ["anthropic", "google-vertex"]
+allow_fallbacks = false
 ```
+
+`routing` must set at least one of `order` or `allow_fallbacks`, its slugs must
+be non-empty and distinct, and `allow_fallbacks = false` requires a non-empty
+`order`. Omitting `allow_fallbacks` defers to OpenRouter's default, which lets
+it route outside `order`. Configuring `routing` for any other provider fails
+validation.
 
 Each provider also accepts an optional `headers` sub-table. Entries override
 the provider's default or hardcoded HTTP headers (`Authorization`, `x-api-key`,

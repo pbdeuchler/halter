@@ -262,6 +262,8 @@ fn config(resilience_policy: ResiliencePolicy) -> ResponsesProviderConfig {
         compact_strategy: Some(CompactStrategy::DedicatedEndpoint),
         rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
         resilience_policy,
+        // Upstream routing is an OpenRouter concept; OpenAI serves its own models.
+        routing: None,
     }
 }
 

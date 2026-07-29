@@ -5,9 +5,9 @@ use futures::{
     stream::{self, BoxStream},
 };
 use halter_protocol::{
-    ApiKind, CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderCompactionStrategy, ProviderError, ProviderErrorKind,
-    ProviderRequest, StreamEvent,
+    ApiKind, CompactionWindow, Message, OpenRouterRouting, ProviderCapabilities,
+    ProviderCompactionRequest, ProviderCompactionResponse, ProviderCompactionStrategy,
+    ProviderError, ProviderErrorKind, ProviderRequest, StreamEvent,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -47,6 +47,10 @@ pub(crate) struct ResponsesProviderConfig {
     /// Resilience policy used by the outer provider decorator and the raw
     /// transport's HTTP client.
     pub resilience_policy: ResiliencePolicy,
+    /// OpenRouter upstream routing preference sent as the `provider` object of
+    /// every stream and compaction request. `None` for provider families that
+    /// have no such concept.
+    pub routing: Option<OpenRouterRouting>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +140,7 @@ impl ResponsesProvider {
                 reasoning_summary: self.config.request.reasoning_summary,
                 instruction_mode: self.config.request.instruction_mode,
                 temperature: self.temperature,
+                routing: self.config.routing.as_ref(),
             },
         ) {
             Ok(request_body) => request_body,
@@ -252,7 +257,8 @@ impl ResponsesProvider {
         request: &ProviderCompactionRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<ProviderCompactionResponse> {
-        let request_body = openai_codec::encode_openrouter_compact_request(request)?;
+        let request_body =
+            openai_codec::encode_openrouter_compact_request(request, self.config.routing.as_ref())?;
         let request_bytes = request_body.to_string().len();
         let response = self
             .transport
@@ -400,6 +406,7 @@ mod tests {
             compact_strategy: None,
             rate_limit_strategy: None,
             resilience_policy: policy,
+            routing: None,
         }
     }
 
@@ -502,6 +509,7 @@ mod tests {
                 compact_strategy: None,
                 rate_limit_strategy: None,
                 resilience_policy: ResiliencePolicy::default(),
+                routing: None,
             },
             "test-key",
             "http://127.0.0.1:1",
@@ -660,6 +668,7 @@ mod tests {
                     compact_strategy: None,
                     rate_limit_strategy: None,
                     resilience_policy: policy,
+                    routing: None,
                 },
                 "test-key",
                 base_url,
