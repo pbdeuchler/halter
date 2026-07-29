@@ -8,9 +8,9 @@ use async_openai::types::responses::{
     ResponseStreamEvent, SummaryPart,
 };
 use halter_protocol::{
-    ApiKind, AssistantPart, BlockId, Message, MessageId, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderRequest, ReasoningEffort, StopReason, StreamEvent, Usage,
-    UserPart,
+    ApiKind, AssistantPart, BlockId, Message, MessageId, OpenRouterRouting,
+    ProviderCompactionRequest, ProviderCompactionResponse, ProviderRequest, ReasoningEffort,
+    StopReason, StreamEvent, Usage, UserPart,
 };
 use serde_json::{Map, Value, json};
 use tracing::warn;
@@ -49,6 +49,9 @@ pub(crate) struct ResponsesRequestOptions<'a> {
     pub instruction_mode: ResponsesInstructionMode,
     /// Sampling temperature forwarded to the Responses API when configured.
     pub temperature: Option<f32>,
+    /// OpenRouter upstream routing preference forwarded as the `provider`
+    /// object when configured.
+    pub routing: Option<&'a OpenRouterRouting>,
 }
 
 pub(crate) fn encode_responses_request(
@@ -112,6 +115,9 @@ pub(crate) fn encode_responses_request(
     if let Some(temperature) = options.temperature {
         body.insert("temperature".to_owned(), json!(temperature));
     }
+    if let Some(routing) = options.routing {
+        body.insert("provider".to_owned(), encode_openrouter_routing(routing)?);
+    }
 
     if let Some(max_output_tokens) = request.model.max_output_tokens {
         body.insert("max_output_tokens".to_owned(), json!(max_output_tokens));
@@ -161,6 +167,7 @@ pub(crate) fn encode_responses_compact_request(
 
 pub(crate) fn encode_openrouter_compact_request(
     request: &ProviderCompactionRequest,
+    routing: Option<&OpenRouterRouting>,
 ) -> anyhow::Result<Value> {
     if request.model.api_kind != ApiKind::OpenAiResponses {
         anyhow::bail!("failed to encode openrouter compaction request: unsupported api kind");
@@ -168,13 +175,25 @@ pub(crate) fn encode_openrouter_compact_request(
 
     let input = encode_responses_compact_input(request)?;
     validate_responses_input_item_ids(&input)?;
-    Ok(json!({
+    let mut body = json!({
         "model": request.model.model.clone(),
         "input": input,
         "instructions": request.instructions.clone(),
         "stream": false,
         "store": false,
-    }))
+    });
+    if let Some(routing) = routing {
+        body["provider"] = encode_openrouter_routing(routing)?;
+    }
+    Ok(body)
+}
+
+/// Render an upstream routing preference as OpenRouter's `provider` request
+/// object. The preference's serde form is that object, so this is a
+/// re-serialization rather than a second encoding of the same shape.
+fn encode_openrouter_routing(routing: &OpenRouterRouting) -> anyhow::Result<Value> {
+    serde_json::to_value(routing)
+        .context("failed to encode openrouter request: unserializable provider routing")
 }
 
 pub(crate) fn decode_responses_compact_response(
@@ -1725,6 +1744,7 @@ mod tests {
                 reasoning_summary: Some("auto"),
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: Some(0.5),
+                routing: None,
             },
         )
         .expect("encode request");
@@ -1779,6 +1799,7 @@ mod tests {
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::TopLevelRequired,
                 temperature: None,
+                routing: None,
             },
         )
         .expect("encode request");
@@ -1811,6 +1832,7 @@ mod tests {
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::TopLevelRequired,
                 temperature: None,
+                routing: None,
             },
         )
         .expect("encode chained request");
@@ -1842,6 +1864,7 @@ mod tests {
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::TopLevelRequired,
                 temperature: None,
+                routing: None,
             },
         )
         .expect_err("top-level instructions should require system text");
@@ -1871,6 +1894,7 @@ mod tests {
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
+                routing: None,
             },
         )
         .expect("encode request");
@@ -1900,6 +1924,7 @@ mod tests {
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
+                routing: None,
             },
         )
         .expect_err("invalid chained start should fail");
@@ -1920,6 +1945,7 @@ mod tests {
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
+                routing: None,
             },
         )
         .expect("encode request");
@@ -2012,13 +2038,15 @@ mod tests {
     #[test]
     fn openrouter_compaction_request_uses_responses_shape() {
         let request = sample_compaction_request(ProviderKind::OpenRouter);
-        let body = encode_openrouter_compact_request(&request).expect("encode compaction request");
+        let body =
+            encode_openrouter_compact_request(&request, None).expect("encode compaction request");
         let input = body["input"].as_array().expect("input");
 
         assert_eq!(body["model"], "gpt-5");
         assert_eq!(body["instructions"], "Summarize the session");
         assert_eq!(body["stream"], false);
         assert_eq!(body["store"], false);
+        assert!(body.get("provider").is_none());
         assert!(input.iter().any(|item| item["role"] == "developer"));
         assert!(input.iter().any(|item| item["role"] == "user"));
         assert!(input.iter().any(|item| item["type"] == "function_call"));
@@ -2027,6 +2055,72 @@ mod tests {
                 .iter()
                 .any(|item| item["type"] == "function_call_output")
         );
+    }
+
+    /// Compaction is a real OpenRouter completion, so a pinned upstream
+    /// provider must apply to it as well as to turn streaming — otherwise a
+    /// session pinned to one upstream silently summarizes on another.
+    #[test]
+    fn openrouter_requests_carry_configured_upstream_routing() {
+        let routing = OpenRouterRouting {
+            order: vec!["anthropic".to_owned(), "google-vertex".to_owned()],
+            allow_fallbacks: Some(false),
+        };
+        let expected = json!({
+            "order": ["anthropic", "google-vertex"],
+            "allow_fallbacks": false,
+        });
+
+        let stream_body = encode_responses_request(
+            &sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter),
+            ResponsesRequestOptions {
+                stream: true,
+                store: Some(false),
+                prompt_cache_key: None,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
+                temperature: None,
+                routing: Some(&routing),
+            },
+        )
+        .expect("encode request");
+        assert_eq!(stream_body["provider"], expected);
+
+        let compact_body = encode_openrouter_compact_request(
+            &sample_compaction_request(ProviderKind::OpenRouter),
+            Some(&routing),
+        )
+        .expect("encode compaction request");
+        assert_eq!(compact_body["provider"], expected);
+    }
+
+    /// An order-only preference must leave `allow_fallbacks` absent rather
+    /// than sending `null`: OpenRouter treats the two differently.
+    #[test]
+    fn openrouter_routing_without_fallback_choice_omits_the_key() {
+        let routing = OpenRouterRouting {
+            order: vec!["anthropic".to_owned()],
+            allow_fallbacks: None,
+        };
+
+        let body = encode_responses_request(
+            &sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter),
+            ResponsesRequestOptions {
+                stream: true,
+                store: Some(false),
+                prompt_cache_key: None,
+                include_encrypted_reasoning: false,
+                reasoning_summary: None,
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
+                temperature: None,
+                routing: Some(&routing),
+            },
+        )
+        .expect("encode request");
+
+        assert_eq!(body["provider"], json!({"order": ["anthropic"]}));
+        assert!(body["provider"].get("allow_fallbacks").is_none());
     }
 
     #[test]
@@ -2146,6 +2240,7 @@ mod tests {
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
+                routing: None,
             },
         )
         .expect("encode request");

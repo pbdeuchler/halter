@@ -10,6 +10,17 @@ once a `1.0.0` line is cut.
 
 ### Added
 
+- `[providers.openrouter.routing]` pins which upstream provider OpenRouter
+  routes to. `order` lists OpenRouter provider slugs most-preferred first and
+  `allow_fallbacks = false` turns that list into an exact allowlist. The
+  preference is sent as the `provider` object of every OpenRouter request body,
+  streaming turns and compaction alike. SDK callers pass the same
+  `halter_protocol::OpenRouterRouting` to
+  `OpenRouterProvider::new_with_headers(...)`.
+  `OpenRouterRouting::normalized` is the single door for the invariant — it
+  trims slugs and rejects an empty order, blank slugs, and repeated slugs —
+  and both the config resolver and the provider constructors apply it, so a
+  value handed straight to the SDK cannot reach a request body unchecked.
 - `policy.shell.allow = ["*"]` allows every program, mirroring the wildcard
   `policy.network.allowed_hosts` already accepts. Deployments that want
   arbitrary shell execution no longer have to allowlist `bash` and route every
@@ -23,6 +34,13 @@ once a `1.0.0` line is cut.
   sensitive patterns keep the built-in globs; an explicit list replaces them
   and an empty list disables the check. `mode` is `"strict"` (default) or
   `"relaxed"`.
+
+### Changed
+
+- **Breaking:** `OpenRouterProvider::new_with_headers` and
+  `OpenRouterProvider::new_with_headers_and_resilience` take an additional
+  `Option<OpenRouterRouting>` argument after `temperature`. Pass `None` for the
+  previous behavior. `OpenRouterProvider::new` is unchanged.
 
 ## [0.5.0] - 2026-07-27
 

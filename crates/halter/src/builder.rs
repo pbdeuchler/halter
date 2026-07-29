@@ -959,6 +959,7 @@ fn build_provider(
                 provider.base_url.clone(),
                 &provider.headers,
                 provider.temperature,
+                provider.routing.clone(),
                 resilience_policy,
                 classifier,
             )?)

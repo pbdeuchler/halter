@@ -275,6 +275,76 @@ pub enum ApiKind {
     Fake,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+/// Preference for which upstream provider OpenRouter routes a request to.
+///
+/// OpenRouter serves most models from several upstream providers and picks one
+/// per request. This type is the `provider` object of an OpenRouter request
+/// body verbatim: its serde form *is* the wire form, so the same value
+/// configures a provider and is sent on every request it makes.
+pub struct OpenRouterRouting {
+    /// Upstream provider slugs to try, most preferred first (for example
+    /// `"anthropic"`, `"openai"`, `"google-vertex"`). Slugs are OpenRouter's,
+    /// not Halter's provider names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    /// Whether OpenRouter may fall back to an upstream provider outside
+    /// [`Self::order`]. `None` defers to OpenRouter's own default (`true`);
+    /// `Some(false)` makes [`Self::order`] an exact allowlist and fails the
+    /// request when none of its providers can serve the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_fallbacks: Option<bool>,
+}
+
+impl OpenRouterRouting {
+    /// Trim the slugs and reject the preferences that would silently do
+    /// nothing or name an upstream OpenRouter cannot match.
+    ///
+    /// This is the single door for the routing invariant: `halter-config`
+    /// applies it while resolving `[providers.openrouter.routing]` and
+    /// `OpenRouterProvider`'s constructors apply it to values supplied
+    /// directly, so nothing unchecked reaches a request body.
+    pub fn normalized(&self) -> Result<Self, InvalidOpenRouterRouting> {
+        let mut order = Vec::with_capacity(self.order.len());
+        for slug in &self.order {
+            let slug = slug.trim();
+            if slug.is_empty() {
+                return Err(InvalidOpenRouterRouting::EmptySlug);
+            }
+            if order.iter().any(|seen: &String| seen == slug) {
+                return Err(InvalidOpenRouterRouting::DuplicateSlug(slug.to_owned()));
+            }
+            order.push(slug.to_owned());
+        }
+
+        // `allow_fallbacks` alone cannot express a preference: `true` is
+        // already OpenRouter's default and `false` would permit nothing. So
+        // the whole invariant reduces to a non-empty order of distinct slugs.
+        if order.is_empty() {
+            return Err(InvalidOpenRouterRouting::EmptyOrder);
+        }
+        Ok(Self {
+            order,
+            allow_fallbacks: self.allow_fallbacks,
+        })
+    }
+}
+
+/// Why an [`OpenRouterRouting`] preference cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidOpenRouterRouting {
+    /// Routing to nothing is not a preference; omit it instead.
+    #[error("order must name at least one upstream provider")]
+    EmptyOrder,
+    /// A blank slug matches no upstream provider.
+    #[error("order entries must not be empty")]
+    EmptySlug,
+    /// A repeated slug states the same preference twice.
+    #[error("order lists '{0}' more than once")]
+    DuplicateSlug(String),
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 /// Provider reasoning budget requested for a model.
@@ -1978,6 +2048,124 @@ mod tests {
             .expect_err("unknown reasoning effort should fail");
 
         assert!(error.to_string().contains("unknown variant `non`"));
+    }
+
+    /// The serde form is the OpenRouter `provider` object, so unset fields
+    /// must disappear rather than serialize as `[]`/`null` — OpenRouter reads
+    /// an explicit `allow_fallbacks: null` differently from an absent key.
+    #[test]
+    fn openrouter_routing_wire_form_matches_openrouter_provider_object() {
+        let cases = [
+            (OpenRouterRouting::default(), serde_json::json!({})),
+            (
+                OpenRouterRouting {
+                    order: vec!["anthropic".to_owned(), "google-vertex".to_owned()],
+                    allow_fallbacks: None,
+                },
+                serde_json::json!({"order": ["anthropic", "google-vertex"]}),
+            ),
+            (
+                OpenRouterRouting {
+                    order: vec!["anthropic".to_owned()],
+                    allow_fallbacks: Some(false),
+                },
+                serde_json::json!({"order": ["anthropic"], "allow_fallbacks": false}),
+            ),
+            (
+                OpenRouterRouting {
+                    order: Vec::new(),
+                    allow_fallbacks: Some(true),
+                },
+                serde_json::json!({"allow_fallbacks": true}),
+            ),
+        ];
+
+        for (routing, wire_value) in cases {
+            let encoded = serde_json::to_value(&routing).expect("serialize routing");
+            assert_eq!(encoded, wire_value);
+
+            let decoded: OpenRouterRouting =
+                serde_json::from_value(encoded).expect("deserialize routing");
+            assert_eq!(decoded, routing);
+        }
+    }
+
+    #[test]
+    fn openrouter_routing_rejects_unknown_fields() {
+        let error = serde_json::from_str::<OpenRouterRouting>(r#"{"sort":"price"}"#)
+            .expect_err("unknown routing field should fail");
+        assert!(error.to_string().contains("unknown field `sort`"));
+    }
+
+    /// `normalized` is the single door for the routing invariant, so it must
+    /// cover every rejected form as well as the trimming every caller relies
+    /// on. `allow_fallbacks` alone is rejected because `true` is already
+    /// OpenRouter's default and `false` would permit nothing.
+    #[test]
+    fn openrouter_routing_normalization_trims_and_rejects_unusable_forms() {
+        type NormalizationCase = (
+            Vec<&'static str>,
+            Option<bool>,
+            Result<Vec<&'static str>, InvalidOpenRouterRouting>,
+        );
+        let cases: [NormalizationCase; 7] = [
+            (vec!["anthropic"], None, Ok(vec!["anthropic"])),
+            (
+                vec![" anthropic ", "google-vertex"],
+                Some(false),
+                Ok(vec!["anthropic", "google-vertex"]),
+            ),
+            (Vec::new(), None, Err(InvalidOpenRouterRouting::EmptyOrder)),
+            (
+                Vec::new(),
+                Some(true),
+                Err(InvalidOpenRouterRouting::EmptyOrder),
+            ),
+            (
+                Vec::new(),
+                Some(false),
+                Err(InvalidOpenRouterRouting::EmptyOrder),
+            ),
+            (
+                vec!["anthropic", "  "],
+                None,
+                Err(InvalidOpenRouterRouting::EmptySlug),
+            ),
+            (
+                vec!["anthropic", " anthropic"],
+                None,
+                Err(InvalidOpenRouterRouting::DuplicateSlug(
+                    "anthropic".to_owned(),
+                )),
+            ),
+        ];
+
+        for (order, allow_fallbacks, expected) in cases {
+            let routing = OpenRouterRouting {
+                order: order.iter().map(|slug| (*slug).to_owned()).collect(),
+                allow_fallbacks,
+            };
+            let expected = expected.map(|order| OpenRouterRouting {
+                order: order.iter().map(|slug| (*slug).to_owned()).collect(),
+                allow_fallbacks,
+            });
+
+            assert_eq!(routing.normalized(), expected, "order: {order:?}");
+        }
+    }
+
+    /// Normalizing an already-normal value must be a no-op, so repeated
+    /// application at successive layers cannot drift.
+    #[test]
+    fn openrouter_routing_normalization_is_idempotent() {
+        let once = OpenRouterRouting {
+            order: vec![" anthropic ".to_owned(), "openai".to_owned()],
+            allow_fallbacks: Some(false),
+        }
+        .normalized()
+        .expect("first normalization");
+
+        assert_eq!(once.normalized(), Ok(once.clone()));
     }
 
     #[test]

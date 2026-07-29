@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    ApiKind, CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
+    ApiKind, CompactionWindow, Message, OpenRouterRouting, ProviderCapabilities,
+    ProviderCompactionRequest, ProviderCompactionResponse, ProviderError, ProviderRequest,
+    StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -24,30 +26,41 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    /// Construct an OpenRouter provider with default headers and no temperature override.
+    /// Construct an OpenRouter provider with default headers, no temperature
+    /// override, and OpenRouter's own choice of upstream provider.
     pub fn new(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_headers(api_key, base_url, &[], None)
+        Self::new_with_headers(api_key, base_url, &[], None, None)
     }
 
     /// Construct an OpenRouter provider with user-configured HTTP header
     /// overrides. Overrides replace any default or hardcoded header
     /// (`Authorization`, `Content-Type`) case-insensitively. When
     /// `temperature` is `Some`, it is forwarded verbatim to every request
-    /// body; otherwise request bodies omit temperature.
+    /// body; otherwise request bodies omit temperature. When `routing` is
+    /// `Some`, it is sent as the `provider` object of every request body so
+    /// OpenRouter routes to the named upstream providers; otherwise
+    /// OpenRouter chooses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `routing` is unusable — see
+    /// [`OpenRouterRouting::normalized`]. Slugs are trimmed before use.
     pub fn new_with_headers(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
+        routing: Option<OpenRouterRouting>,
     ) -> anyhow::Result<Self> {
         Self::new_with_headers_and_resilience(
             api_key,
             base_url,
             header_overrides,
             temperature,
+            routing,
             ResiliencePolicy::default(),
             Arc::new(crate::DefaultProviderErrorClassifier),
         )
@@ -55,15 +68,28 @@ impl OpenRouterProvider {
 
     /// Same as [`OpenRouterProvider::new_with_headers`] with an explicit
     /// provider-request resilience policy and error classifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `routing` is unusable — see
+    /// [`OpenRouterRouting::normalized`]. Slugs are trimmed before use.
     pub fn new_with_headers_and_resilience(
         api_key: impl Into<SecretString>,
         base_url: impl Into<String>,
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
+        routing: Option<OpenRouterRouting>,
         resilience_policy: ResiliencePolicy,
         classifier: Arc<dyn ProviderErrorClassifier>,
     ) -> anyhow::Result<Self> {
-        let config = config(resilience_policy);
+        // The invariant is enforced here rather than trusted from the caller:
+        // `halter-config` is one entry path, but a value passed directly to
+        // this constructor would otherwise reach a request body unchecked.
+        let routing = routing
+            .map(|routing| routing.normalized())
+            .transpose()
+            .context("failed to construct openrouter provider: invalid provider routing")?;
+        let config = config(resilience_policy, routing);
         let policy = config.resilience_policy;
         Ok(Self {
             inner: ResilientProvider::new_with_classifier(
@@ -114,7 +140,10 @@ impl Provider for OpenRouterProvider {
     }
 }
 
-fn config(resilience_policy: ResiliencePolicy) -> ResponsesProviderConfig {
+fn config(
+    resilience_policy: ResiliencePolicy,
+    routing: Option<OpenRouterRouting>,
+) -> ResponsesProviderConfig {
     ResponsesProviderConfig {
         label: "openrouter",
         capabilities: ProviderCapabilities {
@@ -143,6 +172,7 @@ fn config(resilience_policy: ResiliencePolicy) -> ResponsesProviderConfig {
         compact_strategy: Some(CompactStrategy::InlineResponses),
         rate_limit_strategy: None,
         resilience_policy,
+        routing,
     }
 }
 
@@ -159,6 +189,8 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    use futures::StreamExt;
 
     use super::*;
     use crate::Provider;
@@ -239,6 +271,115 @@ mod tests {
         ));
         assert_eq!(window.eligible_messages.len(), 2);
         assert!(!window.reserved_response_block);
+    }
+
+    /// The constructors are a public entry path of their own, so they must
+    /// apply the same invariant `halter-config` does — a value passed
+    /// directly here would otherwise reach a request body unchecked. Accepted
+    /// values are trimmed, so what the provider holds is already canonical.
+    #[test]
+    fn openrouter_provider_construction_normalizes_and_rejects_routing() {
+        let rejected: [(Vec<&str>, Option<bool>, &str); 4] = [
+            (
+                Vec::new(),
+                None,
+                "order must name at least one upstream provider",
+            ),
+            (
+                Vec::new(),
+                Some(false),
+                "order must name at least one upstream provider",
+            ),
+            (
+                vec!["anthropic", " "],
+                None,
+                "order entries must not be empty",
+            ),
+            (
+                vec!["anthropic", "anthropic"],
+                None,
+                "order lists 'anthropic' more than once",
+            ),
+        ];
+
+        for (order, allow_fallbacks, expected) in rejected {
+            let error = OpenRouterProvider::new_with_headers(
+                "test-key",
+                "https://openrouter.ai/api",
+                &[],
+                None,
+                Some(OpenRouterRouting {
+                    order: order.iter().map(|slug| (*slug).to_owned()).collect(),
+                    allow_fallbacks,
+                }),
+            )
+            .expect_err("unusable routing must not build a provider");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("failed to construct openrouter provider")
+                    && message.contains(expected),
+                "order {order:?}: got '{message}'"
+            );
+        }
+
+        assert!(
+            OpenRouterProvider::new_with_headers(
+                "test-key",
+                "https://openrouter.ai/api",
+                &[],
+                None,
+                Some(OpenRouterRouting {
+                    order: vec![" anthropic ".to_owned()],
+                    allow_fallbacks: Some(false),
+                }),
+            )
+            .is_ok(),
+            "padded slugs are trimmed, not rejected"
+        );
+    }
+
+    /// The whole point of configuring routing is that it reaches the wire, so
+    /// assert on the bytes OpenRouter would receive rather than on provider
+    /// state. The padded slug proves normalization reaches the request body
+    /// and not just the constructor's return value. The unconfigured case must
+    /// leave the key off entirely: an empty `provider` object is not the same
+    /// request as no `provider` field.
+    #[tokio::test]
+    async fn openrouter_provider_sends_configured_routing_on_streaming_requests() {
+        let cases = [
+            (
+                Some(OpenRouterRouting {
+                    order: vec![" anthropic ".to_owned()],
+                    allow_fallbacks: Some(false),
+                }),
+                Some(json!({"order": ["anthropic"], "allow_fallbacks": false})),
+            ),
+            (None, None),
+        ];
+
+        for (routing, expected) in cases {
+            let captured = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+            let base_url = spawn_body_capture_server(captured.clone()).await;
+            let provider =
+                OpenRouterProvider::new_with_headers("test-key", base_url, &[], None, routing)
+                    .expect("openrouter provider");
+
+            let mut stream = provider
+                .stream(
+                    sample_request(ApiKind::OpenAiResponses),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("provider stream");
+            while stream.next().await.is_some() {}
+
+            let captured = captured.lock().await.clone();
+            let headers_end = find_headers_end(&captured).expect("headers end");
+            let body: Value =
+                serde_json::from_slice(&captured[headers_end + 4..]).expect("parse request body");
+
+            assert_eq!(body.get("provider").cloned(), expected);
+        }
     }
 
     #[tokio::test]
@@ -342,6 +483,50 @@ mod tests {
         );
 
         server.await.expect("server task");
+    }
+
+    /// Test fixture: HTTP/SSE server that records the first request verbatim
+    /// and answers with an immediately-completed response.
+    async fn spawn_body_capture_server(captured: Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept socket");
+            let buffer = read_http_request(&mut socket).await.expect("read request");
+            *captured.lock().await = buffer;
+
+            let completed = json!({
+                "type": "response.completed",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_routing",
+                    "created_at": 0,
+                    "model": "gpt-5",
+                    "object": "response",
+                    "output": [],
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 0,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": 0,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 0
+                    }
+                }
+            });
+            let body = format!("data: {completed}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        format!("http://{address}")
     }
 
     fn sample_request(api_kind: ApiKind) -> ProviderRequest {

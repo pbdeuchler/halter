@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use halter_protocol::{
-    ApiKind, PanelIsolation, ProviderKind, PruneSignalThreshold, ReasoningEffort,
-    SubagentEventForwarding,
+    ApiKind, OpenRouterRouting, PanelIsolation, ProviderKind, PruneSignalThreshold,
+    ReasoningEffort, SubagentEventForwarding,
 };
 use indexmap::IndexMap;
 use schemars::JsonSchema;
@@ -786,6 +786,10 @@ pub struct ProviderConfig {
     /// temperature is sent to the provider. Must be in `0.0..=2.0`.
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Which upstream provider OpenRouter should route to. Only accepted for
+    /// `[providers.openrouter]`. When unset, OpenRouter picks freely.
+    #[serde(default)]
+    pub routing: Option<OpenRouterRouting>,
     /// Partial override for the global `[resilience]` provider policy.
     #[serde(default)]
     pub resilience: Option<ResilienceOverrideConfig>,
@@ -834,6 +838,10 @@ pub struct ResolvedProviderConfig {
     /// Sampling temperature forwarded to every request this provider emits.
     /// When unset, request bodies omit temperature and defer to the provider.
     pub temperature: Option<f32>,
+    /// OpenRouter upstream routing preference forwarded as the `provider`
+    /// object of every request this provider emits. Always `None` for
+    /// providers other than OpenRouter.
+    pub routing: Option<OpenRouterRouting>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -914,12 +922,25 @@ where
 
     let temperature = configured.and_then(|config| config.temperature);
 
+    let routing = configured
+        .and_then(|config| config.routing.as_ref())
+        .map(|routing| {
+            if provider != ConfiguredProvider::OpenRouter {
+                anyhow::bail!(
+                    "invalid configuration: providers.{provider}.routing is only supported for providers.openrouter"
+                );
+            }
+            normalized_openrouter_routing(&format!("providers.{provider}.routing"), routing)
+        })
+        .transpose()?;
+
     Ok(ResolvedProviderConfig {
         provider,
         base_url,
         auth,
         headers,
         temperature,
+        routing,
     })
 }
 
@@ -969,6 +990,14 @@ fn validate_provider_config(name: &str, provider: &ProviderConfig) -> anyhow::Re
         &format!("providers.{name}.temperature"),
         provider.temperature,
     )?;
+    if let Some(routing) = &provider.routing {
+        if name != ConfiguredProvider::OpenRouter.as_str() {
+            anyhow::bail!(
+                "invalid configuration: providers.{name}.routing is only supported for providers.openrouter"
+            );
+        }
+        normalized_openrouter_routing(&format!("providers.{name}.routing"), routing)?;
+    }
     if let Some(resilience) = &provider.resilience {
         resilience.validate(&format!("providers.{name}.resilience"))?;
     }
@@ -1009,6 +1038,17 @@ fn validate_openai_oauth_config(path: &str, oauth: &OpenAiOAuthConfig) -> anyhow
     validate_required_string(&format!("{path}.id_token"), &oauth.id_token)?;
     validate_required_string(&format!("{path}.refresh_token"), &oauth.refresh_token)?;
     Ok(())
+}
+
+/// Apply the shared [`OpenRouterRouting`] invariant, naming the config key the
+/// bad value came from.
+fn normalized_openrouter_routing(
+    path: &str,
+    routing: &OpenRouterRouting,
+) -> anyhow::Result<OpenRouterRouting> {
+    routing
+        .normalized()
+        .map_err(|error| anyhow::anyhow!("invalid configuration: {path}: {error}"))
 }
 
 fn validate_optional_temperature(path: &str, value: Option<f32>) -> anyhow::Result<()> {
@@ -2331,6 +2371,117 @@ stream_idle_secs = 0
         .expect("resolve provider");
 
         assert_eq!(resolved.temperature, None);
+    }
+
+    #[test]
+    fn provider_resolution_trims_openrouter_routing() {
+        let resolved = resolve_provider_runtime_config(
+            ConfiguredProvider::OpenRouter,
+            Some(&ProviderConfig {
+                api_key: Some("configured-key".to_owned()),
+                routing: Some(OpenRouterRouting {
+                    order: vec![" anthropic ".to_owned(), "google-vertex".to_owned()],
+                    allow_fallbacks: Some(false),
+                }),
+                ..ProviderConfig::default()
+            }),
+            |_| Ok(None),
+        )
+        .expect("resolve provider");
+
+        assert_eq!(
+            resolved.routing,
+            Some(OpenRouterRouting {
+                order: vec!["anthropic".to_owned(), "google-vertex".to_owned()],
+                allow_fallbacks: Some(false),
+            })
+        );
+    }
+
+    #[test]
+    fn provider_resolution_leaves_routing_unset_when_unconfigured() {
+        let resolved = resolve_provider_runtime_config(
+            ConfiguredProvider::OpenRouter,
+            Some(&ProviderConfig {
+                api_key: Some("configured-key".to_owned()),
+                ..ProviderConfig::default()
+            }),
+            |_| Ok(None),
+        )
+        .expect("resolve provider");
+
+        assert_eq!(resolved.routing, None);
+    }
+
+    /// Every rejected routing form, at both doors: `validate_provider_config`
+    /// (whole-config load) and `resolve_provider_runtime_config` (the runtime
+    /// path a library caller can reach without loading a file). The messages
+    /// must name the offending config key, since the shared invariant itself
+    /// knows nothing about `[providers.*]`.
+    #[test]
+    fn openrouter_routing_rejects_unusable_forms_at_both_doors() {
+        let cases: [(ConfiguredProvider, OpenRouterRouting, &str); 5] = [
+            (
+                ConfiguredProvider::OpenAi,
+                OpenRouterRouting {
+                    order: vec!["anthropic".to_owned()],
+                    allow_fallbacks: None,
+                },
+                "providers.openai.routing is only supported for providers.openrouter",
+            ),
+            (
+                ConfiguredProvider::OpenRouter,
+                OpenRouterRouting::default(),
+                "providers.openrouter.routing: order must name at least one upstream provider",
+            ),
+            (
+                ConfiguredProvider::OpenRouter,
+                OpenRouterRouting {
+                    order: vec!["anthropic".to_owned(), "  ".to_owned()],
+                    allow_fallbacks: None,
+                },
+                "providers.openrouter.routing: order entries must not be empty",
+            ),
+            (
+                ConfiguredProvider::OpenRouter,
+                OpenRouterRouting {
+                    order: vec!["anthropic".to_owned(), " anthropic".to_owned()],
+                    allow_fallbacks: None,
+                },
+                "providers.openrouter.routing: order lists 'anthropic' more than once",
+            ),
+            (
+                ConfiguredProvider::OpenRouter,
+                OpenRouterRouting {
+                    order: Vec::new(),
+                    allow_fallbacks: Some(false),
+                },
+                "providers.openrouter.routing: order must name at least one upstream provider",
+            ),
+        ];
+
+        for (provider, routing, expected) in cases {
+            let config = ProviderConfig {
+                api_key: Some("configured-key".to_owned()),
+                routing: Some(routing),
+                ..ProviderConfig::default()
+            };
+
+            let validation_error = validate_provider_config(provider.as_str(), &config)
+                .expect_err("validation should fail");
+            assert!(
+                validation_error.to_string().contains(expected),
+                "validate_provider_config: expected '{expected}', got '{validation_error}'"
+            );
+
+            let resolution_error =
+                resolve_provider_runtime_config(provider, Some(&config), |_| Ok(None))
+                    .expect_err("resolution should fail");
+            assert!(
+                resolution_error.to_string().contains(expected),
+                "resolve_provider_runtime_config: expected '{expected}', got '{resolution_error}'"
+            );
+        }
     }
 
     #[test]

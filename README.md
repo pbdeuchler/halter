@@ -358,6 +358,28 @@ refresh_token = "..."
 
 Halter reads process environment variables. It does not parse `.env` files directly; if you use a `.env` file, load it into the process environment before starting the CLI or SDK process.
 
+OpenRouter serves most models from several upstream providers and picks one per
+request. `[providers.openrouter.routing]` states which upstream to prefer; it is
+sent as the `provider` object of every OpenRouter request body, including
+compaction requests:
+
+```toml
+[providers.openrouter.routing]
+# Most preferred upstream first. Slugs are OpenRouter's, not halter's.
+order = ["anthropic", "google-vertex"]
+# Omit to let OpenRouter fall back to any other upstream (its default).
+# Set false to make `order` an exact allowlist: the request fails instead of
+# routing elsewhere.
+allow_fallbacks = false
+```
+
+`routing` is only accepted for `[providers.openrouter]`. Its `order` must name
+at least one upstream provider and its slugs must be non-empty and distinct;
+slugs are trimmed. `allow_fallbacks` alone is not a preference, because `true`
+is already OpenRouter's default and `false` would permit nothing. The same
+rules apply to a value handed straight to `OpenRouterProvider`, so nothing
+unchecked reaches a request body.
+
 Provider request resilience is configured globally under `[resilience]` and can
 be partially overridden per provider. The same retry policy applies uniformly to
 Anthropic, OpenAI, and OpenRouter, and covers both streaming turns and
