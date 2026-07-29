@@ -165,11 +165,16 @@ order = ["anthropic", "google-vertex"]
 allow_fallbacks = false
 ```
 
-`routing` must set at least one of `order` or `allow_fallbacks`, its slugs must
-be non-empty and distinct, and `allow_fallbacks = false` requires a non-empty
-`order`. Omitting `allow_fallbacks` defers to OpenRouter's default, which lets
-it route outside `order`. Configuring `routing` for any other provider fails
-validation.
+`routing.order` must name at least one upstream provider and its slugs must be
+non-empty and distinct; slugs are trimmed. `allow_fallbacks` alone is not a
+preference, because `true` is already OpenRouter's default and `false` would
+permit nothing. Omitting `allow_fallbacks` defers to OpenRouter's default,
+which lets it route outside `order`. Configuring `routing` for any other
+provider fails validation.
+
+The rules themselves live on `halter_protocol::OpenRouterRouting::normalized`,
+which this crate applies while resolving the config and `OpenRouterProvider`
+applies to values supplied directly.
 
 Each provider also accepts an optional `headers` sub-table. Entries override
 the provider's default or hardcoded HTTP headers (`Authorization`, `x-api-key`,

@@ -373,9 +373,12 @@ order = ["anthropic", "google-vertex"]
 allow_fallbacks = false
 ```
 
-`routing` is only accepted for `[providers.openrouter]`. It must set at least
-one of `order` or `allow_fallbacks`, its slugs must be non-empty and distinct,
-and `allow_fallbacks = false` requires a non-empty `order`.
+`routing` is only accepted for `[providers.openrouter]`. Its `order` must name
+at least one upstream provider and its slugs must be non-empty and distinct;
+slugs are trimmed. `allow_fallbacks` alone is not a preference, because `true`
+is already OpenRouter's default and `false` would permit nothing. The same
+rules apply to a value handed straight to `OpenRouterProvider`, so nothing
+unchecked reaches a request body.
 
 Provider request resilience is configured globally under `[resilience]` and can
 be partially overridden per provider. The same retry policy applies uniformly to

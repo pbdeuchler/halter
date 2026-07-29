@@ -1040,37 +1040,15 @@ fn validate_openai_oauth_config(path: &str, oauth: &OpenAiOAuthConfig) -> anyhow
     Ok(())
 }
 
-/// Trim an OpenRouter routing preference and reject the forms that would
-/// silently do nothing or send a slug OpenRouter cannot match.
+/// Apply the shared [`OpenRouterRouting`] invariant, naming the config key the
+/// bad value came from.
 fn normalized_openrouter_routing(
     path: &str,
     routing: &OpenRouterRouting,
 ) -> anyhow::Result<OpenRouterRouting> {
-    let mut order = Vec::with_capacity(routing.order.len());
-    for slug in &routing.order {
-        let slug = slug.trim();
-        if slug.is_empty() {
-            anyhow::bail!("invalid configuration: {path}.order entries must not be empty");
-        }
-        if order.iter().any(|seen: &String| seen == slug) {
-            anyhow::bail!("invalid configuration: {path}.order lists '{slug}' more than once");
-        }
-        order.push(slug.to_owned());
-    }
-
-    let normalized = OpenRouterRouting {
-        order,
-        allow_fallbacks: routing.allow_fallbacks,
-    };
-    if normalized.is_empty() {
-        anyhow::bail!("invalid configuration: {path} must set order or allow_fallbacks");
-    }
-    if normalized.order.is_empty() && normalized.allow_fallbacks == Some(false) {
-        anyhow::bail!(
-            "invalid configuration: {path}.allow_fallbacks = false requires a non-empty order"
-        );
-    }
-    Ok(normalized)
+    routing
+        .normalized()
+        .map_err(|error| anyhow::anyhow!("invalid configuration: {path}: {error}"))
 }
 
 fn validate_optional_temperature(path: &str, value: Option<f32>) -> anyhow::Result<()> {
@@ -2437,7 +2415,9 @@ stream_idle_secs = 0
 
     /// Every rejected routing form, at both doors: `validate_provider_config`
     /// (whole-config load) and `resolve_provider_runtime_config` (the runtime
-    /// path a library caller can reach without loading a file).
+    /// path a library caller can reach without loading a file). The messages
+    /// must name the offending config key, since the shared invariant itself
+    /// knows nothing about `[providers.*]`.
     #[test]
     fn openrouter_routing_rejects_unusable_forms_at_both_doors() {
         let cases: [(ConfiguredProvider, OpenRouterRouting, &str); 5] = [
@@ -2452,7 +2432,7 @@ stream_idle_secs = 0
             (
                 ConfiguredProvider::OpenRouter,
                 OpenRouterRouting::default(),
-                "providers.openrouter.routing must set order or allow_fallbacks",
+                "providers.openrouter.routing: order must name at least one upstream provider",
             ),
             (
                 ConfiguredProvider::OpenRouter,
@@ -2460,7 +2440,7 @@ stream_idle_secs = 0
                     order: vec!["anthropic".to_owned(), "  ".to_owned()],
                     allow_fallbacks: None,
                 },
-                "providers.openrouter.routing.order entries must not be empty",
+                "providers.openrouter.routing: order entries must not be empty",
             ),
             (
                 ConfiguredProvider::OpenRouter,
@@ -2468,7 +2448,7 @@ stream_idle_secs = 0
                     order: vec!["anthropic".to_owned(), " anthropic".to_owned()],
                     allow_fallbacks: None,
                 },
-                "providers.openrouter.routing.order lists 'anthropic' more than once",
+                "providers.openrouter.routing: order lists 'anthropic' more than once",
             ),
             (
                 ConfiguredProvider::OpenRouter,
@@ -2476,7 +2456,7 @@ stream_idle_secs = 0
                     order: Vec::new(),
                     allow_fallbacks: Some(false),
                 },
-                "providers.openrouter.routing.allow_fallbacks = false requires a non-empty order",
+                "providers.openrouter.routing: order must name at least one upstream provider",
             ),
         ];
 

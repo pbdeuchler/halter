@@ -365,9 +365,11 @@ let provider = OpenRouterProvider::new_with_headers(
 )?;
 ```
 
+The constructor applies `OpenRouterRouting::normalized` before storing the
+value, so slugs are trimmed and a preference that names nothing, blanks a slug,
+or repeats one fails construction rather than reaching a request body.
 Config-driven use goes through `[providers.openrouter.routing]` in
-`halter-config`, which trims the slugs and rejects preferences that would do
-nothing.
+`halter-config`, which applies the same rules while resolving the config.
 
 ---
 

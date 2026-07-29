@@ -17,6 +17,10 @@ once a `1.0.0` line is cut.
   streaming turns and compaction alike. SDK callers pass the same
   `halter_protocol::OpenRouterRouting` to
   `OpenRouterProvider::new_with_headers(...)`.
+  `OpenRouterRouting::normalized` is the single door for the invariant — it
+  trims slugs and rejects an empty order, blank slugs, and repeated slugs —
+  and both the config resolver and the provider constructors apply it, so a
+  value handed straight to the SDK cannot reach a request body unchecked.
 - `policy.shell.allow = ["*"]` allows every program, mirroring the wildcard
   `policy.network.allowed_hosts` already accepts. Deployments that want
   arbitrary shell execution no longer have to allowlist `bash` and route every
