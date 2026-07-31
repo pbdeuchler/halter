@@ -668,7 +668,12 @@ impl SessionHandle {
             .await
     }
 
-    pub(crate) async fn submit_turn_with_cancel(
+    /// Submit a turn with cooperative cancellation.
+    ///
+    /// Cancelling `turn_cancel` stops provider requests and tool execution for
+    /// this turn. The returned stream still reports the resulting terminal
+    /// event when the caller continues draining it.
+    pub async fn submit_turn_with_cancel(
         &self,
         turn: Turn,
         turn_cancel: CancellationToken,
