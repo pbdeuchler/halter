@@ -5007,18 +5007,25 @@ mod tests {
     /// is never separated from its result.
     #[tokio::test]
     async fn tool_results_past_the_threshold_compact_at_the_next_boundary() {
+        const USER_PROMPT: &str = "write a note";
+
         let temp = tempfile::tempdir().expect("tempdir");
         let mut services = configured_services(Arc::new(CompactingToolLoopProvider), temp.path());
         register_builtin_tools(&services.tools, &[]);
-        // The tool-loop provider reports a 12-token context with every reply,
-        // which replaces the inferred count, so the threshold sits just above
-        // that: the user prompt alone stays under it and the tool result
-        // pushes past it.
+        // Keep the threshold just above this feature set's prompt/tool base:
+        // the user prompt and provider anchor stay below it, while the tool
+        // result pushes the ledger across it.
+        let user_tokens = halter_protocol::estimate_message_tokens(&Message::User(
+            halter_protocol::UserMessage::text(USER_PROMPT),
+        ));
+        let compaction_threshold = default_request_base_tokens(&services)
+            .saturating_add(user_tokens)
+            .saturating_add(1);
         install_context_settings(
             &mut services,
             ContextSettings {
-                compaction_threshold: 2_870,
-                ..tiny_context_settings(None)
+                compaction_threshold,
+                max_tokens: None,
             },
         );
         install_compaction(&mut services, Arc::new(crate::ProviderDefault));
@@ -5027,7 +5034,7 @@ mod tests {
         let session = new_session(&runtime, temp.path()).await;
 
         let events = session
-            .submit_turn(Turn::user("write a note"))
+            .submit_turn(Turn::user(USER_PROMPT))
             .await
             .expect("submit turn")
             .try_collect::<Vec<_>>()
@@ -5660,12 +5667,22 @@ mod tests {
         }
     }
 
+    /// Static prompt/tool tokens carried by a default test session before any
+    /// transcript messages have been appended.
+    fn default_request_base_tokens(services: &RuntimeServices) -> u64 {
+        halter_protocol::estimate_request_tokens(
+            &SessionInit::default().system_prompt_seed,
+            &services.tools.specs(),
+        )
+    }
+
     /// Settings under which a 6,000-character prompt crosses the threshold at
     /// the first boundary, before the scripted provider's terse replies, and
-    /// the resulting checkpoint stays under it.
-    fn model_summary_settings() -> ContextSettings {
+    /// the resulting checkpoint stays under it. Deriving the threshold from
+    /// the installed tool specs keeps that invariant stable across features.
+    fn model_summary_settings(services: &RuntimeServices) -> ContextSettings {
         ContextSettings {
-            compaction_threshold: 3_000,
+            compaction_threshold: default_request_base_tokens(services).saturating_add(1_000),
             max_tokens: None,
         }
     }
@@ -6143,7 +6160,8 @@ mod tests {
         ));
         let mut services = configured_services(provider, temp.path());
         install_compaction(&mut services, Arc::new(crate::ProviderDefault));
-        install_context_settings(&mut services, model_summary_settings());
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
         let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
 
         let events = session
@@ -6228,7 +6246,8 @@ mod tests {
         ));
         let mut services = configured_services(provider.clone(), temp.path());
         register_builtin_tools(&services.tools, &[]);
-        install_context_settings(&mut services, model_summary_settings());
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
         let runtime = SessionRuntime::new(services.clone());
         let session = new_session(&runtime, temp.path()).await;
 
@@ -6341,7 +6360,8 @@ mod tests {
             "SUMMARY",
         ));
         let mut services = configured_services(provider.clone(), temp.path());
-        install_context_settings(&mut services, model_summary_settings());
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
         let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
 
         let events = session
@@ -6395,7 +6415,8 @@ mod tests {
         ));
         let mut services = configured_services(provider.clone(), temp.path());
         register_builtin_tools(&services.tools, &[]);
-        install_context_settings(&mut services, model_summary_settings());
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
         let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
 
         let events = session
@@ -6437,7 +6458,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let provider = Arc::new(CheckpointScriptProvider::new(NudgeReply::TextOnly, ""));
         let mut services = configured_services(provider.clone(), temp.path());
-        install_context_settings(&mut services, model_summary_settings());
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
         let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
 
         let events = session
@@ -6506,7 +6528,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut services = configured_services(Arc::new(FailingCheckpointProvider), temp.path());
         register_builtin_tools(&services.tools, &[]);
-        install_context_settings(&mut services, model_summary_settings());
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
         let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
 
         let events = session
