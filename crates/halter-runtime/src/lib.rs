@@ -7,6 +7,7 @@
 // pattern: Functional Core
 
 mod compaction;
+mod compaction_strategy;
 mod context;
 mod event_bus;
 mod hooks_runtime;
@@ -21,11 +22,15 @@ mod trace_format;
 mod trace_recorder;
 mod turn_registry;
 
-pub use compaction::{ContextSettings, score_message};
+pub use compaction::{ContextCapExceeded, ContextSettings, score_message};
+pub use compaction_strategy::{
+    CompactionContext, CompactionStrategy, CompactionTrigger, ProviderCompaction,
+};
 pub use context::{
-    CompactionEffects, CompactionOutcome, ContextManager, DefaultContextManager,
+    CompactionEffects, ContextManager, DefaultContextManager, prompt_segments,
     resolve_response_chain,
 };
+
 pub use event_bus::EventBus;
 pub use halter_protocol::SubagentEventForwarding;
 pub use hooks_runtime::{

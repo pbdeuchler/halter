@@ -30,7 +30,12 @@ bespoke `sys/windows` layer is gone).
 - `[lints.clippy]`: `cargo_common_metadata = "allow"` (the lint trips on
   halter's sibling workspace packages) and `unwrap_used = "allow"` (upstream's
   own unit tests use `unwrap` and upstream does not run clippy with
-  `--all-targets`; halter's CI does).
+  `--all-targets`; halter's CI does). `brush-builtins` additionally sets
+  `unused_async_trait_impl = "allow"`: clippy 1.98 added that pedantic lint,
+  and upstream's builtins implement the async `Execute` trait without
+  awaiting. Both crates already allow `unknown_lints`, so older toolchains
+  accept the entry.
+
 
 ### `brush-core-vendored/src` (cancellation plumbing)
 

@@ -1107,8 +1107,9 @@ fn default_factory_config() -> HarnessConfig {
             },
         },
         context: ContextConfig {
-            compaction_threshold: DEFAULT_SESSION_COMPACTION_THRESHOLD,
-            pre_compaction_target: DEFAULT_SESSION_PRE_COMPACTION_TARGET,
+            compaction_threshold: Some(DEFAULT_SESSION_COMPACTION_THRESHOLD),
+            pre_compaction_target: Some(DEFAULT_SESSION_PRE_COMPACTION_TARGET),
+            max_tokens: None,
             prune_signal_threshold: PruneSignalThreshold::Low,
         },
         tools: ToolsConfig {
@@ -1534,8 +1535,8 @@ async fn build_default_harness(
     );
     let mut config = config.clone();
     add_worktree_policy(&mut config, worktree);
-    config.context.compaction_threshold = DEFAULT_SESSION_COMPACTION_THRESHOLD;
-    config.context.pre_compaction_target = DEFAULT_SESSION_PRE_COMPACTION_TARGET;
+    config.context.compaction_threshold = Some(DEFAULT_SESSION_COMPACTION_THRESHOLD);
+    config.context.pre_compaction_target = Some(DEFAULT_SESSION_PRE_COMPACTION_TARGET);
     let model = model.into_model_config(
         ReasoningEffort::Xhigh,
         Some(DEFAULT_SESSION_COMPACTION_THRESHOLD as u32),
@@ -4109,8 +4110,9 @@ mod tests {
         assert!(config.policy.network.enabled);
         assert_eq!(
             config.context.compaction_threshold,
-            DEFAULT_SESSION_COMPACTION_THRESHOLD
+            Some(DEFAULT_SESSION_COMPACTION_THRESHOLD)
         );
+
         let expected_default_model = ModelSpec::parse(DEFAULT_MODEL_SPEC)
             .expect("valid default model")
             .model;

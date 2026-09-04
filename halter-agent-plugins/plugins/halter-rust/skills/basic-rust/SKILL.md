@@ -79,6 +79,7 @@ version = 1
 provider = "openai"
 model = "gpt-5"
 reasoning = "medium"
+max_input_tokens = 200_000
 
 [models.subagent]
 provider = "openai"
@@ -132,6 +133,7 @@ exclusive. Halter does not parse `.env` files.
 - `reasoning` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
   and `max`.
 - `tokens_per_minute` defaults to `500_000`; use it for proactive rate limiting.
+- `context.compaction_threshold` defaults to `models.default.max_input_tokens - 20_000`. Set one of the two, or config loading and `build()` fail. `context.pre_compaction_target` defaults to three quarters of the threshold and `context.max_tokens` (default `max_input_tokens`) hard-caps the session context: a turn past it fails with `ContextCapExceeded` instead of reaching the provider.
 - `providers.<name>.base_url`, `api_key`, `headers`, and `temperature` are provider-level, not role-level. OpenAI also accepts provider-level `oauth`.
 - Environment overrides include `HALTER_TOOLS_ENABLED`, `HALTER_SKILL_ROOTS`, `HALTER_PLUGIN_ROOTS`, `HALTER_POLICY_SHELL_ALLOW`, `HALTER_POLICY_SHELL_ENABLED`, `HALTER_POLICY_NETWORK_ENABLED`, `HALTER_POLICY_ALLOWED_HOSTS`, and `HALTER_SESSION_BACKEND`.
 - Resource-root paths expand leading `~/` only. `$VAR`, `${VAR}`, `~user`, and shell escapes are not expanded.
@@ -253,6 +255,7 @@ Builder rules:
 - Use `with_compiled_resources(...)` when hooks and hook warnings should survive compilation.
 - Use `with_session_store(...)` to replace the configured built-in backend.
 - Use `with_plugin_hook(...)` or `with_plugin_hook_priority(...)` for in-process SDK hooks.
+- Use `with_compaction(Arc<dyn CompactionStrategy>)` to replace the provider-delegated compaction strategy. The runtime still decides *when* from the session token ledger; the strategy decides what the rewrite is and may contribute tools, prompt segments, and threshold reminders. Never enable a provider's server-side auto-compaction.
 
 ## Custom tools
 
@@ -414,6 +417,9 @@ Run the narrowest meaningful command first. Broaden to the workspace when a chan
 - Unknown subagent model: pass `default`, `small`, or `subagent`, not an upstream model string.
 - SQLite config rejected: enable the `sqlite` feature and set `sessions.backend = "sqlite"`.
 - Commit conflict: serialize writes to a session or reload state before retrying.
+- Missing compaction threshold: set `max_input_tokens` on `models.default` or `context.compaction_threshold`.
+- `ContextCapExceeded` turn failure: the context passed `context.max_tokens` and compaction could not shrink it; raise the cap, lower the threshold, or install a strategy that compacts more.
+
 
 ## Workspace engineering guidance
 

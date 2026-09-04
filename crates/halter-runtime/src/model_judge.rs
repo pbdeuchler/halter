@@ -311,7 +311,10 @@ fn panel_services(
         policy: parent.policy.clone(),
         prompt_assembler: parent.prompt_assembler.clone(),
         context_manager: parent.context_manager.clone(),
+        context: parent.context,
+        compaction: parent.compaction.clone(),
         event_bus: parent.event_bus.clone(),
+
         parent_streams: Arc::new(ParentStreamRegistry::default()),
         turn_registry: Arc::new(TurnRegistry::new()),
         subagent_event_forwarding: SubagentEventForwarding::Off,

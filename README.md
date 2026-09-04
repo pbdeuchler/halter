@@ -534,8 +534,12 @@ enabled = [
 ]
 
 [context]
+# All optional. Unset, compaction_threshold is models.default.max_input_tokens
+# minus 20_000, pre_compaction_target is three quarters of the threshold, and
+# max_tokens (a hard cap that fails the turn) is max_input_tokens itself.
 compaction_threshold = 200_000
 pre_compaction_target = 150_000
+# max_tokens = 260_000
 prune_signal_threshold = "low"
 
 [policy]
@@ -749,8 +753,9 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
             ..PromptsConfig::default()
         },
         context: ContextConfig {
-            compaction_threshold: 200_000,
-            pre_compaction_target: 150_000,
+            compaction_threshold: Some(200_000),
+            pre_compaction_target: Some(150_000),
+            max_tokens: None,
             prune_signal_threshold: PruneSignalThreshold::Low,
         },
         tools: ToolsConfig {
@@ -1013,7 +1018,71 @@ The public session handle is `SessionHandle`; `HalterSession` remains a backward
 > [!NOTE]
 > halter implements its own compaction strategy. This can be less token efficient than managed compaction from inference providers or frontier harnesses. The goal is a higher-quality context window, which can reduce overall token use throughout the turn and gives halter a consistent baseline across providers and models.
 
+#### Compaction
+
+The runtime decides *when* to compact; a compaction strategy decides *what
+happens*.
+
+- Every session keeps a **token ledger** (`SessionState::token_ledger`): the
+  context size the provider reported with the last completed assistant
+  response, plus a heuristic estimate of every message appended since. A new
+  report replaces the anchor and zeroes the estimate; compaction re-estimates
+  the compacted state. Nothing scans the transcript at plan time.
+- Compaction has two trigger points, both Halter-side: immediately after an
+  assistant response that requested no tools, and before every provider
+  request once the appends since the last one (user message, tool results,
+  hook messages) have landed. A tool call is never separated from its result.
+  **Server-side auto-compaction is never used**; a strategy must not enable a
+  provider's own.
+- `context.compaction_threshold` defaults to `models.default.max_input_tokens`
+  minus 20,000; one of the two must be set or loading the config and building
+  the harness fail. `context.pre_compaction_target` defaults to three quarters
+  of the threshold. `context.max_tokens` (default `max_input_tokens`) is a hard
+  cap checked before each provider request, after compaction has had its
+  chance: a turn that would exceed it fails with
+  `halter::compaction::ContextCapExceeded` instead of blowing the provider
+  window.
+- Automatic compaction is best-effort: a strategy that cannot run degrades the
+  turn to an uncompacted context with a `Warning` event. `session.compact(..)`
+  propagates failures. `PreCompact`/`PostCompact` hooks fire on both paths,
+  with trigger `auto` for the automatic one.
+- The default strategy (`ProviderCompaction`) prunes low-signal history and
+  delegates to the provider's native compaction endpoint. Install your own
+  with `HalterBuilder::with_compaction(...)`; a strategy may also contribute
+  tools, system-prompt segments, and reminders as the context fills.
+
+```rust
+use std::sync::Arc;
+
+use halter::HalterBuilder;
+use halter::compaction::{CompactionContext, CompactionEffects, CompactionStrategy};
+
+struct KeepEverything;
+
+#[async_trait::async_trait]
+impl CompactionStrategy for KeepEverything {
+    async fn compact(
+        &self,
+        ctx: CompactionContext<'_>,
+    ) -> anyhow::Result<Option<CompactionEffects>> {
+        // `ctx.state` (messages, `token_ledger`), `ctx.prompt_segments`,
+        // `ctx.tool_specs`, `ctx.model`, and `ctx.provider` are all readable.
+        // `Ok(None)` means there was nothing to compact.
+        let _ = ctx;
+        Ok(None)
+    }
+}
+
+let harness = HalterBuilder::new()
+    .with_config(config)
+    .with_compiled_resources(resources)
+    .with_compaction(Arc::new(KeepEverything))
+    .build()
+    .await?;
+```
+
 ---
+
 
 ## Security model
 

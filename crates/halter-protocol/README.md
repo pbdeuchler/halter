@@ -143,14 +143,23 @@ That lets downstream consumers stay provider-agnostic.
 
 The event log is state-complete for a session's domain fields: the `fold`
 module (`halter_protocol::fold`) applies committed events onto a
-`SessionState`, reproducing `messages`, `compacted_prefix`, and
-`usage_so_far` from the log alone. `fold::apply_event` is the single
+`SessionState`, reproducing `messages`, `compacted_prefix`, `usage_so_far`,
+and `token_ledger` from the log alone. `fold::apply_event` is the single
 transition function, `fold::fold_events` replays a slice, and
 `fold::covered_state_matches` is the conformance predicate the store suite
 uses to verify a checkpoint against its log. `ContextCompacted` events carry
 optional `CompactionEventEffects` (the post-compaction message window and
 provider-native prefix) so compaction — the one operation that rewrites
-history — is reproducible from the log too.
+history — is reproducible from the log too; the runtime applies compaction
+through `fold::apply_event` itself, so the two cannot drift.
+
+`SessionState::append` is the single door for transcript growth: it pushes
+the message and advances the `TokenLedger` (`token_ledger` module), the
+running context-size estimate the runtime triggers compaction from. The
+ledger anchors on the last completed assistant response's reported usage and
+adds the char-heuristic estimate (`estimate_message_tokens` and friends, also
+exported here) of everything appended since.
+
 
 ---
 

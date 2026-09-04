@@ -3,8 +3,9 @@
 use halter_protocol::{
     AgentName, AssistantMessage, AssistantPart, CacheScope, ContentHash, Message, ModelId,
     PromptSegment, PromptSegmentId, PromptSegmentKind, SessionEvent, SessionEventPayload,
-    SessionId, SessionState, SpawnSubagentRequest, SubagentRef, Usage, Volatility,
+    SessionId, SessionState, SpawnSubagentRequest, SubagentRef, TokenLedger, Usage, Volatility,
 };
+
 use halter_tools::SubagentParentContext;
 use sha2::{Digest, Sha256};
 
@@ -84,9 +85,13 @@ pub fn build_subagent_state(
         messages_seen_by_provider: 0,
         // The forked transcript carries the parent's usage reports, but the
         // child runs a different system prompt and tool set, so those figures
-        // do not describe its context. Start with no anchor and let the
-        // child's first response supply one.
-        usage_anchor_floor: parent.state.messages.len(),
+        // do not describe its context. Start with everything inferred and let
+        // the child's first response supply an anchor.
+        token_ledger: TokenLedger::inferred_from(
+            &parent.state.compacted_prefix,
+            &parent.state.messages,
+            &parent.state.summaries,
+        ),
     }
 }
 
@@ -179,6 +184,70 @@ mod tests {
         AgentDef, AgentId, MessageId, PromptSegment, Revision, SessionBlueprint, SessionEvent,
         SessionEventPayload, SubagentEventForwarding,
     };
+
+    /// The parent's usage reports describe the parent's prompt and tool set,
+    /// so a forked child re-estimates everything it inherits; a fresh child
+    /// inherits nothing.
+    #[test]
+    fn build_subagent_state_infers_the_forked_ledger() {
+        let mut parent_state = SessionState {
+            compacted_prefix: vec![
+                serde_json::json!({"type": "reasoning", "encrypted_content": "abcdefgh"}),
+            ],
+            ..SessionState::default()
+        };
+        parent_state.append(Message::User(halter_protocol::UserMessage::text("hello")));
+        parent_state.append(Message::Assistant(AssistantMessage {
+            id: halter_protocol::MessageId::new(),
+            created_at: chrono::Utc::now(),
+            parts: vec![AssistantPart::Text {
+                text: "done".to_owned(),
+            }],
+            stop_reason: Some(halter_protocol::StopReason::EndTurn),
+            usage: Some(Usage {
+                input_tokens: 80_000,
+                output_tokens: 500,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            replay_meta: Default::default(),
+        }));
+        assert_eq!(parent_state.token_ledger.authoritative_tokens, 80_500);
+        let parent = SubagentParentContext {
+            blueprint: halter_protocol::SessionBlueprint {
+                session_id: SessionId::new(),
+                parent_session_id: None,
+                default_model: "default".into(),
+                subagent_model: "subagent".into(),
+                subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
+                snapshot_revision: halter_protocol::Revision::from("revision"),
+                working_dir: ".".into(),
+                system_prompt_seed: Vec::new(),
+                max_turns: None,
+                subagent_depth: 0,
+            },
+            state: parent_state.clone(),
+            snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            model: "default".into(),
+            subagent_model: "subagent".into(),
+        };
+        let child_id = SessionId::new();
+
+        let forked = build_subagent_state(&parent, &child_id, "task", true);
+        assert_eq!(
+            forked.token_ledger,
+            TokenLedger::inferred_from(
+                &parent_state.compacted_prefix,
+                &parent_state.messages,
+                &parent_state.summaries
+            )
+        );
+        assert_eq!(forked.token_ledger.authoritative_tokens, 0);
+        assert!(forked.token_ledger.inferred_tokens > 0);
+
+        let fresh = build_subagent_state(&parent, &child_id, "task", false);
+        assert_eq!(fresh.token_ledger, TokenLedger::default());
+    }
 
     #[test]
     fn build_subagent_state_clears_pending_and_usage() {

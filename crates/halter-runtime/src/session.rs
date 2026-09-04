@@ -30,16 +30,17 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-#[cfg(test)]
-use crate::DefaultContextManager;
 use crate::model_selection::select_models;
 use crate::turn_registry::TurnRegistry;
 use crate::{
-    ContextManager, EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler,
+    CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager, ContextSettings,
+    EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler, prompt_segments,
     run_notification, run_post_compact, run_post_tool_use, run_post_tool_use_failure,
     run_pre_compact, run_pre_tool_use, run_session_end, run_session_start, run_stop,
     run_user_prompt_submit,
 };
+#[cfg(test)]
+use crate::{DefaultContextManager, ProviderCompaction};
 
 /// Stream of committed session events returned by turn submission.
 pub type SessionEventStream = BoxStream<'static, anyhow::Result<SessionEvent>>;
@@ -48,6 +49,9 @@ const PROVIDER_STREAM_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_STREAM_EVENT_CAP: usize = 8_192;
 const TOOL_RUNTIME_EVENT_CAP: usize = 4_096;
 const TOOL_RUNTIME_EVENT_BYTES_CAP: usize = 1024 * 1024;
+/// `PreCompact`/`PostCompact` matcher value for ledger-triggered passes;
+/// manual passes carry the caller-supplied trigger.
+const AUTOMATIC_COMPACTION_TRIGGER: &str = "auto";
 
 /// Per-session entry in the runtime hook store: the [`Hooks`] instance
 /// shared by every live handle for one session, plus a weak reference to
@@ -72,6 +76,11 @@ pub struct RuntimeServices {
     pub policy: Arc<dyn ToolPolicy>,
     pub prompt_assembler: Arc<dyn PromptAssembler>,
     pub context_manager: Arc<dyn ContextManager>,
+    /// Thresholds that decide when the runtime compacts and where it caps
+    /// the context.
+    pub context: ContextSettings,
+    /// What happens when it does.
+    pub compaction: Arc<dyn CompactionStrategy>,
     pub event_bus: Arc<EventBus>,
     pub parent_streams: Arc<ParentStreamRegistry>,
     pub turn_registry: Arc<TurnRegistry>,
@@ -323,12 +332,11 @@ struct ToolEventDrain {
 
 impl ToolEventDrain {
     fn into_events(self) -> Vec<ToolRuntimeEvent> {
-        self.buffer
+        let mut buffer = self
+            .buffer
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .events
-            .drain(..)
-            .collect()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut buffer.events)
     }
 }
 
@@ -1030,40 +1038,37 @@ impl SessionHandle {
             return Ok(());
         }
 
-        let observed = observe_state(
-            stored.blueprint.working_dir.clone(),
-            probe_git(stored.blueprint.working_dir.clone()).await,
-        );
-        let compaction_model = self
-            .services
-            .models
-            .model(&stored.blueprint.default_model)?;
-        let compaction_provider = self.services.models.provider(&compaction_model.provider)?;
-        let outcome = self
-            .services
-            .context_manager
-            .compact_now(
+        let effects = self
+            .compact_via_strategy(
                 &stored.blueprint,
-                &state,
-                &observed,
                 stored.snapshot.as_ref(),
-                &self.services.tools.specs(),
-                &compaction_model,
-                compaction_provider.as_ref(),
-                custom_instructions,
+                &state,
+                CompactionTrigger::Manual {
+                    custom_instructions,
+                },
+                hook_cancel.child_token(),
             )
             .await?;
-        let (summary, effects) = match outcome.apply_with_effects(&mut state) {
-            Some((result, effects)) => (result.summary, Some(Box::new(effects))),
-            None => ("No compaction needed.".to_owned(), None),
+        let (summary, payload) = match effects {
+            Some(effects) => {
+                let (result, payload) = effects.apply(&mut state);
+                (result.summary, payload)
+            }
+            None => {
+                let summary = "No compaction needed.".to_owned();
+                (
+                    summary.clone(),
+                    SessionEventPayload::ContextCompacted {
+                        summary,
+                        effects: None,
+                    },
+                )
+            }
         };
-        self.push_event(
-            &mut events,
-            SessionEventPayload::ContextCompacted {
-                summary: summary.clone(),
-                effects,
-            },
-        );
+        // A manual pass re-arms the compact-sourced SessionStart hooks
+        // whether or not anything was rewritten.
+        state.pending_session_start_source = Some(HookSessionStartSource::Compact);
+        self.push_event(&mut events, payload);
 
         let post_dispatch =
             run_post_compact(self, &fired_hook_ids, hook_ctx, trigger, &summary).await?;
@@ -1166,7 +1171,7 @@ impl SessionHandle {
                 created_at: Utc::now(),
                 text: reason,
             });
-            state.messages.push(blocked.clone());
+            state.append(blocked.clone());
             self.push_event(
                 &mut events,
                 SessionEventPayload::MessageItem { message: blocked },
@@ -1187,9 +1192,12 @@ impl SessionHandle {
         // panels are seeded with the pre-turn context and then submit the user
         // message as their own turn, so this avoids a duplicated user message.
         let full_turn_pre_messages = state.messages.clone();
+        // Effective ledger count at the last consistent boundary, so the
+        // strategy's threshold notifications see each crossing once.
+        let mut ledger_at_boundary = state.token_ledger.effective_tokens();
 
         let user_message = Message::User(turn.user_message.clone());
-        state.messages.push(user_message.clone());
+        state.append(user_message.clone());
         self.push_event(
             &mut events,
             SessionEventPayload::MessageItem {
@@ -1215,11 +1223,27 @@ impl SessionHandle {
             ensure_provider_iteration_allowed(stored.blueprint.max_turns, provider_iterations)?;
             provider_iterations = provider_iterations.saturating_add(1);
 
-            let compaction_model = self
-                .services
-                .models
-                .model(&stored.blueprint.default_model)?;
-            let compaction_provider = self.services.models.provider(&compaction_model.provider)?;
+            // Trigger B lands here: every append since the last boundary
+            // (user message, tool results, hook side effects) has updated the
+            // ledger and no tool call is unresolved, so a due compaction runs
+            // now. The cap is the backstop behind it, checked only once
+            // compaction has had its chance and before the provider sees the
+            // context.
+            self.context_boundary(
+                &stored.blueprint,
+                snapshot.clone(),
+                &mut state,
+                &mut events,
+                &mut fired_hook_ids,
+                hook_ctx,
+                &mut ledger_at_boundary,
+                &turn_cancel,
+            )
+            .await?;
+            self.services
+                .context
+                .check_cap(state.token_ledger.effective_tokens())?;
+
             let observed = observe_state(stored.blueprint.working_dir.clone(), git_probe.clone());
             let plan = self
                 .services
@@ -1230,38 +1254,8 @@ impl SessionHandle {
                     &observed,
                     snapshot.as_ref(),
                     &self.services.tools.specs(),
-                    &compaction_model,
-                    compaction_provider.as_ref(),
                 )
                 .await?;
-
-            if let Some(warning) = plan.compaction_warning.as_ref() {
-                self.push_event(
-                    &mut events,
-                    SessionEventPayload::Warning {
-                        message: format!(
-                            "automatic compaction did not run; continuing with an uncompacted context: {warning}"
-                        ),
-                    },
-                );
-            }
-
-            let plan_outcome = crate::CompactionOutcome {
-                messages: plan.messages.clone(),
-                compacted_prefix: plan.compacted_prefix.clone(),
-                compaction: plan.compaction.clone(),
-                compaction_error: None,
-                session_start_latch: None,
-            };
-            if let Some((result, effects)) = plan_outcome.apply_with_effects(&mut state) {
-                self.push_event(
-                    &mut events,
-                    SessionEventPayload::ContextCompacted {
-                        summary: result.summary,
-                        effects: Some(Box::new(effects)),
-                    },
-                );
-            }
 
             let prompt = self.services.prompt_assembler.assemble(&plan).await?;
 
@@ -1357,7 +1351,7 @@ impl SessionHandle {
             }
 
             let assistant_message = Message::Assistant(materialized.message.clone());
-            state.messages.push(assistant_message.clone());
+            state.append(assistant_message.clone());
 
             // Track response ID for previous_response_id chaining.
             if let Some(ref resp_id) = materialized.response_id {
@@ -1377,6 +1371,20 @@ impl SessionHandle {
 
             let tool_calls = assistant_tool_calls(&materialized.message);
             if tool_calls.is_empty() {
+                // Trigger A: the response is in and no tool call is pending,
+                // so the ledger's verdict can be acted on right away.
+                self.context_boundary(
+                    &stored.blueprint,
+                    snapshot.clone(),
+                    &mut state,
+                    &mut events,
+                    &mut fired_hook_ids,
+                    hook_ctx,
+                    &mut ledger_at_boundary,
+                    &turn_cancel,
+                )
+                .await?;
+
                 let stop_dispatch = run_stop(
                     self,
                     &fired_hook_ids,
@@ -1403,7 +1411,7 @@ impl SessionHandle {
                             &reason
                         },
                     ));
-                    state.messages.push(continuation.clone());
+                    state.append(continuation.clone());
                     self.push_event(
                         &mut events,
                         SessionEventPayload::MessageItem {
@@ -1541,7 +1549,7 @@ impl SessionHandle {
                         error: Some(error),
                         created_at: Utc::now(),
                     });
-                    state.messages.push(message.clone());
+                    state.append(message.clone());
                     self.push_event(
                         &mut events,
                         SessionEventPayload::ToolExecutionCompleted { outcome },
@@ -1690,7 +1698,7 @@ impl SessionHandle {
                 });
 
                 state.pending_tool_calls.shift_remove(&call.id);
-                state.messages.push(message.clone());
+                state.append(message.clone());
                 self.push_event(
                     &mut events,
                     SessionEventPayload::ToolExecutionCompleted { outcome },
@@ -1700,6 +1708,183 @@ impl SessionHandle {
         }
 
         Ok(events)
+    }
+
+    /// Build the strategy's view of the session and run one compaction pass
+    /// against the session's default model.
+    async fn compact_via_strategy(
+        &self,
+        blueprint: &SessionBlueprint,
+        snapshot: &ResourceSnapshot,
+        state: &SessionState,
+        trigger: CompactionTrigger<'_>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+        let model = self.services.models.model(&blueprint.default_model)?;
+        let provider = self.services.models.provider(&model.provider)?;
+        let prompt_segments = prompt_segments(blueprint, state, snapshot);
+        self.services
+            .compaction
+            .compact(CompactionContext {
+                blueprint,
+                state,
+                prompt_segments: &prompt_segments,
+                tool_specs: &self.services.tools.specs(),
+                model: &model,
+                provider: provider.as_ref(),
+                trigger,
+                cancel,
+            })
+            .await
+    }
+
+    /// A consistent boundary in the turn loop: no assistant tool call is
+    /// awaiting its result, so the ledger's verdict can be acted on. Delivers
+    /// the strategy's threshold notifications, then compacts when the ledger
+    /// is at or past the threshold.
+    #[expect(clippy::too_many_arguments)]
+    async fn context_boundary(
+        &self,
+        blueprint: &SessionBlueprint,
+        snapshot: Arc<ResourceSnapshot>,
+        state: &mut SessionState,
+        events: &mut Vec<PendingEvent>,
+        fired_hook_ids: &mut BTreeSet<String>,
+        hook_ctx: HookInvocationContext<'_>,
+        ledger_at_last_boundary: &mut u64,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let settings = self.services.context;
+        for message in self.services.compaction.threshold_notifications(
+            *ledger_at_last_boundary,
+            state.token_ledger.effective_tokens(),
+            settings.compaction_threshold,
+        ) {
+            state.append(message.clone());
+            self.push_event(events, SessionEventPayload::MessageItem { message });
+        }
+
+        if settings.compaction_due(state.token_ledger.effective_tokens()) {
+            self.run_automatic_compaction(
+                blueprint,
+                snapshot,
+                state,
+                events,
+                fired_hook_ids,
+                hook_ctx,
+                cancel,
+            )
+            .await?;
+        }
+        *ledger_at_last_boundary = state.token_ledger.effective_tokens();
+        Ok(())
+    }
+
+    /// One ledger-triggered compaction pass with `PreCompact`/`PostCompact`
+    /// hooks around it. Automatic compaction is best-effort: a hook that
+    /// blocks it or a strategy that cannot run degrades the turn to an
+    /// uncompacted context with a warning event, because the alternative is
+    /// that every turn past the threshold becomes unrecoverable. Hook
+    /// dispatch failures propagate like everywhere else in the turn.
+    async fn run_automatic_compaction(
+        &self,
+        blueprint: &SessionBlueprint,
+        snapshot: Arc<ResourceSnapshot>,
+        state: &mut SessionState,
+        events: &mut Vec<PendingEvent>,
+        fired_hook_ids: &mut BTreeSet<String>,
+        hook_ctx: HookInvocationContext<'_>,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let pre_dispatch = run_pre_compact(
+            self,
+            fired_hook_ids,
+            hook_ctx,
+            AUTOMATIC_COMPACTION_TRIGGER,
+            None,
+        )
+        .await?;
+        track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
+        self.record_hook_dispatch(events, &pre_dispatch);
+        for message in apply_hook_side_effects(state, &pre_dispatch) {
+            self.push_event(events, SessionEventPayload::MessageItem { message });
+        }
+        if let Some(reason) = pre_dispatch.merged.block_reason {
+            self.push_event(
+                events,
+                SessionEventPayload::Warning {
+                    message: format!(
+                        "automatic compaction blocked by a PreCompact hook; continuing with an uncompacted context: {reason}"
+                    ),
+                },
+            );
+            return Ok(());
+        }
+
+        let summary = match self
+            .compact_via_strategy(
+                blueprint,
+                snapshot.as_ref(),
+                state,
+                CompactionTrigger::Automatic,
+                cancel.child_token(),
+            )
+            .await
+        {
+            Ok(Some(effects)) => {
+                let (result, payload) = effects.apply(state);
+                info!(
+                    session_id = %self.session_id,
+                    compacted_messages = result.compacted_count,
+                    remaining_messages = state.messages.len(),
+                    compacted_prefix_items = state.compacted_prefix.len(),
+                    effective_tokens = state.token_ledger.effective_tokens(),
+                    compaction_threshold = self.services.context.compaction_threshold,
+                    "automatic compaction rewrote session state"
+                );
+                self.push_event(events, payload);
+                result.summary
+            }
+            Ok(None) => {
+                debug!(
+                    session_id = %self.session_id,
+                    effective_tokens = state.token_ledger.effective_tokens(),
+                    "automatic compaction was due but found nothing to compact"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = format!("{error:#}"),
+                    "automatic compaction failed; continuing uncompacted"
+                );
+                self.push_event(
+                    events,
+                    SessionEventPayload::Warning {
+                        message: format!(
+                            "automatic compaction did not run; continuing with an uncompacted context: {error:#}"
+                        ),
+                    },
+                );
+                return Ok(());
+            }
+        };
+
+        let post_dispatch = run_post_compact(
+            self,
+            fired_hook_ids,
+            hook_ctx,
+            AUTOMATIC_COMPACTION_TRIGGER,
+            &summary,
+        )
+        .await?;
+        track_fired_hook_ids(fired_hook_ids, &post_dispatch);
+        self.record_hook_dispatch(events, &post_dispatch);
+        for message in apply_hook_side_effects(state, &post_dispatch) {
+            self.push_event(events, SessionEventPayload::MessageItem { message });
+        }
+        Ok(())
     }
 
     /// Commit events and fan them out to the live stream, ancestor streams,
@@ -2263,7 +2448,7 @@ pub(crate) fn apply_hook_side_effects(
             created_at: Utc::now(),
             text: text.clone(),
         });
-        state.messages.push(message.clone());
+        state.append(message.clone());
         messages.push(message);
     }
 
@@ -2452,6 +2637,10 @@ pub(crate) async fn create_session_seeded(
     let subagent_event_forwarding = init
         .subagent_event_forwarding
         .unwrap_or(services.subagent_event_forwarding);
+    // The compaction strategy's session-init contribution: its segments sit
+    // after the caller's seed so house rules and presets keep precedence.
+    let mut system_prompt_seed = init.system_prompt_seed;
+    system_prompt_seed.extend(services.compaction.prompt_segments());
     let blueprint = SessionBlueprint {
         session_id: session_id.clone(),
         parent_session_id: init.parent_session_id,
@@ -2460,7 +2649,7 @@ pub(crate) async fn create_session_seeded(
         subagent_event_forwarding,
         snapshot_revision: snapshot.revision.clone(),
         working_dir: init.working_dir,
-        system_prompt_seed: init.system_prompt_seed,
+        system_prompt_seed,
         max_turns: init.max_turns,
         subagent_depth: init.subagent_depth,
     };
@@ -2768,7 +2957,9 @@ impl Default for RuntimeServices {
             sessions: Arc::new(halter_session::InMemorySessionStore::default()),
             policy: Arc::new(halter_tools::DefaultToolPolicy::new(Default::default())),
             prompt_assembler: Arc::new(crate::DefaultPromptAssembler),
-            context_manager: Arc::new(DefaultContextManager::default()),
+            context_manager: Arc::new(DefaultContextManager),
+            context: ContextSettings::default(),
+            compaction: Arc::new(crate::ProviderCompaction::new(ContextSettings::default())),
             event_bus: Arc::new(EventBus::default()),
             parent_streams: Arc::new(ParentStreamRegistry::default()),
             turn_registry: Arc::new(TurnRegistry::new()),
@@ -2807,7 +2998,8 @@ mod tests {
 
     use super::*;
     use test_support::{
-        configured_services, empty_hooks, install_file_hooks, new_session, resolved_test_model,
+        configured_services, empty_hooks, install_context_settings, install_file_hooks,
+        new_session, resolved_test_model,
     };
 
     #[test]
@@ -3656,7 +3848,10 @@ mod tests {
         use halter_providers::Provider;
         use halter_tools::{DefaultToolPolicy, PolicySettings};
 
-        use super::{HalterSession, ModelRegistry, RuntimeServices, SessionInit, SessionRuntime};
+        use super::{
+            ContextSettings, HalterSession, ModelRegistry, ProviderCompaction, RuntimeServices,
+            SessionInit, SessionRuntime,
+        };
 
         pub(super) fn configured_services(
             provider: Arc<dyn Provider>,
@@ -3740,6 +3935,17 @@ mod tests {
             services.subagent_event_forwarding_cap = subagent_event_forwarding_cap;
             services.trace_recorder = trace_recorder;
             Arc::new(services)
+        }
+
+        /// Install trigger settings and a provider-delegated strategy that
+        /// prunes with the same settings, the way `HalterBuilder` wires them.
+        pub(super) fn install_context_settings(
+            services: &mut Arc<RuntimeServices>,
+            settings: ContextSettings,
+        ) {
+            let services = Arc::get_mut(services).expect("unique services");
+            services.context = settings;
+            services.compaction = Arc::new(ProviderCompaction::new(settings));
         }
 
         pub(super) async fn new_session(
@@ -4567,14 +4773,17 @@ mod tests {
     async fn submit_turn_compacts_immediately_after_response_when_threshold_is_reached() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
-        Arc::get_mut(&mut services)
-            .expect("unique services")
-            .context_manager = Arc::new(DefaultContextManager::new(
-            150,
-            0,
-            halter_protocol::PruneSignalThreshold::VeryLow,
-        ));
+        install_context_settings(
+            &mut services,
+            ContextSettings {
+                compaction_threshold: 150,
+                pre_compaction_target: 0,
+                prune_signal_threshold: halter_protocol::PruneSignalThreshold::VeryLow,
+                max_tokens: None,
+            },
+        );
         let runtime = SessionRuntime::new(services.clone());
+
         let session = new_session(&runtime, temp.path()).await;
 
         session
@@ -4594,6 +4803,684 @@ mod tests {
         assert!(!stored.state.compacted_prefix.is_empty());
         assert_eq!(stored.state.messages.len(), 1);
         assert!(matches!(stored.state.messages[0], Message::Assistant(_)));
+    }
+
+    /// Trigger B: the tool result pushes the ledger past the threshold, and
+    /// the compaction runs at the next boundary — after the whole tool batch
+    /// has landed and before the following provider call — so the tool call
+    /// is never separated from its result.
+    #[tokio::test]
+    async fn tool_results_past_the_threshold_compact_at_the_next_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(CompactingToolLoopProvider), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        // The tool-loop provider reports a 12-token context with every reply,
+        // which replaces the inferred count, so the threshold sits just above
+        // that: the user prompt alone stays under it and the tool result
+        // pushes past it.
+        install_context_settings(
+            &mut services,
+            ContextSettings {
+                compaction_threshold: 110,
+                ..tiny_context_settings(None)
+            },
+        );
+
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("write a note"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let position = |predicate: &dyn Fn(&SessionEventPayload) -> bool| {
+            events
+                .iter()
+                .position(|event| predicate(&event.payload))
+                .expect("event present")
+        };
+        let tool_completed = position(&|payload| {
+            matches!(payload, SessionEventPayload::ToolExecutionCompleted { .. })
+        });
+        let compacted =
+            position(&|payload| matches!(payload, SessionEventPayload::ContextCompacted { .. }));
+        let final_reply = position(&|payload| {
+            matches!(
+                payload,
+                SessionEventPayload::MessageItem { message: Message::Assistant(assistant) }
+                    if assistant.parts.iter().any(|part| matches!(
+                        part,
+                        AssistantPart::Text { text } if text.contains("tool completed")
+                    ))
+            )
+        });
+        assert!(
+            tool_completed < compacted && compacted < final_reply,
+            "expected tool result ({tool_completed}) < compaction ({compacted}) < final reply ({final_reply})"
+        );
+
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert!(!stored.state.compacted_prefix.is_empty());
+        assert!(stored.state.pending_tool_calls.is_empty());
+        // Every tool result in the preserved window still has its call.
+        for message in &stored.state.messages {
+            if let Message::Tool(tool) = message {
+                assert!(stored.state.messages.iter().any(|candidate| matches!(
+                    candidate,
+                    Message::Assistant(assistant) if assistant.parts.iter().any(|part| matches!(
+                        part,
+                        AssistantPart::ToolCall(call) if call.id == tool.call_id
+                    ))
+                )));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_runs_pre_and_post_compact_hooks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        install_context_settings(&mut services, tiny_context_settings(None));
+        let mut registered = RegisteredHooks::default();
+        for event in [HookEventName::PreCompact, HookEventName::PostCompact] {
+            registered.register(
+                PluginId::from("internal"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(event, |_input| async move { HookResponse::passthrough() }),
+            );
+        }
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .registered_hooks = Arc::new(registered);
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("x".repeat(150)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        for expected in ["PreCompact", "PostCompact"] {
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::HookCompleted { run }
+                        if run.event_name == expected && run.status == HookRunStatus::Completed
+                )),
+                "{expected} must fire around automatic compaction"
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_compact_hook_can_block_automatic_compaction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        install_context_settings(&mut services, tiny_context_settings(None));
+        let mut registered = RegisteredHooks::default();
+        registered.register(
+            PluginId::from("internal"),
+            RegisteredHookPriority::AfterPlugins,
+            Hook::callback(HookEventName::PreCompact, |_input| async move {
+                HookResponse::block("not while the notes are open")
+            }),
+        );
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .registered_hooks = Arc::new(registered);
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("x".repeat(150)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::Warning { message }
+                if message.contains("blocked by a PreCompact hook")
+                    && message.contains("not while the notes are open")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        );
+    }
+
+    /// Automatic compaction is best-effort: a strategy that cannot run must
+    /// not take the turn down with it.
+    #[tokio::test]
+    async fn automatic_compaction_failure_degrades_to_a_warning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FailingCompactionProvider), temp.path());
+        install_context_settings(&mut services, tiny_context_settings(None));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("x".repeat(150)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::Warning { message }
+                if message.contains("automatic compaction did not run")
+                    && message.contains("compaction endpoint exploded")
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        );
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert!(stored.state.compacted_prefix.is_empty());
+        assert_eq!(stored.state.messages.len(), 2);
+    }
+
+    /// Manual compaction keeps propagating: the caller asked for it
+    /// explicitly and a silent no-op would be a lie.
+    #[tokio::test]
+    async fn manual_compact_propagates_strategy_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FailingCompactionProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        session
+            .submit_turn(Turn::user("hello"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let error = session
+            .compact("manual", None)
+            .await
+            .expect_err("manual compaction must surface strategy failures");
+
+        assert!(error.to_string().contains("compaction endpoint exploded"));
+        let replay = session.replay().await.expect("replay");
+        assert!(
+            !replay
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn context_cap_fails_the_turn_before_the_provider_call() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CountingProvider::default());
+        let mut services = configured_services(provider.clone(), temp.path());
+        install_context_settings(
+            &mut services,
+            ContextSettings {
+                compaction_threshold: 10_000,
+                pre_compaction_target: 5_000,
+                prune_signal_threshold: halter_protocol::PruneSignalThreshold::Normal,
+                max_tokens: Some(100),
+            },
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("x".repeat(1_000)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::TurnFailed { error, .. }
+                if error.contains("exceeds context.max_tokens (100)")
+        )));
+        assert_eq!(
+            provider.calls(),
+            0,
+            "the provider must never see an over-cap context"
+        );
+
+        // The same message fits under a roomier cap.
+        let mut services = configured_services(provider.clone(), temp.path());
+        install_context_settings(
+            &mut services,
+            ContextSettings {
+                max_tokens: Some(10_000),
+                ..tiny_context_settings(None)
+            },
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let events = session
+            .submit_turn(Turn::user("x".repeat(1_000)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        );
+        assert_eq!(provider.calls(), 1);
+    }
+
+    /// The cap is the backstop, not the mechanism: it is checked only after
+    /// compaction has had its chance to bring the context back under.
+    #[tokio::test]
+    async fn context_cap_is_checked_after_the_compaction_attempt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let settings = ContextSettings {
+            compaction_threshold: 150,
+            pre_compaction_target: 100,
+            prune_signal_threshold: halter_protocol::PruneSignalThreshold::Normal,
+            max_tokens: Some(100),
+        };
+        let oversized = || Turn::user("x".repeat(600));
+
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        install_context_settings(&mut services, settings);
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .compaction = Arc::new(NoopCompaction);
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+        let events = session
+            .submit_turn(oversized())
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.payload,
+                SessionEventPayload::TurnFailed { error, .. }
+                    if error.contains("exceeds context.max_tokens (100)")
+            )),
+            "a strategy that compacts nothing leaves the cap to fail the turn"
+        );
+
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        install_context_settings(&mut services, settings);
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .compaction = Arc::new(WipingCompaction);
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+        let events = session
+            .submit_turn(oversized())
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. })),
+            "compaction brought the context under the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn strategy_seed_segments_and_threshold_notifications_reach_the_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        install_context_settings(
+            &mut services,
+            ContextSettings {
+                compaction_threshold: 10_000,
+                pre_compaction_target: 5_000,
+                prune_signal_threshold: halter_protocol::PruneSignalThreshold::Normal,
+                max_tokens: None,
+            },
+        );
+        Arc::get_mut(&mut services)
+            .expect("unique services")
+            .compaction = Arc::new(ReminderCompaction);
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        // Under half the threshold: no reminder.
+        let quiet = session
+            .submit_turn(Turn::user("hello"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        assert!(!quiet.iter().any(is_reminder));
+
+        // Crossing half the threshold in one append: exactly one reminder.
+        let crossing = session
+            .submit_turn(Turn::user("x".repeat(20_000)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        assert_eq!(
+            crossing.iter().filter(|event| is_reminder(event)).count(),
+            1
+        );
+
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert!(
+            stored
+                .blueprint
+                .system_prompt_seed
+                .last()
+                .is_some_and(|segment| segment.text.contains("Compaction reminders apply."))
+        );
+        assert!(stored.state.messages.iter().any(|message| matches!(
+            message,
+            Message::System(system) if system.text == "Context is half full."
+        )));
+    }
+
+    #[tokio::test]
+    async fn turn_commits_keep_fold_and_checkpoint_in_agreement_across_compaction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        install_context_settings(&mut services, tiny_context_settings(None));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        for prompt in ["x".repeat(150), "y".repeat(150)] {
+            session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+        }
+
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load")
+            .expect("exists");
+        let replayed = services
+            .sessions
+            .replay(session.session_id())
+            .await
+            .expect("replay");
+        assert!(
+            replayed
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
+        );
+        let folded = halter_protocol::fold::fold_events(SessionState::default(), &replayed);
+        assert!(
+            halter_protocol::fold::covered_state_matches(&folded, &stored.state),
+            "folded log diverged from checkpoint\nfolded: {folded:?}\ncheckpoint: {:?}",
+            stored.state
+        );
+        assert_eq!(folded.token_ledger, stored.state.token_ledger);
+    }
+
+    /// Settings under which the fake provider's first reply crosses the
+    /// threshold: a 150-character prompt is ~40 tokens, the echoed reply
+    /// about as many, and the 100-token trigger buffer covers the rest.
+    fn tiny_context_settings(max_tokens: Option<u64>) -> ContextSettings {
+        ContextSettings {
+            compaction_threshold: 150,
+            pre_compaction_target: 0,
+            prune_signal_threshold: halter_protocol::PruneSignalThreshold::VeryLow,
+            max_tokens,
+        }
+    }
+
+    fn is_reminder(event: &SessionEvent) -> bool {
+        matches!(
+            &event.payload,
+            SessionEventPayload::MessageItem {
+                message: Message::System(system),
+            } if system.text == "Context is half full."
+        )
+    }
+
+    /// Strategy that never compacts, so the cap decides.
+    struct NoopCompaction;
+
+    #[async_trait]
+    impl crate::CompactionStrategy for NoopCompaction {
+        async fn compact(
+            &self,
+            _ctx: crate::CompactionContext<'_>,
+        ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+            Ok(None)
+        }
+    }
+
+    /// Strategy that replaces the whole transcript with one tiny item.
+    struct WipingCompaction;
+
+    #[async_trait]
+    impl crate::CompactionStrategy for WipingCompaction {
+        async fn compact(
+            &self,
+            ctx: crate::CompactionContext<'_>,
+        ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+            Ok(Some(crate::CompactionEffects {
+                messages: Vec::new(),
+                compacted_context: halter_protocol::CompactedContext::from(vec![
+                    serde_json::json!({"type": "reasoning", "encrypted_content": "gist"}),
+                ]),
+                result: halter_protocol::CompactionResult {
+                    compacted_count: ctx.state.messages.len(),
+                    summary: "wiped".to_owned(),
+                },
+            }))
+        }
+    }
+
+    /// Strategy exercising the session-init and notification surfaces.
+    struct ReminderCompaction;
+
+    #[async_trait]
+    impl crate::CompactionStrategy for ReminderCompaction {
+        fn prompt_segments(&self) -> Vec<PromptSegment> {
+            vec![crate::appended_system_prompt_segment(
+                "Compaction reminders apply.",
+            )]
+        }
+
+        fn threshold_notifications(
+            &self,
+            previous_tokens: u64,
+            current_tokens: u64,
+            compaction_threshold: u64,
+        ) -> Vec<Message> {
+            let half = compaction_threshold / 2;
+            if previous_tokens < half && current_tokens >= half {
+                vec![Message::System(SystemMessage {
+                    id: MessageId::new(),
+                    created_at: Utc::now(),
+                    text: "Context is half full.".to_owned(),
+                })]
+            } else {
+                Vec::new()
+            }
+        }
+
+        async fn compact(
+            &self,
+            _ctx: crate::CompactionContext<'_>,
+        ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+            Ok(None)
+        }
+    }
+
+    /// Fake provider whose compaction endpoint always fails.
+    struct FailingCompactionProvider;
+
+    #[async_trait]
+    impl Provider for FailingCompactionProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            FakeProvider::default().capabilities()
+        }
+
+        fn compaction_window(
+            &self,
+            messages: &[Message],
+        ) -> Option<halter_protocol::CompactionWindow> {
+            FakeProvider::default().compaction_window(messages)
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            FakeProvider::default().stream(request, cancel).await
+        }
+
+        async fn compact(
+            &self,
+            _request: halter_protocol::ProviderCompactionRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<halter_protocol::ProviderCompactionResponse> {
+            anyhow::bail!("compaction endpoint exploded")
+        }
+    }
+
+    /// The tool-loop provider with compaction support, so a mid-turn
+    /// boundary can actually compact.
+    struct CompactingToolLoopProvider;
+
+    #[async_trait]
+    impl Provider for CompactingToolLoopProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_compaction: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn compaction_window(
+            &self,
+            messages: &[Message],
+        ) -> Option<halter_protocol::CompactionWindow> {
+            Some(
+                halter_protocol::CompactionWindow::preserve_latest_assistant_response_block(
+                    messages,
+                ),
+            )
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            ToolLoopProvider.stream(request, cancel).await
+        }
+
+        async fn compact(
+            &self,
+            _request: halter_protocol::ProviderCompactionRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<halter_protocol::ProviderCompactionResponse> {
+            Ok(halter_protocol::ProviderCompactionResponse {
+                output: vec![serde_json::json!({"type": "reasoning", "encrypted_content": "gist"})],
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    /// Fake provider that counts how many times it was asked to stream.
+    #[derive(Default)]
+    struct CountingProvider {
+        calls: Mutex<usize>,
+    }
+
+    impl CountingProvider {
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("calls")
+        }
+    }
+
+    #[async_trait]
+    impl Provider for CountingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            FakeProvider::default().capabilities()
+        }
+
+        fn compaction_window(
+            &self,
+            messages: &[Message],
+        ) -> Option<halter_protocol::CompactionWindow> {
+            FakeProvider::default().compaction_window(messages)
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            *self.calls.lock().expect("calls") += 1;
+            FakeProvider::default().stream(request, cancel).await
+        }
+
+        async fn compact(
+            &self,
+            request: halter_protocol::ProviderCompactionRequest,
+            cancel: CancellationToken,
+        ) -> anyhow::Result<halter_protocol::ProviderCompactionResponse> {
+            FakeProvider::default().compact(request, cancel).await
+        }
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use halter_protocol::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::compaction::stable_json;
+use halter_protocol::stable_json;
 
 const AGENT_CORE_MARKDOWN: &str = include_str!("../prompts/agent-core.md");
 const SYSTEM_PROMPT_INTRO_MARKDOWN: &str = include_str!("../prompts/system-prompt-intro.md");
@@ -399,8 +399,6 @@ mod tests {
             cache_boundary_hash: "boundary".to_owned(),
             messages: vec![Message::User(UserMessage::text("hello"))],
             estimated_tokens: 10,
-            compaction: None,
-            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
@@ -459,8 +457,6 @@ mod tests {
             cache_boundary_hash: "boundary".to_owned(),
             messages: vec![Message::User(UserMessage::text("hello"))],
             estimated_tokens: 10,
-            compaction: None,
-            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
@@ -524,8 +520,6 @@ mod tests {
             cache_boundary_hash: "boundary".to_owned(),
             messages: vec![Message::User(UserMessage::text("hello"))],
             estimated_tokens: 10,
-            compaction: None,
-            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
@@ -605,8 +599,6 @@ mod tests {
             cache_boundary_hash: "boundary".to_owned(),
             messages: vec![Message::User(UserMessage::text("hi"))],
             estimated_tokens: 0,
-            compaction: None,
-            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
@@ -668,8 +660,6 @@ mod tests {
             cache_boundary_hash: "boundary".to_owned(),
             messages: vec![Message::User(UserMessage::text("hi"))],
             estimated_tokens: 0,
-            compaction: None,
-            compaction_warning: None,
             previous_response_id: None,
             new_messages_start: 0,
         };
