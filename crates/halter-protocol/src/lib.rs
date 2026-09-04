@@ -22,6 +22,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod fold;
+pub mod token_ledger;
+
+pub use token_ledger::{
+    CharHeuristicEstimator, TokenEstimator, TokenLedger, estimate_compacted_prefix_tokens,
+    estimate_json_tokens, estimate_message_tokens, estimate_messages_tokens,
+    estimate_segment_tokens, estimate_summary_tokens, estimate_text_tokens, stable_json,
+};
 
 /// Shared string payloads stay as `String` for now; this is the swap point for any future `Arc<str>` migration.
 pub type SharedStr = String;
@@ -1639,14 +1646,23 @@ pub struct SessionState {
     /// Messages at indices `[0..messages_seen_by_provider)` don't need re-sending.
     #[serde(default)]
     pub messages_seen_by_provider: usize,
-    /// Index into `messages` before which reported `Usage` no longer
-    /// describes the live context. Compaction rewrites history but preserves
-    /// a tail of real messages, and any assistant message in that tail still
-    /// carries the usage from *before* the rewrite. Anchoring context
-    /// estimates on that stale figure would re-trigger compaction every turn,
-    /// so compaction moves this floor past the preserved tail.
+    /// Running context-size estimate, updated on every append through
+    /// [`SessionState::append`] and rebuilt by compaction. Snapshots written
+    /// before the ledger existed load as zero and are corrected by the next
+    /// completed assistant response.
     #[serde(default)]
-    pub usage_anchor_floor: usize,
+    pub token_ledger: TokenLedger,
+}
+
+impl SessionState {
+    /// Append a message to the transcript and account for it in the token
+    /// ledger. The single door for transcript growth: the runtime and the
+    /// event fold both go through it, so the ledger never drifts from the
+    /// messages it describes.
+    pub fn append(&mut self, message: Message) {
+        self.token_ledger.record(&message);
+        self.messages.push(message);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1878,15 +1894,8 @@ pub struct ContextPlan {
     pub cache_boundary_hash: ContentHash,
     pub messages: Vec<Message>,
     pub estimated_tokens: u64,
-    /// If the planner compacted messages this turn, the result is here.
-    /// The caller should apply it to `SessionState` after using the plan.
-    pub compaction: Option<CompactionResult>,
-    /// Set when automatic compaction was due but could not run. The plan is
-    /// still valid and uncompacted, so the turn proceeds; the caller should
-    /// surface this so a degraded context does not look like a healthy one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction_warning: Option<String>,
     /// When set, the codec should chain via `previous_response_id`.
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
     /// Index into `messages` where new messages start (for chained requests).

@@ -1211,8 +1211,13 @@ mod tests {
             sessions: Arc::new(InMemorySessionStore::default()),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default())),
             prompt_assembler: Arc::new(DefaultPromptAssembler),
-            context_manager: Arc::new(DefaultContextManager::default()),
+            context_manager: Arc::new(DefaultContextManager),
+            context: crate::ContextSettings::default(),
+            compaction: Arc::new(crate::ProviderCompaction::new(
+                crate::ContextSettings::default(),
+            )),
             event_bus: Arc::new(EventBus::default()),
+
             parent_streams: Arc::new(crate::ParentStreamRegistry::default()),
             turn_registry: Arc::new(crate::TurnRegistry::new()),
             subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,

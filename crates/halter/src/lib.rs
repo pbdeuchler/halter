@@ -64,6 +64,16 @@ pub mod providers {
     };
 }
 
+/// Compaction: the session token ledger, the runtime's trigger settings, and
+/// the strategy seam installed through [`HalterBuilder::with_compaction`].
+pub mod compaction {
+    pub use halter_protocol::TokenLedger;
+    pub use halter_runtime::{
+        CompactionContext, CompactionEffects, CompactionStrategy, CompactionTrigger,
+        ContextCapExceeded, ContextSettings, ProviderCompaction,
+    };
+}
+
 /// Built-in default prompts and helpers for installing them.
 ///
 /// Read or compose the defaults, then seed a session with one via
@@ -86,8 +96,10 @@ pub mod prelude {
     };
     pub use halter_runtime::{HalterSession, SessionInit, SessionRuntime, SubagentEventForwarding};
 
+    pub use crate::compaction;
     pub use crate::prompts;
     pub use crate::providers;
+
     // Re-exported from the `providers` module so the flattened names have a
     // single maintenance point.
     pub use crate::providers::*;

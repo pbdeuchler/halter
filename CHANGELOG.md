@@ -34,6 +34,38 @@ once a `1.0.0` line is cut.
   sensitive patterns keep the built-in globs; an explicit list replaces them
   and an empty list disables the check. `mode` is `"strict"` (default) or
   `"relaxed"`.
+- Compaction v2, part 1: a session **token ledger**, Halter-owned triggers, a
+  hard context cap, and a public compaction strategy API (#194).
+  - `SessionState::token_ledger` (`halter_protocol::TokenLedger`) carries the
+    context size the provider reported with the last completed assistant
+    response plus a heuristic estimate of every message appended since. It is
+    advanced by `SessionState::append`, the single door for transcript growth
+    that the runtime and the event fold share, and rebuilt from the compacted
+    state by compaction. Plan-time transcript scans are gone.
+  - Compaction now runs at two Halter-side trigger points: immediately after
+    an assistant response with no tool calls, and before every provider
+    request once the appends since the last one have landed, so a tool call is
+    never separated from its result. Server-side auto-compaction is never used;
+    the invariant is documented on `CompactionStrategy`.
+  - `context.max_tokens` hard-caps the session context. It defaults to
+    `models.default.max_input_tokens` and is checked before every provider
+    request, after compaction has had its chance; a turn past it fails with
+    `halter_runtime::ContextCapExceeded`.
+  - `context.compaction_threshold` defaults to `models.default.max_input_tokens`
+    minus `COMPACTION_HEADROOM_TOKENS` (20,000) and `context.pre_compaction_target`
+    to three quarters of the resolved threshold. A config that sets neither the
+    threshold nor the window fails when loaded or built. `ContextConfig::resolve`
+    and `HarnessConfig::resolved_context` expose the resolved values.
+  - `halter_runtime::CompactionStrategy` (with `CompactionContext`,
+    `CompactionTrigger`, and `CompactionEffects`) is the seam above the provider:
+    the runtime owns *when*, the strategy owns *what happens*, and may also
+    contribute tools, system-prompt segments, and threshold reminders. Install
+    one with `HalterBuilder::with_compaction(...)`; the default
+    `ProviderCompaction` re-homes the provider-delegated flow. Re-exported from
+    `halter::compaction`.
+  - `PreCompact`/`PostCompact` hooks now fire around automatic compaction too,
+    with trigger `auto`; a blocking `PreCompact` hook skips the pass with a
+    `Warning` event.
 
 ### Changed
 
@@ -41,8 +73,34 @@ once a `1.0.0` line is cut.
   `OpenRouterProvider::new_with_headers_and_resilience` take an additional
   `Option<OpenRouterRouting>` argument after `temperature`. Pass `None` for the
   previous behavior. `OpenRouterProvider::new` is unchanged.
+- **Breaking:** `ContextConfig::compaction_threshold` and
+  `pre_compaction_target` are `Option<u64>` and the struct gained `max_tokens`.
+  Wrap literal values in `Some(..)` and add `max_tokens: None`. The fixed
+  80,000/60,000 defaults are gone (see Added).
+- **Breaking:** `ContextManager::plan` no longer takes a compaction model and
+  provider, `ContextManager::compact_now` is removed, and `DefaultContextManager`
+  is a unit struct (`new`, `from_settings`, and `settings` are gone). Planning
+  is read-only; compaction happens before it through the strategy.
+- **Breaking:** `CompactionOutcome` is removed. `CompactionEffects` is
+  `{ messages, compacted_context, result }` and `apply` returns the
+  `CompactionResult` plus the `ContextCompacted` payload that records it.
+  `ContextPlan` lost `compaction` and `compaction_warning`.
+- **Breaking:** `SessionState::usage_anchor_floor` is replaced by
+  `token_ledger`; `estimate_context_tokens`, `find_usage_anchor`, and
+  `UsageAnchor` are gone. The estimator (`estimate_text_tokens`,
+  `estimate_message_tokens`, `estimate_messages_tokens`,
+  `estimate_segment_tokens`, `estimate_summary_tokens`,
+  `estimate_compacted_prefix_tokens`, `estimate_json_tokens`, `stable_json`,
+  `TokenEstimator`, `CharHeuristicEstimator`) moved to `halter-protocol`.
+- **Breaking:** `halter_runtime::resolve_response_chain` takes
+  `(last_response_id, messages_seen_by_provider, total_messages, has_compacted_prefix)`;
+  the window-size and compacted-this-turn arguments were always derivable.
+- **Breaking:** `RuntimeServices` gained `context: ContextSettings` and
+  `compaction: Arc<dyn CompactionStrategy>`, and `ContextSettings` gained
+  `max_tokens`.
 
 ## [0.5.0] - 2026-07-27
+
 
 The OpenAI Responses adapter no longer fails a turn when the upstream sends a
 stream event it does not model. This requires a minor release on the pre-1.0

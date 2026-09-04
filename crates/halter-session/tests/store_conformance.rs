@@ -285,8 +285,8 @@ async fn fold_of_full_log_matches_state_checkpoint() {
         // Turn one: user + assistant messages.
         let user = Message::User(UserMessage::text("hello"));
         let assistant = assistant_message("hi there", 12, 4);
-        state.messages.push(user.clone());
-        state.messages.push(assistant.clone());
+        state.append(user.clone());
+        state.append(assistant.clone());
         state
             .usage_so_far
             .saturating_accumulate(&assistant_usage(12, 4));
@@ -315,6 +315,11 @@ async fn fold_of_full_log_matches_state_checkpoint() {
         let prefix = vec![serde_json::json!({"kind": "compacted"})];
         state.messages = window.clone();
         state.compacted_prefix = prefix.clone();
+        // The runtime rebuilds the ledger from the compacted state; the
+        // checkpoint mirrors it so the fold's rebuild has something to match.
+        state.token_ledger =
+            halter_protocol::TokenLedger::inferred_from(&prefix, &window, &state.summaries);
+
         head = commit_events(
             store.as_ref(),
             session_id,
@@ -336,7 +341,7 @@ async fn fold_of_full_log_matches_state_checkpoint() {
 
         // Turn two: another assistant message after compaction.
         let assistant = assistant_message("post-compaction", 3, 9);
-        state.messages.push(assistant.clone());
+        state.append(assistant.clone());
         state
             .usage_so_far
             .saturating_accumulate(&assistant_usage(3, 9));

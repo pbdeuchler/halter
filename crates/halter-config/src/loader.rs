@@ -131,8 +131,12 @@ pub fn generate_starter_config() -> String {
 provider = "openai"
 model = "gpt-5"
 reasoning = "medium"
+# Input window of the model. Compaction triggers 20,000 tokens below it and
+# the session is capped at it unless [context] overrides either.
+max_input_tokens = 200_000
 
 # [models.subagent]
+
 # provider = "openai"
 # model = "gpt-5-mini"
 # reasoning = "medium"
@@ -221,6 +225,9 @@ where
             Ok(Some(value))
         })?;
     }
+    // Compaction needs a threshold to run against; a config that supplies
+    // neither the threshold nor the model window it derives from cannot run.
+    config.resolved_context()?;
     Ok(())
 }
 
@@ -462,6 +469,7 @@ mod tests {
 [models.default]
 provider = "openai"
 model = "gpt-5"
+max_input_tokens = 200000
 
 [providers.openai]
 api_key = "test-key"
@@ -543,6 +551,7 @@ version = 1
 [models.default]
 provider = "openai"
 model = "gpt-5"
+max_input_tokens = 200000
 
 [models.subagent]
 provider = "openrouter"
@@ -574,6 +583,7 @@ version = 1
 [models.default]
 provider = "openai"
 model = "gpt-5"
+max_input_tokens = 200000
 
 [models.small]
 provider = "openrouter"
@@ -594,6 +604,45 @@ api_key = "openai-key"
         .expect_err("runtime requirements should fail");
 
         assert!(error.to_string().contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn runtime_requirements_require_a_compaction_threshold_source() {
+        let without_source = r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "openai-key"
+"#;
+        let config: HarnessConfig = parse_toml(without_source)
+            .expect("parse config")
+            .try_into()
+            .expect("decode config");
+        config
+            .validate()
+            .expect("a partial config still validates statically");
+
+        let error = validate_runtime_requirements_with(&config, |_| None)
+            .expect_err("no threshold and no window cannot run");
+        assert!(
+            error
+                .to_string()
+                .contains("context.compaction_threshold is unset"),
+            "got {error:#}"
+        );
+
+        let with_threshold =
+            format!("{without_source}\n[context]\ncompaction_threshold = 100000\n");
+        let config: HarnessConfig = parse_toml(&with_threshold)
+            .expect("parse config")
+            .try_into()
+            .expect("decode config");
+        validate_runtime_requirements_with(&config, |_| None)
+            .expect("an explicit threshold satisfies the requirement");
     }
 
     #[test]
@@ -671,6 +720,7 @@ version = 1
 [models.default]
 provider = "openai"
 model = "gpt-5"
+max_input_tokens = 200000
 
 [providers.openai]
 api_key = "test-key"
@@ -699,6 +749,7 @@ backend = "flat_file"
 [models.default]
 provider = "openai"
 model = "gpt-5"
+max_input_tokens = 200000
 
 [providers.openai]
 api_key = "test-key"

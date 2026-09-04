@@ -70,6 +70,8 @@ A `HarnessConfig` requires at least:
 
 - `version = 1`
 - `[models.default]`
+- a compaction threshold source: `models.default.max_input_tokens` or
+  `context.compaction_threshold`
 - credentials for the selected provider, either in config or the environment
 
 Minimal example:
@@ -81,8 +83,10 @@ version = 1
 provider = "openai"
 model = "gpt-5"
 reasoning = "medium"
+max_input_tokens = 200_000
 
 [resources.skills]
+
 roots = ["./.agent/skills"]
 
 [resources.plugins]
@@ -392,25 +396,36 @@ append_system_prompt = """
 
 ## Context / compaction policy
 
-`ContextConfig` controls when the runtime compacts session history.
+`ContextConfig` controls when the runtime compacts session history and where
+it caps it. Every threshold is optional.
 
 ```toml
 [context]
-compaction_threshold = 80000
-pre_compaction_target = 60000
+compaction_threshold = 180000    # default: models.default.max_input_tokens - 20000
+pre_compaction_target = 135000   # default: three quarters of compaction_threshold
+max_tokens = 200000              # default: models.default.max_input_tokens
 prune_signal_threshold = "normal"
 ```
 
-Defaults:
+Derivation, applied by `HarnessConfig::resolved_context` (`ContextConfig::resolve`):
 
-- `compaction_threshold = 80000`
-- `pre_compaction_target = 60000`
-- `prune_signal_threshold = "normal"`
+- `compaction_threshold` derives from `models.default.max_input_tokens` minus
+  `COMPACTION_HEADROOM_TOKENS` (20,000). If neither is set, loading the config
+  and building the harness fail with
+  `context.compaction_threshold is unset and models.default.max_input_tokens is unset`.
+  There is no built-in model-to-window table and no silent fallback.
+- `pre_compaction_target` derives as three quarters of the resolved threshold.
+- `max_tokens` derives from `max_input_tokens`; without a window there is no cap.
+  The runtime fails a turn that would exceed it, after compaction has had its
+  chance, instead of sending the context to the provider.
 
-Validation rules:
+Validation rules, checked on the resolved values (`HarnessConfig::validate`
+runs them whenever the threshold is derivable):
 
-- `compaction_threshold` must be greater than zero
+- `compaction_threshold` must be greater than zero; a derived one needs
+  `max_input_tokens` above 20,000
 - `pre_compaction_target` must be less than `compaction_threshold`
+- `max_tokens` must be at least `compaction_threshold`
 
 A more aggressive setup:
 
@@ -823,7 +838,17 @@ You set `sessions.sqlite_path` without enabling the `sqlite` feature or without 
 
 ### Context thresholds reversed
 
-`pre_compaction_target` must be lower than `compaction_threshold`.
+`pre_compaction_target` must be lower than `compaction_threshold`, and
+`max_tokens` must be at least `compaction_threshold`. Derived values count:
+an explicit `pre_compaction_target` above a threshold derived from
+`max_input_tokens` is rejected too.
+
+### No compaction threshold source
+
+Neither `context.compaction_threshold` nor `models.default.max_input_tokens`
+is set. Set one; the threshold derives from the window when only the window is
+present.
+
 
 ### Empty strings where values are required
 

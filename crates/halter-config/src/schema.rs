@@ -131,7 +131,13 @@ impl HarnessConfig {
             anyhow::bail!("invalid configuration: max_read_bytes must be greater than zero");
         }
 
-        self.context.validate()?;
+        // Threshold derivation needs the default model's window. A config
+        // that sets neither is still a valid partial config here; it is
+        // rejected when loaded or built, through `resolved_context`.
+        let default_window = self.default_model()?.max_input_tokens;
+        if self.context.compaction_threshold.is_some() || default_window.is_some() {
+            self.context.resolve(default_window)?;
+        }
         self.runtime.validate()?;
         self.resilience.validate("resilience")?;
         // Provider overrides are partial, so cross-field constraints can only
@@ -178,6 +184,13 @@ impl HarnessConfig {
     /// `[models.model_judge]`).
     pub fn default_model(&self) -> anyhow::Result<&ModelConfig> {
         self.default_slot()?.primary(self.model_judge())
+    }
+
+    /// Context thresholds with the defaults derived from the default model
+    /// applied. Fails when neither `context.compaction_threshold` nor
+    /// `models.default.max_input_tokens` is set.
+    pub fn resolved_context(&self) -> anyhow::Result<ResolvedContextConfig> {
+        self.context.resolve(self.default_model()?.max_input_tokens)
     }
 
     /// Representative subagent leaf model, if a concrete subagent slot is configured.
@@ -1204,58 +1217,102 @@ pub struct PromptsConfig {
     pub append_system_prompt: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Tokens kept free below the model's input window when
+/// `context.compaction_threshold` derives from `models.default.max_input_tokens`.
+pub const COMPACTION_HEADROOM_TOKENS: u64 = 20_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-/// Context window and compaction thresholds.
+/// Context window and compaction thresholds. Every threshold is optional;
+/// unset values derive from the default model's `max_input_tokens` (see
+/// [`ContextConfig::resolve`]).
 pub struct ContextConfig {
-    /// Trigger compaction when the estimated input reaches this threshold, with a 100-token buffer.
-    #[serde(default = "default_compaction_threshold")]
-    pub compaction_threshold: u64,
-    /// Evict low-signal history until the estimated prefix is below this target before compaction.
-    #[serde(default = "default_pre_compaction_target")]
-    pub pre_compaction_target: u64,
+    /// Compact once the session's effective token count reaches this many
+    /// tokens (with a 100-token buffer). Defaults to
+    /// `models.default.max_input_tokens` minus [`COMPACTION_HEADROOM_TOKENS`];
+    /// when neither is set, loading the config or building the harness fails.
+    #[serde(default)]
+    pub compaction_threshold: Option<u64>,
+    /// Evict low-signal history until the projected prefix is below this
+    /// target before compaction. Defaults to three quarters of the resolved
+    /// `compaction_threshold`.
+    #[serde(default)]
+    pub pre_compaction_target: Option<u64>,
+    /// Hard cap on the effective token count, enforced before every provider
+    /// request once compaction has had its chance. Defaults to
+    /// `models.default.max_input_tokens`; no cap when that is unset.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
     /// Highest signal tier eligible for pre-compaction eviction.
     #[serde(default)]
     pub prune_signal_threshold: PruneSignalThreshold,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Context thresholds after the defaults derived from the default model's
+/// input window are applied.
+pub struct ResolvedContextConfig {
+    pub compaction_threshold: u64,
+    pub pre_compaction_target: u64,
+    pub max_tokens: Option<u64>,
+    pub prune_signal_threshold: PruneSignalThreshold,
+}
+
 impl ContextConfig {
-    fn validate(&self) -> anyhow::Result<()> {
-        if self.compaction_threshold == 0 {
+    /// Resolve every threshold against the default model's input window and
+    /// check that they are coherent. This is the single door for the context
+    /// invariants: [`HarnessConfig::validate`] calls it whenever the
+    /// threshold is derivable, and config loading and `HalterBuilder::build`
+    /// always do.
+    pub fn resolve(&self, max_input_tokens: Option<u32>) -> anyhow::Result<ResolvedContextConfig> {
+        let window = max_input_tokens.map(u64::from);
+        let compaction_threshold = match (self.compaction_threshold, window) {
+            (Some(threshold), _) => threshold,
+            (None, Some(window)) => window
+                .checked_sub(COMPACTION_HEADROOM_TOKENS)
+                .filter(|threshold| *threshold > 0)
+                .with_context(|| {
+                    format!(
+                        "invalid configuration: models.default.max_input_tokens ({window}) must exceed {COMPACTION_HEADROOM_TOKENS} to derive context.compaction_threshold; set context.compaction_threshold explicitly"
+                    )
+                })?,
+            (None, None) => anyhow::bail!(
+                "invalid configuration: context.compaction_threshold is unset and models.default.max_input_tokens is unset; set one of them so compaction has a threshold"
+            ),
+        };
+        if compaction_threshold == 0 {
             anyhow::bail!(
                 "invalid configuration: context.compaction_threshold must be greater than zero"
             );
         }
-        if self.pre_compaction_target >= self.compaction_threshold {
+        let pre_compaction_target = self
+            .pre_compaction_target
+            .unwrap_or(compaction_threshold - compaction_threshold / 4);
+        if pre_compaction_target >= compaction_threshold {
             anyhow::bail!(
-                "invalid configuration: context.pre_compaction_target must be less than context.compaction_threshold"
+                "invalid configuration: context.pre_compaction_target ({pre_compaction_target}) must be less than context.compaction_threshold ({compaction_threshold})"
+            );
+        }
+        let max_tokens = self.max_tokens.or(window);
+        if let Some(max_tokens) = max_tokens
+            && max_tokens < compaction_threshold
+        {
+            anyhow::bail!(
+                "invalid configuration: context.max_tokens ({max_tokens}) must be at least context.compaction_threshold ({compaction_threshold})"
             );
         }
 
-        Ok(())
-    }
-}
-
-impl Default for ContextConfig {
-    fn default() -> Self {
-        Self {
-            compaction_threshold: default_compaction_threshold(),
-            pre_compaction_target: default_pre_compaction_target(),
-            prune_signal_threshold: PruneSignalThreshold::default(),
-        }
+        Ok(ResolvedContextConfig {
+            compaction_threshold,
+            pre_compaction_target,
+            max_tokens,
+            prune_signal_threshold: self.prune_signal_threshold,
+        })
     }
 }
 
 const fn default_tokens_per_minute() -> Option<u64> {
     Some(500_000)
-}
-
-const fn default_compaction_threshold() -> u64 {
-    80_000
-}
-
-const fn default_pre_compaction_target() -> u64 {
-    60_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -2806,6 +2863,226 @@ port = 9090
         assert_eq!(parsed.allowed_loopback.len(), 1);
         assert_eq!(parsed.allowed_loopback[0].host, "localhost");
         assert_eq!(parsed.allowed_loopback[0].port, Some(9090));
+    }
+
+    #[test]
+    fn context_resolve_derives_defaults_from_the_model_window() {
+        let resolved = ContextConfig::default()
+            .resolve(Some(200_000))
+            .expect("resolves from the window");
+
+        assert_eq!(
+            resolved,
+            ResolvedContextConfig {
+                compaction_threshold: 200_000 - COMPACTION_HEADROOM_TOKENS,
+                pre_compaction_target: 135_000,
+                max_tokens: Some(200_000),
+                prune_signal_threshold: PruneSignalThreshold::Normal,
+            }
+        );
+    }
+
+    #[test]
+    fn context_resolve_prefers_explicit_values() {
+        let resolved = ContextConfig {
+            compaction_threshold: Some(100_000),
+            pre_compaction_target: Some(40_000),
+            max_tokens: Some(150_000),
+            prune_signal_threshold: PruneSignalThreshold::Low,
+        }
+        .resolve(Some(200_000))
+        .expect("resolves");
+
+        assert_eq!(
+            resolved,
+            ResolvedContextConfig {
+                compaction_threshold: 100_000,
+                pre_compaction_target: 40_000,
+                max_tokens: Some(150_000),
+                prune_signal_threshold: PruneSignalThreshold::Low,
+            }
+        );
+    }
+
+    #[test]
+    fn context_resolve_leaves_the_cap_unset_without_a_window() {
+        let resolved = ContextConfig {
+            compaction_threshold: Some(100_000),
+            ..ContextConfig::default()
+        }
+        .resolve(None)
+        .expect("an explicit threshold needs no window");
+
+        assert_eq!(resolved.compaction_threshold, 100_000);
+        assert_eq!(resolved.pre_compaction_target, 75_000);
+        assert_eq!(resolved.max_tokens, None);
+    }
+
+    #[test]
+    fn context_resolve_rejects_incoherent_thresholds() {
+        struct Case {
+            name: &'static str,
+            config: ContextConfig,
+            window: Option<u32>,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "neither threshold nor window",
+                config: ContextConfig::default(),
+                window: None,
+                expected: "context.compaction_threshold is unset and models.default.max_input_tokens is unset",
+            },
+            Case {
+                name: "window equal to the headroom",
+                config: ContextConfig::default(),
+                window: Some(COMPACTION_HEADROOM_TOKENS as u32),
+                expected: "must exceed 20000 to derive context.compaction_threshold",
+            },
+            Case {
+                name: "window below the headroom",
+                config: ContextConfig::default(),
+                window: Some(1),
+                expected: "must exceed 20000 to derive context.compaction_threshold",
+            },
+            Case {
+                name: "zero threshold",
+                config: ContextConfig {
+                    compaction_threshold: Some(0),
+                    ..ContextConfig::default()
+                },
+                window: Some(200_000),
+                expected: "context.compaction_threshold must be greater than zero",
+            },
+            Case {
+                name: "explicit target not below the derived threshold",
+                config: ContextConfig {
+                    pre_compaction_target: Some(180_000),
+                    ..ContextConfig::default()
+                },
+                window: Some(200_000),
+                expected: "context.pre_compaction_target (180000) must be less than context.compaction_threshold (180000)",
+            },
+            Case {
+                name: "explicit cap below the threshold",
+                config: ContextConfig {
+                    compaction_threshold: Some(100_000),
+                    max_tokens: Some(99_999),
+                    ..ContextConfig::default()
+                },
+                window: None,
+                expected: "context.max_tokens (99999) must be at least context.compaction_threshold (100000)",
+            },
+            Case {
+                name: "derived cap below the explicit threshold",
+                config: ContextConfig {
+                    compaction_threshold: Some(150_000),
+                    ..ContextConfig::default()
+                },
+                window: Some(100_000),
+                expected: "context.max_tokens (100000) must be at least context.compaction_threshold (150000)",
+            },
+        ];
+
+        for case in cases {
+            let error = case.config.resolve(case.window).expect_err(case.name);
+            assert!(
+                error.to_string().contains(case.expected),
+                "{}: expected {:?} in {error:#}",
+                case.name,
+                case.expected
+            );
+        }
+    }
+
+    #[test]
+    fn harness_validate_defers_threshold_derivation_for_partial_configs() {
+        let parsed: HarnessConfig = toml::from_str(
+            r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+
+[providers.openai]
+api_key = "test-key"
+"#,
+        )
+        .expect("parse config");
+
+        parsed
+            .validate()
+            .expect("a config without a threshold source is a valid partial config");
+        let error = parsed
+            .resolved_context()
+            .expect_err("but it cannot resolve a threshold");
+        assert!(
+            error
+                .to_string()
+                .contains("context.compaction_threshold is unset")
+        );
+    }
+
+    #[test]
+    fn harness_validate_checks_context_once_the_threshold_is_derivable() {
+        let base = r#"
+version = 1
+
+[models.default]
+provider = "openai"
+model = "gpt-5"
+max_input_tokens = 200000
+
+[providers.openai]
+api_key = "test-key"
+"#;
+
+        let reversed: HarnessConfig = toml::from_str(&format!(
+            "{base}\n[context]\npre_compaction_target = 190000\n"
+        ))
+        .expect("parse config");
+        let error = reversed
+            .validate()
+            .expect_err("a target above the derived threshold fails validation");
+        assert!(
+            error
+                .to_string()
+                .contains("must be less than context.compaction_threshold (180000)"),
+            "got {error:#}"
+        );
+
+        let capped: HarnessConfig =
+            toml::from_str(&format!("{base}\n[context]\nmax_tokens = 190000\n"))
+                .expect("parse config");
+        capped.validate().expect("config should validate");
+        let resolved = capped.resolved_context().expect("resolves");
+        assert_eq!(resolved.compaction_threshold, 180_000);
+        assert_eq!(resolved.max_tokens, Some(190_000));
+    }
+
+    /// Layered loading serializes the built-in defaults as the base layer;
+    /// unset thresholds must stay unset there or no file could ever derive
+    /// them from the model window.
+    #[test]
+    fn context_defaults_serialize_without_pinning_thresholds() {
+        let defaults =
+            toml::Value::try_from(HarnessConfig::default()).expect("serialize built-in defaults");
+        let context = defaults
+            .get("context")
+            .and_then(toml::Value::as_table)
+            .expect("context table");
+
+        assert!(context.get("compaction_threshold").is_none());
+        assert!(context.get("pre_compaction_target").is_none());
+        assert!(context.get("max_tokens").is_none());
+        assert_eq!(
+            context
+                .get("prune_signal_threshold")
+                .and_then(toml::Value::as_str),
+            Some("normal")
+        );
     }
 
     fn openai_oauth_config() -> OpenAiOAuthConfig {

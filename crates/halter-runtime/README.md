@@ -233,12 +233,13 @@ Injects runtime notifications into the session stream.
 
 ### `compact(...)`
 
-Triggers session compaction according to the configured context manager and provider support.
-The runtime asks the provider for a safe compaction window, then runs the same
-preparation, provider request, event, and state-application path used by
-automatic compaction.
+Runs one compaction pass through the configured `CompactionStrategy`, with
+`PreCompact`/`PostCompact` hooks around it, and applies the result the same
+way automatic compaction does. Unlike the automatic path, a strategy failure
+propagates to the caller, who asked for compaction explicitly.
 
-If the underlying provider does not support compaction, you can see an error like:
+With the default provider-delegated strategy and a provider that does not
+support compaction, you can see an error like:
 
 > `failed to compact session: provider '{}' does not support compaction`
 
@@ -295,21 +296,37 @@ Large sessions need pruning and compaction.
 
 This crate exports:
 
-- `ContextSettings`
-- `ContextManager`
-- `DefaultContextManager`
+- `ContextSettings` and `ContextCapExceeded` — the trigger thresholds and the
+  typed error the hard cap raises
+- `ContextManager` and `DefaultContextManager` — planning the next request
+- `CompactionStrategy`, `CompactionContext`, `CompactionTrigger`, and
+  `CompactionEffects` — the strategy seam
+- `ProviderCompaction` — the default, provider-delegated strategy
 - `score_message(...)`
 
-### What the context manager does
+### Who decides what
 
-It decides how much of the existing transcript to keep inline when constructing the next model request.
+The runtime owns *when*. Every append goes through `SessionState::append`,
+which advances the session's `TokenLedger` (the last completed response's
+reported context size plus a heuristic estimate of everything appended since).
+At each consistent boundary — right after an assistant response with no tool
+calls, and before every provider request once the pending appends have landed
+— a ledger at or past `ContextSettings::compaction_threshold` runs the
+strategy, and then `max_tokens` is enforced with `ContextCapExceeded`. A tool
+call is never separated from its result, and server-side auto-compaction is
+never used.
 
-That includes:
+The strategy owns *what happens*. `compact(ctx)` sees the session state, the
+prompt segments, the tool specs, the default model and its provider, and
+returns the replacement window and compacted prefix as `CompactionEffects`.
+`CompactionEffects::apply` rewrites state through the same
+`halter_protocol::fold::apply_event` replay uses, so live and replayed
+sessions agree. Strategies can also contribute tools, system-prompt segments,
+and threshold reminders; install one with `HalterBuilder::with_compaction`.
 
-- estimating message weight/importance
-- honoring compaction thresholds
-- pruning within the provider-selected compaction window
-- coordinating with provider-backed compaction when available
+The context manager then plans the request from the (possibly compacted)
+state: the full transcript window, the carried prefix, prompt segments, and
+the ledger's effective count as the size estimate.
 
 ### `score_message(...)`
 
@@ -457,10 +474,14 @@ If you don't want to assemble all of that manually, use `halter::Halter`.
 
 ### Provider capability mismatch
 
-If your session needs compaction but the provider does not support it,
-compaction fails. Providers that do support compaction own the safe window
-selection; runtime does not need to know whether that provider uses a dedicated
-endpoint or an inline request.
+If your session needs compaction but the provider does not support it, the
+default strategy fails: automatic passes degrade to an uncompacted turn with a
+`Warning` event, manual `compact(...)` calls return the error. Providers that
+do support compaction own the safe window selection; the strategy does not
+need to know whether that provider uses a dedicated endpoint or an inline
+request. Past `context.max_tokens`, the turn fails with `ContextCapExceeded`
+before the provider is called.
+
 
 ### Event backpressure
 

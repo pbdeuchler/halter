@@ -25,8 +25,9 @@ use halter_providers::{
     RetryPolicy,
 };
 use halter_runtime::{
-    DefaultContextManager, DefaultPromptAssembler, EventBus, HalterSession, ResourceHandle,
-    RuntimeServices, SessionInit, SessionRuntime, TraceRecorder,
+    CompactionStrategy, ContextSettings, DefaultContextManager, DefaultPromptAssembler, EventBus,
+    HalterSession, ProviderCompaction, ResourceHandle, RuntimeServices, SessionInit,
+    SessionRuntime, TraceRecorder,
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
@@ -52,6 +53,7 @@ pub struct HalterBuilder {
     loaded_plugins: Vec<LoadedPlugin>,
     tools: Vec<Arc<dyn Tool>>,
     session_store: Option<Arc<dyn SessionStore>>,
+    compaction: Option<Arc<dyn CompactionStrategy>>,
     resilience_policy: Option<ResiliencePolicy>,
     provider_error_classifier: Option<Arc<dyn ProviderErrorClassifier>>,
 }
@@ -134,6 +136,17 @@ impl HalterBuilder {
         self
     }
 
+    /// Install a compaction strategy in place of the provider-delegated
+    /// default. The runtime still decides *when* to compact, from the
+    /// session token ledger and `[context]`; the strategy decides what
+    /// happens then. Its `tools()` are registered on the runtime and its
+    /// `prompt_segments()` seed every new session.
+    #[must_use]
+    pub fn with_compaction(mut self, strategy: Arc<dyn CompactionStrategy>) -> Self {
+        self.compaction = Some(strategy);
+        self
+    }
+
     /// Override provider request timeouts and retry policy for all provider
     /// families built by this harness.
     #[must_use]
@@ -165,12 +178,16 @@ impl HalterBuilder {
             loaded_plugins,
             tools: custom_tools,
             session_store,
+            compaction,
             resilience_policy,
             provider_error_classifier,
         } = self;
         debug!("validating halter builder config");
         config.validate()?;
         registered_hooks.validate()?;
+        let context = context_settings(&config)?;
+        let compaction: Arc<dyn CompactionStrategy> =
+            compaction.unwrap_or_else(|| Arc::new(ProviderCompaction::new(context)));
 
         if resource_snapshot.is_some() && (!loaded_skills.is_empty() || !loaded_plugins.is_empty())
         {
@@ -219,7 +236,9 @@ impl HalterBuilder {
         let models = Arc::new(build_model_registry(&config, &provider_options)?);
         let tools = Arc::new(ToolRuntime::new());
         register_builtin_tools(&tools, &config.tools.enabled);
-        for tool in custom_tools {
+        // Strategy tools sit between the built-ins and explicitly supplied
+        // tools, so a `with_tool` entry of the same name still wins.
+        for tool in compaction.tools().into_iter().chain(custom_tools) {
             tools.register(tool);
         }
 
@@ -249,11 +268,9 @@ impl HalterBuilder {
             sessions,
             policy: policy.clone(),
             prompt_assembler: Arc::new(DefaultPromptAssembler),
-            context_manager: Arc::new(DefaultContextManager::new(
-                config.context.compaction_threshold,
-                config.context.pre_compaction_target,
-                config.context.prune_signal_threshold,
-            )),
+            context_manager: Arc::new(DefaultContextManager),
+            context,
+            compaction,
             event_bus: Arc::new(EventBus::default()),
             parent_streams: Arc::new(halter_runtime::ParentStreamRegistry::default()),
             turn_registry: Arc::new(halter_runtime::TurnRegistry::new()),
@@ -485,6 +502,18 @@ fn describe_session_backend(config: &SessionsConfig) -> &'static str {
 struct ProviderBuildOptions {
     resilience_policy: Option<ResiliencePolicy>,
     provider_error_classifier: Arc<dyn ProviderErrorClassifier>,
+}
+
+/// Runtime trigger settings from `[context]`, with unset thresholds derived
+/// from the default model's input window.
+fn context_settings(config: &HarnessConfig) -> anyhow::Result<ContextSettings> {
+    let resolved = config.resolved_context()?;
+    Ok(ContextSettings {
+        compaction_threshold: resolved.compaction_threshold,
+        pre_compaction_target: resolved.pre_compaction_target,
+        prune_signal_threshold: resolved.prune_signal_threshold,
+        max_tokens: resolved.max_tokens,
+    })
 }
 
 fn build_model_registry(
@@ -1394,7 +1423,7 @@ mod tests {
         let leaf = |model: &str| ModelConfig {
             provider: ConfiguredProvider::OpenAi,
             model: model.to_owned(),
-            max_input_tokens: None,
+            max_input_tokens: Some(200_000),
             max_output_tokens: None,
             reasoning: None,
             tokens_per_minute: None,
@@ -1437,7 +1466,7 @@ mod tests {
         let leaf = |model: &str| ModelConfig {
             provider: ConfiguredProvider::OpenAi,
             model: model.to_owned(),
-            max_input_tokens: None,
+            max_input_tokens: Some(200_000),
             max_output_tokens: None,
             reasoning: None,
             tokens_per_minute: None,
@@ -1488,7 +1517,7 @@ mod tests {
         let leaf = |model: &str| ModelConfig {
             provider: ConfiguredProvider::OpenAi,
             model: model.to_owned(),
-            max_input_tokens: None,
+            max_input_tokens: Some(200_000),
             max_output_tokens: None,
             reasoning: None,
             tokens_per_minute: None,
@@ -1754,6 +1783,80 @@ mod tests {
             .await
             .expect("list persisted sessions");
         assert_eq!(persisted.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_config_without_a_compaction_threshold_source() {
+        let mut config = openai_config(Some("test-key"));
+        if let Some(ModelSlot::Inline(model)) = config.models.default.as_mut() {
+            model.max_input_tokens = None;
+        }
+
+        let Err(error) = HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+        else {
+            panic!("no threshold and no model window must not build");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("context.compaction_threshold is unset"),
+            "got {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_installs_a_custom_compaction_strategy() {
+        struct SeedingCompaction;
+
+        #[async_trait::async_trait]
+        impl CompactionStrategy for SeedingCompaction {
+            fn prompt_segments(&self) -> Vec<halter_protocol::PromptSegment> {
+                vec![halter_runtime::appended_system_prompt_segment(
+                    "Compaction reminders apply.",
+                )]
+            }
+
+            async fn compact(
+                &self,
+                _ctx: halter_runtime::CompactionContext<'_>,
+            ) -> anyhow::Result<Option<halter_runtime::CompactionEffects>> {
+                Ok(None)
+            }
+        }
+
+        let halter = HalterBuilder::default()
+            .with_config(openai_config(Some("test-key")))
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .with_compaction(Arc::new(SeedingCompaction))
+            .build()
+            .await
+            .expect("build");
+        let session = halter
+            .new_session(SessionInit::default())
+            .await
+            .expect("session");
+
+        let blueprint = halter
+            .runtime()
+            .list_sessions()
+            .await
+            .expect("list sessions")
+            .into_iter()
+            .find(|blueprint| &blueprint.session_id == session.session_id())
+            .expect("session blueprint");
+        assert!(
+            blueprint
+                .system_prompt_seed
+                .last()
+                .is_some_and(|segment| segment.text.contains("Compaction reminders apply.")),
+            "strategy segments must follow the caller's seed: {:?}",
+            blueprint.system_prompt_seed
+        );
     }
 
     fn openai_config(api_key: Option<&str>) -> HarnessConfig {

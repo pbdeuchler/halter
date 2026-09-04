@@ -135,9 +135,13 @@ Streams a model turn as canonical halter chunks.
 
 If supported, compacts session history for context management.
 
-The runtime does not branch on whether the provider uses a dedicated compaction
-endpoint or an inline request. It asks `compaction_window(...)` which messages
-can be summarized, then sends that prepared job through `compact(...)`.
+The runtime's default compaction strategy (`halter_runtime::ProviderCompaction`)
+does not branch on whether the provider uses a dedicated compaction endpoint or
+an inline request. It asks `compaction_window(...)` which messages can be
+summarized, then sends that prepared job through `compact(...)`. When it runs is
+decided by the runtime's session token ledger, never by the provider: a
+provider adapter must not enable server-side auto-compaction.
+
 
 The default behavior is an error:
 

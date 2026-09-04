@@ -4,6 +4,7 @@ version = 1
 provider = "openai"
 model = "gpt-5"
 reasoning = "medium"
+max_input_tokens = 200000
 
 [models.subagent]
 provider = "openrouter"

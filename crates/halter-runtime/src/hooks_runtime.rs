@@ -881,7 +881,10 @@ async fn run_agent(
         policy: sess.services().policy.clone(),
         prompt_assembler: sess.services().prompt_assembler.clone(),
         context_manager: sess.services().context_manager.clone(),
+        context: sess.services().context,
+        compaction: sess.services().compaction.clone(),
         event_bus: sess.services().event_bus.clone(),
+
         parent_streams: Arc::new(crate::ParentStreamRegistry::default()),
         // Hook-spawned agents get their own (isolated) turn registry so
         // that draining the parent runtime does not race with cooperative

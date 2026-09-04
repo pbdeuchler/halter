@@ -18,22 +18,24 @@
 //! - `compacted_prefix` — replaced by `ContextCompacted` effects.
 //! - `usage_so_far` — accumulated (saturating) from the `usage` stamped on
 //!   assistant messages.
+//! - `token_ledger` — advanced by every `MessageItem` through
+//!   [`SessionState::append`] and rebuilt from `ContextCompacted` effects,
+//!   exactly as the runtime does.
 //!
 //! Runtime bookkeeping fields (`file_view_cache`, `pending_tool_calls`,
 //! `fired_hook_ids`, `appended_prompt_segments`, `lineage`, hook latches, and
 //! provider-chaining fields) are deliberately *not* event-covered: they are
 //! carried by the checkpoint, which the runtime writes on every
 //! state-changing commit. The one exception is that `ContextCompacted`
-//! effects also reset `last_response_id` / `messages_seen_by_provider` and
-//! advance `usage_anchor_floor`, mirroring the runtime's compaction rules so
-//! a mid-replay view is not left pointing at a provider response chain — or
-//! at reported token usage — that predates the rewrite.
+//! effects also reset `last_response_id` / `messages_seen_by_provider`,
+//! mirroring the runtime's compaction rules so a mid-replay view is not left
+//! pointing at a provider response chain that predates the rewrite.
 //!
 //! The store conformance suite locks the invariant in: after any sequence of
 //! commits, folding the full log over a default state must agree with the
 //! persisted checkpoint on every covered field ([`covered_state_matches`]).
 
-use crate::{Message, SessionEvent, SessionEventPayload, SessionState};
+use crate::{Message, SessionEvent, SessionEventPayload, SessionState, TokenLedger};
 
 /// Apply one committed event payload to `state`, mutating only the
 /// fold-covered fields (see the module docs for the exact list). Events that
@@ -47,7 +49,7 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
             {
                 state.usage_so_far.saturating_accumulate(usage);
             }
-            state.messages.push(message.clone());
+            state.append(message.clone());
         }
         SessionEventPayload::ContextCompacted {
             effects: Some(effects),
@@ -60,7 +62,11 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
             state.last_response_id = None;
             state.messages_seen_by_provider = 0;
             // Usage reported by the preserved tail predates this rewrite.
-            state.usage_anchor_floor = state.messages.len();
+            state.token_ledger = TokenLedger::inferred_from(
+                &state.compacted_prefix,
+                &state.messages,
+                &state.summaries,
+            );
         }
         SessionEventPayload::ContextCompacted { effects: None, .. }
         | SessionEventPayload::SessionStarted
@@ -101,6 +107,7 @@ pub fn covered_state_matches(a: &SessionState, b: &SessionState) -> bool {
     a.messages == b.messages
         && a.compacted_prefix == b.compacted_prefix
         && a.usage_so_far == b.usage_so_far
+        && a.token_ledger == b.token_ledger
 }
 
 #[cfg(test)]
@@ -160,6 +167,15 @@ mod tests {
 
         assert_eq!(state.messages.len(), 2);
         assert_eq!(state.usage_so_far, usage(10, 5));
+        // The completed report anchors the ledger, just as the runtime's
+        // append does.
+        assert_eq!(
+            state.token_ledger,
+            TokenLedger {
+                authoritative_tokens: 15,
+                inferred_tokens: 0,
+            }
+        );
     }
 
     #[test]
@@ -174,6 +190,11 @@ mod tests {
 
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.usage_so_far, Usage::default());
+        assert_eq!(state.token_ledger.authoritative_tokens, 0);
+        assert_eq!(
+            state.token_ledger.inferred_tokens,
+            crate::estimate_messages_tokens(&state.messages)
+        );
     }
 
     #[test]
@@ -202,6 +223,10 @@ mod tests {
             ],
             last_response_id: Some("resp-1".to_owned()),
             messages_seen_by_provider: 2,
+            token_ledger: TokenLedger {
+                authoritative_tokens: 80_000,
+                inferred_tokens: 0,
+            },
             ..SessionState::default()
         };
         let window = vec![Message::User(UserMessage::text("kept"))];
@@ -220,9 +245,13 @@ mod tests {
         assert_eq!(state.compacted_prefix, vec![json!({"kind": "prefix"})]);
         assert_eq!(state.last_response_id, None);
         assert_eq!(state.messages_seen_by_provider, 0);
-        // Replay must reach the same anchor floor the runtime sets, or a
-        // resumed session would re-anchor on pre-compaction usage.
-        assert_eq!(state.usage_anchor_floor, window.len());
+        // Replay must rebuild the same ledger the runtime does, or a resumed
+        // session would keep the stale pre-compaction anchor.
+        assert_eq!(
+            state.token_ledger,
+            TokenLedger::inferred_from(&state.compacted_prefix, &window, &[])
+        );
+        assert_eq!(state.token_ledger.authoritative_tokens, 0);
     }
 
     #[test]
@@ -340,6 +369,15 @@ mod tests {
             ..base.clone()
         };
         assert!(!covered_state_matches(&base, &messages_differ));
+
+        let ledger_differs = SessionState {
+            token_ledger: TokenLedger {
+                authoritative_tokens: 1,
+                inferred_tokens: 0,
+            },
+            ..base.clone()
+        };
+        assert!(!covered_state_matches(&base, &ledger_differs));
     }
 
     fn fold_payload_strategy() -> impl Strategy<Value = SessionEventPayload> {

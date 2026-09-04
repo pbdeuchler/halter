@@ -3,21 +3,30 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use halter_protocol::{
-    AssistantPart, CompactedContext, CompactionWindow, Message, MessageSignal, PromptSegment,
-    PruneSignalThreshold, SummarySlice, ToolCall, ToolCallId, ToolName, ToolResult,
-    ToolResultMessage,
+    AssistantPart, CompactedContext, CompactionWindow, Message, MessageSignal,
+    PruneSignalThreshold, ToolCall, ToolCallId, ToolName, ToolResult, ToolResultMessage,
+    estimate_compacted_prefix_tokens, estimate_message_tokens,
 };
-use serde_json::Value;
 
 /// Token buffer applied before triggering automatic compaction.
 pub const COMPACTION_TRIGGER_BUFFER: u64 = 100;
 
 #[derive(Debug, Clone, Copy)]
-/// Token thresholds used by context planning.
+/// Token thresholds that decide *when* the runtime compacts and how much the
+/// provider-delegated strategy prunes first.
 pub struct ContextSettings {
+    /// Compact once the ledger's effective count (plus
+    /// [`COMPACTION_TRIGGER_BUFFER`]) reaches this many tokens.
     pub compaction_threshold: u64,
+    /// Evict low-signal history until the projected prefix is below this
+    /// target before asking the provider to compact.
     pub pre_compaction_target: u64,
+    /// Highest signal tier eligible for pre-compaction eviction.
     pub prune_signal_threshold: PruneSignalThreshold,
+    /// Hard cap on the effective count. Checked after compaction has had its
+    /// chance, before every provider request; exceeding it fails the turn
+    /// with [`ContextCapExceeded`] instead of blowing the provider's window.
+    pub max_tokens: Option<u64>,
 }
 
 impl Default for ContextSettings {
@@ -26,8 +35,41 @@ impl Default for ContextSettings {
             compaction_threshold: 80_000,
             pre_compaction_target: 60_000,
             prune_signal_threshold: PruneSignalThreshold::Normal,
+            max_tokens: None,
         }
     }
+}
+
+impl ContextSettings {
+    /// Whether the effective ledger count is close enough to trigger
+    /// compaction.
+    #[must_use]
+    pub fn compaction_due(&self, effective_tokens: u64) -> bool {
+        effective_tokens.saturating_add(COMPACTION_TRIGGER_BUFFER) >= self.compaction_threshold
+    }
+
+    /// Enforce the hard cap on the effective ledger count.
+    pub fn check_cap(&self, effective_tokens: u64) -> Result<(), ContextCapExceeded> {
+        match self.max_tokens {
+            Some(max_tokens) if effective_tokens > max_tokens => Err(ContextCapExceeded {
+                effective_tokens,
+                max_tokens,
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The session context grew past `context.max_tokens` and compaction could
+/// not bring it back under. Raised before the provider request that would
+/// have carried the oversized context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "failed to run turn: session context of {effective_tokens} tokens exceeds context.max_tokens ({max_tokens})"
+)]
+pub struct ContextCapExceeded {
+    pub effective_tokens: u64,
+    pub max_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -49,12 +91,6 @@ struct CompactionUnit {
 }
 
 #[must_use]
-/// Whether the estimated context is close enough to trigger compaction.
-pub fn should_trigger_compaction(estimated_tokens: u64, settings: &ContextSettings) -> bool {
-    estimated_tokens.saturating_add(COMPACTION_TRIGGER_BUFFER) >= settings.compaction_threshold
-}
-
-#[must_use]
 /// Select messages to compact after pruning low-signal units.
 pub fn prepare_compaction(
     settings: &ContextSettings,
@@ -62,7 +98,7 @@ pub fn prepare_compaction(
     window: CompactionWindow,
 ) -> CompactionPreparation {
     let units = build_compaction_units(&window.eligible_messages);
-    let compacted_prefix_tokens = estimate_compacted_context_tokens(compacted_context);
+    let compacted_prefix_tokens = estimate_compacted_prefix_tokens(compacted_context.items());
     let retained_units = prune_units(settings, compacted_prefix_tokens, &units);
     let retained_indices = retained_units
         .iter()
@@ -83,181 +119,6 @@ pub fn prepare_compaction(
         reserved_response_block: window.reserved_response_block,
         compacted_message_count,
         evicted_unit_count: units.len().saturating_sub(retained_units.len()),
-    }
-}
-
-/// Estimate total context tokens for prompt, summaries, compacted prefix, and
-/// messages.
-///
-/// Prefers ground truth over the character heuristic. Providers report the
-/// exact context size with every assistant response, so when the transcript
-/// contains a usable report this anchors on it and estimates only the
-/// messages that arrived afterwards — bounding heuristic error to one turn's
-/// tail instead of letting it compound across the whole transcript. The
-/// reported figure already accounts for the prompt, summaries, and compacted
-/// prefix, so those are *not* added on top of an anchor.
-///
-/// Falls back to estimating everything when no usable report exists: a fresh
-/// session, a transcript whose assistant turns all failed, or one whose
-/// reports predate the last compaction (see
-/// [`SessionState::usage_anchor_floor`](halter_protocol::SessionState)).
-#[must_use]
-pub fn estimate_context_tokens(
-    prompt_segments: &[PromptSegment],
-    summaries: &[SummarySlice],
-    compacted_prefix: &[Value],
-    messages: &[Message],
-    usage_anchor_floor: usize,
-) -> u64 {
-    match find_usage_anchor(messages, usage_anchor_floor) {
-        Some(anchor) => anchor
-            .context_tokens
-            .saturating_add(estimate_messages_tokens(&messages[anchor.index + 1..])),
-        None => {
-            estimate_segment_tokens(prompt_segments)
-                + estimate_summary_tokens(summaries)
-                + estimate_compacted_prefix_tokens(compacted_prefix)
-                + estimate_messages_tokens(messages)
-        }
-    }
-}
-
-/// A provider-reported context measurement usable as an estimation anchor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UsageAnchor {
-    /// Index in `messages` of the assistant message that reported it.
-    pub index: usize,
-    /// Context size the provider reported at that point.
-    pub context_tokens: u64,
-}
-
-/// Find the most recent assistant message at or after `floor` carrying a
-/// usable context report.
-///
-/// A report is usable only if the turn actually completed: interrupted and
-/// errored turns can report partial or zero usage, which would anchor the
-/// whole estimate to a figure far below the real context.
-#[must_use]
-pub fn find_usage_anchor(messages: &[Message], floor: usize) -> Option<UsageAnchor> {
-    messages
-        .iter()
-        .enumerate()
-        .skip(floor)
-        .rev()
-        .find_map(|(index, message)| {
-            let Message::Assistant(assistant) = message else {
-                return None;
-            };
-            if matches!(
-                assistant.stop_reason,
-                Some(halter_protocol::StopReason::Interrupted | halter_protocol::StopReason::Error)
-            ) {
-                return None;
-            }
-            let context_tokens = assistant.usage.as_ref()?.context_tokens();
-            (context_tokens > 0).then_some(UsageAnchor {
-                index,
-                context_tokens,
-            })
-        })
-}
-
-#[must_use]
-/// Estimate tokens for prompt segments.
-pub fn estimate_segment_tokens(segments: &[PromptSegment]) -> u64 {
-    segments
-        .iter()
-        .map(|segment| estimate_text_tokens(&segment.text))
-        .sum()
-}
-
-#[must_use]
-/// Estimate tokens for carried summaries.
-pub fn estimate_summary_tokens(summaries: &[SummarySlice]) -> u64 {
-    summaries
-        .iter()
-        .map(|summary| estimate_text_tokens(&summary.text))
-        .sum()
-}
-
-#[must_use]
-/// Estimate tokens for provider-native compacted prefix items.
-pub fn estimate_compacted_prefix_tokens(compacted_prefix: &[Value]) -> u64 {
-    compacted_prefix.iter().map(estimate_json_tokens).sum()
-}
-
-#[must_use]
-/// Estimate tokens for a compacted context wrapper.
-pub fn estimate_compacted_context_tokens(compacted_context: &CompactedContext) -> u64 {
-    estimate_compacted_prefix_tokens(compacted_context.items())
-}
-
-#[must_use]
-/// Estimate tokens for a transcript slice.
-pub fn estimate_messages_tokens(messages: &[Message]) -> u64 {
-    messages.iter().map(estimate_message_tokens).sum()
-}
-
-#[must_use]
-/// Estimate tokens for one transcript message.
-pub fn estimate_message_tokens(message: &Message) -> u64 {
-    match message {
-        Message::System(message) => estimate_text_tokens(&message.text),
-        Message::User(message) => estimate_text_tokens(&message.plain_text()),
-        Message::Assistant(message) => message
-            .parts
-            .iter()
-            .map(|part| match part {
-                AssistantPart::Text { text } => estimate_text_tokens(text),
-                AssistantPart::Thinking(block) => estimate_text_tokens(&block.text),
-                AssistantPart::ToolCall(call) => {
-                    estimate_text_tokens(&call.name.0)
-                        + estimate_json_tokens(&call.arguments)
-                        + estimate_text_tokens("tool_call")
-                }
-            })
-            .sum(),
-        Message::Tool(message) => match &message.content {
-            ToolResult::Empty => 0,
-            ToolResult::Text { text } => estimate_text_tokens(text),
-            ToolResult::Json { value } => estimate_json_tokens(value),
-        },
-    }
-}
-
-/// Estimates the number of tokens consumed by `text` for budgeting purposes.
-///
-/// Uses a char-to-token ratio of 10/37 (≈3.7 chars per token), which averages
-/// English prose across current BPE tokenizers (cl100k_base, o200k_base, GPT
-/// tokenizers). This is intentionally *heuristic*: it runs in O(chars) and
-/// avoids loading tokenizer tables, at the cost of being wrong by ±20% for
-/// code-heavy or non-Latin text.
-///
-/// The compaction loop uses this solely for triggering thresholds, not for
-/// billing, so the approximation is acceptable. If a per-provider tokenizer
-/// becomes available, implement [`TokenEstimator`] and thread an alternative
-/// estimator through the context manager.
-#[must_use]
-pub fn estimate_text_tokens(text: &str) -> u64 {
-    CharHeuristicEstimator.estimate(text)
-}
-
-/// A pluggable token-budget estimator. Implementors may swap in a
-/// model-specific tokenizer when one becomes available; today only
-/// [`CharHeuristicEstimator`] is provided.
-pub trait TokenEstimator {
-    fn estimate(&self, text: &str) -> u64;
-}
-
-/// Default estimator: `floor(chars * 10 / 37)` — see
-/// [`estimate_text_tokens`] for the rationale and caveats.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CharHeuristicEstimator;
-
-impl TokenEstimator for CharHeuristicEstimator {
-    fn estimate(&self, text: &str) -> u64 {
-        let chars = text.chars().count() as u64;
-        (chars * 10) / 37
     }
 }
 
@@ -443,32 +304,6 @@ fn score_tool_result(message: &ToolResultMessage, tool_name: Option<&ToolName>) 
     }
 }
 
-fn estimate_json_tokens(value: &Value) -> u64 {
-    estimate_text_tokens(&stable_json(value))
-}
-
-pub(crate) fn stable_json(value: &Value) -> String {
-    match value {
-        Value::Object(map) => {
-            let sorted = map.iter().collect::<BTreeMap<_, _>>();
-            let body = sorted
-                .into_iter()
-                .map(|(key, value)| format!("\"{key}\":{}", stable_json(value)))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{body}}}")
-        }
-        Value::Array(values) => format!(
-            "[{}]",
-            values.iter().map(stable_json).collect::<Vec<_>>().join(",")
-        ),
-        Value::String(text) => serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned()),
-        Value::Bool(boolean) => boolean.to_string(),
-        Value::Null => "null".to_owned(),
-        Value::Number(number) => number.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -479,197 +314,66 @@ mod tests {
 
     use super::*;
 
-    fn assistant(
-        text: &str,
-        stop_reason: Option<halter_protocol::StopReason>,
-        usage: Option<halter_protocol::Usage>,
-    ) -> Message {
-        Message::Assistant(AssistantMessage {
-            id: MessageId::new(),
-            created_at: Utc::now(),
-            parts: vec![AssistantPart::Text {
-                text: text.to_owned(),
-            }],
-            stop_reason,
-            usage,
-            replay_meta: Default::default(),
-        })
-    }
-
-    fn reported(input_tokens: u64, output_tokens: u64) -> Option<halter_protocol::Usage> {
-        Some(halter_protocol::Usage {
-            input_tokens,
-            output_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        })
-    }
-
-    /// The whole point of anchoring: a provider report replaces the heuristic
-    /// for everything up to and including the reporting message, and the
-    /// prompt/summaries/prefix are not re-added on top because the report
-    /// already covered them.
     #[test]
-    fn estimate_context_tokens_anchors_on_reported_usage() {
-        let messages = vec![
-            Message::User(UserMessage::text("x".repeat(4_000).as_str())),
-            assistant(
-                "done",
-                Some(halter_protocol::StopReason::EndTurn),
-                reported(50_000, 200),
-            ),
-            Message::User(UserMessage::text("follow up")),
-        ];
-        let summaries = vec![SummarySlice {
-            id: "s".to_owned(),
-            text: "y".repeat(4_000),
-        }];
-
-        let estimated = estimate_context_tokens(&[], &summaries, &[], &messages, 0);
-
-        // 50_000 + 200 reported, plus only the trailing user message.
-        assert_eq!(
-            estimated,
-            50_200 + estimate_message_tokens(&messages[2]),
-            "anchor must exclude everything the report already covered"
-        );
-    }
-
-    #[test]
-    fn estimate_context_tokens_falls_back_to_heuristic_without_usage() {
-        let messages = vec![
-            Message::User(UserMessage::text("hello")),
-            assistant("done", Some(halter_protocol::StopReason::EndTurn), None),
-        ];
-
-        let estimated = estimate_context_tokens(&[], &[], &[], &messages, 0);
-
-        assert_eq!(estimated, estimate_messages_tokens(&messages));
-    }
-
-    /// Interrupted and errored turns report partial or zero usage. Anchoring
-    /// on those would peg the estimate far below the real context and stop
-    /// compaction from ever firing.
-    #[test]
-    fn find_usage_anchor_rejects_unusable_reports() {
+    fn compaction_due_applies_the_trigger_buffer() {
+        let settings = ContextSettings {
+            compaction_threshold: 1_000,
+            ..ContextSettings::default()
+        };
         struct Case {
-            name: &'static str,
-            message: Message,
+            effective_tokens: u64,
+            due: bool,
         }
-
         let cases = [
             Case {
-                name: "interrupted",
-                message: assistant(
-                    "partial",
-                    Some(halter_protocol::StopReason::Interrupted),
-                    reported(50_000, 10),
-                ),
+                effective_tokens: 0,
+                due: false,
             },
             Case {
-                name: "error",
-                message: assistant(
-                    "boom",
-                    Some(halter_protocol::StopReason::Error),
-                    reported(50_000, 10),
-                ),
+                effective_tokens: 1_000 - COMPACTION_TRIGGER_BUFFER - 1,
+                due: false,
             },
             Case {
-                name: "zero usage",
-                message: assistant(
-                    "empty",
-                    Some(halter_protocol::StopReason::EndTurn),
-                    reported(0, 0),
-                ),
+                effective_tokens: 1_000 - COMPACTION_TRIGGER_BUFFER,
+                due: true,
             },
             Case {
-                name: "no usage",
-                message: assistant("none", Some(halter_protocol::StopReason::EndTurn), None),
-            },
-            Case {
-                name: "not an assistant message",
-                message: Message::User(UserMessage::text("user")),
+                effective_tokens: u64::MAX,
+                due: true,
             },
         ];
-
         for case in cases {
             assert_eq!(
-                find_usage_anchor(std::slice::from_ref(&case.message), 0),
-                None,
-                "{}: must not anchor",
-                case.name
+                settings.compaction_due(case.effective_tokens),
+                case.due,
+                "{} tokens",
+                case.effective_tokens
             );
         }
     }
 
     #[test]
-    fn find_usage_anchor_picks_the_most_recent_usable_report() {
-        let messages = vec![
-            assistant(
-                "first",
-                Some(halter_protocol::StopReason::EndTurn),
-                reported(10, 1),
-            ),
-            assistant(
-                "second",
-                Some(halter_protocol::StopReason::EndTurn),
-                reported(20, 2),
-            ),
-            assistant(
-                "third",
-                Some(halter_protocol::StopReason::Error),
-                reported(999, 0),
-            ),
-        ];
+    fn check_cap_fails_only_past_a_configured_cap() {
+        let uncapped = ContextSettings::default();
+        assert_eq!(uncapped.check_cap(u64::MAX), Ok(()));
 
-        let anchor = find_usage_anchor(&messages, 0).expect("anchor");
-
-        assert_eq!(anchor.index, 1);
-        assert_eq!(anchor.context_tokens, 22);
-    }
-
-    /// Compaction preserves a message tail whose usage describes the
-    /// pre-compaction context. Without the floor, that stale figure would
-    /// re-trigger compaction on every following turn.
-    #[test]
-    fn find_usage_anchor_ignores_reports_below_the_floor() {
-        let messages = vec![
-            assistant(
-                "pre-compaction",
-                Some(halter_protocol::StopReason::EndTurn),
-                reported(80_000, 500),
-            ),
-            Message::User(UserMessage::text("after compaction")),
-        ];
-
-        assert_eq!(find_usage_anchor(&messages, 1), None);
-
-        // ...and the estimate falls back to the heuristic rather than 80_500.
-        let estimated = estimate_context_tokens(&[], &[], &[], &messages, 1);
-        assert_eq!(estimated, estimate_messages_tokens(&messages));
-        assert!(estimated < 1_000);
-    }
-
-    #[test]
-    fn estimate_text_tokens_uses_character_count() {
-        assert_eq!(estimate_text_tokens(""), 0);
-        assert_eq!(estimate_text_tokens("abcd"), 1);
-        assert_eq!(estimate_text_tokens("abcdefghij"), 2);
-    }
-
-    #[test]
-    fn compacted_context_estimation_uses_stable_json_rendering() {
-        let context = CompactedContext::new(vec![json!({
-            "b": true,
-            "a": "abcd",
-        })]);
-
-        let rendered = stable_json(&context.items()[0]);
-
-        assert_eq!(rendered, "{\"a\":\"abcd\",\"b\":true}");
+        let capped = ContextSettings {
+            max_tokens: Some(500),
+            ..ContextSettings::default()
+        };
+        assert_eq!(capped.check_cap(500), Ok(()));
+        let error = capped.check_cap(501).expect_err("over cap");
         assert_eq!(
-            estimate_compacted_context_tokens(&context),
-            estimate_text_tokens(&rendered)
+            error,
+            ContextCapExceeded {
+                effective_tokens: 501,
+                max_tokens: 500,
+            }
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("501 tokens exceeds context.max_tokens (500)")
         );
     }
 
@@ -753,6 +457,7 @@ mod tests {
                 compaction_threshold: 100,
                 pre_compaction_target: 1,
                 prune_signal_threshold: PruneSignalThreshold::Normal,
+                max_tokens: None,
             },
             &CompactedContext::default(),
             CompactionWindow::preserve_latest_assistant_response_block(&messages),
@@ -854,6 +559,7 @@ mod tests {
                     compaction_threshold: 100,
                     pre_compaction_target: 1,
                     prune_signal_threshold: case.threshold,
+                    max_tokens: None,
                 },
                 &CompactedContext::default(),
                 CompactionWindow::preserve_latest_assistant_response_block(&messages),
@@ -973,6 +679,7 @@ mod tests {
                 compaction_threshold: 50,
                 pre_compaction_target: 1,
                 prune_signal_threshold: PruneSignalThreshold::Normal,
+                max_tokens: None,
             },
             &CompactedContext::default(),
             CompactionWindow::preserve_through_latest_user(&messages),
