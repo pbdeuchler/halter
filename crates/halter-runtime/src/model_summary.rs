@@ -98,6 +98,7 @@ impl CompactionStrategy for ModelSummary {
                     }
                 ),
             },
+            usage: Default::default(),
         }))
     }
 }

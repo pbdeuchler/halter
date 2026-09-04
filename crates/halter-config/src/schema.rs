@@ -1241,7 +1241,7 @@ pub enum CompactionStrategyKind {
 /// `max_input_tokens` (see [`ContextConfig::resolve`]).
 pub struct ContextConfig {
     /// Compact once the session's effective token count reaches this many
-    /// tokens (with a 100-token buffer). Defaults to
+    /// tokens. Defaults to
     /// `models.default.max_input_tokens` minus [`COMPACTION_HEADROOM_TOKENS`];
     /// when neither is set, loading the config or building the harness fails.
     #[serde(default)]

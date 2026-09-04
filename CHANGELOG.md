@@ -111,9 +111,10 @@ once a `1.0.0` line is cut.
   is a unit struct (`new`, `from_settings`, and `settings` are gone). Planning
   is read-only; compaction happens before it through the strategy.
 - **Breaking:** `CompactionOutcome` is removed. `CompactionEffects` is
-  `{ messages, compacted_context, result }` and `apply` returns the
+  `{ messages, compacted_context, result, usage }` and `apply` returns the
   `CompactionResult` plus the `ContextCompacted` payload that records it.
-  `ContextPlan` lost `compaction` and `compaction_warning`.
+  `CompactionEventEffects` likewise gained `usage`. `ContextPlan` lost
+  `compaction` and `compaction_warning`.
 - **Breaking:** `SessionState::usage_anchor_floor` is replaced by
   `token_ledger`; `estimate_context_tokens`, `find_usage_anchor`, and
   `UsageAnchor` are gone. The estimator (`estimate_text_tokens`,
@@ -146,6 +147,30 @@ once a `1.0.0` line is cut.
 - **Breaking:** the default compaction behavior changed from provider-native
   compaction to a model-written checkpoint. Set
   `context.compaction = "provider_default"` to keep the previous behavior.
+- **Breaking:** `CompactionStrategy::threshold_notifications` is replaced by
+  per-session `context_boundary(CompactionBoundary)`. It returns persisted,
+  per-window notifications and a `CompactionDirective` (`Continue`, `Compact`,
+  or `Rollover`), which supplies the state and forced-rollover control needed
+  by the CleanWindow strategy in #196. `CompactionTrigger` gained `Rollover`;
+  `SessionState` gained `context_window` and `compaction_notifications`.
+- **Breaking:** `SessionEventPayload` gained `ContextProjectionUpdated` for
+  replayable request-base accounting. Exhaustive matches must add an arm.
+  `TokenLedger` gained request-base and accounting-version fields; downstream
+  struct literals should use `..TokenLedger::default()`.
+
+### Fixed
+
+- The token ledger and hard cap now include prompt segments, tool declarations,
+  media-only messages, and hook-added context. Legacy ledgers rebuild before
+  use instead of loading as a permanent zero estimate.
+- Failed and no-op compaction passes restore their staged transcript, usage,
+  and audit events. Empty model/provider summaries are rejected without
+  deleting context, while successful compaction usage reaches both session
+  totals and `TurnCompleted`.
+- Inline provider compaction summarizes an older prefix and preserves the
+  suffix, keeping the summary in chronological order. Automatic compaction
+  now triggers exactly at the configured threshold rather than 100 tokens
+  early.
 
 
 ## [0.5.0] - 2026-07-27

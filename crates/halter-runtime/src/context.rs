@@ -50,6 +50,8 @@ pub struct CompactionEffects {
     pub compacted_context: CompactedContext,
     /// What happened, for the `ContextCompacted` event and PostCompact hooks.
     pub result: CompactionResult,
+    /// Provider-native compaction usage that has no assistant message event.
+    pub usage: halter_protocol::Usage,
 }
 
 impl CompactionEffects {
@@ -68,12 +70,14 @@ impl CompactionEffects {
             messages,
             compacted_context,
             result,
+            usage,
         } = self;
         let payload = SessionEventPayload::ContextCompacted {
             summary: result.summary.clone(),
             effects: Some(Box::new(CompactionEventEffects {
                 messages,
                 compacted_prefix: compacted_context.into_items(),
+                usage,
             })),
         };
         halter_protocol::fold::apply_event(state, &payload);
@@ -129,7 +133,8 @@ impl ContextManager for DefaultContextManager {
             })
             .collect::<Vec<_>>();
 
-        let estimated_tokens = state.token_ledger.effective_tokens();
+        let request_tokens = halter_protocol::estimate_request_tokens(&prompt_segments, tool_specs);
+        let estimated_tokens = state.token_ledger.projected_tokens(request_tokens);
         let (previous_response_id, new_messages_start) = resolve_response_chain(
             state.last_response_id.as_deref(),
             state.messages_seen_by_provider,
@@ -302,6 +307,7 @@ mod tests {
             token_ledger: TokenLedger {
                 authoritative_tokens: 80_000,
                 inferred_tokens: 0,
+                ..TokenLedger::default()
             },
             ..SessionState::default()
         };
@@ -316,6 +322,7 @@ mod tests {
                 compacted_count: 2,
                 summary: "squashed".to_owned(),
             },
+            usage: Default::default(),
         };
 
         let (result, payload) = effects.apply(&mut state);
@@ -360,6 +367,7 @@ mod tests {
                 compacted_count: 1,
                 summary: "squashed".to_owned(),
             },
+            usage: Default::default(),
         };
 
         let (_, payload) = effects.apply(&mut live);

@@ -1025,10 +1025,11 @@ The runtime decides *when* to compact; a compaction strategy decides *what
 happens*.
 
 - Every session keeps a **token ledger** (`SessionState::token_ledger`): the
-  context size the provider reported with the last completed assistant
-  response, plus a heuristic estimate of every message appended since. A new
-  report replaces the anchor and zeroes the estimate; compaction re-estimates
-  the compacted state. Nothing scans the transcript at plan time.
+  last completed response's provider-reported context size plus inferred
+  transcript growth and the current request base (system/skill/hook prompt
+  segments and tool declarations). Media-only messages have a non-zero
+  estimate. Each usable report replaces the transcript anchor; compaction and
+  legacy snapshots safely rebuild it.
 - Compaction has two trigger points, both Halter-side: immediately after an
   assistant response that requested no tools, and before every provider
   request once the appends since the last one (user message, tool results,
@@ -1060,9 +1061,10 @@ happens*.
   cannot compact. Either way the trigger is Halter's ledger, never the
   provider's own auto-compaction.
 - Install your own strategy with `HalterBuilder::with_compaction(...)`; it may
-  also contribute tools, system-prompt segments, and reminders as the context
-  fills, and it can drive the model and tools through the `CompactionContext`
-  the runtime hands it.
+  also contribute tools and system-prompt segments. Its per-session
+  `context_boundary` policy can deliver exactly-once, per-window reminders
+  and request ordinary compaction or a forced rollover. It can drive the
+  model and tools through the `CompactionContext` the runtime hands it.
 
 
 ```rust
@@ -1079,8 +1081,8 @@ impl CompactionStrategy for KeepEverything {
         &self,
         ctx: CompactionContext<'_>,
     ) -> anyhow::Result<Option<CompactionEffects>> {
-        // `ctx.state` (messages, `token_ledger`), `ctx.prompt_segments`,
-        // `ctx.tool_specs`, `ctx.model`, and `ctx.provider` are all readable.
+        // `ctx.state()` (messages, `token_ledger`), `ctx.prompt_segments()`,
+        // `ctx.tool_specs()`, `ctx.model()`, and `ctx.provider()` are readable.
         // `Ok(None)` means there was nothing to compact.
         let _ = ctx;
         Ok(None)

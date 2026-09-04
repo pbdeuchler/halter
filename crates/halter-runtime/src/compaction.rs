@@ -1,15 +1,11 @@
 // pattern: Functional Core
 
-/// Token buffer applied before triggering automatic compaction.
-pub const COMPACTION_TRIGGER_BUFFER: u64 = 100;
-
 #[derive(Debug, Clone, Copy)]
 /// Thresholds that decide *when* the runtime compacts and where it caps the
 /// context. What happens then is the installed
 /// [`CompactionStrategy`](crate::CompactionStrategy)'s business.
 pub struct ContextSettings {
-    /// Compact once the ledger's effective count (plus
-    /// [`COMPACTION_TRIGGER_BUFFER`]) reaches this many tokens.
+    /// Compact once the ledger's effective count reaches this many tokens.
     pub compaction_threshold: u64,
     /// Hard cap on the effective count. Checked after compaction has had its
     /// chance, before every provider request; exceeding it fails the turn
@@ -27,11 +23,10 @@ impl Default for ContextSettings {
 }
 
 impl ContextSettings {
-    /// Whether the effective ledger count is close enough to trigger
-    /// compaction.
+    /// Whether the effective ledger count reached the threshold.
     #[must_use]
     pub fn compaction_due(&self, effective_tokens: u64) -> bool {
-        effective_tokens.saturating_add(COMPACTION_TRIGGER_BUFFER) >= self.compaction_threshold
+        effective_tokens >= self.compaction_threshold
     }
 
     /// Enforce the hard cap on the effective ledger count.
@@ -63,7 +58,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compaction_due_applies_the_trigger_buffer() {
+    fn compaction_due_uses_the_exact_threshold() {
         let settings = ContextSettings {
             compaction_threshold: 1_000,
             max_tokens: None,
@@ -78,11 +73,11 @@ mod tests {
                 due: false,
             },
             Case {
-                effective_tokens: 1_000 - COMPACTION_TRIGGER_BUFFER - 1,
+                effective_tokens: 999,
                 due: false,
             },
             Case {
-                effective_tokens: 1_000 - COMPACTION_TRIGGER_BUFFER,
+                effective_tokens: 1_000,
                 due: true,
             },
             Case {

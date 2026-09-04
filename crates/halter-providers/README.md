@@ -138,7 +138,7 @@ This is the transport primitive behind the runtime's `ProviderDefault`
 strategy (`context.compaction = "provider_default"`). The strategy decides which
 messages a rewrite may replace from `ProviderCapabilities::compaction_strategy`
 — everything before the latest assistant block for a dedicated endpoint, only
-the tail after the latest user message for an inline request — and the adapter
+the prefix before the latest user message for an inline request — and the adapter
 encodes the request it is handed. When it runs is decided by the runtime's
 session token ledger, never by the provider: an adapter must not enable
 server-side auto-compaction. That is why the Anthropic adapter sends an

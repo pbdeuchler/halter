@@ -310,7 +310,8 @@ This crate exports:
 
 The runtime owns *when*. Every append goes through `SessionState::append`,
 which advances the session's `TokenLedger` (the last completed response's
-reported context size plus a heuristic estimate of everything appended since).
+reported context size, a heuristic estimate of everything appended since,
+and the current prompt/tool request base).
 At each consistent boundary — right after an assistant response with no tool
 calls, and before every provider request once the pending appends have landed
 — a ledger at or past `ContextSettings::compaction_threshold` runs the
@@ -327,8 +328,11 @@ cache), and `execute_tool_calls` runs tools through hooks and policy. It
 returns the replacement window and compacted prefix as `CompactionEffects`,
 which `apply` writes through the same `halter_protocol::fold::apply_event`
 replay uses, so live and replayed sessions agree. Strategies can also
-contribute tools, system-prompt segments, and threshold reminders; install
-one with `HalterBuilder::with_compaction`.
+contribute tools and system-prompt segments. At each boundary,
+`context_boundary` receives the session id, logical window, effective counts,
+threshold, and persisted notification ids; it can return exactly-once
+reminders plus a compact or forced-rollover directive. Install one with
+`HalterBuilder::with_compaction`.
 
 `ModelSummary` runs up to two inferences: when the `task` tool is registered,
 a nudge to persist remaining work (only that reply's `task` calls run; its text
@@ -339,8 +343,9 @@ reply becomes the next window as one user-role message after the static
 prefix, with a todo reminder when the nudge ran calls. `ProviderDefault`
 hands `Provider::compact` the window its
 `ProviderCapabilities::compaction_strategy` allows: everything before the
-latest assistant block for a dedicated endpoint, the tail after the latest user
-message for an inline request.
+latest assistant block for a dedicated endpoint, or the prefix before the
+latest user message for an inline request. In both cases the summary remains
+before the preserved suffix in the next provider request.
 
 The context manager then plans the request from the (possibly compacted)
 state: the full transcript window, the carried prefix, prompt segments, and

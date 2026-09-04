@@ -7,6 +7,7 @@
 //! each other.
 // pattern: Functional Core
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,7 +28,8 @@ pub mod token_ledger;
 pub use token_ledger::{
     CharHeuristicEstimator, TokenEstimator, TokenLedger, estimate_compacted_prefix_tokens,
     estimate_json_tokens, estimate_message_tokens, estimate_messages_tokens,
-    estimate_segment_tokens, estimate_text_tokens, stable_json,
+    estimate_request_tokens, estimate_segment_tokens, estimate_text_tokens,
+    estimate_tool_spec_tokens, stable_json,
 };
 
 /// Shared string payloads stay as `String` for now; this is the swap point for any future `Arc<str>` migration.
@@ -931,6 +933,10 @@ pub struct CompactionEventEffects {
     /// Provider-native compacted items that replace
     /// [`SessionState::compacted_prefix`].
     pub compacted_prefix: Vec<Value>,
+    /// Provider-native compaction usage not represented by an assistant
+    /// `MessageItem` event.
+    #[serde(default)]
+    pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -950,6 +956,12 @@ pub enum SessionEventPayload {
     },
     MessageItem {
         message: Message,
+    },
+    /// Updates the non-transcript portion of the context projection. Emitted
+    /// when prompt segments or tool declarations change, including the first
+    /// request after loading a legacy snapshot.
+    ContextProjectionUpdated {
+        request_tokens: u64,
     },
     DeltaItem {
         delta: DeltaItem,
@@ -1582,10 +1594,24 @@ pub struct SessionState {
     pub messages_seen_by_provider: usize,
     /// Running context-size estimate, updated on every append through
     /// [`SessionState::append`] and rebuilt by compaction. Snapshots written
-    /// before the ledger existed load as zero and are corrected by the next
-    /// completed assistant response.
-    #[serde(default)]
+    /// before the current accounting format are rebuilt from their transcript
+    /// before the next request.
+    #[serde(default = "legacy_token_ledger")]
     pub token_ledger: TokenLedger,
+    /// Logical context-window ordinal. Successful rewrites increment it;
+    /// strategies use it to scope exactly-once boundary notifications.
+    #[serde(default)]
+    pub context_window: u64,
+    /// Notification ids delivered in the current logical window.
+    #[serde(default)]
+    pub compaction_notifications: BTreeSet<String>,
+}
+
+fn legacy_token_ledger() -> TokenLedger {
+    TokenLedger {
+        accounting_version: 0,
+        ..TokenLedger::default()
+    }
 }
 
 impl SessionState {

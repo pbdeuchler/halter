@@ -21,6 +21,7 @@
 //! - `token_ledger` — advanced by every `MessageItem` through
 //!   [`SessionState::append`] and rebuilt from `ContextCompacted` effects,
 //!   exactly as the runtime does.
+//! - `context_window` — advanced by each state-rewriting compaction.
 //!
 //! Runtime bookkeeping fields (`file_view_cache`, `pending_tool_calls`,
 //! `fired_hook_ids`, `appended_prompt_segments`, `lineage`, hook latches, and
@@ -35,7 +36,7 @@
 //! commits, folding the full log over a default state must agree with the
 //! persisted checkpoint on every covered field ([`covered_state_matches`]).
 
-use crate::{Message, SessionEvent, SessionEventPayload, SessionState, TokenLedger};
+use crate::{Message, SessionEvent, SessionEventPayload, SessionState};
 
 /// Apply one committed event payload to `state`, mutating only the
 /// fold-covered fields (see the module docs for the exact list). Events that
@@ -51,10 +52,18 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
             }
             state.append(message.clone());
         }
+        SessionEventPayload::ContextProjectionUpdated { request_tokens } => {
+            let compacted_prefix = &state.compacted_prefix;
+            let messages = &state.messages;
+            state
+                .token_ledger
+                .prepare_request(*request_tokens, compacted_prefix, messages);
+        }
         SessionEventPayload::ContextCompacted {
             effects: Some(effects),
             ..
         } => {
+            state.usage_so_far.saturating_accumulate(&effects.usage);
             state.messages = effects.messages.clone();
             state.compacted_prefix = effects.compacted_prefix.clone();
             // Compaction breaks the provider response chain; mirror the
@@ -62,8 +71,11 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
             state.last_response_id = None;
             state.messages_seen_by_provider = 0;
             // Usage reported by the preserved tail predates this rewrite.
-            state.token_ledger =
-                TokenLedger::inferred_from(&state.compacted_prefix, &state.messages);
+            state
+                .token_ledger
+                .rebuild_context(&state.compacted_prefix, &state.messages);
+            state.context_window = state.context_window.saturating_add(1);
+            state.compaction_notifications.clear();
         }
         SessionEventPayload::ContextCompacted { effects: None, .. }
         | SessionEventPayload::SessionStarted
@@ -105,6 +117,7 @@ pub fn covered_state_matches(a: &SessionState, b: &SessionState) -> bool {
         && a.compacted_prefix == b.compacted_prefix
         && a.usage_so_far == b.usage_so_far
         && a.token_ledger == b.token_ledger
+        && a.context_window == b.context_window
 }
 
 #[cfg(test)]
@@ -116,7 +129,7 @@ mod tests {
     use super::*;
     use crate::{
         AssistantMessage, CompactionEventEffects, Delivery, MessageId, PendingEvent, ReplayMeta,
-        SessionId, StopReason, Usage, UserMessage,
+        SessionId, StopReason, TokenLedger, Usage, UserMessage,
     };
 
     fn assistant_message(text: &str, usage: Option<Usage>) -> Message {
@@ -171,6 +184,7 @@ mod tests {
             TokenLedger {
                 authoritative_tokens: 15,
                 inferred_tokens: 0,
+                ..TokenLedger::default()
             }
         );
     }
@@ -223,6 +237,7 @@ mod tests {
             token_ledger: TokenLedger {
                 authoritative_tokens: 80_000,
                 inferred_tokens: 0,
+                ..TokenLedger::default()
             },
             ..SessionState::default()
         };
@@ -234,6 +249,7 @@ mod tests {
                 effects: Some(Box::new(CompactionEventEffects {
                     messages: window.clone(),
                     compacted_prefix: vec![json!({"kind": "prefix"})],
+                    usage: Usage::default(),
                 })),
             },
         );
@@ -324,6 +340,7 @@ mod tests {
                     effects: Some(Box::new(CompactionEventEffects {
                         messages: Vec::new(),
                         compacted_prefix: vec![json!("p")],
+                        usage: Usage::default(),
                     })),
                 },
             ),
@@ -372,10 +389,17 @@ mod tests {
             token_ledger: TokenLedger {
                 authoritative_tokens: 1,
                 inferred_tokens: 0,
+                ..TokenLedger::default()
             },
             ..base.clone()
         };
         assert!(!covered_state_matches(&base, &ledger_differs));
+
+        let window_differs = SessionState {
+            context_window: 1,
+            ..base.clone()
+        };
+        assert!(!covered_state_matches(&base, &window_differs));
     }
 
     fn fold_payload_strategy() -> impl Strategy<Value = SessionEventPayload> {
@@ -414,6 +438,7 @@ mod tests {
                         .map(|text| Message::User(UserMessage::text(text)))
                         .collect(),
                     compacted_prefix: prefix.into_iter().map(|value| json!(value)).collect(),
+                    usage: Usage::default(),
                 })),
             });
 

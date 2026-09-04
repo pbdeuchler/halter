@@ -60,6 +60,12 @@ impl CompactionStrategy for ProviderDefault {
                 ctx.cancel().clone(),
             )
             .await?;
+        if response.output.is_empty() {
+            anyhow::bail!(
+                "failed to compact session: provider '{}' returned no compacted context",
+                ctx.model().provider
+            );
+        }
         let summary = format!(
             "Compacted {} older messages into {} provider-native items; kept {} verbatim.",
             eligible.len(),
@@ -74,6 +80,7 @@ impl CompactionStrategy for ProviderDefault {
                 compacted_count: eligible.len(),
                 summary,
             },
+            usage: response.usage,
         }))
     }
 }
@@ -82,9 +89,10 @@ impl CompactionStrategy for ProviderDefault {
 ///
 /// A dedicated endpoint restores compacted context as provider-native items,
 /// so everything before the latest assistant block is eligible and that
-/// block stays verbatim. An inline request only summarizes the tail after
-/// the latest user message, so system, tool, skill, and latest-user cache
-/// anchors stay verbatim.
+/// block stays verbatim. An inline request summarizes the prefix before the
+/// latest user message and keeps that user-led suffix verbatim. Both shapes
+/// preserve chronology because provider-native compacted items are encoded
+/// before `messages` in the next request.
 pub(crate) fn split_window(
     strategy: ProviderCompactionStrategy,
     messages: &[Message],
@@ -101,9 +109,9 @@ pub(crate) fn split_window(
             let pivot = messages
                 .iter()
                 .rposition(|message| matches!(message, Message::User(_)))
-                .map_or(messages.len(), |index| index + 1);
+                .unwrap_or(messages.len());
 
-            (messages[pivot..].to_vec(), messages[..pivot].to_vec())
+            (messages[..pivot].to_vec(), messages[pivot..].to_vec())
         }
     }
 }
@@ -157,7 +165,7 @@ mod tests {
                 preserved_first: None,
             },
             Case {
-                name: "inline compacts only the tail after the latest user",
+                name: "inline compacts the prefix before the latest user",
                 strategy: ProviderCompactionStrategy::Inline,
                 messages: vec![
                     user("first"),
@@ -165,15 +173,15 @@ mod tests {
                     user("latest"),
                     assistant("tail"),
                 ],
-                eligible: 1,
-                preserved_first: Some("first"),
+                eligible: 2,
+                preserved_first: Some("latest"),
             },
             Case {
-                name: "inline without a user preserves everything",
+                name: "inline without a user compacts everything",
                 strategy: ProviderCompactionStrategy::Inline,
                 messages: vec![assistant("only")],
-                eligible: 0,
-                preserved_first: Some("only"),
+                eligible: 1,
+                preserved_first: None,
             },
             Case {
                 name: "empty transcript",

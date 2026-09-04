@@ -91,6 +91,8 @@ pub fn build_subagent_state(
             &parent.state.compacted_prefix,
             &parent.state.messages,
         ),
+        context_window: 0,
+        compaction_notifications: Default::default(),
     }
 }
 

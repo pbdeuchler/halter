@@ -12,7 +12,7 @@ use std::sync::Arc;
 use halter_protocol::{
     CompactionEventEffects, Delivery, Message, ModelId, PendingEvent, ResourceSnapshot,
     SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState,
-    SubagentEventForwarding, UserMessage, fold,
+    SubagentEventForwarding, Usage, UserMessage, fold,
 };
 use halter_session::{InMemorySessionStore, SessionCommitConflict, SessionStore, StoredSession};
 
@@ -315,6 +315,8 @@ async fn fold_of_full_log_matches_state_checkpoint() {
         let prefix = vec![serde_json::json!({"kind": "compacted"})];
         state.messages = window.clone();
         state.compacted_prefix = prefix.clone();
+        state.context_window = state.context_window.saturating_add(1);
+        state.compaction_notifications.clear();
         // The runtime rebuilds the ledger from the compacted state; the
         // checkpoint mirrors it so the fold's rebuild has something to match.
         state.token_ledger = halter_protocol::TokenLedger::inferred_from(&prefix, &window);
@@ -332,6 +334,7 @@ async fn fold_of_full_log_matches_state_checkpoint() {
                     effects: Some(Box::new(CompactionEventEffects {
                         messages: window,
                         compacted_prefix: prefix,
+                        usage: Usage::default(),
                     })),
                 },
             )],

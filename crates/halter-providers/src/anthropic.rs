@@ -271,7 +271,7 @@ impl Provider for AnthropicMessagesProvider {
     }
 
     /// Inline compaction: one ordinary Messages request that asks the model
-    /// to summarize the eligible tail, re-injected later as a tagged system
+    /// to summarize the eligible history, re-injected later as a tagged system
     /// section. Anthropic's native compaction (`context_management` edit
     /// `compact_20260112`, beta `compact-2026-01-12`) is deliberately not
     /// used: it only fires when a request's input exceeds a trigger of at
