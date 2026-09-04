@@ -332,12 +332,11 @@ struct ToolEventDrain {
 
 impl ToolEventDrain {
     fn into_events(self) -> Vec<ToolRuntimeEvent> {
-        self.buffer
+        let mut buffer = self
+            .buffer
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .events
-            .drain(..)
-            .collect()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut buffer.events)
     }
 }
 
