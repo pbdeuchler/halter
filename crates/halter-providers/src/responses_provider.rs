@@ -5,9 +5,9 @@ use futures::{
     stream::{self, BoxStream},
 };
 use halter_protocol::{
-    ApiKind, CompactionWindow, Message, OpenRouterRouting, ProviderCapabilities,
-    ProviderCompactionRequest, ProviderCompactionResponse, ProviderCompactionStrategy,
-    ProviderError, ProviderErrorKind, ProviderRequest, StreamEvent,
+    ApiKind, OpenRouterRouting, ProviderCapabilities, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderCompactionStrategy, ProviderError, ProviderErrorKind,
+    ProviderRequest, StreamEvent,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -293,18 +293,6 @@ impl ResponsesProvider {
 impl Provider for ResponsesProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities.clone()
-    }
-
-    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
-        match self.config.compact_strategy {
-            Some(CompactStrategy::DedicatedEndpoint) => Some(
-                CompactionWindow::preserve_latest_assistant_response_block(messages),
-            ),
-            Some(CompactStrategy::InlineResponses) => {
-                Some(CompactionWindow::preserve_through_latest_user(messages))
-            }
-            None => None,
-        }
     }
 
     async fn stream(

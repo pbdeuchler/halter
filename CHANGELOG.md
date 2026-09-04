@@ -66,6 +66,35 @@ once a `1.0.0` line is cut.
   - `PreCompact`/`PostCompact` hooks now fire around automatic compaction too,
     with trigger `auto`; a blocking `PreCompact` hook skips the pass with a
     `Warning` event.
+- Compaction v2, part 2: the two request-rewriting strategies, selectable
+  from config, and the pruning machinery they replace deleted (#195).
+  - `ModelSummary` is the new default. When the `task` tool is registered it
+    first nudges the model to persist its remaining work (only that reply's
+    `task` calls run; its text and other calls never reach the next request,
+    though the event log keeps the whole reply), then sends the built-in
+    checkpoint instructions, and the reply becomes the next window as a
+    single user-role message after the static prefix, with a todo reminder
+    when the nudge ran calls. No tail of old messages is kept.
+  - `ProviderDefault` delegates the rewrite to the provider's native
+    compaction, on Halter's trigger only, and derives the window it may
+    replace from `ProviderCapabilities::compaction_strategy`. Anthropic keeps
+    the inline summarization request: the shipped `compact_20260112` context
+    edit fires only on the server's own token trigger (50,000 tokens minimum)
+    and cannot be invoked on demand.
+  - `context.compaction = "model_summary" | "provider_default"`
+    (`CompactionStrategyKind`). Selecting `provider_default` with a default
+    model whose provider cannot compact fails `HalterBuilder::build` with an
+    actionable error, never the first compaction.
+  - `CompactionContext` is now a runtime-backed engine rather than a bag of
+    references: `append`, `record`, `infer`, and `execute_tool_calls` let a
+    strategy drive the model and tools through the turn's own planning,
+    prompt cache, hooks, policy, and event log; reads go through `state()`,
+    `model()`, `provider()`, `prompt_segments()`, `tool_specs()`, and
+    `trigger()`. `halter::compaction` re-exports `ModelSummary`,
+    `ProviderDefault`, `CompactionStrategyKind`, and
+    `compaction_instructions`.
+  - `default_compaction_prompt()` is now the context-checkpoint request the
+    model receives; it ends by asking for plain text and no tool calls.
 
 ### Changed
 
@@ -98,6 +127,26 @@ once a `1.0.0` line is cut.
 - **Breaking:** `RuntimeServices` gained `context: ContextSettings` and
   `compaction: Arc<dyn CompactionStrategy>`, and `ContextSettings` gained
   `max_tokens`.
+- **Breaking:** `context.pre_compaction_target` and
+  `context.prune_signal_threshold` are removed along with signal-scored
+  pruning; `ContextConfig` and `ResolvedContextConfig` gained `compaction`
+  and `ContextSettings` lost the two pruning fields. `MessageSignal`,
+  `PruneSignalThreshold`, `CompactionWindow`, `SummarySlice`,
+  `SessionState::summaries`, `ContextPlan::carried_summaries`,
+  `estimate_summary_tokens`, and `halter_runtime::score_message` are gone;
+  `TokenLedger::inferred_from` takes `(compacted_prefix, messages)`.
+- **Breaking:** `Provider::compaction_window` is removed from the provider
+  trait; which messages a rewrite preserves is strategy policy, derived from
+  `ProviderCapabilities::compaction_strategy`. `FakeProvider` now reports
+  `Some(Dedicated)`.
+- **Breaking:** `ProviderCompaction` is replaced by `ProviderDefault` (no
+  settings) and the interim provider-delegated default by `ModelSummary`.
+  `CompactionContext`'s fields are private; use its accessors. `plan()` no
+  longer renders carried summaries into the prefix.
+- **Breaking:** the default compaction behavior changed from provider-native
+  compaction to a model-written checkpoint. Set
+  `context.compaction = "provider_default"` to keep the previous behavior.
+
 
 ## [0.5.0] - 2026-07-27
 

@@ -34,7 +34,7 @@ async fn commit_succeeds_with_matching_expected_head() {
         let session = test_session("matching");
         store.create_session(session.clone()).await.expect(backend);
 
-        let updated_state = state_with_summary("updated");
+        let updated_state = state_with_marker("updated");
         store
             .commit(
                 &session.blueprint.session_id,
@@ -68,7 +68,7 @@ async fn commit_rejects_stale_expected_head() {
                 &session.blueprint.session_id,
                 None,
                 Some(0),
-                Some(state_with_summary("first-writer")),
+                Some(state_with_marker("first-writer")),
                 vec![test_event("first")],
             )
             .await
@@ -79,7 +79,7 @@ async fn commit_rejects_stale_expected_head() {
                 &session.blueprint.session_id,
                 None,
                 Some(0),
-                Some(state_with_summary("second-writer")),
+                Some(state_with_marker("second-writer")),
                 vec![test_event("second")],
             )
             .await
@@ -98,7 +98,7 @@ async fn commit_rejects_stale_expected_head() {
             .expect(backend);
         assert_eq!(
             reloaded.state,
-            state_with_summary("first-writer"),
+            state_with_marker("first-writer"),
             "{backend}"
         );
         assert_eq!(reloaded.head_sequence, 1, "{backend}");
@@ -124,7 +124,7 @@ async fn commit_without_expected_head_skips_conflict_detection() {
                     &session.blueprint.session_id,
                     None,
                     None,
-                    Some(state_with_summary(summary)),
+                    Some(state_with_marker(summary)),
                     Vec::new(),
                 )
                 .await
@@ -229,7 +229,7 @@ async fn checkpoint_lags_head_after_event_only_commit() {
                 &session.blueprint.session_id,
                 None,
                 Some(0),
-                Some(state_with_summary("checkpointed")),
+                Some(state_with_marker("checkpointed")),
                 vec![test_event("one")],
             )
             .await
@@ -317,8 +317,7 @@ async fn fold_of_full_log_matches_state_checkpoint() {
         state.compacted_prefix = prefix.clone();
         // The runtime rebuilds the ledger from the compacted state; the
         // checkpoint mirrors it so the fold's rebuild has something to match.
-        state.token_ledger =
-            halter_protocol::TokenLedger::inferred_from(&prefix, &window, &state.summaries);
+        state.token_ledger = halter_protocol::TokenLedger::inferred_from(&prefix, &window);
 
         head = commit_events(
             store.as_ref(),
@@ -442,12 +441,11 @@ fn test_session(name: &str) -> StoredSession {
     StoredSession::new(blueprint, SessionState::default(), snapshot)
 }
 
-fn state_with_summary(text: &str) -> SessionState {
+/// A state distinguishable by `text` and equal to itself on every call:
+/// messages carry fresh ids and timestamps, a prefix marker does not.
+fn state_with_marker(text: &str) -> SessionState {
     SessionState {
-        summaries: vec![halter_protocol::SummarySlice {
-            id: format!("summary-{text}"),
-            text: text.to_owned(),
-        }],
+        compacted_prefix: vec![serde_json::json!({"marker": text})],
         ..SessionState::default()
     }
 }

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    ApiKind, CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
+    ApiKind, ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse,
+    ProviderError, ProviderRequest, StreamEvent, ToolCallIdPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -207,10 +207,6 @@ impl Provider for OpenAiProvider {
         self.inner.capabilities()
     }
 
-    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
-        self.inner.compaction_window(messages)
-    }
-
     async fn stream(
         &self,
         request: ProviderRequest,
@@ -297,9 +293,8 @@ mod tests {
 
     use futures::StreamExt;
     use halter_protocol::{
-        ApiKind, AssembledPrompt, AssistantMessage, AssistantPart, Message, MessageId, ModelId,
-        ModelRole, ProviderKind, ProviderName, ReplayMeta, ResolvedModel, SessionId, StreamEvent,
-        TurnId, UserMessage,
+        ApiKind, AssembledPrompt, ModelId, ModelRole, ProviderKind, ProviderName, ResolvedModel,
+        SessionId, StreamEvent, TurnId,
     };
     use serde_json::json;
     use tokio::io::AsyncWriteExt;
@@ -329,25 +324,6 @@ mod tests {
                 .to_string()
                 .contains("openai provider requires openai_responses api kind")
         );
-    }
-
-    #[test]
-    fn openai_provider_compaction_window_preserves_latest_assistant_response_block() {
-        let provider =
-            OpenAiProvider::new("test-key", "https://api.openai.com").expect("openai provider");
-        let messages = vec![
-            Message::User(UserMessage::text("first")),
-            assistant_text("answer"),
-            Message::User(UserMessage::text("follow up")),
-        ];
-
-        let window = provider
-            .compaction_window(&messages)
-            .expect("compaction window");
-
-        assert_eq!(window.eligible_messages.len(), 1);
-        assert_eq!(window.preserved_messages.len(), 2);
-        assert!(window.reserved_response_block);
     }
 
     #[tokio::test]
@@ -545,12 +521,6 @@ mod tests {
             capabilities.compaction_strategy,
             Some(halter_protocol::ProviderCompactionStrategy::Dedicated)
         );
-        let messages = vec![
-            Message::User(UserMessage::text("first")),
-            assistant_text("answer"),
-            Message::User(UserMessage::text("follow up")),
-        ];
-        assert!(provider.compaction_window(&messages).is_some());
     }
 
     #[test]
@@ -666,19 +636,6 @@ mod tests {
             previous_response_id: None,
             new_messages_start: 0,
         }
-    }
-
-    fn assistant_text(text: &str) -> Message {
-        Message::Assistant(AssistantMessage {
-            id: MessageId::new(),
-            created_at: chrono::Utc::now(),
-            parts: vec![AssistantPart::Text {
-                text: text.to_owned(),
-            }],
-            stop_reason: None,
-            usage: None,
-            replay_meta: ReplayMeta::default(),
-        })
     }
 
     async fn spawn_retrying_stream_server(

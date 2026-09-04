@@ -76,7 +76,7 @@ pub fn build_subagent_state(
         appended_prompt_segments: parent.state.appended_prompt_segments.clone(),
         pending_tool_calls: Default::default(),
         usage_so_far: Usage::default(),
-        summaries: parent.state.summaries.clone(),
+
         lineage,
         fired_hook_ids: parent.state.fired_hook_ids.clone(),
         pending_session_start_source: None,
@@ -90,7 +90,6 @@ pub fn build_subagent_state(
         token_ledger: TokenLedger::inferred_from(
             &parent.state.compacted_prefix,
             &parent.state.messages,
-            &parent.state.summaries,
         ),
     }
 }
@@ -236,11 +235,7 @@ mod tests {
         let forked = build_subagent_state(&parent, &child_id, "task", true);
         assert_eq!(
             forked.token_ledger,
-            TokenLedger::inferred_from(
-                &parent_state.compacted_prefix,
-                &parent_state.messages,
-                &parent_state.summaries
-            )
+            TokenLedger::inferred_from(&parent_state.compacted_prefix, &parent_state.messages)
         );
         assert_eq!(forked.token_ledger.authoritative_tokens, 0);
         assert!(forked.token_ledger.inferred_tokens > 0);

@@ -146,7 +146,7 @@ impl ContextManager for DefaultContextManager {
             },
             compacted_prefix: state.compacted_prefix.clone(),
             file_views,
-            carried_summaries: state.summaries.clone(),
+
             elided_tool_results: Vec::new(),
             memory_items: Vec::new(),
             tool_specs: tool_specs.to_vec(),
@@ -211,9 +211,7 @@ pub fn resolve_response_chain(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use halter_protocol::{
-        SessionId, SubagentEventForwarding, SummarySlice, TokenLedger, UserMessage,
-    };
+    use halter_protocol::{SessionId, SubagentEventForwarding, TokenLedger, UserMessage};
 
     use super::*;
 
@@ -263,11 +261,8 @@ mod tests {
                 "id": "cmp_1",
                 "encrypted_content": "x",
             })],
-            summaries: vec![SummarySlice {
-                id: "summary-1".to_owned(),
-                text: "summary".to_owned(),
-            }],
             messages: vec![Message::User(UserMessage::text("hello"))],
+
             last_response_id: Some("resp_1".to_owned()),
             messages_seen_by_provider: 1,
             ..SessionState::default()
@@ -335,7 +330,7 @@ mod tests {
         // state only.
         assert_eq!(
             state.token_ledger,
-            TokenLedger::inferred_from(&prefix, &window, &[])
+            TokenLedger::inferred_from(&prefix, &window)
         );
         match payload {
             SessionEventPayload::ContextCompacted {

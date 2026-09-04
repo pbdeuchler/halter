@@ -67,10 +67,12 @@ pub mod providers {
 /// Compaction: the session token ledger, the runtime's trigger settings, and
 /// the strategy seam installed through [`HalterBuilder::with_compaction`].
 pub mod compaction {
+    pub use halter_config::CompactionStrategyKind;
     pub use halter_protocol::TokenLedger;
     pub use halter_runtime::{
         CompactionContext, CompactionEffects, CompactionStrategy, CompactionTrigger,
-        ContextCapExceeded, ContextSettings, ProviderCompaction,
+        ContextCapExceeded, ContextSettings, ModelSummary, ProviderDefault,
+        compaction_instructions,
     };
 }
 

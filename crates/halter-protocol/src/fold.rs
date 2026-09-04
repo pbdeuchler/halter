@@ -62,11 +62,8 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
             state.last_response_id = None;
             state.messages_seen_by_provider = 0;
             // Usage reported by the preserved tail predates this rewrite.
-            state.token_ledger = TokenLedger::inferred_from(
-                &state.compacted_prefix,
-                &state.messages,
-                &state.summaries,
-            );
+            state.token_ledger =
+                TokenLedger::inferred_from(&state.compacted_prefix, &state.messages);
         }
         SessionEventPayload::ContextCompacted { effects: None, .. }
         | SessionEventPayload::SessionStarted
@@ -249,8 +246,9 @@ mod tests {
         // session would keep the stale pre-compaction anchor.
         assert_eq!(
             state.token_ledger,
-            TokenLedger::inferred_from(&state.compacted_prefix, &window, &[])
+            TokenLedger::inferred_from(&state.compacted_prefix, &window)
         );
+
         assert_eq!(state.token_ledger.authoritative_tokens, 0);
     }
 

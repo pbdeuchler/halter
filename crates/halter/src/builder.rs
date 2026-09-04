@@ -7,16 +7,16 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use halter_config::{
-    ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig, ModelJudgeConfig,
-    ModelJudgeMode, ModelSlot, ModelSlotRef, OpenAiOAuthConfig, PolicyConfig, PromptsConfig,
-    ResilienceConfig, ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID,
+    CompactionStrategyKind, ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig,
+    ModelJudgeConfig, ModelJudgeMode, ModelSlot, ModelSlotRef, OpenAiOAuthConfig, PolicyConfig,
+    PromptsConfig, ResilienceConfig, ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID,
     SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, ShellModeConfig, SystemPromptPreset,
     expand_path, load_path, resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
-    HookWarning, ModelId, ModelRole, PromptSegmentKind, ProviderName, ResolvedModel,
-    ResourceSnapshot,
+    HookWarning, ModelId, ModelRole, PromptSegmentKind, ProviderCapabilities, ProviderName,
+    ResolvedModel, ResourceSnapshot,
 };
 use halter_providers::{
     AnthropicProvider, DefaultProviderErrorClassifier, FullTurnJudgePlan, FullTurnPanelist,
@@ -26,7 +26,7 @@ use halter_providers::{
 };
 use halter_runtime::{
     CompactionStrategy, ContextSettings, DefaultContextManager, DefaultPromptAssembler, EventBus,
-    HalterSession, ProviderCompaction, ResourceHandle, RuntimeServices, SessionInit,
+    HalterSession, ModelSummary, ProviderDefault, ResourceHandle, RuntimeServices, SessionInit,
     SessionRuntime, TraceRecorder,
 };
 use halter_session::{InMemorySessionStore, SessionStore};
@@ -185,9 +185,11 @@ impl HalterBuilder {
         debug!("validating halter builder config");
         config.validate()?;
         registered_hooks.validate()?;
-        let context = context_settings(&config)?;
-        let compaction: Arc<dyn CompactionStrategy> =
-            compaction.unwrap_or_else(|| Arc::new(ProviderCompaction::new(context)));
+        let resolved_context = config.resolved_context()?;
+        let context = ContextSettings {
+            compaction_threshold: resolved_context.compaction_threshold,
+            max_tokens: resolved_context.max_tokens,
+        };
 
         if resource_snapshot.is_some() && (!loaded_skills.is_empty() || !loaded_plugins.is_empty())
         {
@@ -234,6 +236,10 @@ impl HalterBuilder {
                 .unwrap_or_else(|| Arc::new(DefaultProviderErrorClassifier)),
         };
         let models = Arc::new(build_model_registry(&config, &provider_options)?);
+        let compaction = match compaction {
+            Some(strategy) => strategy,
+            None => configured_compaction(resolved_context.compaction, &models)?,
+        };
         let tools = Arc::new(ToolRuntime::new());
         register_builtin_tools(&tools, &config.tools.enabled);
         // Strategy tools sit between the built-ins and explicitly supplied
@@ -504,16 +510,37 @@ struct ProviderBuildOptions {
     provider_error_classifier: Arc<dyn ProviderErrorClassifier>,
 }
 
-/// Runtime trigger settings from `[context]`, with unset thresholds derived
-/// from the default model's input window.
-fn context_settings(config: &HarnessConfig) -> anyhow::Result<ContextSettings> {
-    let resolved = config.resolved_context()?;
-    Ok(ContextSettings {
-        compaction_threshold: resolved.compaction_threshold,
-        pre_compaction_target: resolved.pre_compaction_target,
-        prune_signal_threshold: resolved.prune_signal_threshold,
-        max_tokens: resolved.max_tokens,
-    })
+/// The strategy `[context].compaction` names. `provider_default` is checked
+/// against the default model's provider here, at build time, so a provider
+/// without native compaction fails the build rather than the first
+/// compaction.
+fn configured_compaction(
+    kind: CompactionStrategyKind,
+    models: &ModelRegistry,
+) -> anyhow::Result<Arc<dyn CompactionStrategy>> {
+    match kind {
+        CompactionStrategyKind::ModelSummary => Ok(Arc::new(ModelSummary)),
+        CompactionStrategyKind::ProviderDefault => {
+            let model = models.default_model()?;
+            let capabilities = models.provider(&model.provider)?.capabilities();
+            ensure_provider_compaction(&model, &capabilities)?;
+            Ok(Arc::new(ProviderDefault))
+        }
+    }
+}
+
+fn ensure_provider_compaction(
+    model: &ResolvedModel,
+    capabilities: &ProviderCapabilities,
+) -> anyhow::Result<()> {
+    if capabilities.supports_compaction && capabilities.compaction_strategy.is_some() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "invalid configuration: context.compaction = \"provider_default\" but provider '{}' serving models.default ({}) does not support native compaction; use \"model_summary\"",
+        model.provider,
+        model.model
+    )
 }
 
 fn build_model_registry(
@@ -1807,6 +1834,90 @@ mod tests {
                 .contains("context.compaction_threshold is unset"),
             "got {error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn builder_selects_the_configured_compaction_strategy() {
+        // Every built-in provider compacts natively, so `provider_default`
+        // builds against the OpenAI config too.
+        let mut config = openai_config(Some("test-key"));
+        config.context.compaction = CompactionStrategyKind::ProviderDefault;
+        HalterBuilder::default()
+            .with_config(config)
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("provider_default builds when the provider compacts natively");
+    }
+
+    #[test]
+    fn provider_default_requires_native_compaction() {
+        let model = ResolvedModel {
+            role: ModelRole::default(),
+            id: ModelId::from("default"),
+            provider: ProviderName::from("fake"),
+            provider_kind: halter_protocol::ProviderKind::Fake,
+            api_kind: halter_protocol::ApiKind::Fake,
+            model: "halter/fake".to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            reasoning: None,
+            tokens_per_minute: None,
+        };
+        struct Case {
+            name: &'static str,
+            capabilities: ProviderCapabilities,
+            ok: bool,
+        }
+        let cases = [
+            Case {
+                name: "dedicated endpoint",
+                capabilities: ProviderCapabilities {
+                    supports_compaction: true,
+                    compaction_strategy: Some(
+                        halter_protocol::ProviderCompactionStrategy::Dedicated,
+                    ),
+                    ..ProviderCapabilities::default()
+                },
+                ok: true,
+            },
+            Case {
+                name: "inline",
+                capabilities: ProviderCapabilities {
+                    supports_compaction: true,
+                    compaction_strategy: Some(halter_protocol::ProviderCompactionStrategy::Inline),
+                    ..ProviderCapabilities::default()
+                },
+                ok: true,
+            },
+            Case {
+                name: "no compaction",
+                capabilities: ProviderCapabilities::default(),
+                ok: false,
+            },
+            Case {
+                name: "advertised without a strategy",
+                capabilities: ProviderCapabilities {
+                    supports_compaction: true,
+                    compaction_strategy: None,
+                    ..ProviderCapabilities::default()
+                },
+                ok: false,
+            },
+        ];
+        for case in cases {
+            let result = ensure_provider_compaction(&model, &case.capabilities);
+            assert_eq!(result.is_ok(), case.ok, "{}: {result:?}", case.name);
+            if let Err(error) = result {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("context.compaction = \"provider_default\" but provider 'fake'"),
+                    "{}: {error:#}",
+                    case.name
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -48,7 +48,7 @@ Key exports include:
 - `ContextManager`, `DefaultContextManager`
 - `PromptAssembler`, `DefaultPromptAssembler`
 - hook runtime integration helpers
-- `score_message(...)`
+- `CompactionStrategy`, `ModelSummary`, `ProviderDefault`
 
 These are the building blocks for long-lived, tool-using, event-emitting agent sessions.
 
@@ -238,8 +238,9 @@ Runs one compaction pass through the configured `CompactionStrategy`, with
 way automatic compaction does. Unlike the automatic path, a strategy failure
 propagates to the caller, who asked for compaction explicitly.
 
-With the default provider-delegated strategy and a provider that does not
-support compaction, you can see an error like:
+With `ProviderDefault` installed by hand on a provider that cannot compact
+natively (the builder refuses that combination from config), you can see an
+error like:
 
 > `failed to compact session: provider '{}' does not support compaction`
 
@@ -292,17 +293,18 @@ If consumers fall behind, `dropped_events()` provides visibility into loss.
 
 ## Context management
 
-Large sessions need pruning and compaction.
+Large sessions need compaction.
 
 This crate exports:
 
-- `ContextSettings` and `ContextCapExceeded` — the trigger thresholds and the
-  typed error the hard cap raises
+- `ContextSettings` and `ContextCapExceeded` — the trigger threshold, the
+  hard cap, and the typed error the cap raises
 - `ContextManager` and `DefaultContextManager` — planning the next request
 - `CompactionStrategy`, `CompactionContext`, `CompactionTrigger`, and
   `CompactionEffects` — the strategy seam
-- `ProviderCompaction` — the default, provider-delegated strategy
-- `score_message(...)`
+- `ModelSummary` — the default strategy: the session's model writes a
+  context checkpoint and the next window starts from it
+- `ProviderDefault` — the provider's native compaction, on Halter's trigger
 
 ### Who decides what
 
@@ -316,21 +318,33 @@ strategy, and then `max_tokens` is enforced with `ContextCapExceeded`. A tool
 call is never separated from its result, and server-side auto-compaction is
 never used.
 
-The strategy owns *what happens*. `compact(ctx)` sees the session state, the
-prompt segments, the tool specs, the default model and its provider, and
-returns the replacement window and compacted prefix as `CompactionEffects`.
-`CompactionEffects::apply` rewrites state through the same
-`halter_protocol::fold::apply_event` replay uses, so live and replayed
-sessions agree. Strategies can also contribute tools, system-prompt segments,
-and threshold reminders; install one with `HalterBuilder::with_compaction`.
+The strategy owns *what happens*. `compact(ctx)` receives a
+`CompactionContext` that reads the session (state, ledger, prompt segments,
+tool specs, the default model and its provider) and can act through the
+runtime: `append` puts a message in the transcript and the event log, `infer`
+runs one inference with the turn's own static prefix (so it shares the prompt
+cache), and `execute_tool_calls` runs tools through hooks and policy. It
+returns the replacement window and compacted prefix as `CompactionEffects`,
+which `apply` writes through the same `halter_protocol::fold::apply_event`
+replay uses, so live and replayed sessions agree. Strategies can also
+contribute tools, system-prompt segments, and threshold reminders; install
+one with `HalterBuilder::with_compaction`.
+
+`ModelSummary` runs up to two inferences: when the `task` tool is registered,
+a nudge to persist remaining work (only that reply's `task` calls run; its text
+and other calls never reach the next request, though the event log keeps the
+whole reply), then the built-in checkpoint instructions
+(`default_compaction_prompt`, plus a manual pass's custom instructions). The
+reply becomes the next window as one user-role message after the static
+prefix, with a todo reminder when the nudge ran calls. `ProviderDefault`
+hands `Provider::compact` the window its
+`ProviderCapabilities::compaction_strategy` allows: everything before the
+latest assistant block for a dedicated endpoint, the tail after the latest user
+message for an inline request.
 
 The context manager then plans the request from the (possibly compacted)
 state: the full transcript window, the carried prefix, prompt segments, and
 the ledger's effective count as the size estimate.
-
-### `score_message(...)`
-
-This helper supports ranking/prioritization decisions about which messages matter most for context retention.
 
 ### Practical implication
 
@@ -474,13 +488,14 @@ If you don't want to assemble all of that manually, use `halter::Halter`.
 
 ### Provider capability mismatch
 
-If your session needs compaction but the provider does not support it, the
-default strategy fails: automatic passes degrade to an uncompacted turn with a
-`Warning` event, manual `compact(...)` calls return the error. Providers that
-do support compaction own the safe window selection; the strategy does not
-need to know whether that provider uses a dedicated endpoint or an inline
-request. Past `context.max_tokens`, the turn fails with `ContextCapExceeded`
-before the provider is called.
+The default `ModelSummary` strategy only needs the provider to answer a
+request, so it works everywhere. `ProviderDefault` needs native compaction;
+`HalterBuilder::build` rejects `context.compaction = "provider_default"` when
+the default model's provider lacks it. Whichever strategy is installed, a
+failed automatic pass degrades to an uncompacted turn with a `Warning` event
+and a failed manual `compact(...)` returns the error. Past
+`context.max_tokens`, the turn fails with `ContextCapExceeded` before the
+provider is called.
 
 
 ### Event backpressure

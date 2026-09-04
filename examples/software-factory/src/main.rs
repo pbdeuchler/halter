@@ -18,14 +18,15 @@ use clap::Parser;
 use futures::{StreamExt, future::join_all};
 use halter::prelude::*;
 use halter_config::{
-    ContextConfig, HarnessConfig, ModelConfig, ModelSlot, ModelSlotRef, ModelsConfig,
-    NetworkPolicyConfig, PolicyConfig, ProviderConfig, ProvidersConfig, ResourcesConfig,
-    RuntimeConfig, SearchRoots, SessionsConfig, ShellModeConfig, ShellPolicyConfig, ToolsConfig,
+    CompactionStrategyKind, ContextConfig, HarnessConfig, ModelConfig, ModelSlot, ModelSlotRef,
+    ModelsConfig, NetworkPolicyConfig, PolicyConfig, ProviderConfig, ProvidersConfig,
+    ResourcesConfig, RuntimeConfig, SearchRoots, SessionsConfig, ShellModeConfig,
+    ShellPolicyConfig, ToolsConfig,
 };
 use halter_protocol::{
     AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
-    PruneSignalThreshold, ReasoningEffort, SessionEventPayload, ToolCapabilities, ToolConcurrency,
-    ToolName, ToolResult, ToolSpec, Turn, Usage, Volatility,
+    ReasoningEffort, SessionEventPayload, ToolCapabilities, ToolConcurrency, ToolName, ToolResult,
+    ToolSpec, Turn, Usage, Volatility,
 };
 use halter_tools::{Tool, ToolContext};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -142,7 +143,6 @@ const PANEL_MODEL_SPECS: [&str; 3] = [
     "openrouter/qwen/qwen3.6-27b",
 ];
 const DEFAULT_SESSION_COMPACTION_THRESHOLD: u64 = 300_000;
-const DEFAULT_SESSION_PRE_COMPACTION_TARGET: u64 = 200_000;
 const FACTORY_AGENT_MAX_INPUT_TOKENS: u32 = 230_000;
 const FACTORY_AGENT_MAX_OUTPUT_TOKENS: u32 = 16_384;
 const RANK_RESPONSES_TOOL: &str = "rank_responses";
@@ -1108,9 +1108,8 @@ fn default_factory_config() -> HarnessConfig {
         },
         context: ContextConfig {
             compaction_threshold: Some(DEFAULT_SESSION_COMPACTION_THRESHOLD),
-            pre_compaction_target: Some(DEFAULT_SESSION_PRE_COMPACTION_TARGET),
             max_tokens: None,
-            prune_signal_threshold: PruneSignalThreshold::Low,
+            compaction: CompactionStrategyKind::default(),
         },
         tools: ToolsConfig {
             enabled: factory_example_tools()
@@ -1536,7 +1535,7 @@ async fn build_default_harness(
     let mut config = config.clone();
     add_worktree_policy(&mut config, worktree);
     config.context.compaction_threshold = Some(DEFAULT_SESSION_COMPACTION_THRESHOLD);
-    config.context.pre_compaction_target = Some(DEFAULT_SESSION_PRE_COMPACTION_TARGET);
+
     let model = model.into_model_config(
         ReasoningEffort::Xhigh,
         Some(DEFAULT_SESSION_COMPACTION_THRESHOLD as u32),

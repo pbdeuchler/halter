@@ -112,7 +112,6 @@ At the center of the crate is the `Provider` trait.
 Important methods:
 
 - `capabilities()`
-- `compaction_window(messages)` — chooses the provider-safe compaction window
 - `stream(request, cancel)`
 - `compact(request, cancel)` — optional, with a default error implementation
 
@@ -135,12 +134,16 @@ Streams a model turn as canonical halter chunks.
 
 If supported, compacts session history for context management.
 
-The runtime's default compaction strategy (`halter_runtime::ProviderCompaction`)
-does not branch on whether the provider uses a dedicated compaction endpoint or
-an inline request. It asks `compaction_window(...)` which messages can be
-summarized, then sends that prepared job through `compact(...)`. When it runs is
-decided by the runtime's session token ledger, never by the provider: a
-provider adapter must not enable server-side auto-compaction.
+This is the transport primitive behind the runtime's `ProviderDefault`
+strategy (`context.compaction = "provider_default"`). The strategy decides which
+messages a rewrite may replace from `ProviderCapabilities::compaction_strategy`
+— everything before the latest assistant block for a dedicated endpoint, only
+the tail after the latest user message for an inline request — and the adapter
+encodes the request it is handed. When it runs is decided by the runtime's
+session token ledger, never by the provider: an adapter must not enable
+server-side auto-compaction. That is why the Anthropic adapter sends an
+ordinary summarization request rather than the `compact_20260112` context
+edit, which only fires on the server's own token trigger.
 
 
 The default behavior is an error:

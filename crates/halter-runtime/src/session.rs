@@ -10,15 +10,16 @@ use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
 use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
-    AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash, Delivery,
-    HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState, PendingEvent,
-    PendingToolCall, PromptSegment, PromptSegmentId, PromptSegmentKind, ProviderError,
-    ProviderRequest, ReplayMeta, ResourceSnapshot, SessionBlueprint, SessionEvent,
-    SessionEventPayload, SessionId, SessionState, StopReason, StreamEvent, SubagentEventForwarding,
-    SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn,
-    TurnId, Usage, Volatility,
+    AssembledPrompt, AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash,
+    ContextPlan, Delivery, HookSessionStartSource, HookWarning, Message, MessageId, ModelId,
+    ObservedState, PendingEvent, PendingToolCall, PromptSegment, PromptSegmentId,
+    PromptSegmentKind, ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, ResourceSnapshot,
+    SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
+    StreamEvent, SubagentEventForwarding, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome,
+    ToolResult, ToolResultMessage, Turn, TurnId, Usage, Volatility,
 };
-use halter_providers::ModelRegistry;
+use halter_providers::{ModelRegistry, Provider};
+
 use halter_session::{SessionStore, StoredSession};
 use halter_tools::{
     PathLockMap, SubagentControl, SubagentParentContext, ToolEventSink, ToolPolicy, ToolRuntime,
@@ -34,13 +35,12 @@ use crate::model_selection::select_models;
 use crate::turn_registry::TurnRegistry;
 use crate::{
     CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager, ContextSettings,
-    EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler, prompt_segments,
-    run_notification, run_post_compact, run_post_tool_use, run_post_tool_use_failure,
-    run_pre_compact, run_pre_tool_use, run_session_end, run_session_start, run_stop,
-    run_user_prompt_submit,
+    EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler, run_notification,
+    run_post_compact, run_post_tool_use, run_post_tool_use_failure, run_pre_compact,
+    run_pre_tool_use, run_session_end, run_session_start, run_stop, run_user_prompt_submit,
 };
 #[cfg(test)]
-use crate::{DefaultContextManager, ProviderCompaction};
+use crate::{DefaultContextManager, ModelSummary};
 
 /// Stream of committed session events returned by turn submission.
 pub type SessionEventStream = BoxStream<'static, anyhow::Result<SessionEvent>>;
@@ -1041,8 +1041,11 @@ impl SessionHandle {
         let effects = self
             .compact_via_strategy(
                 &stored.blueprint,
-                stored.snapshot.as_ref(),
-                &state,
+                stored.snapshot.clone(),
+                &mut state,
+                &mut events,
+                &mut fired_hook_ids,
+                &turn_id,
                 CompactionTrigger::Manual {
                     custom_instructions,
                 },
@@ -1245,19 +1248,9 @@ impl SessionHandle {
                 .check_cap(state.token_ledger.effective_tokens())?;
 
             let observed = observe_state(stored.blueprint.working_dir.clone(), git_probe.clone());
-            let plan = self
-                .services
-                .context_manager
-                .plan(
-                    &stored.blueprint,
-                    &state,
-                    &observed,
-                    snapshot.as_ref(),
-                    &self.services.tools.specs(),
-                )
+            let (plan, prompt) = self
+                .plan_and_assemble(&stored.blueprint, snapshot.as_ref(), &state, &observed)
                 .await?;
-
-            let prompt = self.services.prompt_assembler.assemble(&plan).await?;
 
             let selected_models = select_models(
                 &stored.blueprint.default_model,
@@ -1320,8 +1313,14 @@ impl SessionHandle {
                 new_messages_start: plan.new_messages_start,
             };
 
-            let provider_stream = provider.stream(request, turn_cancel.child_token()).await?;
-            let mut materialized = materialize_assistant_message(provider_stream, &model).await?;
+            let materialized = self
+                .run_provider_request(
+                    &model,
+                    provider.as_ref(),
+                    request,
+                    turn_cancel.child_token(),
+                )
+                .await?;
             state
                 .usage_so_far
                 .saturating_accumulate(&materialized.usage);
@@ -1331,24 +1330,8 @@ impl SessionHandle {
                 turn_id = %turn.id,
                 model_id = %model.id,
                 subagent_model_id = %subagent_model.id,
-                assistant_part_count = materialized.message.parts.len(),
-                stop_reason = ?materialized.message.stop_reason,
-                input_tokens = materialized.usage.input_tokens,
-                output_tokens = materialized.usage.output_tokens,
-                "materialized assistant message"
+                "selected models for provider iteration"
             );
-
-            let (deduped_parts, duplicate_tool_calls) =
-                dedupe_assistant_tool_call_parts(std::mem::take(&mut materialized.message.parts));
-            materialized.message.parts = deduped_parts;
-            if duplicate_tool_calls > 0 {
-                warn!(
-                    session_id = %self.session_id,
-                    turn_id = %turn.id,
-                    duplicate_tool_call_count = duplicate_tool_calls,
-                    "deduped duplicate tool calls from provider output"
-                );
-            }
 
             let assistant_message = Message::Assistant(materialized.message.clone());
             state.append(assistant_message.clone());
@@ -1483,7 +1466,7 @@ impl SessionHandle {
     }
 
     #[expect(clippy::too_many_arguments)]
-    async fn execute_tool_calls(
+    pub(crate) async fn execute_tool_calls(
         &self,
         blueprint: &SessionBlueprint,
         snapshot: Arc<ResourceSnapshot>,
@@ -1710,31 +1693,109 @@ impl SessionHandle {
         Ok(events)
     }
 
-    /// Build the strategy's view of the session and run one compaction pass
-    /// against the session's default model.
-    async fn compact_via_strategy(
+    /// Plan the next provider request over `state`'s transcript and assemble
+    /// its prompt. Shared by the turn loop and compaction strategies, so a
+    /// strategy's inferences carry the same static prefix as the turn and
+    /// hit the same prompt cache.
+    pub(crate) async fn plan_and_assemble(
         &self,
         blueprint: &SessionBlueprint,
         snapshot: &ResourceSnapshot,
         state: &SessionState,
+        observed: &ObservedState,
+    ) -> anyhow::Result<(ContextPlan, AssembledPrompt)> {
+        let plan = self
+            .services
+            .context_manager
+            .plan(
+                blueprint,
+                state,
+                observed,
+                snapshot,
+                &self.services.tools.specs(),
+            )
+            .await?;
+        let prompt = self.services.prompt_assembler.assemble(&plan).await?;
+        Ok((plan, prompt))
+    }
+
+    /// Stream one provider request and materialize the reply, with duplicate
+    /// tool calls removed. Appends nothing.
+    pub(crate) async fn run_provider_request(
+        &self,
+        model: &ResolvedModel,
+        provider: &dyn Provider,
+        request: ProviderRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<MaterializedAssistantMessage> {
+        let turn_id = request.turn_id.clone();
+        let provider_stream = provider.stream(request, cancel).await?;
+        let mut materialized = materialize_assistant_message(provider_stream, model).await?;
+        debug!(
+            session_id = %self.session_id,
+            turn_id = %turn_id,
+            model_id = %model.id,
+            assistant_part_count = materialized.message.parts.len(),
+            stop_reason = ?materialized.message.stop_reason,
+            input_tokens = materialized.usage.input_tokens,
+            output_tokens = materialized.usage.output_tokens,
+            "materialized assistant message"
+        );
+
+        let (deduped_parts, duplicate_tool_calls) =
+            dedupe_assistant_tool_call_parts(std::mem::take(&mut materialized.message.parts));
+        materialized.message.parts = deduped_parts;
+        if duplicate_tool_calls > 0 {
+            warn!(
+                session_id = %self.session_id,
+                turn_id = %turn_id,
+                duplicate_tool_call_count = duplicate_tool_calls,
+                "deduped duplicate tool calls from provider output"
+            );
+        }
+        Ok(materialized)
+    }
+
+    /// Hand the session to the configured strategy for one compaction pass
+    /// against the session's default model. The strategy may append to
+    /// `state` and `events` on the way; the caller applies whatever effects
+    /// it returns.
+    #[expect(clippy::too_many_arguments)]
+    async fn compact_via_strategy(
+        &self,
+        blueprint: &SessionBlueprint,
+        snapshot: Arc<ResourceSnapshot>,
+        state: &mut SessionState,
+        events: &mut Vec<PendingEvent>,
+        fired_hook_ids: &mut BTreeSet<String>,
+        turn_id: &TurnId,
         trigger: CompactionTrigger<'_>,
         cancel: CancellationToken,
     ) -> anyhow::Result<Option<crate::CompactionEffects>> {
         let model = self.services.models.model(&blueprint.default_model)?;
         let provider = self.services.models.provider(&model.provider)?;
-        let prompt_segments = prompt_segments(blueprint, state, snapshot);
-        self.services
-            .compaction
-            .compact(CompactionContext {
+        // Compaction is rare enough that its own git probe is cheaper than
+        // threading the turn's through every boundary.
+        let observed = observe_state(
+            blueprint.working_dir.clone(),
+            probe_git(blueprint.working_dir.clone()).await,
+        );
+        let strategy = self.services.compaction.clone();
+        strategy
+            .compact(CompactionContext::new(
+                self,
                 blueprint,
+                snapshot,
                 state,
-                prompt_segments: &prompt_segments,
-                tool_specs: &self.services.tools.specs(),
-                model: &model,
-                provider: provider.as_ref(),
+                events,
+                fired_hook_ids,
+                turn_id,
+                observed,
+                model,
+                provider,
                 trigger,
                 cancel,
-            })
+            ))
             .await
     }
 
@@ -1824,8 +1885,11 @@ impl SessionHandle {
         let summary = match self
             .compact_via_strategy(
                 blueprint,
-                snapshot.as_ref(),
+                snapshot,
                 state,
+                events,
+                fired_hook_ids,
+                hook_ctx.turn_id,
                 CompactionTrigger::Automatic,
                 cancel.child_token(),
             )
@@ -2014,7 +2078,7 @@ impl SessionHandle {
         )
     }
 
-    fn push_event(&self, events: &mut Vec<PendingEvent>, payload: SessionEventPayload) {
+    pub(crate) fn push_event(&self, events: &mut Vec<PendingEvent>, payload: SessionEventPayload) {
         events.push(self.make_event(payload));
     }
 
@@ -2959,7 +3023,7 @@ impl Default for RuntimeServices {
             prompt_assembler: Arc::new(crate::DefaultPromptAssembler),
             context_manager: Arc::new(DefaultContextManager),
             context: ContextSettings::default(),
-            compaction: Arc::new(crate::ProviderCompaction::new(ContextSettings::default())),
+            compaction: Arc::new(ModelSummary),
             event_bus: Arc::new(EventBus::default()),
             parent_streams: Arc::new(ParentStreamRegistry::default()),
             turn_registry: Arc::new(TurnRegistry::new()),
@@ -2998,8 +3062,8 @@ mod tests {
 
     use super::*;
     use test_support::{
-        configured_services, empty_hooks, install_context_settings, install_file_hooks,
-        new_session, resolved_test_model,
+        configured_services, empty_hooks, install_compaction, install_context_settings,
+        install_file_hooks, new_session, resolved_test_model,
     };
 
     #[test]
@@ -3849,7 +3913,7 @@ mod tests {
         use halter_tools::{DefaultToolPolicy, PolicySettings};
 
         use super::{
-            ContextSettings, HalterSession, ModelRegistry, ProviderCompaction, RuntimeServices,
+            CompactionStrategy, ContextSettings, HalterSession, ModelRegistry, RuntimeServices,
             SessionInit, SessionRuntime,
         };
 
@@ -3937,15 +4001,20 @@ mod tests {
             Arc::new(services)
         }
 
-        /// Install trigger settings and a provider-delegated strategy that
-        /// prunes with the same settings, the way `HalterBuilder` wires them.
+        /// Install trigger settings on unique services.
         pub(super) fn install_context_settings(
             services: &mut Arc<RuntimeServices>,
             settings: ContextSettings,
         ) {
-            let services = Arc::get_mut(services).expect("unique services");
-            services.context = settings;
-            services.compaction = Arc::new(ProviderCompaction::new(settings));
+            Arc::get_mut(services).expect("unique services").context = settings;
+        }
+
+        /// Install a compaction strategy on unique services.
+        pub(super) fn install_compaction(
+            services: &mut Arc<RuntimeServices>,
+            strategy: Arc<dyn CompactionStrategy>,
+        ) {
+            Arc::get_mut(services).expect("unique services").compaction = strategy;
         }
 
         pub(super) async fn new_session(
@@ -4754,8 +4823,15 @@ mod tests {
             .await
             .expect("load compacted session")
             .expect("session exists");
-        assert!(!stored.state.compacted_prefix.is_empty());
-        assert!(stored.state.messages.is_empty());
+        // The default strategy asks the model for a checkpoint; the fake
+        // provider echoes the request, custom instructions included.
+        assert!(stored.state.compacted_prefix.is_empty());
+        assert_eq!(stored.state.messages.len(), 1);
+        assert!(matches!(
+            &stored.state.messages[0],
+            Message::User(user) if user.plain_text().starts_with(crate::CHECKPOINT_PREFIX)
+                && user.plain_text().contains("Focus on decisions")
+        ));
         assert_eq!(
             stored.state.pending_session_start_source,
             Some(HookSessionStartSource::Compact)
@@ -4777,8 +4853,6 @@ mod tests {
             &mut services,
             ContextSettings {
                 compaction_threshold: 150,
-                pre_compaction_target: 0,
-                prune_signal_threshold: halter_protocol::PruneSignalThreshold::VeryLow,
                 max_tokens: None,
             },
         );
@@ -4800,9 +4874,12 @@ mod tests {
             .await
             .expect("load session")
             .expect("session exists");
-        assert!(!stored.state.compacted_prefix.is_empty());
+        assert!(stored.state.compacted_prefix.is_empty());
         assert_eq!(stored.state.messages.len(), 1);
-        assert!(matches!(stored.state.messages[0], Message::Assistant(_)));
+        assert!(matches!(
+            &stored.state.messages[0],
+            Message::User(user) if user.plain_text().starts_with(crate::CHECKPOINT_PREFIX)
+        ));
     }
 
     /// Trigger B: the tool result pushes the ledger past the threshold, and
@@ -4825,6 +4902,7 @@ mod tests {
                 ..tiny_context_settings(None)
             },
         );
+        install_compaction(&mut services, Arc::new(crate::ProviderDefault));
 
         let runtime = SessionRuntime::new(services.clone());
         let session = new_session(&runtime, temp.path()).await;
@@ -4981,6 +5059,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut services = configured_services(Arc::new(FailingCompactionProvider), temp.path());
         install_context_settings(&mut services, tiny_context_settings(None));
+        install_compaction(&mut services, Arc::new(crate::ProviderDefault));
         let runtime = SessionRuntime::new(services.clone());
         let session = new_session(&runtime, temp.path()).await;
 
@@ -5018,7 +5097,8 @@ mod tests {
     #[tokio::test]
     async fn manual_compact_propagates_strategy_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let services = configured_services(Arc::new(FailingCompactionProvider), temp.path());
+        let mut services = configured_services(Arc::new(FailingCompactionProvider), temp.path());
+        install_compaction(&mut services, Arc::new(crate::ProviderDefault));
         let runtime = SessionRuntime::new(services.clone());
         let session = new_session(&runtime, temp.path()).await;
         session
@@ -5052,8 +5132,6 @@ mod tests {
             &mut services,
             ContextSettings {
                 compaction_threshold: 10_000,
-                pre_compaction_target: 5_000,
-                prune_signal_threshold: halter_protocol::PruneSignalThreshold::Normal,
                 max_tokens: Some(100),
             },
         );
@@ -5084,10 +5162,11 @@ mod tests {
         install_context_settings(
             &mut services,
             ContextSettings {
+                compaction_threshold: 10_000,
                 max_tokens: Some(10_000),
-                ..tiny_context_settings(None)
             },
         );
+
         let runtime = SessionRuntime::new(services.clone());
         let session = new_session(&runtime, temp.path()).await;
         let events = session
@@ -5112,8 +5191,6 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let settings = ContextSettings {
             compaction_threshold: 150,
-            pre_compaction_target: 100,
-            prune_signal_threshold: halter_protocol::PruneSignalThreshold::Normal,
             max_tokens: Some(100),
         };
         let oversized = || Turn::user("x".repeat(600));
@@ -5174,8 +5251,6 @@ mod tests {
             &mut services,
             ContextSettings {
                 compaction_threshold: 10_000,
-                pre_compaction_target: 5_000,
-                prune_signal_threshold: halter_protocol::PruneSignalThreshold::Normal,
                 max_tokens: None,
             },
         );
@@ -5276,9 +5351,17 @@ mod tests {
     fn tiny_context_settings(max_tokens: Option<u64>) -> ContextSettings {
         ContextSettings {
             compaction_threshold: 150,
-            pre_compaction_target: 0,
-            prune_signal_threshold: halter_protocol::PruneSignalThreshold::VeryLow,
             max_tokens,
+        }
+    }
+
+    /// Settings under which a 600-character prompt (~160 tokens) crosses the
+    /// threshold at the first boundary, before the scripted provider's terse
+    /// replies, and the resulting checkpoint stays under it.
+    fn model_summary_settings() -> ContextSettings {
+        ContextSettings {
+            compaction_threshold: 200,
+            max_tokens: None,
         }
     }
 
@@ -5319,7 +5402,8 @@ mod tests {
                     serde_json::json!({"type": "reasoning", "encrypted_content": "gist"}),
                 ]),
                 result: halter_protocol::CompactionResult {
-                    compacted_count: ctx.state.messages.len(),
+                    compacted_count: ctx.state().messages.len(),
+
                     summary: "wiped".to_owned(),
                 },
             }))
@@ -5372,13 +5456,6 @@ mod tests {
             FakeProvider::default().capabilities()
         }
 
-        fn compaction_window(
-            &self,
-            messages: &[Message],
-        ) -> Option<halter_protocol::CompactionWindow> {
-            FakeProvider::default().compaction_window(messages)
-        }
-
         async fn stream(
             &self,
             request: ProviderRequest,
@@ -5405,19 +5482,9 @@ mod tests {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 supports_compaction: true,
+                compaction_strategy: Some(halter_protocol::ProviderCompactionStrategy::Dedicated),
                 ..ProviderCapabilities::default()
             }
-        }
-
-        fn compaction_window(
-            &self,
-            messages: &[Message],
-        ) -> Option<halter_protocol::CompactionWindow> {
-            Some(
-                halter_protocol::CompactionWindow::preserve_latest_assistant_response_block(
-                    messages,
-                ),
-            )
         }
 
         async fn stream(
@@ -5458,13 +5525,6 @@ mod tests {
             FakeProvider::default().capabilities()
         }
 
-        fn compaction_window(
-            &self,
-            messages: &[Message],
-        ) -> Option<halter_protocol::CompactionWindow> {
-            FakeProvider::default().compaction_window(messages)
-        }
-
         async fn stream(
             &self,
             request: ProviderRequest,
@@ -5481,6 +5541,452 @@ mod tests {
         ) -> anyhow::Result<halter_protocol::ProviderCompactionResponse> {
             FakeProvider::default().compact(request, cancel).await
         }
+    }
+
+    #[tokio::test]
+    async fn provider_default_compacts_after_the_response_when_threshold_is_reached() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        install_context_settings(&mut services, tiny_context_settings(None));
+        install_compaction(&mut services, Arc::new(crate::ProviderDefault));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        session
+            .submit_turn(Turn::user("x".repeat(150)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        // The fake provider is a dedicated-endpoint compactor: everything
+        // before the latest assistant block became provider-native items.
+        assert!(!stored.state.compacted_prefix.is_empty());
+        assert_eq!(stored.state.messages.len(), 1);
+        assert!(matches!(stored.state.messages[0], Message::Assistant(_)));
+    }
+
+    #[tokio::test]
+    async fn provider_default_rejects_a_provider_without_native_compaction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(
+            Arc::new(CheckpointScriptProvider::new(
+                NudgeReply::TextOnly,
+                "SUMMARY",
+            )),
+            temp.path(),
+        );
+        install_compaction(&mut services, Arc::new(crate::ProviderDefault));
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+        session
+            .submit_turn(Turn::user("hello"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let error = session
+            .compact("manual", None)
+            .await
+            .expect_err("a provider without native compaction cannot serve provider_default");
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider 'fake' does not support compaction"),
+            "got {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_compact_on_an_empty_session_is_a_noop_for_every_strategy() {
+        let strategies: [(&str, Arc<dyn CompactionStrategy>); 2] = [
+            ("model_summary", Arc::new(crate::ModelSummary)),
+            ("provider_default", Arc::new(crate::ProviderDefault)),
+        ];
+        for (name, strategy) in strategies {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+            install_compaction(&mut services, strategy);
+            let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+
+            session.compact("manual", None).await.expect(name);
+
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load session")
+                .expect("session exists");
+            assert!(stored.state.messages.is_empty(), "{name}");
+            assert!(stored.state.compacted_prefix.is_empty(), "{name}");
+            let replay = session.replay().await.expect("replay");
+            assert!(
+                replay.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::ContextCompacted { summary, effects: None }
+                        if summary == "No compaction needed."
+                )),
+                "{name}"
+            );
+        }
+    }
+
+    /// The whole model-summary flow with the todo tool registered: the
+    /// nudge's `task` call runs, its other call and text never reach the
+    /// checkpoint request, and the next window is one user-role checkpoint
+    /// carrying the reminder.
+    #[tokio::test]
+    async fn model_summary_persists_todos_and_checkpoints_the_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CheckpointScriptProvider::new(
+            NudgeReply::TaskAndForeignCalls,
+            "SUMMARY: finish the report next",
+        ));
+        let mut services = configured_services(provider.clone(), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        install_context_settings(&mut services, model_summary_settings());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("x".repeat(600)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert!(stored.state.compacted_prefix.is_empty());
+        assert!(stored.state.pending_tool_calls.is_empty());
+        // The prompt crossed the threshold at the first boundary, so the
+        // window is the checkpoint plus the turn's own reply.
+        assert_eq!(stored.state.messages.len(), 2);
+        assert!(matches!(stored.state.messages[1], Message::Assistant(_)));
+        let Message::User(checkpoint) = &stored.state.messages[0] else {
+            panic!("the new window must start with a user message");
+        };
+        let text = checkpoint.plain_text();
+        assert!(text.starts_with(crate::CHECKPOINT_PREFIX), "{text}");
+        assert!(text.contains("SUMMARY: finish the report next"), "{text}");
+        assert!(text.ends_with(crate::TODO_REMINDER), "{text}");
+
+        // The task call ran; the foreign write call was dropped silently.
+        let tasks = services
+            .tool_sessions
+            .task_session(session.session_id())
+            .lock()
+            .list();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].subject, "finish the report");
+        assert!(!temp.path().join("note.txt").exists());
+        let completed: Vec<String> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                SessionEventPayload::ToolExecutionCompleted { outcome } => {
+                    Some(outcome.call.name.0.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, vec!["task".to_owned()]);
+
+        // The full nudge reply is in the log even though only its task call
+        // reached the transcript...
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::MessageItem { message: Message::Assistant(assistant) }
+                if assistant.parts.iter().any(|part| matches!(
+                    part,
+                    AssistantPart::ToolCall(call) if call.name.0 == "write"
+                ))
+        )));
+        // ...and the checkpoint request the provider saw carried the nudge,
+        // the task call alone, and its result — nothing dangling.
+        let requests = provider.requests();
+        let checkpoint_request = requests
+            .iter()
+            .find(|request| {
+                latest_user_text(&request.messages).starts_with(crate::default_compaction_prompt())
+            })
+            .expect("checkpoint request");
+        assert!(checkpoint_request.previous_response_id.is_none());
+        let nudge_index = checkpoint_request
+            .messages
+            .iter()
+            .position(|message| {
+                matches!(message, Message::User(user) if user.plain_text() == crate::TODO_NUDGE)
+            })
+            .expect("nudge in transcript");
+        let Message::Assistant(kept) = &checkpoint_request.messages[nudge_index + 1] else {
+            panic!("the kept nudge reply follows the nudge");
+        };
+        assert_eq!(kept.parts.len(), 1);
+        assert!(matches!(
+            &kept.parts[0],
+            AssistantPart::ToolCall(call) if call.name.0 == "task"
+        ));
+        assert!(matches!(
+            &checkpoint_request.messages[nudge_index + 2],
+            Message::Tool(result) if result.error.is_none()
+        ));
+
+        // Log-first: replaying the log lands on the same window.
+        let replayed = services
+            .sessions
+            .replay(session.session_id())
+            .await
+            .expect("replay");
+        let folded = halter_protocol::fold::fold_events(SessionState::default(), &replayed);
+        assert!(halter_protocol::fold::covered_state_matches(
+            &folded,
+            &stored.state
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_summary_skips_the_nudge_without_the_task_tool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CheckpointScriptProvider::new(
+            NudgeReply::TaskAndForeignCalls,
+            "SUMMARY",
+        ));
+        let mut services = configured_services(provider.clone(), temp.path());
+        install_context_settings(&mut services, model_summary_settings());
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+
+        session
+            .submit_turn(Turn::user("x".repeat(600)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(
+            !provider
+                .requests()
+                .iter()
+                .any(|request| latest_user_text(&request.messages) == crate::TODO_NUDGE),
+            "no todo tool, no nudge"
+        );
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert!(matches!(
+            &stored.state.messages[..],
+            [Message::User(user), Message::Assistant(_)]
+                if user.plain_text() == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_summary_omits_the_reminder_when_no_task_calls_ran() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CheckpointScriptProvider::new(
+            NudgeReply::TextOnly,
+            "SUMMARY",
+        ));
+        let mut services = configured_services(provider.clone(), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        install_context_settings(&mut services, model_summary_settings());
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("x".repeat(600)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        assert!(
+            provider
+                .requests()
+                .iter()
+                .any(|request| latest_user_text(&request.messages) == crate::TODO_NUDGE),
+            "the todo tool is registered, so the nudge is sent"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event.payload,
+            SessionEventPayload::ToolExecutionStarted { .. }
+        )));
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert!(matches!(
+            &stored.state.messages[..],
+            [Message::User(user), Message::Assistant(_)]
+                if user.plain_text() == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+        ));
+    }
+
+    /// An empty checkpoint is a failed compaction: automatic passes degrade
+    /// to a warning, manual passes propagate.
+    #[tokio::test]
+    async fn model_summary_without_a_summary_degrades_automatically_and_propagates_manually() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CheckpointScriptProvider::new(NudgeReply::TextOnly, ""));
+        let mut services = configured_services(provider.clone(), temp.path());
+        install_context_settings(&mut services, model_summary_settings());
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("x".repeat(600)))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::Warning { message }
+                if message.contains("automatic compaction did not run")
+                    && message.contains("returned no checkpoint summary")
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        );
+
+        let error = session
+            .compact("manual", None)
+            .await
+            .expect_err("manual compaction surfaces the empty summary");
+        assert!(error.to_string().contains("returned no checkpoint summary"));
+    }
+
+    /// What the scripted provider answers the todo nudge with.
+    #[derive(Clone, Copy)]
+    enum NudgeReply {
+        /// Text plus a `task` call plus a foreign `write` call.
+        TaskAndForeignCalls,
+        TextOnly,
+    }
+
+    /// Provider scripted for the model-summary flow: keyed on the latest
+    /// user message, it answers the nudge per `nudge_reply`, the checkpoint
+    /// request with `summary`, and anything else with "ok". It records
+    /// every request and has no native compaction.
+    struct CheckpointScriptProvider {
+        nudge_reply: NudgeReply,
+        summary: &'static str,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    impl CheckpointScriptProvider {
+        fn new(nudge_reply: NudgeReply, summary: &'static str) -> Self {
+            Self {
+                nudge_reply,
+                summary,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ProviderRequest> {
+            self.requests.lock().expect("requests").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for CheckpointScriptProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
+            let latest = latest_user_text(&request.messages);
+            if latest == crate::TODO_NUDGE {
+                return Ok(match self.nudge_reply {
+                    NudgeReply::TextOnly => text_stream(vec!["nothing to persist"]),
+                    NudgeReply::TaskAndForeignCalls => nudge_reply_stream(),
+                });
+            }
+            if latest.starts_with(crate::default_compaction_prompt()) {
+                return Ok(text_stream(vec![self.summary]));
+            }
+            Ok(text_stream(vec!["ok"]))
+        }
+    }
+
+    /// Text, a `task` create call, and a `write` call in one reply.
+    fn nudge_reply_stream() -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        let message_id = halter_protocol::MessageId::new();
+        let text_block = BlockId::new();
+        let task_block = BlockId::new();
+        let write_block = BlockId::new();
+        stream::iter(vec![
+            Ok(StreamEvent::MessageStart {
+                id: message_id.clone(),
+            }),
+            Ok(StreamEvent::TextStart {
+                id: text_block.clone(),
+            }),
+            Ok(StreamEvent::TextDelta {
+                id: text_block.clone(),
+                delta: "noting todos".to_owned(),
+            }),
+            Ok(StreamEvent::TextEnd { id: text_block }),
+            Ok(StreamEvent::ToolCallStart {
+                id: task_block.clone(),
+                tool_call_id: ToolCallId::new(),
+                name: halter_protocol::ToolName::from("task"),
+            }),
+            Ok(StreamEvent::ToolArgsDelta {
+                id: task_block.clone(),
+                delta: serde_json::json!({"action": "create", "subject": "finish the report"})
+                    .to_string(),
+            }),
+            Ok(StreamEvent::ToolCallEnd { id: task_block }),
+            Ok(StreamEvent::ToolCallStart {
+                id: write_block.clone(),
+                tool_call_id: ToolCallId::new(),
+                name: halter_protocol::ToolName::from("write"),
+            }),
+            Ok(StreamEvent::ToolArgsDelta {
+                id: write_block.clone(),
+                delta: serde_json::json!({"path": "note.txt", "content": "dropped"}).to_string(),
+            }),
+            Ok(StreamEvent::ToolCallEnd { id: write_block }),
+            Ok(StreamEvent::UsageUpdate {
+                usage: Usage::default(),
+            }),
+            Ok(StreamEvent::MessageEnd {
+                id: message_id,
+                stop_reason: StopReason::ToolUse,
+                response_id: None,
+            }),
+        ])
+        .boxed()
     }
 
     #[tokio::test]

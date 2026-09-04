@@ -396,15 +396,14 @@ append_system_prompt = """
 
 ## Context / compaction policy
 
-`ContextConfig` controls when the runtime compacts session history and where
-it caps it. Every threshold is optional.
+`ContextConfig` controls when the runtime compacts session history, where it
+caps it, and which strategy does the rewrite. Both thresholds are optional.
 
 ```toml
 [context]
 compaction_threshold = 180000    # default: models.default.max_input_tokens - 20000
-pre_compaction_target = 135000   # default: three quarters of compaction_threshold
 max_tokens = 200000              # default: models.default.max_input_tokens
-prune_signal_threshold = "normal"
+compaction = "model_summary"     # default; or "provider_default"
 ```
 
 Derivation, applied by `HarnessConfig::resolved_context` (`ContextConfig::resolve`):
@@ -414,17 +413,23 @@ Derivation, applied by `HarnessConfig::resolved_context` (`ContextConfig::resolv
   and building the harness fail with
   `context.compaction_threshold is unset and models.default.max_input_tokens is unset`.
   There is no built-in model-to-window table and no silent fallback.
-- `pre_compaction_target` derives as three quarters of the resolved threshold.
 - `max_tokens` derives from `max_input_tokens`; without a window there is no cap.
   The runtime fails a turn that would exceed it, after compaction has had its
   chance, instead of sending the context to the provider.
+
+`compaction` selects the strategy (`CompactionStrategyKind`):
+
+- `model_summary` (default): the session's own model writes a context
+  checkpoint and the next window starts from that summary alone.
+- `provider_default`: the provider's native compaction rewrites the context.
+  The default model's provider must support it; `HalterBuilder::build` fails
+  otherwise, so a misconfiguration never waits for the first compaction.
 
 Validation rules, checked on the resolved values (`HarnessConfig::validate`
 runs them whenever the threshold is derivable):
 
 - `compaction_threshold` must be greater than zero; a derived one needs
   `max_input_tokens` above 20,000
-- `pre_compaction_target` must be less than `compaction_threshold`
 - `max_tokens` must be at least `compaction_threshold`
 
 A more aggressive setup:
@@ -432,8 +437,9 @@ A more aggressive setup:
 ```toml
 [context]
 compaction_threshold = 200000
-pre_compaction_target = 150000
-prune_signal_threshold = "low"
+max_tokens = 230000
+compaction = "provider_default"
+
 ```
 
 ---
@@ -838,10 +844,16 @@ You set `sessions.sqlite_path` without enabling the `sqlite` feature or without 
 
 ### Context thresholds reversed
 
-`pre_compaction_target` must be lower than `compaction_threshold`, and
-`max_tokens` must be at least `compaction_threshold`. Derived values count:
-an explicit `pre_compaction_target` above a threshold derived from
-`max_input_tokens` is rejected too.
+`max_tokens` must be at least `compaction_threshold`. Derived values count: an
+explicit `compaction_threshold` above a cap derived from `max_input_tokens` is
+rejected too.
+
+### Provider cannot compact
+
+`context.compaction = "provider_default"` was selected but the default model's
+provider does not support native compaction. `HalterBuilder::build` reports it;
+use `"model_summary"`.
+
 
 ### No compaction threshold source
 

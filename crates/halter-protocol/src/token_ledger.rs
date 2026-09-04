@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AssistantPart, Message, PromptSegment, StopReason, SummarySlice, ToolResult};
+use crate::{AssistantPart, Message, PromptSegment, StopReason, ToolResult};
 
 /// Running estimate of the tokens the provider will see on the next request.
 ///
@@ -64,16 +64,11 @@ impl TokenLedger {
     /// describe the pre-rewrite context, and for forked subagents, whose
     /// parent's reports describe a different prompt and tool set.
     #[must_use]
-    pub fn inferred_from(
-        compacted_prefix: &[Value],
-        messages: &[Message],
-        summaries: &[SummarySlice],
-    ) -> Self {
+    pub fn inferred_from(compacted_prefix: &[Value], messages: &[Message]) -> Self {
         Self {
             authoritative_tokens: 0,
             inferred_tokens: estimate_compacted_prefix_tokens(compacted_prefix)
-                .saturating_add(estimate_messages_tokens(messages))
-                .saturating_add(estimate_summary_tokens(summaries)),
+                .saturating_add(estimate_messages_tokens(messages)),
         }
     }
 }
@@ -135,15 +130,6 @@ pub fn estimate_segment_tokens(segments: &[PromptSegment]) -> u64 {
     segments
         .iter()
         .map(|segment| estimate_text_tokens(&segment.text))
-        .sum()
-}
-
-#[must_use]
-/// Estimate tokens for carried summaries.
-pub fn estimate_summary_tokens(summaries: &[SummarySlice]) -> u64 {
-    summaries
-        .iter()
-        .map(|summary| estimate_text_tokens(&summary.text))
         .sum()
 }
 
@@ -356,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn inferred_from_counts_prefix_messages_and_summaries_without_an_anchor() {
+    fn inferred_from_counts_prefix_and_messages_without_an_anchor() {
         let prefix = vec![json!({"type": "reasoning", "encrypted_content": "abcdefgh"})];
         let messages = vec![
             Message::User(UserMessage::text("kept")),
@@ -366,19 +352,13 @@ mod tests {
                 reported(80_000, 500),
             ),
         ];
-        let summaries = vec![SummarySlice {
-            id: "s".to_owned(),
-            text: "y".repeat(370),
-        }];
 
-        let ledger = TokenLedger::inferred_from(&prefix, &messages, &summaries);
+        let ledger = TokenLedger::inferred_from(&prefix, &messages);
 
         assert_eq!(ledger.authoritative_tokens, 0);
         assert_eq!(
             ledger.inferred_tokens,
-            estimate_compacted_prefix_tokens(&prefix)
-                + estimate_messages_tokens(&messages)
-                + estimate_summary_tokens(&summaries)
+            estimate_compacted_prefix_tokens(&prefix) + estimate_messages_tokens(&messages)
         );
         assert!(
             ledger.effective_tokens() < 1_000,
@@ -388,10 +368,7 @@ mod tests {
 
     #[test]
     fn inferred_from_empty_context_is_zero() {
-        assert_eq!(
-            TokenLedger::inferred_from(&[], &[], &[]),
-            TokenLedger::default()
-        );
+        assert_eq!(TokenLedger::inferred_from(&[], &[]), TokenLedger::default());
     }
 
     #[test]
