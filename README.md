@@ -1061,10 +1061,12 @@ happens*.
   cannot compact. Either way the trigger is Halter's ledger, never the
   provider's own auto-compaction.
 - Install your own strategy with `HalterBuilder::with_compaction(...)`; it may
-  also contribute tools and system-prompt segments. Its per-session
-  `context_boundary` policy can deliver exactly-once, per-window reminders
-  and request ordinary compaction or a forced rollover. It can drive the
-  model and tools through the `CompactionContext` the runtime hands it.
+  also contribute tools and system-prompt segments, and its `context_boundary`
+  hook can deliver exactly-once, per-window reminders as the context fills.
+  The runtime alone decides when compaction runs. A strategy can drive the
+  model and tools through the `CompactionContext` the runtime hands it; if
+  its pass fails, the window goes back to what it was while everything the
+  pass did stays in the event log.
 
 
 ```rust

@@ -330,8 +330,11 @@ which `apply` writes through the same `halter_protocol::fold::apply_event`
 replay uses, so live and replayed sessions agree. Strategies can also
 contribute tools and system-prompt segments. At each boundary,
 `context_boundary` receives the session id, logical window, effective counts,
-threshold, and persisted notification ids; it can return exactly-once
-reminders plus a compact or forced-rollover directive. Install one with
+threshold, and persisted notification ids; it returns exactly-once reminders
+for the current window and nothing else: the trigger stays the runtime's.
+When a pass returns `Err` or `Ok(None)` after appending, the runtime records a
+`ContextRestored` event that puts the window back; the pass's messages, tool
+runs, and usage stay in the log and the session totals. Install one with
 `HalterBuilder::with_compaction`.
 
 `ModelSummary` runs up to two inferences: when the `task` tool is registered,

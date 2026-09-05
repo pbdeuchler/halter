@@ -22,13 +22,9 @@ use crate::session::SessionHandle;
 /// Why a compaction pass is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionTrigger<'a> {
-    /// The boundary policy requested ordinary compaction. A failure degrades
-    /// the turn to an uncompacted context with a warning event.
+    /// The token ledger reached `context.compaction_threshold`. A failure
+    /// degrades the turn to an uncompacted context with a warning event.
     Automatic,
-    /// A boundary policy requested a clean logical-window rollover. This is
-    /// distinct from threshold compaction so strategies such as CleanWindow
-    /// can wipe context instead of summarizing it.
-    Rollover,
     /// `HalterSession::compact` was called. A failure propagates to the
     /// caller, who asked for compaction explicitly and needs to know it did
     /// not happen.
@@ -43,7 +39,7 @@ impl<'a> CompactionTrigger<'a> {
     #[must_use]
     pub fn custom_instructions(self) -> Option<&'a str> {
         match self {
-            Self::Automatic | Self::Rollover => None,
+            Self::Automatic => None,
             Self::Manual {
                 custom_instructions,
             } => custom_instructions,
@@ -51,56 +47,22 @@ impl<'a> CompactionTrigger<'a> {
     }
 }
 
-/// Runtime action requested by a strategy at a consistent context boundary.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum CompactionDirective {
-    /// Keep accumulating context.
-    #[default]
-    Continue,
-    /// Run ordinary automatic compaction.
-    Compact,
-    /// Force a clean logical-window rollover.
-    Rollover,
-}
-
-/// One exactly-once message a strategy wants delivered in this window.
+/// One exactly-once message a strategy wants delivered in the current
+/// logical window. The runtime persists delivered ids per window, so a
+/// stateless strategy can provide milestone reminders that fire once.
 #[derive(Debug, Clone)]
 pub struct CompactionNotification {
     pub id: String,
     pub message: Message,
 }
 
-/// Result of evaluating one consistent context boundary.
-#[derive(Debug, Clone, Default)]
-pub struct CompactionBoundaryResult {
-    pub notifications: Vec<CompactionNotification>,
-    pub directive: CompactionDirective,
-}
-
-impl CompactionBoundaryResult {
+impl CompactionNotification {
     #[must_use]
-    pub const fn compact() -> Self {
+    pub fn new(id: impl Into<String>, message: Message) -> Self {
         Self {
-            notifications: Vec::new(),
-            directive: CompactionDirective::Compact,
-        }
-    }
-
-    #[must_use]
-    pub const fn rollover() -> Self {
-        Self {
-            notifications: Vec::new(),
-            directive: CompactionDirective::Rollover,
-        }
-    }
-
-    #[must_use]
-    pub fn with_notification(mut self, id: impl Into<String>, message: Message) -> Self {
-        self.notifications.push(CompactionNotification {
             id: id.into(),
             message,
-        });
-        self
+        }
     }
 }
 
@@ -405,9 +367,10 @@ impl<'a> CompactionContext<'a> {
 /// The runtime alone decides when compaction runs. Every append updates the
 /// session's [`TokenLedger`](halter_protocol::TokenLedger); at the next
 /// consistent boundary — no assistant tool call still awaiting its result —
-/// [`context_boundary`](Self::context_boundary) chooses whether to invoke
-/// [`compact`](Self::compact). Its default does so at or past
-/// `context.compaction_threshold`. **Server-side or provider-automatic
+/// a ledger at or past `context.compaction_threshold` invokes
+/// [`compact`](Self::compact). A strategy cannot move or veto that trigger;
+/// [`context_boundary`](Self::context_boundary) only lets it speak to the
+/// model as the window fills. **Server-side or provider-automatic
 /// compaction is never used.** A strategy must not enable a provider's own
 /// auto-compaction: the ledger, the `previous_response_id` chain, and the
 /// committed event log would silently diverge from what the provider holds.
@@ -429,26 +392,25 @@ pub trait CompactionStrategy: Send + Sync {
         Vec::new()
     }
 
-    /// Decide what happens at a consistent per-session boundary. The default
-    /// requests ordinary compaction exactly at the configured threshold.
-    /// Notification ids returned here are deduplicated and persisted by the
-    /// runtime for the current logical window.
-    fn context_boundary(&self, boundary: CompactionBoundary<'_>) -> CompactionBoundaryResult {
-        if boundary.current_tokens() >= boundary.compaction_threshold() {
-            CompactionBoundaryResult::compact()
-        } else {
-            CompactionBoundaryResult::default()
-        }
+    /// Messages to append at a consistent per-session boundary: reminders as
+    /// the window fills toward the threshold. Ids are deduplicated and
+    /// persisted by the runtime for the current logical window, so each
+    /// milestone is delivered once per window. The runtime compacts on its
+    /// own threshold regardless of what is returned here. Default: nothing.
+    fn context_boundary(&self, boundary: CompactionBoundary<'_>) -> Vec<CompactionNotification> {
+        let _ = boundary;
+        Vec::new()
     }
 
     /// Compact the session. `Ok(None)` means there was nothing to compact and
     /// the transcript is left as the strategy found it; `Err` means
     /// compaction could not run, which the runtime degrades to a warning for
     /// [`CompactionTrigger::Automatic`] and propagates for
-    /// [`CompactionTrigger::Manual`]. Either way, anything the strategy
-    /// appended through the context is committed only when effects are
-    /// returned successfully. `Err` and `Ok(None)` roll state and audit
-    /// events back to the pre-strategy checkpoint.
+    /// [`CompactionTrigger::Manual`]. On `Err` and `Ok(None)` the runtime
+    /// puts the transcript window back to what it was before the pass, so
+    /// the model never sees a half-finished exchange; the exchange itself,
+    /// its tool runs, and its usage stay in the event log and the session
+    /// totals as they happened.
     async fn compact(
         &self,
         ctx: CompactionContext<'_>,
@@ -472,17 +434,11 @@ mod tests {
     }
 
     #[test]
-    fn default_boundary_policy_compacts_at_the_exact_threshold() {
+    fn default_boundary_delivers_no_notifications() {
         let session_id = SessionId::from("boundary-test");
         let notifications = BTreeSet::new();
-        for (tokens, expected) in [
-            (999, CompactionDirective::Continue),
-            (1_000, CompactionDirective::Compact),
-        ] {
-            let boundary =
-                CompactionBoundary::new(&session_id, 0, 0, tokens, 1_000, &notifications);
-            assert_eq!(NoopStrategy.context_boundary(boundary).directive, expected);
-        }
+        let boundary = CompactionBoundary::new(&session_id, 0, 0, 5_000, 1_000, &notifications);
+        assert!(NoopStrategy.context_boundary(boundary).is_empty());
     }
 
     #[test]

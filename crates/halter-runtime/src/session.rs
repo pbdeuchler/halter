@@ -34,11 +34,11 @@ use tracing::{debug, error, info, warn};
 use crate::model_selection::select_models;
 use crate::turn_registry::TurnRegistry;
 use crate::{
-    CompactionBoundary, CompactionContext, CompactionDirective, CompactionStrategy,
-    CompactionTrigger, ContextManager, ContextSettings, EventBus, ExecutedHookDispatch,
-    HookInvocationContext, PromptAssembler, run_notification, run_post_compact, run_post_tool_use,
-    run_post_tool_use_failure, run_pre_compact, run_pre_tool_use, run_session_end,
-    run_session_start, run_stop, run_user_prompt_submit,
+    CompactionBoundary, CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager,
+    ContextSettings, EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler,
+    run_notification, run_post_compact, run_post_tool_use, run_post_tool_use_failure,
+    run_pre_compact, run_pre_tool_use, run_session_end, run_session_start, run_stop,
+    run_user_prompt_submit,
 };
 #[cfg(test)]
 use crate::{DefaultContextManager, ModelSummary};
@@ -53,11 +53,6 @@ const TOOL_RUNTIME_EVENT_BYTES_CAP: usize = 1024 * 1024;
 /// `PreCompact`/`PostCompact` matcher value for ledger-triggered passes;
 /// manual passes carry the caller-supplied trigger.
 const AUTOMATIC_COMPACTION_TRIGGER: &str = "auto";
-
-struct StrategyCompaction {
-    effects: crate::CompactionEffects,
-    inference_usage: Usage,
-}
 
 /// Per-session entry in the runtime hook store: the [`Hooks`] instance
 /// shared by every live handle for one session, plus a weak reference to
@@ -1044,7 +1039,7 @@ impl SessionHandle {
             return Ok(());
         }
 
-        let compaction = self
+        let compaction = match self
             .compact_via_strategy(
                 &stored.blueprint,
                 stored.snapshot.clone(),
@@ -1056,11 +1051,33 @@ impl SessionHandle {
                     custom_instructions,
                 },
                 hook_cancel.child_token(),
+                &mut Usage::default(),
             )
-            .await?;
+            .await
+        {
+            Ok(compaction) => compaction,
+            Err(error) => {
+                // The pass's exchange and the restore that ended it are
+                // already in `events`; commit them so the log tells the
+                // truth, then surface the failure.
+                if !events.is_empty() {
+                    let _ = self
+                        .commit_and_publish(
+                            &stored.blueprint,
+                            None,
+                            Some(expected_head),
+                            Some(state),
+                            events,
+                            None,
+                        )
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
         let (summary, payload) = match compaction {
-            Some(compaction) => {
-                let (result, payload) = compaction.effects.apply(&mut state);
+            Some(effects) => {
+                let (result, payload) = effects.apply(&mut state);
                 (result.summary, payload)
             }
             None => {
@@ -1202,7 +1219,14 @@ impl SessionHandle {
         // message as their own turn, so this avoids a duplicated user message.
         let full_turn_pre_messages = state.messages.clone();
         // Effective ledger count at the last consistent boundary, so the
-        // strategy's threshold notifications see each crossing once.
+        // strategy's notifications see each crossing once. Prepared first so
+        // a fresh session's request base does not read as a crossing.
+        self.prepare_token_ledger(
+            &stored.blueprint,
+            snapshot.as_ref(),
+            &mut state,
+            &mut events,
+        );
         let mut ledger_at_boundary = state.token_ledger.effective_tokens();
 
         let user_message = Message::User(turn.user_message.clone());
@@ -1819,8 +1843,11 @@ impl SessionHandle {
 
     /// Hand the session to the configured strategy for one compaction pass
     /// against the session's default model. The strategy may append to
-    /// `state` and `events` on the way; those mutations are staged as one
-    /// transaction and rolled back on `Err` or `Ok(None)`.
+    /// `state` and `events` on the way. When it returns `Err` or `Ok(None)`
+    /// after appending, the transcript window goes back to what it was
+    /// through a logged `ContextRestored` transition: the model never sees
+    /// the half-finished exchange, while the log, the session totals, and
+    /// `turn_usage` keep every message and token the pass produced.
     #[expect(clippy::too_many_arguments)]
     async fn compact_via_strategy(
         &self,
@@ -1832,7 +1859,8 @@ impl SessionHandle {
         turn_id: &TurnId,
         trigger: CompactionTrigger<'_>,
         cancel: CancellationToken,
-    ) -> anyhow::Result<Option<StrategyCompaction>> {
+        turn_usage: &mut Usage,
+    ) -> anyhow::Result<Option<crate::CompactionEffects>> {
         self.prepare_token_ledger(blueprint, &snapshot, state, events);
         let model = self.services.models.model(&blueprint.default_model)?;
         let provider = self.services.models.provider(&model.provider)?;
@@ -1843,9 +1871,11 @@ impl SessionHandle {
             probe_git(blueprint.working_dir.clone()).await,
         );
         let strategy = self.services.compaction.clone();
-        let state_checkpoint = state.clone();
-        let event_checkpoint = events.len();
-        let fired_hook_checkpoint = fired_hook_ids.clone();
+        let window_before = halter_protocol::RestoredContext {
+            messages: state.messages.clone(),
+            compacted_prefix: state.compacted_prefix.clone(),
+            token_ledger: state.token_ledger,
+        };
         let mut inference_usage = Usage::default();
         let result = strategy
             .compact(CompactionContext::new(
@@ -1864,30 +1894,29 @@ impl SessionHandle {
                 &mut inference_usage,
             ))
             .await;
-        match result {
-            Ok(Some(effects)) => Ok(Some(StrategyCompaction {
-                effects,
-                inference_usage,
-            })),
-            Ok(None) => {
-                *state = state_checkpoint;
-                events.truncate(event_checkpoint);
-                *fired_hook_ids = fired_hook_checkpoint;
-                Ok(None)
-            }
-            Err(error) => {
-                *state = state_checkpoint;
-                events.truncate(event_checkpoint);
-                *fired_hook_ids = fired_hook_checkpoint;
-                Err(error)
-            }
+        turn_usage.saturating_accumulate(&inference_usage);
+        let reason = match &result {
+            Ok(Some(_)) => return result,
+            Ok(None) => "nothing to compact".to_owned(),
+            Err(error) => format!("{error:#}"),
+        };
+        if state.messages != window_before.messages
+            || state.compacted_prefix != window_before.compacted_prefix
+        {
+            let payload = SessionEventPayload::ContextRestored {
+                reason,
+                effects: Box::new(window_before),
+            };
+            halter_protocol::fold::apply_event(state, &payload);
+            self.push_event(events, payload);
         }
+        result
     }
 
     /// A consistent boundary in the turn loop: no assistant tool call is
     /// awaiting its result, so the ledger's verdict can be acted on. Delivers
-    /// the strategy's exactly-once notifications, then follows its compact or
-    /// rollover directive.
+    /// the strategy's exactly-once notifications, then compacts when the
+    /// ledger is at or past the threshold.
     #[expect(clippy::too_many_arguments)]
     async fn context_boundary(
         &self,
@@ -1911,8 +1940,7 @@ impl SessionHandle {
             settings.compaction_threshold,
             &state.compaction_notifications,
         );
-        let result = self.services.compaction.context_boundary(boundary);
-        for notification in result.notifications {
+        for notification in self.services.compaction.context_boundary(boundary) {
             if notification.id.trim().is_empty() {
                 anyhow::bail!("failed to evaluate context boundary: notification id is empty");
             }
@@ -1927,12 +1955,7 @@ impl SessionHandle {
             self.push_event(events, SessionEventPayload::MessageItem { message });
         }
 
-        let trigger = match result.directive {
-            CompactionDirective::Continue => None,
-            CompactionDirective::Compact => Some(CompactionTrigger::Automatic),
-            CompactionDirective::Rollover => Some(CompactionTrigger::Rollover),
-        };
-        if let Some(trigger) = trigger {
+        if settings.compaction_due(state.token_ledger.effective_tokens()) {
             self.run_automatic_compaction(
                 blueprint,
                 snapshot.clone(),
@@ -1940,7 +1963,6 @@ impl SessionHandle {
                 events,
                 fired_hook_ids,
                 hook_ctx,
-                trigger,
                 turn_usage,
                 cancel,
             )
@@ -1969,7 +1991,6 @@ impl SessionHandle {
         events: &mut Vec<PendingEvent>,
         fired_hook_ids: &mut BTreeSet<String>,
         hook_ctx: HookInvocationContext<'_>,
-        trigger: CompactionTrigger<'_>,
         turn_usage: &mut Usage,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
@@ -2006,16 +2027,15 @@ impl SessionHandle {
                 events,
                 fired_hook_ids,
                 hook_ctx.turn_id,
-                trigger,
+                CompactionTrigger::Automatic,
                 cancel.child_token(),
+                turn_usage,
             )
             .await
         {
-            Ok(Some(compaction)) => {
-                let mut compaction_usage = compaction.inference_usage;
-                compaction_usage.saturating_accumulate(&compaction.effects.usage);
-                turn_usage.saturating_accumulate(&compaction_usage);
-                let (result, payload) = compaction.effects.apply(state);
+            Ok(Some(effects)) => {
+                turn_usage.saturating_accumulate(&effects.usage);
+                let (result, payload) = effects.apply(state);
                 info!(
                     session_id = %self.session_id,
                     compacted_messages = result.compacted_count,
@@ -5564,22 +5584,20 @@ mod tests {
         assert!(stored.state.compaction_notifications.contains("half-full"));
     }
 
+    /// Milestones are the strategy's; the compaction that follows is the
+    /// runtime's threshold, and it opens a new window in which milestones
+    /// can fire again.
     #[tokio::test]
-    async fn boundary_policy_can_force_a_rollover_above_ninety_percent() {
+    async fn milestone_notifications_precede_the_runtime_compaction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
-        install_context_settings(
-            &mut services,
-            ContextSettings {
-                compaction_threshold: 2_000,
-                max_tokens: None,
-            },
-        );
-        install_compaction(&mut services, Arc::new(RolloverCompaction));
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
+        install_compaction(&mut services, Arc::new(MilestoneCompaction));
         let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
 
         let events = session
-            .submit_turn(Turn::user("x".repeat(2_000)))
+            .submit_turn(Turn::user("x".repeat(6_000)))
             .await
             .expect("submit turn")
             .try_collect::<Vec<_>>()
@@ -5608,7 +5626,10 @@ mod tests {
             .expect("load")
             .expect("exists");
         assert_eq!(stored.state.context_window, 1);
-        assert_eq!(stored.state.compaction_notifications.len(), 2);
+        // The new window starts at the request base alone: past 50% of the
+        // threshold again, short of 75%.
+        assert!(stored.state.compaction_notifications.contains("50-percent"));
+        assert!(!stored.state.compaction_notifications.contains("75-percent"));
     }
 
     #[tokio::test]
@@ -5747,21 +5768,21 @@ mod tests {
         fn context_boundary(
             &self,
             boundary: crate::CompactionBoundary<'_>,
-        ) -> crate::CompactionBoundaryResult {
+        ) -> Vec<crate::CompactionNotification> {
             let half = boundary.compaction_threshold() / 2;
             if boundary.current_tokens() >= half
                 && !boundary.notification_was_delivered("half-full")
             {
-                crate::CompactionBoundaryResult::default().with_notification(
+                vec![crate::CompactionNotification::new(
                     "half-full",
                     Message::System(SystemMessage {
                         id: MessageId::new(),
                         created_at: Utc::now(),
                         text: "Context is half full.".to_owned(),
                     }),
-                )
+                )]
             } else {
-                crate::CompactionBoundaryResult::default()
+                Vec::new()
             }
         }
 
@@ -5773,53 +5794,46 @@ mod tests {
         }
     }
 
-    struct RolloverCompaction;
+    /// Milestone reminders at 50% and 75% of the threshold; the runtime's own
+    /// threshold does the compacting, which wipes the window.
+    struct MilestoneCompaction;
 
     #[async_trait]
-    impl crate::CompactionStrategy for RolloverCompaction {
+    impl crate::CompactionStrategy for MilestoneCompaction {
         fn context_boundary(
             &self,
             boundary: crate::CompactionBoundary<'_>,
-        ) -> crate::CompactionBoundaryResult {
-            let mut result = crate::CompactionBoundaryResult::default();
-            if boundary.current_tokens().saturating_mul(2) >= boundary.compaction_threshold()
-                && !boundary.notification_was_delivered("50-percent")
-            {
-                result = result.with_notification(
-                    "50-percent",
+        ) -> Vec<crate::CompactionNotification> {
+            let milestone = |id: &str, text: &str| {
+                crate::CompactionNotification::new(
+                    id,
                     Message::System(SystemMessage {
                         id: MessageId::new(),
                         created_at: Utc::now(),
-                        text: "milestone:50".to_owned(),
+                        text: text.to_owned(),
                     }),
-                );
+                )
+            };
+            let mut notifications = Vec::new();
+            if boundary.current_tokens().saturating_mul(2) >= boundary.compaction_threshold()
+                && !boundary.notification_was_delivered("50-percent")
+            {
+                notifications.push(milestone("50-percent", "milestone:50"));
             }
             if boundary.current_tokens().saturating_mul(4)
                 >= boundary.compaction_threshold().saturating_mul(3)
                 && !boundary.notification_was_delivered("75-percent")
             {
-                result = result.with_notification(
-                    "75-percent",
-                    Message::System(SystemMessage {
-                        id: MessageId::new(),
-                        created_at: Utc::now(),
-                        text: "milestone:75".to_owned(),
-                    }),
-                );
+                notifications.push(milestone("75-percent", "milestone:75"));
             }
-            if boundary.current_tokens().saturating_mul(10)
-                > boundary.compaction_threshold().saturating_mul(9)
-            {
-                result.directive = crate::CompactionDirective::Rollover;
-            }
-            result
+            notifications
         }
 
         async fn compact(
             &self,
             ctx: crate::CompactionContext<'_>,
         ) -> anyhow::Result<Option<crate::CompactionEffects>> {
-            assert_eq!(ctx.trigger(), CompactionTrigger::Rollover);
+            assert_eq!(ctx.trigger(), CompactionTrigger::Automatic);
             Ok(Some(crate::CompactionEffects {
                 messages: Vec::new(),
                 compacted_context: halter_protocol::CompactedContext::default(),
@@ -6480,10 +6494,17 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
         );
-        assert!(!events.iter().any(|event| matches!(
+        // The checkpoint request the pass sent stays in the log, and the
+        // restore that ended the pass follows it.
+        assert!(events.iter().any(|event| matches!(
             &event.payload,
             SessionEventPayload::MessageItem { message: Message::User(user) }
                 if user.plain_text().starts_with(crate::default_compaction_prompt())
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::ContextRestored { reason, .. }
+                if reason.contains("returned no checkpoint summary")
         )));
         let before_manual = services
             .sessions
@@ -6516,15 +6537,42 @@ mod tests {
             .await
             .expect("load")
             .expect("exists");
-        assert_eq!(after_manual.state, before_manual.state);
+        assert_eq!(after_manual.state.messages, before_manual.state.messages);
         assert_eq!(
-            session.replay().await.expect("replay after manual"),
-            replay_before_manual
+            after_manual.state.compacted_prefix,
+            before_manual.state.compacted_prefix
         );
+        assert_eq!(
+            after_manual.state.token_ledger,
+            before_manual.state.token_ledger
+        );
+        // The manual pass is in the log too: its request, its reply, and the
+        // restore, committed even though the call returned an error.
+        let replay_after_manual = session.replay().await.expect("replay after manual");
+        assert!(replay_after_manual.len() > replay_before_manual.len());
+        assert!(
+            replay_after_manual[replay_before_manual.len()..]
+                .iter()
+                .any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::ContextRestored { reason, .. }
+                        if reason.contains("returned no checkpoint summary")
+                ))
+        );
+        let folded =
+            halter_protocol::fold::fold_events(SessionState::default(), &replay_after_manual);
+        assert!(halter_protocol::fold::covered_state_matches(
+            &folded,
+            &after_manual.state
+        ));
     }
 
+    /// A pass that fails after the nudge ran leaves everything it did in the
+    /// log — the nudge, the reply, the todo it persisted — and restores the
+    /// window through a logged transition, so replay and the checkpoint
+    /// still agree and the model never sees the half-finished exchange.
     #[tokio::test]
-    async fn model_summary_provider_failure_rolls_back_mid_pass_state_and_events() {
+    async fn model_summary_provider_failure_restores_the_window_and_keeps_the_log() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut services = configured_services(Arc::new(FailingCheckpointProvider), temp.path());
         register_builtin_tools(&services.tools, &[]);
@@ -6545,18 +6593,53 @@ mod tests {
             SessionEventPayload::Warning { message }
                 if message.contains("checkpoint inference failed")
         )));
-        assert!(!events.iter().any(|event| matches!(
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
+        );
+        // Everything the pass did is in the log...
+        assert!(events.iter().any(|event| matches!(
             event.payload,
-            SessionEventPayload::ToolExecutionStarted { .. }
-                | SessionEventPayload::ToolExecutionCompleted { .. }
-                | SessionEventPayload::ContextCompacted { .. }
+            SessionEventPayload::ToolExecutionCompleted { .. }
         )));
-        assert!(!events.iter().any(|event| matches!(
-            &event.payload,
-            SessionEventPayload::MessageItem { message: Message::User(user) }
-                if user.plain_text() == crate::TODO_NUDGE
-                    || user.plain_text().starts_with(crate::default_compaction_prompt())
-        )));
+        for expected in [
+            crate::TODO_NUDGE.to_owned(),
+            crate::default_compaction_prompt().to_owned(),
+        ] {
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::MessageItem { message: Message::User(user) }
+                        if user.plain_text().starts_with(&expected)
+                )),
+                "the log keeps the pass's request starting {:?}",
+                &expected[..40]
+            );
+        }
+        // ...and the restore is the transition that took the window back.
+        let restored = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::ContextRestored { reason, effects } => Some((reason, effects)),
+                _ => None,
+            })
+            .expect("restore event");
+        assert!(restored.0.contains("checkpoint inference failed"));
+        assert!(matches!(
+            &restored.1.messages[..],
+            [Message::User(user)] if user.plain_text() == "x".repeat(6_000)
+        ));
+        // The todo the nudge persisted is a real side effect and stays.
+        assert_eq!(
+            services
+                .tool_sessions
+                .task_session(session.session_id())
+                .lock()
+                .list()
+                .len(),
+            1
+        );
 
         let stored = services
             .sessions
@@ -6568,6 +6651,7 @@ mod tests {
             &stored.state.messages[..],
             [Message::User(user), Message::Assistant(_)] if user.plain_text() == "x".repeat(6_000)
         ));
+        assert!(stored.state.pending_tool_calls.is_empty());
         let folded = halter_protocol::fold::fold_events(
             SessionState::default(),
             &session.replay().await.expect("replay"),

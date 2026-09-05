@@ -940,6 +940,22 @@ pub struct CompactionEventEffects {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// State-complete record of a transcript window put back after a compaction
+/// pass appended to it and then failed or found nothing to do. Carried on
+/// [`SessionEventPayload::ContextRestored`]. The pass's own messages, tool
+/// runs, and usage stay in the log exactly as they happened; this is the
+/// transition that ends the pass.
+pub struct RestoredContext {
+    /// Message window that replaces [`SessionState::messages`].
+    pub messages: Vec<Message>,
+    /// Provider-native items that replace [`SessionState::compacted_prefix`].
+    pub compacted_prefix: Vec<Value>,
+    /// The ledger as it stood before the pass, which is exactly what the
+    /// restored window is.
+    pub token_ledger: TokenLedger,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 /// Event payload emitted by the session runtime.
 pub enum SessionEventPayload {
@@ -962,6 +978,13 @@ pub enum SessionEventPayload {
     /// request after loading a legacy snapshot.
     ContextProjectionUpdated {
         request_tokens: u64,
+    },
+    /// A compaction pass appended to the transcript and then failed or found
+    /// nothing to compact. The window goes back to what it was; everything
+    /// the pass did stays in the log.
+    ContextRestored {
+        reason: String,
+        effects: Box<RestoredContext>,
     },
     DeltaItem {
         delta: DeltaItem,
@@ -1722,9 +1745,10 @@ pub struct ProviderCapabilities {
     /// provider-delegated strategy branches on this to decide which messages
     /// a rewrite may replace: a dedicated endpoint restores compacted context
     /// as provider-native items, so everything before the latest assistant
-    /// block is eligible; an inline request only summarizes the tail after
-    /// the latest user message so cache anchors stay verbatim. `None` means
-    /// the provider cannot compact.
+    /// block is eligible; an inline request summarizes the prefix before the
+    /// latest user message and keeps that user-led suffix verbatim, so the
+    /// summary stays ahead of it in the next request. `None` means the
+    /// provider cannot compact.
     #[serde(default)]
     pub compaction_strategy: Option<ProviderCompactionStrategy>,
     pub supports_tool_result_media: bool,
@@ -1744,9 +1768,9 @@ pub enum ProviderCompactionStrategy {
     Dedicated,
     /// In-band compaction via the regular completions endpoint
     /// (e.g. OpenRouter's responses passthrough). Lossy: the runtime
-    /// only compacts the trailing window after the last cache breakpoint
-    /// and wraps the result in explicit compaction tags so the model can
-    /// distinguish it from authoritative system content.
+    /// compacts the prefix before the latest user message, keeps that
+    /// suffix verbatim, and wraps the result in explicit compaction tags so
+    /// the model can distinguish it from authoritative system content.
     Inline,
 }
 

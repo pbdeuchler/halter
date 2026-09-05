@@ -148,25 +148,29 @@ once a `1.0.0` line is cut.
   compaction to a model-written checkpoint. Set
   `context.compaction = "provider_default"` to keep the previous behavior.
 - **Breaking:** `CompactionStrategy::threshold_notifications` is replaced by
-  per-session `context_boundary(CompactionBoundary)`. It returns persisted,
-  per-window notifications and a `CompactionDirective` (`Continue`, `Compact`,
-  or `Rollover`), which supplies the state and forced-rollover control needed
-  by the CleanWindow strategy in #196. `CompactionTrigger` gained `Rollover`;
-  `SessionState` gained `context_window` and `compaction_notifications`.
+  per-session `context_boundary(CompactionBoundary)`, which returns
+  `CompactionNotification`s: exactly-once, per-window reminders whose ids the
+  runtime persists. It cannot move or veto the trigger; the runtime compacts
+  on `context.compaction_threshold` whatever it returns. `SessionState` gained
+  `context_window` and `compaction_notifications`.
 - **Breaking:** `SessionEventPayload` gained `ContextProjectionUpdated` for
-  replayable request-base accounting. Exhaustive matches must add an arm.
-  `TokenLedger` gained request-base and accounting-version fields; downstream
-  struct literals should use `..TokenLedger::default()`.
+  replayable request-base accounting and `ContextRestored` for the window a
+  failed or no-op compaction pass puts back. Exhaustive matches must add both
+  arms. `TokenLedger` gained request-base and accounting-version fields;
+  downstream struct literals should use `..TokenLedger::default()`.
 
 ### Fixed
 
 - The token ledger and hard cap now include prompt segments, tool declarations,
   media-only messages, and hook-added context. Legacy ledgers rebuild before
   use instead of loading as a permanent zero estimate.
-- Failed and no-op compaction passes restore their staged transcript, usage,
-  and audit events. Empty model/provider summaries are rejected without
-  deleting context, while successful compaction usage reaches both session
-  totals and `TurnCompleted`.
+- A compaction pass that fails or finds nothing to do after appending to the
+  transcript no longer leaves its half-finished exchange for the model: the
+  window goes back to what it was through a logged `ContextRestored`
+  transition. Nothing is removed from the event log, and every token the
+  pass spent reaches the session totals and `TurnCompleted`. Empty model or
+  provider summaries are rejected the same way, and successful compaction
+  usage is counted too.
 - Inline provider compaction summarizes an older prefix and preserves the
   suffix, keeping the summary in chronological order. Automatic compaction
   now triggers exactly at the configured threshold rather than 100 tokens

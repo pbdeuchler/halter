@@ -14,18 +14,20 @@
 //!
 //! - `messages` — appended by [`SessionEventPayload::MessageItem`], replaced
 //!   by [`SessionEventPayload::ContextCompacted`] when it carries
-//!   [`CompactionEventEffects`].
-//! - `compacted_prefix` — replaced by `ContextCompacted` effects.
+//!   [`CompactionEventEffects`] and by [`SessionEventPayload::ContextRestored`].
+//! - `compacted_prefix` — replaced by `ContextCompacted` and `ContextRestored`
+//!   effects.
 //! - `usage_so_far` — accumulated (saturating) from the `usage` stamped on
 //!   assistant messages.
 //! - `token_ledger` — advanced by every `MessageItem` through
-//!   [`SessionState::append`] and rebuilt from `ContextCompacted` effects,
-//!   exactly as the runtime does.
+//!   [`SessionState::append`], rebuilt from `ContextCompacted` effects, and
+//!   put back by `ContextRestored`, exactly as the runtime does.
 //! - `context_window` — advanced by each state-rewriting compaction.
 //!
 //! Runtime bookkeeping fields (`file_view_cache`, `pending_tool_calls`,
-//! `fired_hook_ids`, `appended_prompt_segments`, `lineage`, hook latches, and
-//! provider-chaining fields) are deliberately *not* event-covered: they are
+//! `fired_hook_ids`, `appended_prompt_segments`, `compaction_notifications`,
+//! `lineage`, hook latches, and provider-chaining fields) are deliberately
+//! *not* event-covered: they are
 //! carried by the checkpoint, which the runtime writes on every
 //! state-changing commit. The one exception is that `ContextCompacted`
 //! effects also reset `last_response_id` / `messages_seen_by_provider`,
@@ -58,6 +60,11 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
             state
                 .token_ledger
                 .prepare_request(*request_tokens, compacted_prefix, messages);
+        }
+        SessionEventPayload::ContextRestored { effects, .. } => {
+            state.messages = effects.messages.clone();
+            state.compacted_prefix = effects.compacted_prefix.clone();
+            state.token_ledger = effects.token_ledger;
         }
         SessionEventPayload::ContextCompacted {
             effects: Some(effects),
@@ -266,6 +273,46 @@ mod tests {
         );
 
         assert_eq!(state.token_ledger.authoritative_tokens, 0);
+    }
+
+    /// A pass that appended and then failed leaves its exchange in the log;
+    /// the restore is the transition that takes the window back, ledger
+    /// included, without touching the usage those messages accumulated.
+    #[test]
+    fn context_restored_puts_the_window_and_ledger_back() {
+        let mut state = SessionState::default();
+        state.append(Message::User(UserMessage::text("kept")));
+        let before = state.clone();
+        apply_event(
+            &mut state,
+            &SessionEventPayload::MessageItem {
+                message: Message::User(UserMessage::text("compaction nudge")),
+            },
+        );
+        apply_event(
+            &mut state,
+            &SessionEventPayload::MessageItem {
+                message: assistant_message("reply", Some(usage(10, 5))),
+            },
+        );
+        assert_ne!(state.messages, before.messages);
+
+        apply_event(
+            &mut state,
+            &SessionEventPayload::ContextRestored {
+                reason: "checkpoint inference failed".to_owned(),
+                effects: Box::new(crate::RestoredContext {
+                    messages: before.messages.clone(),
+                    compacted_prefix: before.compacted_prefix.clone(),
+                    token_ledger: before.token_ledger,
+                }),
+            },
+        );
+
+        assert_eq!(state.messages, before.messages);
+        assert_eq!(state.compacted_prefix, before.compacted_prefix);
+        assert_eq!(state.token_ledger, before.token_ledger);
+        assert_eq!(state.usage_so_far, usage(10, 5), "billed usage is kept");
     }
 
     #[test]

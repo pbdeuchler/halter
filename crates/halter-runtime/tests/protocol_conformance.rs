@@ -136,6 +136,14 @@ fn session_event_payload_variants_have_stable_kind() {
             }),
         },
         SessionEventPayload::ContextProjectionUpdated { request_tokens: 42 },
+        SessionEventPayload::ContextRestored {
+            reason: "r".to_owned(),
+            effects: Box::new(halter_protocol::RestoredContext {
+                messages: Vec::new(),
+                compacted_prefix: Vec::new(),
+                token_ledger: halter_protocol::TokenLedger::default(),
+            }),
+        },
         SessionEventPayload::DeltaItem {
             delta: DeltaItem {
                 text: "d".to_owned(),
@@ -189,6 +197,7 @@ fn session_event_payload_variants_have_stable_kind() {
             SessionEventPayload::TurnStarted { .. } => "turn_started",
             SessionEventPayload::MessageItem { .. } => "message_item",
             SessionEventPayload::ContextProjectionUpdated { .. } => "context_projection_updated",
+            SessionEventPayload::ContextRestored { .. } => "context_restored",
             SessionEventPayload::DeltaItem { .. } => "delta_item",
             SessionEventPayload::ProviderMetadata { .. } => "provider_metadata",
             SessionEventPayload::ToolExecutionStarted { .. } => "tool_execution_started",

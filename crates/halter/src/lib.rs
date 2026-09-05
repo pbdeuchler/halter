@@ -70,10 +70,9 @@ pub mod compaction {
     pub use halter_config::CompactionStrategyKind;
     pub use halter_protocol::TokenLedger;
     pub use halter_runtime::{
-        CompactionBoundary, CompactionBoundaryResult, CompactionContext, CompactionDirective,
-        CompactionEffects, CompactionNotification, CompactionStrategy, CompactionTrigger,
-        ContextCapExceeded, ContextSettings, ModelSummary, ProviderDefault,
-        compaction_instructions,
+        CompactionBoundary, CompactionContext, CompactionEffects, CompactionNotification,
+        CompactionStrategy, CompactionTrigger, ContextCapExceeded, ContextSettings, ModelSummary,
+        ProviderDefault, compaction_instructions,
     };
 }
 

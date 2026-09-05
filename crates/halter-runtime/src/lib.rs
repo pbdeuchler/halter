@@ -26,8 +26,8 @@ mod turn_registry;
 
 pub use compaction::{ContextCapExceeded, ContextSettings};
 pub use compaction_strategy::{
-    CompactionBoundary, CompactionBoundaryResult, CompactionContext, CompactionDirective,
-    CompactionNotification, CompactionStrategy, CompactionTrigger, compaction_instructions,
+    CompactionBoundary, CompactionContext, CompactionNotification, CompactionStrategy,
+    CompactionTrigger, compaction_instructions,
 };
 pub use context::{
     CompactionEffects, ContextManager, DefaultContextManager, prompt_segments,
