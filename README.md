@@ -250,7 +250,7 @@ halter ships three built-in prompts, all available to SDK users:
 
 - a **general-purpose system prompt** (the default for every session),
 - a **batteries-included coding-agent prompt** — a quick on-ramp for a working coding agent, and
-- the **conversation-compaction** instructions used by the default context manager.
+- the **context-checkpoint** instructions the default compaction strategy sends the model.
 
 The two system prompts are assembled from a shared behavioral core plus a small role-specific intro, so common guidance (acting autonomously in headless runs, preferring the provided tools, honesty, safety) is defined in exactly one place.
 
@@ -534,13 +534,14 @@ enabled = [
 ]
 
 [context]
-# All optional. Unset, compaction_threshold is models.default.max_input_tokens
-# minus 20_000, pre_compaction_target is three quarters of the threshold, and
-# max_tokens (a hard cap that fails the turn) is max_input_tokens itself.
+# Thresholds are optional. Unset, compaction_threshold is
+# models.default.max_input_tokens minus 20_000 and max_tokens (a hard cap that
+# fails the turn) is max_input_tokens itself.
 compaction_threshold = 200_000
-pre_compaction_target = 150_000
 # max_tokens = 260_000
-prune_signal_threshold = "low"
+# "model_summary" (default): the model writes a context checkpoint and the next
+# window starts from it. "provider_default": the provider's native compaction.
+compaction = "model_summary"
 
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
@@ -687,12 +688,13 @@ use std::sync::Arc;
 use halter::session::InMemorySessionStore;
 use halter::{HalterBuilder, LoadedSkill};
 use halter_config::{
-    ConfiguredProvider, ContextConfig, HarnessConfig, ModelConfig, ModelsConfig,
-    NetworkPolicyConfig, PolicyConfig, PromptsConfig, ProviderConfig, ProvidersConfig,
-    ResourcesConfig, RuntimeConfig, SearchRoots, SessionBackend, SessionsConfig,
-    ShellPolicyConfig, ToolsConfig,
+    CompactionStrategyKind, ConfiguredProvider, ContextConfig, HarnessConfig, ModelConfig,
+    ModelsConfig, NetworkPolicyConfig, PolicyConfig, PromptsConfig, ProviderConfig,
+    ProvidersConfig, ResourcesConfig, RuntimeConfig, SearchRoots, SessionBackend,
+    SessionsConfig, ShellPolicyConfig, ToolsConfig,
 };
-use halter_protocol::{PruneSignalThreshold, ReasoningEffort, SkillId, Turn};
+use halter_protocol::{ReasoningEffort, SkillId, Turn};
+
 use halter_runtime::SessionInit;
 
 const SYSTEM_PROMPT: &str =
@@ -754,9 +756,8 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
         },
         context: ContextConfig {
             compaction_threshold: Some(200_000),
-            pre_compaction_target: Some(150_000),
             max_tokens: None,
-            prune_signal_threshold: PruneSignalThreshold::Low,
+            compaction: CompactionStrategyKind::ModelSummary,
         },
         tools: ToolsConfig {
             enabled: vec![
@@ -1024,10 +1025,11 @@ The runtime decides *when* to compact; a compaction strategy decides *what
 happens*.
 
 - Every session keeps a **token ledger** (`SessionState::token_ledger`): the
-  context size the provider reported with the last completed assistant
-  response, plus a heuristic estimate of every message appended since. A new
-  report replaces the anchor and zeroes the estimate; compaction re-estimates
-  the compacted state. Nothing scans the transcript at plan time.
+  last completed response's provider-reported context size plus inferred
+  transcript growth and the current request base (system/skill/hook prompt
+  segments and tool declarations). Media-only messages have a non-zero
+  estimate. Each usable report replaces the transcript anchor; compaction and
+  legacy snapshots safely rebuild it.
 - Compaction has two trigger points, both Halter-side: immediately after an
   assistant response that requested no tools, and before every provider
   request once the appends since the last one (user message, tool results,
@@ -1036,8 +1038,7 @@ happens*.
   provider's own.
 - `context.compaction_threshold` defaults to `models.default.max_input_tokens`
   minus 20,000; one of the two must be set or loading the config and building
-  the harness fail. `context.pre_compaction_target` defaults to three quarters
-  of the threshold. `context.max_tokens` (default `max_input_tokens`) is a hard
+  the harness fail. `context.max_tokens` (default `max_input_tokens`) is a hard
   cap checked before each provider request, after compaction has had its
   chance: a turn that would exceed it fails with
   `halter::compaction::ContextCapExceeded` instead of blowing the provider
@@ -1046,10 +1047,27 @@ happens*.
   turn to an uncompacted context with a `Warning` event. `session.compact(..)`
   propagates failures. `PreCompact`/`PostCompact` hooks fire on both paths,
   with trigger `auto` for the automatic one.
-- The default strategy (`ProviderCompaction`) prunes low-signal history and
-  delegates to the provider's native compaction endpoint. Install your own
-  with `HalterBuilder::with_compaction(...)`; a strategy may also contribute
-  tools, system-prompt segments, and reminders as the context fills.
+- `context.compaction` picks the strategy. `"model_summary"` (the default)
+  asks the session's own model for a context checkpoint: when the `task` tool
+  is registered it first nudges the model to persist its remaining work there
+  (only `task` calls from that reply run; nothing else reaches the next
+  request), then sends the built-in checkpoint instructions, and the reply
+  becomes the next window as a single user-role message after the static
+  prefix. No tail of old messages is kept, which is also the one client-side
+  shape that survives preserved-thinking checks. `"provider_default"`
+  delegates the rewrite to the provider's native compaction (OpenAI's
+  `/v1/responses/compact`; inline summarization requests for Anthropic and
+  OpenRouter), and the harness fails to build if the default model's provider
+  cannot compact. Either way the trigger is Halter's ledger, never the
+  provider's own auto-compaction.
+- Install your own strategy with `HalterBuilder::with_compaction(...)`; it may
+  also contribute tools and system-prompt segments, and its `context_boundary`
+  hook can deliver exactly-once, per-window reminders as the context fills.
+  The runtime alone decides when compaction runs. A strategy can drive the
+  model and tools through the `CompactionContext` the runtime hands it; if
+  its pass fails, the window goes back to what it was while everything the
+  pass did stays in the event log.
+
 
 ```rust
 use std::sync::Arc;
@@ -1065,8 +1083,8 @@ impl CompactionStrategy for KeepEverything {
         &self,
         ctx: CompactionContext<'_>,
     ) -> anyhow::Result<Option<CompactionEffects>> {
-        // `ctx.state` (messages, `token_ledger`), `ctx.prompt_segments`,
-        // `ctx.tool_specs`, `ctx.model`, and `ctx.provider` are all readable.
+        // `ctx.state()` (messages, `token_ledger`), `ctx.prompt_segments()`,
+        // `ctx.tool_specs()`, `ctx.model()`, and `ctx.provider()` are readable.
         // `Ok(None)` means there was nothing to compact.
         let _ = ctx;
         Ok(None)

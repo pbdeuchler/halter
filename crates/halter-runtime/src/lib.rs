@@ -13,7 +13,9 @@ mod event_bus;
 mod hooks_runtime;
 mod model_judge;
 mod model_selection;
+mod model_summary;
 mod prompt;
+mod provider_default;
 mod session;
 mod subagent_session;
 mod subagents;
@@ -22,14 +24,17 @@ mod trace_format;
 mod trace_recorder;
 mod turn_registry;
 
-pub use compaction::{ContextCapExceeded, ContextSettings, score_message};
+pub use compaction::{ContextCapExceeded, ContextSettings};
 pub use compaction_strategy::{
-    CompactionContext, CompactionStrategy, CompactionTrigger, ProviderCompaction,
+    CompactionBoundary, CompactionContext, CompactionNotification, CompactionStrategy,
+    CompactionTrigger, compaction_instructions,
 };
 pub use context::{
     CompactionEffects, ContextManager, DefaultContextManager, prompt_segments,
     resolve_response_chain,
 };
+pub use model_summary::{CHECKPOINT_PREFIX, ModelSummary, TODO_NUDGE, TODO_REMINDER};
+pub use provider_default::ProviderDefault;
 
 pub use event_bus::EventBus;
 pub use halter_protocol::SubagentEventForwarding;

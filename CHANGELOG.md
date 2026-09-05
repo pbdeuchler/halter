@@ -66,6 +66,35 @@ once a `1.0.0` line is cut.
   - `PreCompact`/`PostCompact` hooks now fire around automatic compaction too,
     with trigger `auto`; a blocking `PreCompact` hook skips the pass with a
     `Warning` event.
+- Compaction v2, part 2: the two request-rewriting strategies, selectable
+  from config, and the pruning machinery they replace deleted (#195).
+  - `ModelSummary` is the new default. When the `task` tool is registered it
+    first nudges the model to persist its remaining work (only that reply's
+    `task` calls run; its text and other calls never reach the next request,
+    though the event log keeps the whole reply), then sends the built-in
+    checkpoint instructions, and the reply becomes the next window as a
+    single user-role message after the static prefix, with a todo reminder
+    when the nudge ran calls. No tail of old messages is kept.
+  - `ProviderDefault` delegates the rewrite to the provider's native
+    compaction, on Halter's trigger only, and derives the window it may
+    replace from `ProviderCapabilities::compaction_strategy`. Anthropic keeps
+    the inline summarization request: the shipped `compact_20260112` context
+    edit fires only on the server's own token trigger (50,000 tokens minimum)
+    and cannot be invoked on demand.
+  - `context.compaction = "model_summary" | "provider_default"`
+    (`CompactionStrategyKind`). Selecting `provider_default` with a default
+    model whose provider cannot compact fails `HalterBuilder::build` with an
+    actionable error, never the first compaction.
+  - `CompactionContext` is now a runtime-backed engine rather than a bag of
+    references: `append`, `record`, `infer`, and `execute_tool_calls` let a
+    strategy drive the model and tools through the turn's own planning,
+    prompt cache, hooks, policy, and event log; reads go through `state()`,
+    `model()`, `provider()`, `prompt_segments()`, `tool_specs()`, and
+    `trigger()`. `halter::compaction` re-exports `ModelSummary`,
+    `ProviderDefault`, `CompactionStrategyKind`, and
+    `compaction_instructions`.
+  - `default_compaction_prompt()` is now the context-checkpoint request the
+    model receives; it ends by asking for plain text and no tool calls.
 
 ### Changed
 
@@ -82,9 +111,10 @@ once a `1.0.0` line is cut.
   is a unit struct (`new`, `from_settings`, and `settings` are gone). Planning
   is read-only; compaction happens before it through the strategy.
 - **Breaking:** `CompactionOutcome` is removed. `CompactionEffects` is
-  `{ messages, compacted_context, result }` and `apply` returns the
+  `{ messages, compacted_context, result, usage }` and `apply` returns the
   `CompactionResult` plus the `ContextCompacted` payload that records it.
-  `ContextPlan` lost `compaction` and `compaction_warning`.
+  `CompactionEventEffects` likewise gained `usage`. `ContextPlan` lost
+  `compaction` and `compaction_warning`.
 - **Breaking:** `SessionState::usage_anchor_floor` is replaced by
   `token_ledger`; `estimate_context_tokens`, `find_usage_anchor`, and
   `UsageAnchor` are gone. The estimator (`estimate_text_tokens`,
@@ -98,6 +128,54 @@ once a `1.0.0` line is cut.
 - **Breaking:** `RuntimeServices` gained `context: ContextSettings` and
   `compaction: Arc<dyn CompactionStrategy>`, and `ContextSettings` gained
   `max_tokens`.
+- **Breaking:** `context.pre_compaction_target` and
+  `context.prune_signal_threshold` are removed along with signal-scored
+  pruning; `ContextConfig` and `ResolvedContextConfig` gained `compaction`
+  and `ContextSettings` lost the two pruning fields. `MessageSignal`,
+  `PruneSignalThreshold`, `CompactionWindow`, `SummarySlice`,
+  `SessionState::summaries`, `ContextPlan::carried_summaries`,
+  `estimate_summary_tokens`, and `halter_runtime::score_message` are gone;
+  `TokenLedger::inferred_from` takes `(compacted_prefix, messages)`.
+- **Breaking:** `Provider::compaction_window` is removed from the provider
+  trait; which messages a rewrite preserves is strategy policy, derived from
+  `ProviderCapabilities::compaction_strategy`. `FakeProvider` now reports
+  `Some(Dedicated)`.
+- **Breaking:** `ProviderCompaction` is replaced by `ProviderDefault` (no
+  settings) and the interim provider-delegated default by `ModelSummary`.
+  `CompactionContext`'s fields are private; use its accessors. `plan()` no
+  longer renders carried summaries into the prefix.
+- **Breaking:** the default compaction behavior changed from provider-native
+  compaction to a model-written checkpoint. Set
+  `context.compaction = "provider_default"` to keep the previous behavior.
+- **Breaking:** `CompactionStrategy::threshold_notifications` is replaced by
+  per-session `context_boundary(CompactionBoundary)`, which returns
+  `CompactionNotification`s: exactly-once, per-window reminders whose ids the
+  runtime persists. It cannot move or veto the trigger; the runtime compacts
+  on `context.compaction_threshold` whatever it returns. `SessionState` gained
+  `context_window` and `compaction_notifications`.
+- **Breaking:** `SessionEventPayload` gained `ContextProjectionUpdated` for
+  replayable request-base accounting and `ContextRestored` for the window a
+  failed or no-op compaction pass puts back. Exhaustive matches must add both
+  arms. `TokenLedger` gained request-base and accounting-version fields;
+  downstream struct literals should use `..TokenLedger::default()`.
+
+### Fixed
+
+- The token ledger and hard cap now include prompt segments, tool declarations,
+  media-only messages, and hook-added context. Legacy ledgers rebuild before
+  use instead of loading as a permanent zero estimate.
+- A compaction pass that fails or finds nothing to do after appending to the
+  transcript no longer leaves its half-finished exchange for the model: the
+  window goes back to what it was through a logged `ContextRestored`
+  transition. Nothing is removed from the event log, and every token the
+  pass spent reaches the session totals and `TurnCompleted`. Empty model or
+  provider summaries are rejected the same way, and successful compaction
+  usage is counted too.
+- Inline provider compaction summarizes an older prefix and preserves the
+  suffix, keeping the summary in chronological order. Automatic compaction
+  now triggers exactly at the configured threshold rather than 100 tokens
+  early.
+
 
 ## [0.5.0] - 2026-07-27
 

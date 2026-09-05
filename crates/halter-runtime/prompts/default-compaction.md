@@ -1,59 +1,34 @@
-Compress the conversation into a structured summary
-that preserves all information needed to continue work seamlessly. Optimize for the assistant's
-ability to continue working, not human readability.
-
-<analysis-instructions>
-Before generating your summary, analyze the transcript in <think>...</think> tags:
-1. What did the user originally request? (Exact phrasing)
-2. What actions succeeded? What failed and why?
-3. Did the user correct or redirect the assistant at any point?
-4. What was actively being worked on at the end?
-5. What tasks remain incomplete or pending?
-6. What specific details (IDs, paths, values, names) must survive compression?
-7. What constraints or instructions did the user state that must keep applying — especially
-   security-relevant ones (sensitive files or data to avoid, operations that must not be
-   performed, secret/credential handling rules)?
-</analysis-instructions>
+You are performing a CONTEXT CHECKPOINT COMPACTION. Summarize this session for your own
+continuation in a fresh context window, where this summary will be the only record of the work
+so far. Optimize for your ability to continue working, not for human readability.
 
 <summary-format>
-## User Intent
-The user's original request and any refinements. Use direct quotes for key requirements.
-If the user's goal evolved during the conversation, capture that progression.
+## End Objective
+What the user ultimately asked for, with direct quotes for key requirements. If the goal evolved,
+capture that progression.
 
-## Completed Work
-Actions successfully performed. Be specific:
-- What was created, modified, or deleted
-- Exact identifiers (file paths, record IDs, URLs, names)
-- Specific values, configurations, or settings applied
+## Progress and Key Decisions
+What has been accomplished and the decisions that shaped it, with the reasoning that still
+matters. Be specific: what was created, modified, or deleted; approaches that failed so they are
+not retried.
 
-## Errors & Corrections
-- Problems encountered and how they were resolved
-- Approaches that failed (so they aren't retried)
-- User corrections: "don't do X", "actually I meant Y", "that's wrong because..."
-Capture corrections verbatim—these represent learned preferences.
-
-## Constraints & Instructions
-Standing instructions and constraints that must continue to apply after compaction. Reproduce
+## User Instructions and Input
+High-priority instructions, corrections, and preferences the user stated. Reproduce
 security-relevant ones verbatim: forbidden operations, sensitive files or data to avoid,
-credential/secret handling rules, and any "always/never" directive the user gave.
+credential handling rules, and any "always/never" directive.
 
-## Active Work
-What was in progress when the session ended. Include:
-- The specific task being performed
-- Direct quotes showing exactly where work left off (verbatim, to prevent drift)
-- Any partial results or intermediate state
+## Context and Constraints
+Technical constraints, environment facts, and background discovered along the way that the
+next window must not rediscover.
 
-## Pending Tasks
-Remaining items the user requested that haven't been started.
-Distinguish between "explicitly requested" and "implied/assumed."
-Do not invent next steps beyond what the user actually asked for.
+## What Remains
+The remaining work in order, distinguishing what was explicitly requested from what was
+implied. Do not invent steps beyond what the user asked for. Include exactly where in-progress
+work left off, quoting verbatim where drift would be costly.
 
-## Key References
-Important details needed to continue:
-- Identifiers: IDs, paths, URLs, names, keys
-- Values: numbers, dates, configurations, credentials (redacted)
-- Context: relevant background information, constraints, preferences
-- Citations: sources referenced during the conversation
+## Critical Data
+Identifiers, paths, URLs, commands, values, error messages, and results you will need again.
+Redact credentials.
 </summary-format>
 
 <preserve-rules>
@@ -63,14 +38,15 @@ Always preserve when present:
 - User corrections and negative feedback
 - Security-relevant instructions and constraints, verbatim, so they keep applying
 - Specific values, formulas, or configurations
-- Technical constraints or requirements discovered
 - The precise state of any in-progress work
 </preserve-rules>
 
 <compression-rules>
-- Weight recent messages more heavily—the end of the transcript is the active context
-- Omit pleasantries, acknowledgments, and filler ("Sure!", "Great question")
-- Omit system context that will be re-injected separately
-- Keep each section under 500 words; condense older content to make room for recent
-- If you must cut details, preserve: security constraints > user corrections > errors > active work > completed work
+- Weight recent messages more heavily: the end of the transcript is the active context
+- Omit pleasantries, acknowledgments, and filler
+- Omit the system prompt and skills; they are re-injected separately
+- Keep each section concise; if you must cut, preserve: security constraints > user corrections >
+  errors > active work > completed work
 </compression-rules>
+
+Respond with the summary as plain text. Do not call tools.

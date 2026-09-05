@@ -133,7 +133,8 @@ exclusive. Halter does not parse `.env` files.
 - `reasoning` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
   and `max`.
 - `tokens_per_minute` defaults to `500_000`; use it for proactive rate limiting.
-- `context.compaction_threshold` defaults to `models.default.max_input_tokens - 20_000`. Set one of the two, or config loading and `build()` fail. `context.pre_compaction_target` defaults to three quarters of the threshold and `context.max_tokens` (default `max_input_tokens`) hard-caps the session context: a turn past it fails with `ContextCapExceeded` instead of reaching the provider.
+- `context.compaction_threshold` defaults to `models.default.max_input_tokens - 20_000`. Set one of the two, or config loading and `build()` fail. `context.max_tokens` (default `max_input_tokens`) hard-caps the session context: a turn past it fails with `ContextCapExceeded` instead of reaching the provider.
+- `context.compaction` is `"model_summary"` (default: the model writes a context checkpoint and the next window starts from it, after a nudge to persist todos when the `task` tool is registered) or `"provider_default"` (the provider's native compaction; `build()` fails if the default model's provider cannot compact).
 - `providers.<name>.base_url`, `api_key`, `headers`, and `temperature` are provider-level, not role-level. OpenAI also accepts provider-level `oauth`.
 - Environment overrides include `HALTER_TOOLS_ENABLED`, `HALTER_SKILL_ROOTS`, `HALTER_PLUGIN_ROOTS`, `HALTER_POLICY_SHELL_ALLOW`, `HALTER_POLICY_SHELL_ENABLED`, `HALTER_POLICY_NETWORK_ENABLED`, `HALTER_POLICY_ALLOWED_HOSTS`, and `HALTER_SESSION_BACKEND`.
 - Resource-root paths expand leading `~/` only. `$VAR`, `${VAR}`, `~user`, and shell escapes are not expanded.
@@ -255,7 +256,7 @@ Builder rules:
 - Use `with_compiled_resources(...)` when hooks and hook warnings should survive compilation.
 - Use `with_session_store(...)` to replace the configured built-in backend.
 - Use `with_plugin_hook(...)` or `with_plugin_hook_priority(...)` for in-process SDK hooks.
-- Use `with_compaction(Arc<dyn CompactionStrategy>)` to replace the provider-delegated compaction strategy. The runtime still decides *when* from the session token ledger; the strategy decides what the rewrite is and may contribute tools, prompt segments, and threshold reminders. Never enable a provider's server-side auto-compaction.
+- Use `with_compaction(Arc<dyn CompactionStrategy>)` to replace the configured compaction strategy. The runtime still decides *when* from the session token ledger; the strategy decides what the rewrite is, can drive the model and tools through its `CompactionContext`, and may contribute tools, prompt segments, and threshold reminders. Never enable a provider's server-side auto-compaction.
 
 ## Custom tools
 

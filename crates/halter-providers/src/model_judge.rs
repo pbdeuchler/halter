@@ -18,9 +18,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
 use halter_protocol::{
-    AssistantMessage, AssistantPart, BlockId, CompactionWindow, Message, MessageId, ModelId,
-    PanelIsolation, ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse,
-    ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, StopReason, StreamEvent, ToolCall,
+    AssistantMessage, AssistantPart, BlockId, Message, MessageId, ModelId, PanelIsolation,
+    ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
+    ProviderRequest, ReplayMeta, ResolvedModel, StopReason, StreamEvent, ToolCall,
     ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolResultMessage, ToolSpec,
     UserMessage,
 };
@@ -127,10 +127,6 @@ impl Provider for ModelJudgeProvider {
         // The user-visible stream comes from the default member, so mirror its
         // capabilities (tool support, compaction strategy, token limits, ...).
         self.default.provider.capabilities()
-    }
-
-    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
-        self.default.provider.compaction_window(messages)
     }
 
     async fn stream(

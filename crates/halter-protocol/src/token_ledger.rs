@@ -8,7 +8,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AssistantPart, Message, PromptSegment, StopReason, SummarySlice, ToolResult};
+use crate::{AssistantPart, Message, PromptSegment, StopReason, ToolResult, ToolSpec, UserPart};
+
+const CURRENT_ACCOUNTING_VERSION: u8 = 1;
+const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
+const PROMPT_SEGMENT_OVERHEAD_TOKENS: u64 = 4;
+const TOOL_SPEC_OVERHEAD_TOKENS: u64 = 8;
+
+const fn legacy_accounting_version() -> u8 {
+    0
+}
 
 /// Running estimate of the tokens the provider will see on the next request.
 ///
@@ -21,24 +30,93 @@ use crate::{AssistantPart, Message, PromptSegment, StopReason, SummarySlice, Too
 /// discards the anchor and re-estimates the compacted state
 /// ([`TokenLedger::inferred_from`]).
 ///
-/// Prompt segments (system prompt, skills, hook context) are not counted:
-/// every authoritative report already covers them, and between reports the
-/// ledger tracks transcript growth only.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+/// `request_tokens` is the current heuristic size of the provider-visible
+/// prompt segments and tool declarations. `request_tokens_at_last_anchor`
+/// remembers how much of that base the last authoritative report already
+/// covered, so a changed prompt base contributes only its delta.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct TokenLedger {
     /// Context size reported by the last completed assistant response, or
     /// zero when no usable report covers the current transcript.
     pub authoritative_tokens: u64,
     /// Heuristic estimate of everything appended since that report.
     pub inferred_tokens: u64,
+    /// Current estimate of prompt segments and provider-visible tool specs.
+    #[serde(default)]
+    pub request_tokens: u64,
+    /// Request-base estimate covered by `authoritative_tokens`.
+    #[serde(default)]
+    pub request_tokens_at_last_anchor: u64,
+    /// Version of the accounting semantics used by this serialized ledger.
+    /// Missing or unrecognized versions are rebuilt before use.
+    #[doc(hidden)]
+    #[serde(default = "legacy_accounting_version")]
+    pub accounting_version: u8,
+}
+
+impl Default for TokenLedger {
+    fn default() -> Self {
+        Self {
+            authoritative_tokens: 0,
+            inferred_tokens: 0,
+            request_tokens: 0,
+            request_tokens_at_last_anchor: 0,
+            accounting_version: CURRENT_ACCOUNTING_VERSION,
+        }
+    }
 }
 
 impl TokenLedger {
+    #[must_use]
+    pub const fn needs_request_preparation(&self, request_tokens: u64) -> bool {
+        self.accounting_version != CURRENT_ACCOUNTING_VERSION
+            || self.request_tokens != request_tokens
+    }
+
     /// Tokens the next request is expected to carry.
     #[must_use]
     pub const fn effective_tokens(&self) -> u64 {
+        self.projected_tokens(self.request_tokens)
+    }
+
+    /// Project the next request against a freshly computed request base.
+    #[must_use]
+    pub const fn projected_tokens(&self, request_tokens: u64) -> u64 {
+        if self.authoritative_tokens == 0 {
+            return self.inferred_tokens.saturating_add(request_tokens);
+        }
         self.authoritative_tokens
+            .saturating_sub(self.request_tokens_at_last_anchor)
+            .saturating_add(request_tokens)
             .saturating_add(self.inferred_tokens)
+    }
+
+    /// Install the current request-base estimate. Legacy ledgers are rebuilt
+    /// from the context first because their authoritative count included an
+    /// unknown prompt/tool base and cannot safely be adjusted by a delta.
+    pub fn prepare_request(
+        &mut self,
+        request_tokens: u64,
+        compacted_prefix: &[Value],
+        messages: &[Message],
+    ) {
+        if self.accounting_version != CURRENT_ACCOUNTING_VERSION {
+            self.authoritative_tokens = 0;
+            self.inferred_tokens = estimate_compacted_prefix_tokens(compacted_prefix)
+                .saturating_add(estimate_messages_tokens(messages));
+            self.request_tokens_at_last_anchor = 0;
+            self.accounting_version = CURRENT_ACCOUNTING_VERSION;
+        }
+        self.request_tokens = request_tokens;
+    }
+
+    /// Re-estimate a rewritten transcript while preserving its request base.
+    pub fn rebuild_context(&mut self, compacted_prefix: &[Value], messages: &[Message]) {
+        self.authoritative_tokens = 0;
+        self.inferred_tokens = estimate_compacted_prefix_tokens(compacted_prefix)
+            .saturating_add(estimate_messages_tokens(messages));
+        self.request_tokens_at_last_anchor = 0;
+        self.accounting_version = CURRENT_ACCOUNTING_VERSION;
     }
 
     /// Account for one message appended to the transcript. A completed
@@ -50,6 +128,8 @@ impl TokenLedger {
             Some(tokens) => {
                 self.authoritative_tokens = tokens;
                 self.inferred_tokens = 0;
+                self.request_tokens_at_last_anchor = self.request_tokens;
+                self.accounting_version = CURRENT_ACCOUNTING_VERSION;
             }
             None => {
                 self.inferred_tokens = self
@@ -64,17 +144,10 @@ impl TokenLedger {
     /// describe the pre-rewrite context, and for forked subagents, whose
     /// parent's reports describe a different prompt and tool set.
     #[must_use]
-    pub fn inferred_from(
-        compacted_prefix: &[Value],
-        messages: &[Message],
-        summaries: &[SummarySlice],
-    ) -> Self {
-        Self {
-            authoritative_tokens: 0,
-            inferred_tokens: estimate_compacted_prefix_tokens(compacted_prefix)
-                .saturating_add(estimate_messages_tokens(messages))
-                .saturating_add(estimate_summary_tokens(summaries)),
-        }
+    pub fn inferred_from(compacted_prefix: &[Value], messages: &[Message]) -> Self {
+        let mut ledger = Self::default();
+        ledger.rebuild_context(compacted_prefix, messages);
+        ledger
     }
 }
 
@@ -134,17 +207,30 @@ pub fn estimate_text_tokens(text: &str) -> u64 {
 pub fn estimate_segment_tokens(segments: &[PromptSegment]) -> u64 {
     segments
         .iter()
-        .map(|segment| estimate_text_tokens(&segment.text))
+        .map(|segment| {
+            PROMPT_SEGMENT_OVERHEAD_TOKENS.saturating_add(estimate_text_tokens(&segment.text))
+        })
         .sum()
 }
 
 #[must_use]
-/// Estimate tokens for carried summaries.
-pub fn estimate_summary_tokens(summaries: &[SummarySlice]) -> u64 {
-    summaries
+/// Estimate provider-visible tool declarations.
+pub fn estimate_tool_spec_tokens(tools: &[ToolSpec]) -> u64 {
+    tools
         .iter()
-        .map(|summary| estimate_text_tokens(&summary.text))
+        .map(|tool| {
+            TOOL_SPEC_OVERHEAD_TOKENS
+                .saturating_add(estimate_text_tokens(&tool.name.0))
+                .saturating_add(estimate_text_tokens(&tool.description))
+                .saturating_add(estimate_json_tokens(&tool.input_schema))
+        })
         .sum()
+}
+
+#[must_use]
+/// Estimate request material that is not part of the transcript.
+pub fn estimate_request_tokens(segments: &[PromptSegment], tools: &[ToolSpec]) -> u64 {
+    estimate_segment_tokens(segments).saturating_add(estimate_tool_spec_tokens(tools))
 }
 
 #[must_use]
@@ -162,9 +248,18 @@ pub fn estimate_messages_tokens(messages: &[Message]) -> u64 {
 #[must_use]
 /// Estimate tokens for one transcript message.
 pub fn estimate_message_tokens(message: &Message) -> u64 {
-    match message {
+    MESSAGE_OVERHEAD_TOKENS.saturating_add(match message {
         Message::System(message) => estimate_text_tokens(&message.text),
-        Message::User(message) => estimate_text_tokens(&message.plain_text()),
+        Message::User(message) => message
+            .parts
+            .iter()
+            .map(|part| match part {
+                UserPart::Text { text } => estimate_text_tokens(text),
+                UserPart::Image { media_type, data } | UserPart::Document { media_type, data } => {
+                    estimate_media_tokens(media_type, data.len())
+                }
+            })
+            .sum(),
         Message::Assistant(message) => message
             .parts
             .iter()
@@ -183,7 +278,16 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
             ToolResult::Text { text } => estimate_text_tokens(text),
             ToolResult::Json { value } => estimate_json_tokens(value),
         },
-    }
+    })
+}
+
+fn estimate_media_tokens(media_type: &crate::MediaType, byte_len: usize) -> u64 {
+    // Providers commonly carry binary input as base64. Estimate that wire
+    // representation rather than treating a media-only message as free.
+    let encoded_chars = (byte_len as u64).saturating_add(2) / 3 * 4;
+    estimate_json_tokens(&serde_json::to_value(media_type).unwrap_or(Value::Null))
+        .saturating_add((encoded_chars.saturating_mul(10).saturating_add(36)) / 37)
+        .max(1)
 }
 
 #[must_use]
@@ -219,11 +323,16 @@ pub fn stable_json(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use chrono::Utc;
+    use indexmap::IndexMap;
     use serde_json::json;
 
     use super::*;
-    use crate::{AssistantMessage, MessageId, Usage, UserMessage};
+    use crate::{
+        AssistantMessage, CacheScope, MessageId, PromptSegmentId, PromptSegmentKind, SessionState,
+        ToolCapabilities, ToolConcurrency, Usage, UserMessage, Volatility,
+    };
 
     fn assistant(text: &str, stop_reason: Option<StopReason>, usage: Option<Usage>) -> Message {
         Message::Assistant(AssistantMessage {
@@ -268,6 +377,7 @@ mod tests {
             TokenLedger {
                 authoritative_tokens: 50_200,
                 inferred_tokens: 0,
+                ..TokenLedger::default()
             }
         );
         assert_eq!(ledger.effective_tokens(), 50_200);
@@ -278,6 +388,7 @@ mod tests {
         let mut ledger = TokenLedger {
             authoritative_tokens: 50_000,
             inferred_tokens: 0,
+            ..TokenLedger::default()
         };
         let follow_up = Message::User(UserMessage::text("follow up"));
 
@@ -328,6 +439,7 @@ mod tests {
             let mut ledger = TokenLedger {
                 authoritative_tokens: 7,
                 inferred_tokens: 3,
+                ..TokenLedger::default()
             };
             ledger.record(&case.message);
             assert_eq!(
@@ -349,6 +461,7 @@ mod tests {
         let mut ledger = TokenLedger {
             authoritative_tokens: u64::MAX,
             inferred_tokens: u64::MAX,
+            ..TokenLedger::default()
         };
         ledger.record(&Message::User(UserMessage::text("more")));
         assert_eq!(ledger.inferred_tokens, u64::MAX);
@@ -356,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn inferred_from_counts_prefix_messages_and_summaries_without_an_anchor() {
+    fn inferred_from_counts_prefix_and_messages_without_an_anchor() {
         let prefix = vec![json!({"type": "reasoning", "encrypted_content": "abcdefgh"})];
         let messages = vec![
             Message::User(UserMessage::text("kept")),
@@ -366,19 +479,13 @@ mod tests {
                 reported(80_000, 500),
             ),
         ];
-        let summaries = vec![SummarySlice {
-            id: "s".to_owned(),
-            text: "y".repeat(370),
-        }];
 
-        let ledger = TokenLedger::inferred_from(&prefix, &messages, &summaries);
+        let ledger = TokenLedger::inferred_from(&prefix, &messages);
 
         assert_eq!(ledger.authoritative_tokens, 0);
         assert_eq!(
             ledger.inferred_tokens,
-            estimate_compacted_prefix_tokens(&prefix)
-                + estimate_messages_tokens(&messages)
-                + estimate_summary_tokens(&summaries)
+            estimate_compacted_prefix_tokens(&prefix) + estimate_messages_tokens(&messages)
         );
         assert!(
             ledger.effective_tokens() < 1_000,
@@ -388,10 +495,122 @@ mod tests {
 
     #[test]
     fn inferred_from_empty_context_is_zero() {
+        assert_eq!(TokenLedger::inferred_from(&[], &[]), TokenLedger::default());
+    }
+
+    #[test]
+    fn request_base_changes_adjust_an_authoritative_anchor_without_double_counting() {
+        let mut ledger = TokenLedger::default();
+        ledger.prepare_request(100, &[], &[]);
+        ledger.record(&assistant(
+            "done",
+            Some(StopReason::EndTurn),
+            reported(900, 100),
+        ));
+
+        assert_eq!(ledger.effective_tokens(), 1_000);
+        assert_eq!(ledger.projected_tokens(200), 1_100);
+        assert_eq!(ledger.projected_tokens(50), 950);
+
+        ledger.prepare_request(200, &[], &[]);
+        assert_eq!(ledger.effective_tokens(), 1_100);
+    }
+
+    #[test]
+    fn legacy_ledger_is_rebuilt_before_request_projection() {
+        let mut ledger: TokenLedger = serde_json::from_value(json!({
+            "authoritative_tokens": 50_000,
+            "inferred_tokens": 0
+        }))
+        .expect("legacy ledger");
+        let messages = vec![Message::User(UserMessage::text("restored transcript"))];
+
+        ledger.prepare_request(250, &[], &messages);
+
+        assert_eq!(ledger.authoritative_tokens, 0);
+        assert_eq!(ledger.inferred_tokens, estimate_messages_tokens(&messages));
         assert_eq!(
-            TokenLedger::inferred_from(&[], &[], &[]),
-            TokenLedger::default()
+            ledger.effective_tokens(),
+            250 + estimate_messages_tokens(&messages)
         );
+        assert_eq!(ledger.accounting_version, CURRENT_ACCOUNTING_VERSION);
+    }
+
+    #[test]
+    fn unknown_accounting_version_is_rebuilt_before_request_projection() {
+        let messages = vec![Message::User(UserMessage::text("restored transcript"))];
+        let mut ledger = TokenLedger {
+            authoritative_tokens: 50_000,
+            inferred_tokens: 0,
+            request_tokens: 250,
+            request_tokens_at_last_anchor: 250,
+            accounting_version: CURRENT_ACCOUNTING_VERSION.saturating_add(1),
+        };
+
+        ledger.prepare_request(250, &[], &messages);
+
+        assert_eq!(ledger.authoritative_tokens, 0);
+        assert_eq!(ledger.inferred_tokens, estimate_messages_tokens(&messages));
+        assert_eq!(ledger.accounting_version, CURRENT_ACCOUNTING_VERSION);
+    }
+
+    #[test]
+    fn legacy_session_without_a_ledger_rebuilds_its_transcript() {
+        let message = Message::User(UserMessage::text("legacy transcript"));
+        let state = SessionState {
+            messages: vec![message.clone()],
+            ..SessionState::default()
+        };
+        let mut json = serde_json::to_value(state).expect("serialize state");
+        json.as_object_mut()
+            .expect("state object")
+            .remove("token_ledger");
+        let mut restored: SessionState = serde_json::from_value(json).expect("legacy state");
+
+        restored
+            .token_ledger
+            .prepare_request(100, &restored.compacted_prefix, &restored.messages);
+
+        assert_eq!(restored.token_ledger.authoritative_tokens, 0);
+        assert_eq!(
+            restored.token_ledger.inferred_tokens,
+            estimate_message_tokens(&message)
+        );
+        assert_eq!(
+            restored.token_ledger.effective_tokens(),
+            100 + estimate_message_tokens(&message)
+        );
+    }
+
+    #[test]
+    fn media_only_messages_and_request_declarations_are_not_free() {
+        let media = Message::User(UserMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            parts: vec![UserPart::Image {
+                media_type: "image/png".to_owned(),
+                data: Bytes::from_static(&[0; 64]),
+            }],
+        });
+        let segment = PromptSegment {
+            id: PromptSegmentId::new(),
+            text: "system instructions".to_owned(),
+            volatility: Volatility::Static,
+            cache_scope: CacheScope::PrefixCacheable,
+            content_hash: "segment".to_owned(),
+            kind: PromptSegmentKind::System,
+        };
+        let tool = ToolSpec {
+            name: "read".into(),
+            description: "Read a file".to_owned(),
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            concurrency: ToolConcurrency::ReadOnly,
+            capabilities: ToolCapabilities::default(),
+            provider_aliases: IndexMap::new(),
+        };
+
+        assert!(estimate_message_tokens(&media) > MESSAGE_OVERHEAD_TOKENS);
+        assert!(estimate_request_tokens(&[segment], &[tool]) > 0);
     }
 
     #[test]
@@ -437,15 +656,22 @@ mod tests {
             text: "x".repeat(37),
         });
 
-        assert_eq!(estimate_message_tokens(&empty_tool), 0);
+        assert_eq!(
+            estimate_message_tokens(&empty_tool),
+            MESSAGE_OVERHEAD_TOKENS
+        );
         assert_eq!(
             estimate_message_tokens(&json_tool),
-            estimate_text_tokens("{\"a\":\"abcd\",\"b\":true}")
+            MESSAGE_OVERHEAD_TOKENS + estimate_text_tokens("{\"a\":\"abcd\",\"b\":true}")
         );
-        assert_eq!(estimate_message_tokens(&system), 10);
+        assert_eq!(
+            estimate_message_tokens(&system),
+            MESSAGE_OVERHEAD_TOKENS + 10
+        );
         assert_eq!(
             estimate_message_tokens(&tool_call),
-            estimate_text_tokens("read")
+            MESSAGE_OVERHEAD_TOKENS
+                + estimate_text_tokens("read")
                 + estimate_text_tokens("{\"path\":\"a.txt\"}")
                 + estimate_text_tokens("tool_call")
         );

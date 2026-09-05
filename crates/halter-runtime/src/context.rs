@@ -50,6 +50,8 @@ pub struct CompactionEffects {
     pub compacted_context: CompactedContext,
     /// What happened, for the `ContextCompacted` event and PostCompact hooks.
     pub result: CompactionResult,
+    /// Provider-native compaction usage that has no assistant message event.
+    pub usage: halter_protocol::Usage,
 }
 
 impl CompactionEffects {
@@ -68,12 +70,14 @@ impl CompactionEffects {
             messages,
             compacted_context,
             result,
+            usage,
         } = self;
         let payload = SessionEventPayload::ContextCompacted {
             summary: result.summary.clone(),
             effects: Some(Box::new(CompactionEventEffects {
                 messages,
                 compacted_prefix: compacted_context.into_items(),
+                usage,
             })),
         };
         halter_protocol::fold::apply_event(state, &payload);
@@ -129,7 +133,8 @@ impl ContextManager for DefaultContextManager {
             })
             .collect::<Vec<_>>();
 
-        let estimated_tokens = state.token_ledger.effective_tokens();
+        let request_tokens = halter_protocol::estimate_request_tokens(&prompt_segments, tool_specs);
+        let estimated_tokens = state.token_ledger.projected_tokens(request_tokens);
         let (previous_response_id, new_messages_start) = resolve_response_chain(
             state.last_response_id.as_deref(),
             state.messages_seen_by_provider,
@@ -146,7 +151,7 @@ impl ContextManager for DefaultContextManager {
             },
             compacted_prefix: state.compacted_prefix.clone(),
             file_views,
-            carried_summaries: state.summaries.clone(),
+
             elided_tool_results: Vec::new(),
             memory_items: Vec::new(),
             tool_specs: tool_specs.to_vec(),
@@ -211,9 +216,7 @@ pub fn resolve_response_chain(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use halter_protocol::{
-        SessionId, SubagentEventForwarding, SummarySlice, TokenLedger, UserMessage,
-    };
+    use halter_protocol::{SessionId, SubagentEventForwarding, TokenLedger, UserMessage};
 
     use super::*;
 
@@ -263,11 +266,8 @@ mod tests {
                 "id": "cmp_1",
                 "encrypted_content": "x",
             })],
-            summaries: vec![SummarySlice {
-                id: "summary-1".to_owned(),
-                text: "summary".to_owned(),
-            }],
             messages: vec![Message::User(UserMessage::text("hello"))],
+
             last_response_id: Some("resp_1".to_owned()),
             messages_seen_by_provider: 1,
             ..SessionState::default()
@@ -307,6 +307,7 @@ mod tests {
             token_ledger: TokenLedger {
                 authoritative_tokens: 80_000,
                 inferred_tokens: 0,
+                ..TokenLedger::default()
             },
             ..SessionState::default()
         };
@@ -321,6 +322,7 @@ mod tests {
                 compacted_count: 2,
                 summary: "squashed".to_owned(),
             },
+            usage: Default::default(),
         };
 
         let (result, payload) = effects.apply(&mut state);
@@ -335,7 +337,7 @@ mod tests {
         // state only.
         assert_eq!(
             state.token_ledger,
-            TokenLedger::inferred_from(&prefix, &window, &[])
+            TokenLedger::inferred_from(&prefix, &window)
         );
         match payload {
             SessionEventPayload::ContextCompacted {
@@ -365,6 +367,7 @@ mod tests {
                 compacted_count: 1,
                 summary: "squashed".to_owned(),
             },
+            usage: Default::default(),
         };
 
         let (_, payload) = effects.apply(&mut live);
