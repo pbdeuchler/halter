@@ -6,7 +6,9 @@
 //! the `sqlite` feature.
 // pattern: Functional Core
 
+mod history;
 mod memory;
+pub use history::{HistoryItem, history_items};
 #[cfg(feature = "sqlite")]
 mod sqlite;
 

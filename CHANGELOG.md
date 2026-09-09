@@ -10,6 +10,20 @@ once a `1.0.0` line is cut.
 
 ### Added
 
+- **Compaction v2 (3/3): CleanWindow** (`context.compaction = "clean_window"`).
+  Installs `notes`, `session_search`, and `new_context`; reminders fire once
+  per window at 50% and 75%, and forced rollover runs strictly above 90%.
+  Rollover records a `ContextWindowRolledOver` boundary, clears the old
+  conversation, and continues the turn from a recovery prompt. Todos survive
+  within the harness process; notes and stored history support session resume.
+  Public `NotesBackend` / `SessionSearchBackend` traits override storage and
+  descriptions. `context.notes_root` configures the filesystem root.
+  **API additions affecting exhaustive matches and struct literals:**
+  `CompactionStrategyKind::CleanWindow`, `CompactionTrigger::Rollover`,
+  `SessionEventPayload::ContextWindowRolledOver`, and `ContextConfig::notes_root`.
+  `CompactionStrategy::window_policy` defaults to ordinary compaction; the
+  runtime owns both its original threshold and the CleanWindow rollover rule.
+
 - `[providers.openrouter.routing]` pins which upstream provider OpenRouter
   routes to. `order` lists OpenRouter provider slugs most-preferred first and
   `allow_fallbacks = false` turns that list into an exact allowlist. The

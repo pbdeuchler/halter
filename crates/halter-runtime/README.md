@@ -48,7 +48,7 @@ Key exports include:
 - `ContextManager`, `DefaultContextManager`
 - `PromptAssembler`, `DefaultPromptAssembler`
 - hook runtime integration helpers
-- `CompactionStrategy`, `ModelSummary`, `ProviderDefault`
+- `CompactionStrategy`, `ModelSummary`, `ProviderDefault`, `CleanWindow`
 
 These are the building blocks for long-lived, tool-using, event-emitting agent sessions.
 
@@ -305,6 +305,7 @@ This crate exports:
 - `ModelSummary` — the default strategy: the session's model writes a
   context checkpoint and the next window starts from it
 - `ProviderDefault` — the provider's native compaction, on Halter's trigger
+- `CleanWindow` — model-managed notes and history recovery after a clean wipe
 
 ### Who decides what
 
@@ -349,6 +350,83 @@ hands `Provider::compact` the window its
 latest assistant block for a dedicated endpoint, or the prefix before the
 latest user message for an inline request. In both cases the summary remains
 before the preserved suffix in the next provider request.
+
+### CleanWindow
+
+Select `context.compaction = "clean_window"` to keep continuity in durable
+notes and session history. The system prompt explains that saturation wipes
+the conversation. `notes`, `session_search`, and `new_context` are always
+installed, including in child sessions with tool allowlists. These tools
+manage session continuity; they do not grant access to project files.
+
+The runtime owns this strategy's trigger policy too: reminders at 50% and
+75% of `compaction_threshold`, then a forced rollover strictly above 90%.
+Milestone IDs are persisted with the session checkpoint and reset by each
+window transition. A successful `new_context` call requests rollover at the
+next consistent boundary, after all pending tool results have been recorded.
+It does not spend another inference asking for a checkpoint.
+
+For forced rollover, the runtime allows at most two checkpoint replies:
+one to save notes, then one to call `new_context`. Only `notes` and
+`new_context` calls execute. Other calls and text remain in the event log,
+but do not enter the next request. The wipe happens even if neither tool is
+called, a notes operation fails, or the checkpoint provider is unavailable.
+Cancellation still stops the turn. A PreCompact hook that blocks rollover
+fails the turn before another provider request. PostCompact hooks run after
+successful rollover.
+
+`ContextWindowRolledOver` commits the new bootstrap, advances the logical
+window, clears the old transcript, provider response chain, dynamic prompt
+additions, and file-view cache, and rebuilds the token ledger. The static
+system prefix stays unchanged. The current turn continues with:
+
+> Session context has been wiped. Use the todo (task), notes, and
+> session_search tools to regain context and continue your tasks.
+
+The session-scoped `task` list survives rollover. Its default store is still
+in memory; it does not survive restarting the harness process. Notes survive
+resume when the same root is used. History survives according to the chosen
+session store (SQLite for persistence across process restarts).
+
+The remaining 10% of the threshold, plus the default 20,000-token gap to the
+model limit, provides room for the checkpoint exchange. Large tool results
+can consume that room in one step. The hard cap applies to checkpoint
+requests too; if it prevents a checkpoint, CleanWindow warns and wipes
+without one. Choose a threshold that leaves room for your tools and model.
+If the bootstrap itself exceeds the rollover threshold, the turn fails with
+an actionable configuration error instead of repeatedly wiping the window.
+
+| Tool | Actions and limits |
+| --- | --- |
+| `notes` | `write_file`, `append_to_file`, `read_file`, `list_files_by_prefix`, `search_contents`. Virtual paths reject empty, `.` and `..` segments; `~` is literal. Files hold at most 1,000,000 UTF-8 bytes. Reads return the full file or an inclusive one-based line range. Listings and literal searches return bounded results; use prefixes to narrow them. |
+| `session_search` | `list_windows`, `list_items`, `read_item`, `search_contents`. Includes all committed windows, including the live one. Items use stable opaque IDs derived from window and event sequence. Filter by window, role, or tool; paginate with `next_after` passed as `after`. Reads use one-based inclusive line ranges. Responses cap rows and bytes and report truncation; long lines are clipped. |
+| `new_context` | Takes `{}`. Save notes before calling it. |
+
+Default tool descriptions call notes and history private model-only state.
+Embedders can replace that wording and storage through the typed backends:
+
+```rust,no_run
+use std::sync::Arc;
+use halter::compaction::{CleanWindow, FsNotes, StoreSearch};
+use halter::session::{SessionStore, SqliteSessionStore};
+
+# fn example() -> anyhow::Result<()> {
+let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open("sessions.db")?);
+let strategy = CleanWindow::new(FsNotes::new("notes")?, StoreSearch(store.clone()));
+let builder = halter::Halter::builder()
+    .with_session_store(store)
+    .with_compaction(Arc::new(strategy));
+# Ok(())
+# }
+```
+
+This example requires the `sqlite` feature. Supply implementations of
+`NotesBackend` and `SessionSearchBackend` to `CleanWindow::new` for custom
+storage; each trait also exposes `description()`. The default filesystem
+backend hashes session IDs and virtual paths into private storage filenames,
+uses atomic replacement for writes, and fixes its root independently of
+session working directories. `StoreSearch` reads the event log on each query;
+very long logs may benefit from an indexed custom backend.
 
 The context manager then plans the request from the (possibly compacted)
 state: the full transcript window, the carried prefix, prompt segments, and
@@ -499,7 +577,7 @@ If you don't want to assemble all of that manually, use `halter::Halter`.
 The default `ModelSummary` strategy only needs the provider to answer a
 request, so it works everywhere. `ProviderDefault` needs native compaction;
 `HalterBuilder::build` rejects `context.compaction = "provider_default"` when
-the default model's provider lacks it. Whichever strategy is installed, a
+the default model's provider lacks it. For these two summary strategies, a
 failed automatic pass degrades to an uncompacted turn with a `Warning` event
 and a failed manual `compact(...)` returns the error. Past
 `context.max_tokens`, the turn fails with `ContextCapExceeded` before the

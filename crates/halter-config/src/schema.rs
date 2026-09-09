@@ -1232,6 +1232,8 @@ pub enum CompactionStrategyKind {
     /// Delegate the rewrite to the provider's native compaction. The default
     /// model's provider must support it, or building the harness fails.
     ProviderDefault,
+    /// Wipe context and recover through notes, todos, and session history.
+    CleanWindow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -1254,6 +1256,9 @@ pub struct ContextConfig {
     /// Which strategy rewrites the context once the threshold is reached.
     #[serde(default)]
     pub compaction: CompactionStrategyKind,
+    /// Durable CleanWindow notes root, independent of session working directories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1272,6 +1277,12 @@ impl ContextConfig {
     /// threshold is derivable, and config loading and `HalterBuilder::build`
     /// always do.
     pub fn resolve(&self, max_input_tokens: Option<u32>) -> anyhow::Result<ResolvedContextConfig> {
+        if let Some(root) = &self.notes_root {
+            anyhow::ensure!(
+                !root.as_os_str().is_empty(),
+                "invalid configuration: context.notes_root must not be empty"
+            );
+        }
         let window = max_input_tokens.map(u64::from);
         let compaction_threshold = match (self.compaction_threshold, window) {
             (Some(threshold), _) => threshold,
@@ -2885,6 +2896,7 @@ port = 9090
             compaction_threshold: Some(100_000),
             max_tokens: Some(150_000),
             compaction: CompactionStrategyKind::ProviderDefault,
+            notes_root: None,
         }
         .resolve(Some(200_000))
         .expect("resolves");
@@ -3090,9 +3102,14 @@ api_key = "test-key"
                 expected: Ok(CompactionStrategyKind::ProviderDefault),
             },
             Case {
-                name: "unknown",
+                name: "clean_window",
                 context: "[context]\ncompaction = \"clean_window\"\n",
-                expected: Err("unknown variant `clean_window`"),
+                expected: Ok(CompactionStrategyKind::CleanWindow),
+            },
+            Case {
+                name: "unknown",
+                context: "[context]\ncompaction = \"unknown\"\n",
+                expected: Err("unknown variant `unknown`"),
             },
         ];
 

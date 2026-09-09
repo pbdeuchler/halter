@@ -69,7 +69,12 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         SessionEventPayload::ContextCompacted {
             effects: Some(effects),
             ..
-        } => {
+        }
+        | SessionEventPayload::ContextWindowRolledOver { effects, .. } => {
+            if matches!(payload, SessionEventPayload::ContextWindowRolledOver { .. }) {
+                state.appended_prompt_segments.clear();
+                state.file_view_cache.clear();
+            }
             state.usage_so_far.saturating_accumulate(&effects.usage);
             state.messages = effects.messages.clone();
             state.compacted_prefix = effects.compacted_prefix.clone();

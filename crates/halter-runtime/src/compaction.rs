@@ -23,6 +23,11 @@ impl Default for ContextSettings {
 }
 
 impl ContextSettings {
+    /// CleanWindow's checkpoint exchange starts strictly above 90%.
+    #[must_use]
+    pub fn rollover_due(&self, effective_tokens: u64) -> bool {
+        u128::from(effective_tokens) * 10 > u128::from(self.compaction_threshold) * 9
+    }
     /// Whether the effective ledger count reached the threshold.
     #[must_use]
     pub fn compaction_due(&self, effective_tokens: u64) -> bool {
@@ -56,6 +61,27 @@ pub struct ContextCapExceeded {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_window_rollover_is_strictly_above_ninety_percent() {
+        for (threshold, tokens, due) in [
+            (1_000, 899, false),
+            (1_000, 900, false),
+            (1_000, 901, true),
+            (u64::MAX, u64::MAX, true),
+            (1, 0, false),
+            (1, 1, true),
+        ] {
+            assert_eq!(
+                ContextSettings {
+                    compaction_threshold: threshold,
+                    max_tokens: None
+                }
+                .rollover_due(tokens),
+                due
+            );
+        }
+    }
 
     #[test]
     fn compaction_due_uses_the_exact_threshold() {

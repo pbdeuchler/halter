@@ -173,6 +173,14 @@ fn session_event_payload_variants_have_stable_kind() {
             summary: "s".into(),
             effects: None,
         },
+        SessionEventPayload::ContextWindowRolledOver {
+            summary: "rollover".into(),
+            effects: Box::new(halter_protocol::CompactionEventEffects {
+                messages: vec![],
+                compacted_prefix: vec![],
+                usage: Usage::default(),
+            }),
+        },
         SessionEventPayload::TurnCompleted {
             turn_id: TurnId::from("t1"),
             usage: Usage::default(),
@@ -207,6 +215,7 @@ fn session_event_payload_variants_have_stable_kind() {
             SessionEventPayload::ToolExecutionCompleted { .. } => "tool_execution_completed",
             SessionEventPayload::ApprovalRequested { .. } => "approval_requested",
             SessionEventPayload::ContextCompacted { .. } => "context_compacted",
+            SessionEventPayload::ContextWindowRolledOver { .. } => "context_window_rolled_over",
             SessionEventPayload::TurnCompleted { .. } => "turn_completed",
             SessionEventPayload::TurnFailed { .. } => "turn_failed",
             SessionEventPayload::Lagged { .. } => "lagged",

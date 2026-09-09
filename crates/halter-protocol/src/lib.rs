@@ -1023,6 +1023,11 @@ pub enum SessionEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effects: Option<Box<CompactionEventEffects>>,
     },
+    /// A clean wipe, with a recovery bootstrap and no retained conversation.
+    ContextWindowRolledOver {
+        summary: String,
+        effects: Box<CompactionEventEffects>,
+    },
     TurnCompleted {
         turn_id: TurnId,
         usage: Usage,
