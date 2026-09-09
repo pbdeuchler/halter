@@ -60,8 +60,10 @@ pub fn default_coding_agent_prompt() -> &'static str {
     DEFAULT_CODING_AGENT_PROMPT.as_str()
 }
 
-/// The built-in conversation-compaction instructions used by the default
-/// context manager.
+/// The built-in context-checkpoint instructions: what the `ModelSummary`
+/// strategy asks the session's model when compaction is due, and the
+/// `instructions` the `ProviderDefault` strategy hands provider-native
+/// compaction. A manual `compact()` call's custom instructions are appended.
 #[must_use]
 pub fn default_compaction_prompt() -> &'static str {
     DEFAULT_COMPACTION_PROMPT_MARKDOWN.trim()
@@ -140,14 +142,6 @@ impl PromptAssembler for DefaultPromptAssembler {
         let mut prefix_parts: Vec<String> = Vec::with_capacity(ordered_segments.len() + 8);
         for segment in &ordered_segments {
             prefix_parts.push(segment.text.clone());
-        }
-
-        // Accumulated summaries (append-only, changes only on compaction).
-        // Including these in the prefix keeps the cache key stable across
-        // turns while giving the model visibility into compacted earlier
-        // conversation.
-        for summary in &plan.carried_summaries {
-            prefix_parts.push(summary.text.clone());
         }
 
         // Raw compacted prefix items returned by the provider compaction
@@ -288,8 +282,7 @@ mod tests {
     use chrono::Utc;
     use halter_protocol::{
         CacheScope, ContentHash, ContextPlan, Message, ObservedState, PromptSegment,
-        PromptSegmentId, PromptSegmentKind, SummarySlice, TranscriptWindow, UserMessage,
-        Volatility,
+        PromptSegmentId, PromptSegmentKind, TranscriptWindow, UserMessage, Volatility,
     };
 
     use super::*;
@@ -381,10 +374,6 @@ mod tests {
             },
             compacted_prefix: vec![],
             file_views: Vec::new(),
-            carried_summaries: vec![SummarySlice {
-                id: "summary".to_owned(),
-                text: "kept summary".to_owned(),
-            }],
             elided_tool_results: Vec::new(),
             memory_items: Vec::new(),
             tool_specs: Vec::new(),
@@ -423,66 +412,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prefix_cache_key_changes_when_summaries_change() {
-        let assembler = DefaultPromptAssembler;
-        let segments = vec![PromptSegment {
-            id: PromptSegmentId::new(),
-            text: "system".to_owned(),
-            volatility: Volatility::Static,
-            cache_scope: CacheScope::PrefixCacheable,
-            content_hash: ContentHash::from("seg-1"),
-            kind: PromptSegmentKind::System,
-        }];
-        let base_plan = ContextPlan {
-            prompt_segments: segments.clone(),
-            transcript_window: TranscriptWindow {
-                messages: vec![Message::User(UserMessage::text("hello"))],
-                elided_message_count: 0,
-            },
-            compacted_prefix: vec![],
-            file_views: Vec::new(),
-            carried_summaries: vec![],
-            elided_tool_results: Vec::new(),
-            memory_items: Vec::new(),
-            tool_specs: Vec::new(),
-            observed_state: ObservedState {
-                cwd: ".".into(),
-                git_branch: None,
-                git_dirty: None,
-                now_utc: Utc::now(),
-                env_facts: Default::default(),
-            },
-            projected_input_tokens: 10,
-            cache_boundary_hash: "boundary".to_owned(),
-            messages: vec![Message::User(UserMessage::text("hello"))],
-            estimated_tokens: 10,
-            previous_response_id: None,
-            new_messages_start: 0,
-        };
-
-        let without_summary = assembler.assemble(&base_plan).await.expect("assemble");
-
-        let mut with_summary = base_plan.clone();
-        with_summary.carried_summaries = vec![SummarySlice {
-            id: "s1".to_owned(),
-            text: "earlier context was compacted".to_owned(),
-        }];
-        let with_summary = assembler.assemble(&with_summary).await.expect("assemble");
-
-        // Adding a summary changes the prefix cache key.
-        assert_ne!(
-            without_summary.prefix_cache_key,
-            with_summary.prefix_cache_key
-        );
-        // The summary text appears in the rendered prefix.
-        assert!(
-            with_summary
-                .rendered_prefix
-                .contains("earlier context was compacted")
-        );
-    }
-
     /// Regression: dynamic `Append` segments render into `rendered_prefix`
     /// but were excluded from the fingerprint, so a hook-injected append
     /// could change the prefix bytes under an unchanged cache key.
@@ -505,7 +434,6 @@ mod tests {
             },
             compacted_prefix: vec![],
             file_views: Vec::new(),
-            carried_summaries: vec![],
             elided_tool_results: Vec::new(),
             memory_items: Vec::new(),
             tool_specs: Vec::new(),
@@ -584,7 +512,6 @@ mod tests {
             },
             compacted_prefix: vec![],
             file_views: Vec::new(),
-            carried_summaries: vec![],
             elided_tool_results: Vec::new(),
             memory_items: Vec::new(),
             tool_specs: Vec::new(),
@@ -645,7 +572,6 @@ mod tests {
             },
             compacted_prefix: vec![],
             file_views: Vec::new(),
-            carried_summaries: vec![],
             elided_tool_results: Vec::new(),
             memory_items: Vec::new(),
             tool_specs: Vec::new(),

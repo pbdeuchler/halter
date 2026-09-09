@@ -801,7 +801,7 @@ mod tests {
 
     use halter_protocol::{
         InstructionFile, ModelId, PromptSegment, ResourceSnapshot, Revision,
-        SubagentEventForwarding, SubagentRef, SummarySlice,
+        SubagentEventForwarding, SubagentRef,
     };
     use tempfile::tempdir;
 
@@ -1394,10 +1394,6 @@ mod tests {
 
     fn test_state(name: &str) -> SessionState {
         SessionState {
-            summaries: vec![SummarySlice {
-                id: format!("summary-{name}"),
-                text: format!("summary text {name}"),
-            }],
             lineage: vec![SubagentRef {
                 session_id: SessionId::from(format!("lineage-{name}")),
                 task: format!("task-{name}"),

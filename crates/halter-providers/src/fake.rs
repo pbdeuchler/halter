@@ -3,8 +3,9 @@
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use halter_protocol::{
-    BlockId, CompactionWindow, Message, MessageId, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderError, ProviderRequest, StopReason, StreamEvent, Usage,
+    BlockId, Message, MessageId, ProviderCapabilities, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderCompactionStrategy, ProviderError, ProviderRequest,
+    StopReason, StreamEvent, Usage,
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -57,14 +58,9 @@ impl Provider for FakeProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_compaction: true,
+            compaction_strategy: Some(ProviderCompactionStrategy::Dedicated),
             ..ProviderCapabilities::default()
         }
-    }
-
-    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
-        Some(CompactionWindow::preserve_latest_assistant_response_block(
-            messages,
-        ))
     }
 
     async fn stream(

@@ -39,8 +39,8 @@ mod unsupported;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use halter_protocol::{
-    CompactionWindow, Message, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderError, ProviderRequest, StreamEvent,
+    ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
+    ProviderRequest, StreamEvent,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -69,14 +69,6 @@ pub trait Provider: Send + Sync {
     /// Capability flags used by the runtime and prompt codecs.
     fn capabilities(&self) -> ProviderCapabilities;
 
-    /// Return the provider-specific compaction window for a transcript.
-    ///
-    /// Providers that do not support compaction return `None`.
-    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
-        let _ = messages;
-        None
-    }
-
     /// Start a streaming generation request.
     async fn stream(
         &self,
@@ -85,6 +77,14 @@ pub trait Provider: Send + Sync {
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>>;
 
     /// Compact a transcript into provider-native context items.
+    ///
+    /// This is the transport primitive behind the runtime's provider-delegated
+    /// compaction strategy. Which messages a rewrite may replace is that
+    /// strategy's policy, derived from
+    /// [`ProviderCapabilities::compaction_strategy`]; an adapter only encodes
+    /// the request it is handed. It is invoked when the runtime's token ledger
+    /// says so and never by a server-side trigger: an adapter must not enable
+    /// a provider's own automatic compaction.
     ///
     /// The default implementation rejects the call for providers without
     /// compaction support.

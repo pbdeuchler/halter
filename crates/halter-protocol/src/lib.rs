@@ -7,6 +7,7 @@
 //! each other.
 // pattern: Functional Core
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,7 +28,8 @@ pub mod token_ledger;
 pub use token_ledger::{
     CharHeuristicEstimator, TokenEstimator, TokenLedger, estimate_compacted_prefix_tokens,
     estimate_json_tokens, estimate_message_tokens, estimate_messages_tokens,
-    estimate_segment_tokens, estimate_summary_tokens, estimate_text_tokens, stable_json,
+    estimate_request_tokens, estimate_segment_tokens, estimate_text_tokens,
+    estimate_tool_spec_tokens, stable_json,
 };
 
 /// Shared string payloads stay as `String` for now; this is the swap point for any future `Arc<str>` migration.
@@ -931,6 +933,26 @@ pub struct CompactionEventEffects {
     /// Provider-native compacted items that replace
     /// [`SessionState::compacted_prefix`].
     pub compacted_prefix: Vec<Value>,
+    /// Provider-native compaction usage not represented by an assistant
+    /// `MessageItem` event.
+    #[serde(default)]
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// State-complete record of a transcript window put back after a compaction
+/// pass appended to it and then failed or found nothing to do. Carried on
+/// [`SessionEventPayload::ContextRestored`]. The pass's own messages, tool
+/// runs, and usage stay in the log exactly as they happened; this is the
+/// transition that ends the pass.
+pub struct RestoredContext {
+    /// Message window that replaces [`SessionState::messages`].
+    pub messages: Vec<Message>,
+    /// Provider-native items that replace [`SessionState::compacted_prefix`].
+    pub compacted_prefix: Vec<Value>,
+    /// The ledger as it stood before the pass, which is exactly what the
+    /// restored window is.
+    pub token_ledger: TokenLedger,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -950,6 +972,19 @@ pub enum SessionEventPayload {
     },
     MessageItem {
         message: Message,
+    },
+    /// Updates the non-transcript portion of the context projection. Emitted
+    /// when prompt segments or tool declarations change, including the first
+    /// request after loading a legacy snapshot.
+    ContextProjectionUpdated {
+        request_tokens: u64,
+    },
+    /// A compaction pass appended to the transcript and then failed or found
+    /// nothing to compact. The window goes back to what it was; everything
+    /// the pass did stays in the log.
+    ContextRestored {
+        reason: String,
+        effects: Box<RestoredContext>,
     },
     DeltaItem {
         delta: DeltaItem,
@@ -1456,13 +1491,6 @@ pub struct PendingToolCall {
     pub submitted_at: Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-/// Summary retained after older context has been compacted.
-pub struct SummarySlice {
-    pub id: String,
-    pub text: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 /// Active transcript window after pruning and compaction planning.
 pub struct TranscriptWindow {
@@ -1516,64 +1544,6 @@ impl From<Vec<Value>> for CompactedContext {
 impl AsRef<[Value]> for CompactedContext {
     fn as_ref(&self) -> &[Value] {
         self.items()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
-/// Split of messages selected for provider compaction.
-pub struct CompactionWindow {
-    pub eligible_messages: Vec<Message>,
-    pub preserved_messages: Vec<Message>,
-    pub reserved_response_block: bool,
-}
-
-impl CompactionWindow {
-    /// Preserve the latest assistant response block and compact the older
-    /// prefix. Providers with a first-class compaction endpoint use this
-    /// broader window because the provider restores the compacted context as
-    /// provider-native content.
-    #[must_use]
-    pub fn preserve_latest_assistant_response_block(messages: &[Message]) -> Self {
-        let Some(last_assistant_index) = messages
-            .iter()
-            .rposition(|message| matches!(message, Message::Assistant(_)))
-        else {
-            return Self {
-                eligible_messages: messages.to_vec(),
-                preserved_messages: Vec::new(),
-                reserved_response_block: false,
-            };
-        };
-
-        Self {
-            eligible_messages: messages[..last_assistant_index].to_vec(),
-            preserved_messages: messages[last_assistant_index..].to_vec(),
-            reserved_response_block: true,
-        }
-    }
-
-    /// Preserve every message through the latest user message and compact
-    /// only the post-user tail. Inline compaction providers use this narrower
-    /// window so system, tool, skill, and latest-user cache anchors remain
-    /// verbatim.
-    #[must_use]
-    pub fn preserve_through_latest_user(messages: &[Message]) -> Self {
-        let Some(last_user_index) = messages
-            .iter()
-            .rposition(|message| matches!(message, Message::User(_)))
-        else {
-            return Self {
-                eligible_messages: Vec::new(),
-                preserved_messages: messages.to_vec(),
-                reserved_response_block: false,
-            };
-        };
-        let pivot = last_user_index + 1;
-        Self {
-            eligible_messages: messages[pivot..].to_vec(),
-            preserved_messages: messages[..pivot].to_vec(),
-            reserved_response_block: false,
-        }
     }
 }
 
@@ -1633,7 +1603,6 @@ pub struct SessionState {
     pub appended_prompt_segments: Vec<PromptSegment>,
     pub pending_tool_calls: IndexMap<ToolCallId, PendingToolCall>,
     pub usage_so_far: Usage,
-    pub summaries: Vec<SummarySlice>,
     pub lineage: Vec<SubagentRef>,
     pub fired_hook_ids: Vec<String>,
     pub pending_session_start_source: Option<HookSessionStartSource>,
@@ -1648,10 +1617,24 @@ pub struct SessionState {
     pub messages_seen_by_provider: usize,
     /// Running context-size estimate, updated on every append through
     /// [`SessionState::append`] and rebuilt by compaction. Snapshots written
-    /// before the ledger existed load as zero and are corrected by the next
-    /// completed assistant response.
-    #[serde(default)]
+    /// before the current accounting format are rebuilt from their transcript
+    /// before the next request.
+    #[serde(default = "legacy_token_ledger")]
     pub token_ledger: TokenLedger,
+    /// Logical context-window ordinal. Successful rewrites increment it;
+    /// strategies use it to scope exactly-once boundary notifications.
+    #[serde(default)]
+    pub context_window: u64,
+    /// Notification ids delivered in the current logical window.
+    #[serde(default)]
+    pub compaction_notifications: BTreeSet<String>,
+}
+
+fn legacy_token_ledger() -> TokenLedger {
+    TokenLedger {
+        accounting_version: 0,
+        ..TokenLedger::default()
+    }
 }
 
 impl SessionState {
@@ -1758,9 +1741,14 @@ pub struct ProviderCapabilities {
     pub supports_documents: bool,
     pub supports_prompt_cache: bool,
     pub supports_compaction: bool,
-    /// How the provider implements compaction. This remains exposed for
-    /// diagnostics and external callers, but runtime planning asks the
-    /// provider for a `CompactionWindow` instead of branching on this value.
+    /// How the provider implements compaction. The runtime's
+    /// provider-delegated strategy branches on this to decide which messages
+    /// a rewrite may replace: a dedicated endpoint restores compacted context
+    /// as provider-native items, so everything before the latest assistant
+    /// block is eligible; an inline request summarizes the prefix before the
+    /// latest user message and keeps that user-led suffix verbatim, so the
+    /// summary stays ahead of it in the next request. `None` means the
+    /// provider cannot compact.
     #[serde(default)]
     pub compaction_strategy: Option<ProviderCompactionStrategy>,
     pub supports_tool_result_media: bool,
@@ -1780,9 +1768,9 @@ pub enum ProviderCompactionStrategy {
     Dedicated,
     /// In-band compaction via the regular completions endpoint
     /// (e.g. OpenRouter's responses passthrough). Lossy: the runtime
-    /// only compacts the trailing window after the last cache breakpoint
-    /// and wraps the result in explicit compaction tags so the model can
-    /// distinguish it from authoritative system content.
+    /// compacts the prefix before the latest user message, keeps that
+    /// suffix verbatim, and wraps the result in explicit compaction tags so
+    /// the model can distinguish it from authoritative system content.
     Inline,
 }
 
@@ -1835,39 +1823,6 @@ pub struct ResolvedModel {
     pub tokens_per_minute: Option<u64>,
 }
 
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
-)]
-#[serde(rename_all = "snake_case")]
-/// Relative value of a message when pruning context before compaction.
-pub enum MessageSignal {
-    /// Compact first -- orientation commands, empty results, duplicate failures.
-    VeryLow = 0,
-    /// Low signal -- failed tool calls, stale reads.
-    Low = 1,
-    /// Default for most messages.
-    Normal = 2,
-    /// Active file reads and system guidance.
-    High = 3,
-    /// Assistant text or reasoning content.
-    VeryHigh = 4,
-    /// Never compact -- user messages.
-    Anchor = 5,
-}
-
-#[derive(
-    Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
-)]
-#[serde(rename_all = "snake_case")]
-/// Highest message-signal tier eligible for pre-compaction pruning.
-pub enum PruneSignalThreshold {
-    VeryLow,
-    Low,
-    #[default]
-    Normal,
-    High,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// Result of applying a compaction output to session state.
 pub struct CompactionResult {
@@ -1885,7 +1840,6 @@ pub struct ContextPlan {
     #[serde(default)]
     pub compacted_prefix: Vec<Value>,
     pub file_views: Vec<FileViewSlice>,
-    pub carried_summaries: Vec<SummarySlice>,
     pub elided_tool_results: Vec<ElisionMarker>,
     pub memory_items: Vec<MemoryItem>,
     pub tool_specs: Vec<ToolSpec>,
@@ -2382,7 +2336,6 @@ mod tests {
                 "cache_creation_input_tokens": 0,
                 "cache_read_input_tokens": 0
             },
-            "summaries": [],
             "lineage": [],
             "fired_hook_ids": [],
             "pending_session_start_source": null,
@@ -2391,41 +2344,6 @@ mod tests {
         }))
         .expect("deserialize existing session state");
         assert_eq!(state.compacted_prefix.len(), 1);
-    }
-
-    #[test]
-    fn compaction_window_preserves_latest_assistant_response_block() {
-        let messages = vec![
-            Message::User(UserMessage::text("first")),
-            assistant_text("answer"),
-            Message::User(UserMessage::text("follow up")),
-        ];
-
-        let window = CompactionWindow::preserve_latest_assistant_response_block(&messages);
-
-        assert_eq!(window.eligible_messages.len(), 1);
-        assert_eq!(window.preserved_messages.len(), 2);
-        assert!(window.reserved_response_block);
-    }
-
-    #[test]
-    fn compaction_window_preserves_through_latest_user() {
-        let messages = vec![
-            Message::User(UserMessage::text("first")),
-            assistant_text("answer"),
-            Message::User(UserMessage::text("follow up")),
-            assistant_text("tail"),
-        ];
-
-        let window = CompactionWindow::preserve_through_latest_user(&messages);
-
-        assert_eq!(window.preserved_messages.len(), 3);
-        assert!(matches!(
-            window.preserved_messages.last(),
-            Some(Message::User(_))
-        ));
-        assert_eq!(window.eligible_messages.len(), 1);
-        assert!(!window.reserved_response_block);
     }
 
     #[test]
@@ -2463,18 +2381,5 @@ mod tests {
         let encoded = serde_json::to_string(&event).expect("serialize event");
         let decoded: StreamEvent = serde_json::from_str(&encoded).expect("deserialize event");
         assert_eq!(decoded, event);
-    }
-
-    fn assistant_text(text: &str) -> Message {
-        Message::Assistant(AssistantMessage {
-            id: MessageId::new(),
-            created_at: Utc::now(),
-            parts: vec![AssistantPart::Text {
-                text: text.to_owned(),
-            }],
-            stop_reason: None,
-            usage: None,
-            replay_meta: ReplayMeta::default(),
-        })
     }
 }

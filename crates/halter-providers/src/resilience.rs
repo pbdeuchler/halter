@@ -10,8 +10,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt, channel::mpsc, stream::BoxStream};
 use halter_protocol::{
-    CompactionWindow, Message, MessageId, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderError, ProviderErrorKind, ProviderRequest, StreamEvent,
+    MessageId, ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse,
+    ProviderError, ProviderErrorKind, ProviderRequest, StreamEvent,
 };
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -123,10 +123,6 @@ where
 {
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
-    }
-
-    fn compaction_window(&self, messages: &[Message]) -> Option<CompactionWindow> {
-        self.inner.compaction_window(messages)
     }
 
     async fn stream(
