@@ -304,6 +304,10 @@ impl<'a> CompactionContext<'a> {
                 SessionEventPayload::ContextProjectionUpdated { request_tokens },
             );
         }
+        self.session
+            .services()
+            .context
+            .check_cap(self.state.token_ledger.effective_tokens())?;
         let (plan, prompt) = self
             .session
             .plan_and_assemble(self.blueprint, &self.snapshot, self.state, &self.observed)

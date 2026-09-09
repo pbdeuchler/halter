@@ -399,7 +399,7 @@ an actionable configuration error instead of repeatedly wiping the window.
 | Tool | Actions and limits |
 | --- | --- |
 | `notes` | `write_file`, `append_to_file`, `read_file`, `list_files_by_prefix`, `search_contents`. Virtual paths reject empty, `.` and `..` segments; `~` is literal. Files hold at most 1,000,000 UTF-8 bytes. Reads return the full file or an inclusive one-based line range. Listings and literal searches return bounded results; use prefixes to narrow them. |
-| `session_search` | `list_windows`, `list_items`, `read_item`, `search_contents`. Includes all committed windows, including the live one. Items use stable opaque IDs derived from window and event sequence. Filter by window, role, or tool; paginate with `next_after` passed as `after`. Reads use one-based inclusive line ranges. Responses cap rows and bytes and report truncation; long lines are clipped. |
+| `session_search` | `list_windows`, `list_items`, `read_item`, `search_contents`. Includes all committed windows, including the live one. Items use stable opaque IDs derived from window and event sequence. Filter by window, role, or tool; paginate with `next_after` passed as `after`. Reads use one-based inclusive line ranges. Responses cap rows and bytes; continue a truncated read, including within long lines, by passing `next_byte` as `start_byte`. |
 | `new_context` | Takes `{}`. Save notes before calling it. |
 
 Default tool descriptions call notes and history private model-only state.

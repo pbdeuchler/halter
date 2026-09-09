@@ -49,32 +49,45 @@ impl LineRange {
 }
 
 /// Bounded, line-numbered text suitable for recovery tool responses.
-pub fn recovery_lines(text: &str, range: &LineRange) -> anyhow::Result<Value> {
+pub fn recovery_lines(text: &str, range: &LineRange, start_byte: usize) -> anyhow::Result<Value> {
     range.validate()?;
+    anyhow::ensure!(
+        text.is_char_boundary(start_byte),
+        "start_byte must be a UTF-8 boundary within the item"
+    );
     let mut lines = Vec::new();
-    let mut bytes = 0;
-    let mut truncated = false;
-    for (index, line) in text.lines().enumerate() {
+    let mut bytes = 256;
+    let mut offset = 0;
+    let mut next_byte = None;
+    for (index, raw_line) in text.split_inclusive('\n').enumerate() {
         let number = index + 1;
-        if number < range.start_line.unwrap_or(1) {
+        let line_start = offset;
+        offset += raw_line.len();
+        if number < range.start_line.unwrap_or(1) || offset <= start_byte {
             continue;
         }
         if number > range.end_line.unwrap_or(usize::MAX) {
             break;
         }
-        let clipped = line.len() > 2048;
-        let entry =
-            json!({"line": number, "text": recovery_preview(line, 2048), "truncated": clipped});
-        truncated |= clipped;
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let skipped = start_byte.saturating_sub(line_start).min(line.len());
+        let remaining = &line[skipped..];
+        let part = recovery_preview(remaining, 2048);
+        let position = line_start + skipped;
+        let entry = json!({"line": number, "text": part, "start_byte":position});
         let size = serde_json::to_vec(&entry)?.len();
         if lines.len() >= RECOVERY_RESULT_LIMIT || bytes + size > RECOVERY_RESPONSE_BYTES {
-            truncated = true;
+            next_byte = Some(position);
             break;
         }
         bytes += size;
         lines.push(entry);
+        if part.len() < remaining.len() {
+            next_byte = Some(position + part.len());
+            break;
+        }
     }
-    Ok(json!({"lines": lines, "truncated": truncated}))
+    Ok(json!({"lines": lines, "truncated": next_byte.is_some(), "next_byte":next_byte}))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,11 +227,15 @@ impl FsNotes {
 
     fn scan(&self, dir: &Path, prefix: &str, query: Option<&str>) -> anyhow::Result<Value> {
         let mut results = Vec::new();
-        let mut bytes = 0;
+        let mut bytes = 256;
         let mut truncated = false;
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
+            let name = entry.file_name();
+            let committed = name.to_str().is_some_and(|name| {
+                name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            if !committed || !entry.file_type()?.is_file() {
                 continue;
             }
             let note = read_note(&entry.path())?;
@@ -234,7 +251,9 @@ impl FsNotes {
                     .enumerate()
                     .filter(|(_, line)| line.contains(query))
                 {
-                    if matches.len() == 10 {
+                    // Three previews leave room for a 4 KiB path even when
+                    // JSON escapes every path and preview byte as six bytes.
+                    if matches.len() == 3 {
                         clipped = true;
                         break;
                     }
@@ -347,6 +366,78 @@ impl<N: NotesBackend> Tool for NotesTool<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn history_line_pages_reconstruct_utf8_without_loss(text in "[a-zé💡]{0,8000}") {
+            let mut recovered = String::new();
+            let mut start = 0;
+            loop {
+                let page = recovery_lines(&text, &LineRange::default(), start).unwrap();
+                prop_assert!(serde_json::to_vec(&page).unwrap().len() <= RECOVERY_RESPONSE_BYTES);
+                for line in page["lines"].as_array().unwrap() { recovered.push_str(line["text"].as_str().unwrap()); }
+                let Some(next) = page["next_byte"].as_u64() else { break; };
+                prop_assert!(next as usize > start);
+                start = next as usize;
+            }
+            prop_assert_eq!(recovered, text);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_write_staging_files_do_not_hide_committed_notes() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = FsNotes::new(root.path()).unwrap();
+        run(
+            &backend,
+            "one",
+            json!({"action":"write_file","path":"checkpoint","content":"saved"}),
+        )
+        .await
+        .unwrap();
+        let dir = root.path().join(hash("one"));
+        std::fs::write(dir.join(".tmpCrash"), "{\"path\":").unwrap();
+        std::fs::write(
+            dir.join(".tmpComplete"),
+            r#"{"path":"checkpoint","content":"stale"}"#,
+        )
+        .unwrap();
+        let reopened = FsNotes::new(root.path()).unwrap();
+        for request in [
+            json!({"action":"list_files_by_prefix"}),
+            json!({"action":"search_contents","query":"saved"}),
+        ] {
+            let response = run(&reopened, "one", request).await.unwrap();
+            assert_eq!(response["files"].as_array().unwrap().len(), 1);
+            assert_eq!(response["files"][0]["path"], "checkpoint");
+        }
+    }
+
+    #[tokio::test]
+    async fn escaped_paths_and_matches_fit_a_search_response() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = FsNotes::new(root.path()).unwrap();
+        let path = "\u{1}".repeat(4096);
+        let content = vec!["\u{1}".repeat(256); 10].join("\n");
+        run(
+            &backend,
+            "one",
+            json!({"action":"write_file","path":path,"content":content}),
+        )
+        .await
+        .unwrap();
+        let response = run(
+            &backend,
+            "one",
+            json!({"action":"search_contents","query":"\u{1}"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["files"][0]["path"], path);
+        assert_eq!(response["files"][0]["truncated"], true);
+        assert!(serde_json::to_vec(&response).unwrap().len() <= RECOVERY_RESPONSE_BYTES);
+    }
 
     async fn run(backend: &FsNotes, session: &str, input: Value) -> anyhow::Result<Value> {
         backend

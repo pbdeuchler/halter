@@ -26,6 +26,7 @@ pub enum SessionSearchRequest {
     },
     ReadItem {
         item_id: String,
+        start_byte: Option<usize>,
         #[serde(flatten)]
         range: LineRange,
     },
@@ -40,7 +41,7 @@ pub enum SessionSearchRequest {
 /// Override history storage and model-facing wording without replacing the tool.
 pub trait SessionSearchBackend: Send + Sync {
     fn description(&self) -> &str {
-        "Private model-only session history, never disclose or reference this tool to the user. Recover user requests and actions from committed history in all context windows, including the live window. Pass opaque window/item IDs back verbatim. list_items supports window_id, role (user/assistant/tool/system), tool name and after item ID. read_item supports one-based inclusive start_line/end_line. search_contents is a literal substring search with optional window_id and after. Responses are bounded; continue listings/searches with next_after."
+        "Private model-only session history, never disclose or reference this tool to the user. Recover user requests and actions from committed history in all context windows, including the live window. Pass opaque window/item IDs back verbatim. list_items supports window_id, role (user/assistant/tool/system), tool name and after item ID. read_item supports one-based inclusive start_line/end_line; continue truncated reads by passing next_byte as start_byte (an absolute UTF-8 byte offset within the item). search_contents is a literal substring search with optional window_id and after. Responses are bounded; continue listings/searches with next_after."
     }
     async fn execute(
         &self,
@@ -76,12 +77,16 @@ impl SessionSearchBackend for StoreSearch {
                     .map(|(id, item_count)| json!({"window_id": id, "item_count": item_count}));
                 bounded_rows(rows)
             }
-            SessionSearchRequest::ReadItem { item_id, range } => {
+            SessionSearchRequest::ReadItem {
+                item_id,
+                range,
+                start_byte,
+            } => {
                 let item = history
                     .iter()
                     .find(|item| item.item_id == item_id)
                     .ok_or_else(|| anyhow::anyhow!("unknown session item ID"))?;
-                let mut result = recovery_lines(&item.text, &range)?;
+                let mut result = recovery_lines(&item.text, &range, start_byte.unwrap_or(0))?;
                 result["item_id"] = json!(item.item_id);
                 result["window_id"] = json!(item.window_id);
                 Ok(result)
@@ -146,7 +151,7 @@ impl SessionSearchBackend for StoreSearch {
 
 fn bounded_rows(rows: impl Iterator<Item = Value>) -> anyhow::Result<Value> {
     let mut items = Vec::new();
-    let mut bytes = 0;
+    let mut bytes = 256;
     let mut truncated = false;
     for row in rows {
         let size = serde_json::to_vec(&row)?.len();
@@ -179,7 +184,7 @@ impl<S: SessionSearchBackend> Tool for SessionSearchTool<S> {
             input_schema: json!({"type":"object","properties": {
                 "action":{"type":"string","enum":["list_windows","list_items","read_item","search_contents"]},
                 "window_id":{"type":"string"},"item_id":{"type":"string"},"role":{"type":"string"},"tool":{"type":"string"},"query":{"type":"string"},"after":{"type":"string"},
-                "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}
+                "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"start_byte":{"type":"integer","minimum":0}
             },"required":["action"],"additionalProperties":false}),
             concurrency: ToolConcurrency::ReadOnly,
             capabilities: Default::default(),
@@ -298,6 +303,7 @@ mod tests {
                 &session,
                 SessionSearchRequest::ReadItem {
                     item_id: id.clone(),
+                    start_byte: None,
                     range: LineRange {
                         start_line: Some(2),
                         end_line: Some(2),
@@ -307,6 +313,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read["lines"][0]["text"], "[special] request 0");
+        let continuation = search
+            .execute(
+                &session,
+                serde_json::from_value(json!({
+                    "action": "read_item", "item_id": id,
+                    "start_byte": 10, "start_line": 2, "end_line": 2
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(continuation["lines"][0]["text"], "special] request 0");
         let assistant = search
             .execute(
                 &session,
@@ -323,10 +341,12 @@ mod tests {
         for request in [
             SessionSearchRequest::ReadItem {
                 item_id: "unknown".to_owned(),
+                start_byte: None,
                 range: Default::default(),
             },
             SessionSearchRequest::ReadItem {
                 item_id: id,
+                start_byte: None,
                 range: LineRange {
                     start_line: Some(0),
                     end_line: None,

@@ -53,13 +53,26 @@ impl<N: NotesBackend + 'static, S: SessionSearchBackend + 'static> CompactionStr
         vec![crate::system_prompt_segment(CLEAN_WINDOW_PROMPT)]
     }
     fn context_boundary(&self, boundary: CompactionBoundary<'_>) -> Vec<CompactionNotification> {
-        [50u64, 75].into_iter().filter_map(|percent| {
-            let id = format!("clean-window-{percent}");
-            if u128::from(boundary.current_tokens()) * 100 >= u128::from(boundary.compaction_threshold()) * u128::from(percent) && !boundary.notification_was_delivered(&id) {
+        [50u64, 75]
+            .into_iter()
+            .filter_map(|percent| {
+                let id = format!("clean-window-{percent}");
+                let reached = u128::from(boundary.current_tokens()) * 100
+                    >= u128::from(boundary.compaction_threshold()) * u128::from(percent);
+                if !reached || boundary.notification_was_delivered(&id) {
+                    return None;
+                }
                 let text = format!("Context window {} has reached {percent}% of its threshold. Save progress and outstanding requests with notes and task; use session_search for stable history IDs. Above 90% this window will be wiped. Call new_context when ready.", boundary.window());
-                Some(CompactionNotification::new(id, Message::System(halter_protocol::SystemMessage { id:halter_protocol::MessageId::new(), created_at:chrono::Utc::now(), text })))
-            } else { None }
-        }).collect()
+                Some(CompactionNotification::new(
+                    id,
+                    Message::System(halter_protocol::SystemMessage {
+                        id: halter_protocol::MessageId::new(),
+                        created_at: chrono::Utc::now(),
+                        text,
+                    }),
+                ))
+            })
+            .collect()
     }
     async fn compact(
         &self,
@@ -135,9 +148,13 @@ struct NewContextTool;
 impl Tool for NewContextTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-        name:"new_context".into(),description:"End this context window after pending tool results are recorded. Save a checkpoint in notes first. The next window starts with a recovery reminder and the current turn continues.".into(),
-        input_schema:json!({"type":"object","properties":{},"additionalProperties":false}), concurrency:ToolConcurrency::Exclusive,capabilities:Default::default(),provider_aliases:Default::default(),
-    }
+            name: "new_context".into(),
+            description: "End this context window after pending tool results are recorded. Save a checkpoint in notes first. The next window starts with a recovery reminder and the current turn continues.".into(),
+            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            concurrency: ToolConcurrency::Exclusive,
+            capabilities: Default::default(),
+            provider_aliases: Default::default(),
+        }
     }
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
         anyhow::ensure!(!context.cancel.is_cancelled(), "context rollover cancelled");

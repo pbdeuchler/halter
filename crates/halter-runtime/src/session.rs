@@ -1259,9 +1259,6 @@ impl SessionHandle {
         let git_probe = probe_git(stored.blueprint.working_dir.clone()).await;
 
         loop {
-            ensure_provider_iteration_allowed(stored.blueprint.max_turns, provider_iterations)?;
-            provider_iterations = provider_iterations.saturating_add(1);
-
             // Trigger B lands here: every append since the last boundary
             // (user message, tool results, hook side effects) has updated the
             // ledger and no tool call is unresolved, so a due compaction runs
@@ -1291,6 +1288,8 @@ impl SessionHandle {
             )
             .await?;
             boundary_result?;
+            ensure_provider_iteration_allowed(stored.blueprint.max_turns, provider_iterations)?;
+            provider_iterations = provider_iterations.saturating_add(1);
             self.services
                 .context
                 .check_cap(state.token_ledger.effective_tokens())?;
@@ -6975,6 +6974,7 @@ mod tests {
                             session.session_id(),
                             SessionSearchRequest::ReadItem {
                                 item_id: id.clone(),
+                                start_byte: None,
                                 range: Default::default()
                             }
                         )
@@ -6999,6 +6999,7 @@ mod tests {
                             resumed.session_id(),
                             SessionSearchRequest::ReadItem {
                                 item_id: id,
+                                start_byte: None,
                                 range: Default::default()
                             }
                         )
@@ -7191,6 +7192,78 @@ mod tests {
                 &folded,
                 &stored.state
             ));
+        }
+
+        #[tokio::test]
+        async fn new_context_rolls_over_even_on_the_last_allowed_iteration() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![vec![("new_context", json!({}))]]));
+            let services = clean_services(provider.clone(), temp.path());
+            let runtime = SessionRuntime::new(services);
+            let session = runtime
+                .new_session(SessionInit {
+                    working_dir: temp.path().to_owned(),
+                    max_turns: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let events = session
+                .submit_turn(Turn::user("work"))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let rollover = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.payload,
+                        SessionEventPayload::ContextWindowRolledOver { .. }
+                    )
+                })
+                .unwrap();
+            let failure = events.iter().position(|event| matches!(&event.payload, SessionEventPayload::TurnFailed { error, .. } if error.contains("max_turns 1"))).unwrap();
+            assert!(rollover < failure);
+            assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn an_over_cap_checkpoint_is_skipped_before_dispatch() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![vec![]]));
+            let mut services = clean_services(provider.clone(), temp.path());
+            let threshold = services.context.compaction_threshold;
+            install_context_settings(
+                &mut services,
+                ContextSettings {
+                    compaction_threshold: threshold,
+                    max_tokens: Some(threshold),
+                },
+            );
+            let runtime = SessionRuntime::new(services);
+            let session = new_session(&runtime, temp.path()).await;
+            let events = session
+                .submit_turn(Turn::user("x".repeat(24_000)))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(events.iter().any(|event| matches!(&event.payload, SessionEventPayload::Warning { message } if message.contains("exceeds context.max_tokens"))));
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    SessionEventPayload::TurnCompleted { .. }
+                ))
+            );
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                latest_user_text(&requests[0].messages),
+                crate::CLEAN_WINDOW_BOOTSTRAP
+            );
         }
     }
 
