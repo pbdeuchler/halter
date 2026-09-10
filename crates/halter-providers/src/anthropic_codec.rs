@@ -19,9 +19,28 @@ const COMPACTED_CONTEXT_TYPE: &str = "halter_compacted_context";
 const COMPACTED_CONTEXT_OPEN: &str = "<compacted_context>";
 const COMPACTED_CONTEXT_CLOSE: &str = "</compacted_context>";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThinkingMode {
+    Adaptive,
+    DeprecatedBudget,
+}
+
+impl ThinkingMode {
+    pub(crate) fn from_deprecated_budget_env(value: Option<&str>) -> Self {
+        match value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("1" | "true" | "yes" | "on") => Self::DeprecatedBudget,
+            _ => Self::Adaptive,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AnthropicRequestOptions {
     stream: bool,
+    thinking_mode: ThinkingMode,
 }
 
 #[cfg(test)]
@@ -32,18 +51,25 @@ pub(crate) fn encode_request(
     encode_request_with_options(
         request,
         temperature,
-        AnthropicRequestOptions { stream: false },
+        AnthropicRequestOptions {
+            stream: false,
+            thinking_mode: ThinkingMode::Adaptive,
+        },
     )
 }
 
 pub(crate) fn encode_stream_request(
     request: &ProviderRequest,
     temperature: Option<f32>,
+    thinking_mode: ThinkingMode,
 ) -> anyhow::Result<Value> {
     encode_request_with_options(
         request,
         temperature,
-        AnthropicRequestOptions { stream: true },
+        AnthropicRequestOptions {
+            stream: true,
+            thinking_mode,
+        },
     )
 }
 
@@ -89,6 +115,7 @@ fn encode_request_with_options(
         &request.model.model,
         request.model.reasoning,
         request.model.max_output_tokens,
+        options.thinking_mode,
     ) {
         if let Some(output_config) = thinking.output_config {
             body.insert("output_config".to_owned(), output_config);
@@ -569,12 +596,13 @@ fn encode_thinking(
     model: &str,
     reasoning: Option<ReasoningEffort>,
     max_output_tokens: Option<u32>,
+    thinking_mode: ThinkingMode,
 ) -> Option<EncodedThinking> {
     let reasoning = reasoning?;
     if reasoning == ReasoningEffort::None {
         return None;
     }
-    if prefers_adaptive_thinking(model) {
+    if thinking_mode == ThinkingMode::Adaptive {
         let mut output_config = Map::new();
         output_config.insert(
             "effort".to_owned(),
@@ -619,14 +647,6 @@ fn encode_thinking(
         }),
         output_config: None,
     })
-}
-
-fn prefers_adaptive_thinking(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("claude-opus-4-7")
-        || model.contains("claude-opus-4-6")
-        || model.contains("claude-sonnet-4-6")
-        || model.contains("claude-mythos")
 }
 
 fn adaptive_effort_for_model(model: &str, reasoning: ReasoningEffort) -> &'static str {
@@ -1100,7 +1120,12 @@ mod tests {
             (ReasoningEffort::Max, Some("max")),
         ];
         for (effort, expected) in cases {
-            let encoded = encode_thinking("claude-opus-4-7-latest", Some(effort), Some(16_384));
+            let encoded = encode_thinking(
+                "claude-opus-4-7-latest",
+                Some(effort),
+                Some(16_384),
+                ThinkingMode::Adaptive,
+            );
             assert_eq!(
                 encoded
                     .as_ref()
@@ -1111,7 +1136,15 @@ mod tests {
                 "effort: {effort:?}"
             );
         }
-        assert!(encode_thinking("claude-opus-4-7-latest", None, Some(16_384)).is_none());
+        assert!(
+            encode_thinking(
+                "claude-opus-4-7-latest",
+                None,
+                Some(16_384),
+                ThinkingMode::Adaptive
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1121,8 +1154,13 @@ mod tests {
             (ReasoningEffort::Max, 8_192),
         ];
         for (effort, expected) in cases {
-            let encoded =
-                encode_thinking("claude-legacy", Some(effort), Some(16_384)).expect("thinking");
+            let encoded = encode_thinking(
+                "claude-legacy",
+                Some(effort),
+                Some(16_384),
+                ThinkingMode::DeprecatedBudget,
+            )
+            .expect("thinking");
             assert_eq!(encoded.thinking["budget_tokens"], expected);
             assert_eq!(encoded.output_config, None);
         }
@@ -1201,7 +1239,7 @@ mod tests {
             "text": "older decisions are summarized",
         })];
 
-        let body = encode_stream_request(&request, None).expect("encode");
+        let body = encode_stream_request(&request, None, ThinkingMode::Adaptive).expect("encode");
 
         assert_eq!(body["stream"], true);
         let system = body["system"].as_array().expect("system blocks");
@@ -1247,11 +1285,81 @@ mod tests {
         request.model.model = "claude-opus-4-7-latest".to_owned();
         request.model.reasoning = Some(ReasoningEffort::Xhigh);
 
-        let body = encode_stream_request(&request, None).expect("encode");
+        let body = encode_stream_request(&request, None, ThinkingMode::Adaptive).expect("encode");
 
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "summarized");
         assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn thinking_mode_controls_wire_shape_for_every_model() {
+        for model in [
+            "claude-opus-4-7-latest",
+            "claude-sonnet-4-6",
+            "claude-mythos",
+            "claude-haiku-4-5",
+            "claude-legacy",
+            "custom-model",
+        ] {
+            for (mode, expected) in [
+                (
+                    ThinkingMode::Adaptive,
+                    json!({"type": "adaptive", "display": "summarized"}),
+                ),
+                (
+                    ThinkingMode::DeprecatedBudget,
+                    json!({"type": "enabled", "budget_tokens": 8192}),
+                ),
+            ] {
+                let mut request = sample_request(Vec::new());
+                request.model.model = model.to_owned();
+                request.model.reasoning = Some(ReasoningEffort::Max);
+                request.model.max_output_tokens = Some(16_384);
+                let body = encode_stream_request(&request, None, mode).expect("encode");
+                assert_eq!(body["thinking"], expected, "{model}: {mode:?}");
+                if mode == ThinkingMode::Adaptive {
+                    assert_eq!(body["output_config"], json!({"effort": "max"}));
+                } else {
+                    assert!(body.get("output_config").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_deprecated_thinking_depends_on_an_explicit_token_budget() {
+        for (limit, expected_budget) in [
+            (None, None),
+            (Some(0), None),
+            (Some(1024), None),
+            (Some(1025), Some(1024)),
+            (Some(4096), Some(4095)),
+            (Some(u32::MAX), Some(8192)),
+        ] {
+            for mode in [ThinkingMode::Adaptive, ThinkingMode::DeprecatedBudget] {
+                let mut request = sample_request(Vec::new());
+                request.model.reasoning = Some(ReasoningEffort::High);
+                request.model.max_output_tokens = limit;
+                let body = encode_stream_request(&request, None, mode).expect("encode");
+                match mode {
+                    ThinkingMode::Adaptive => {
+                        assert_eq!(body["thinking"]["type"], "adaptive");
+                        assert!(body["thinking"].get("budget_tokens").is_none());
+                    }
+                    ThinkingMode::DeprecatedBudget => match expected_budget {
+                        Some(budget) => assert_eq!(body["thinking"]["budget_tokens"], budget),
+                        None => assert!(body.get("thinking").is_none()),
+                    },
+                }
+                for reasoning in [None, Some(ReasoningEffort::None)] {
+                    request.model.reasoning = reasoning;
+                    let body = encode_stream_request(&request, None, mode).expect("encode");
+                    assert!(body.get("thinking").is_none());
+                    assert!(body.get("output_config").is_none());
+                }
+            }
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ use tracing::{debug, info};
 
 use crate::Provider;
 use crate::anthropic_codec;
+use crate::anthropic_codec::ThinkingMode;
 use crate::header_overrides::HeaderOverrides;
 use crate::http_client::{JsonHttpClient, JsonRequest, join_url, provider_error_from_anyhow};
 use crate::resilience::{ProviderErrorClassifier, ResiliencePolicy, ResilientProvider};
@@ -28,6 +29,9 @@ const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 /// transport core is wrapped in a [`ResilientProvider`], so every constructor
 /// yields bounded retries with backoff for transient failures (429/529,
 /// overload, network faults) on both `stream` and `compact`.
+/// Thinking uses the adaptive API for every model. At construction,
+/// `DEPRECATED_ANTHROPIC_THINKING_BUDGET` opts into deprecated token budgets
+/// when set to `1`, `true`, `yes`, or `on` (case-insensitive, whitespace trimmed).
 pub struct AnthropicProvider {
     inner: ResilientProvider<AnthropicMessagesProvider>,
 }
@@ -127,6 +131,7 @@ struct AnthropicMessagesProvider {
     client: JsonHttpClient,
     header_overrides: HeaderOverrides,
     temperature: Option<f32>,
+    thinking_mode: ThinkingMode,
 }
 
 impl AnthropicMessagesProvider {
@@ -137,12 +142,23 @@ impl AnthropicMessagesProvider {
         temperature: Option<f32>,
         resilience_policy: ResiliencePolicy,
     ) -> anyhow::Result<Self> {
+        let thinking_mode = ThinkingMode::from_deprecated_budget_env(
+            std::env::var("DEPRECATED_ANTHROPIC_THINKING_BUDGET")
+                .ok()
+                .as_deref(),
+        );
+        if thinking_mode == ThinkingMode::DeprecatedBudget {
+            tracing::warn!(
+                "anthropic token-budget thinking is deprecated; unset DEPRECATED_ANTHROPIC_THINKING_BUDGET to use adaptive thinking"
+            );
+        }
         Ok(Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
             client: JsonHttpClient::try_new_with_timeouts(resilience_policy.timeouts)?,
             header_overrides: HeaderOverrides::new(header_overrides)?,
             temperature,
+            thinking_mode,
         })
     }
 
@@ -202,7 +218,11 @@ impl Provider for AnthropicMessagesProvider {
 
         // Deterministic encode failures are Fatal so the resilience wrapper
         // short-circuits instead of burning the retry budget (H4).
-        let body = match anthropic_codec::encode_stream_request(&request, self.temperature) {
+        let body = match anthropic_codec::encode_stream_request(
+            &request,
+            self.temperature,
+            self.thinking_mode,
+        ) {
             Ok(body) => body,
             Err(error) => {
                 return Ok(single_error_stream(ProviderError::with_kind(
@@ -211,8 +231,9 @@ impl Provider for AnthropicMessagesProvider {
                 )));
             }
         };
+        // Adaptive thinking includes interleaved thinking without the legacy beta.
         let enable_interleaved_thinking =
-            request.model.reasoning.is_some() && !request.tools.is_empty();
+            body["thinking"]["type"] == "enabled" && !request.tools.is_empty();
         let raw_stream = match self
             .client
             .post_json_event_stream(
@@ -379,6 +400,48 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_provider_streams_sse_messages() {
+        const EXPECT_BUDGET: &str = "HALTER_TEST_EXPECT_ANTHROPIC_BUDGET";
+        // Each case constructs the public provider in an isolated environment.
+        // Mutating process-global environment variables would race other tests.
+        let Ok(expected_budget) = std::env::var(EXPECT_BUDGET) else {
+            for (value, expected) in [
+                (None, false),
+                (Some(""), false),
+                (Some("  "), false),
+                (Some("0"), false),
+                (Some("false"), false),
+                (Some("no"), false),
+                (Some("off"), false),
+                (Some("unexpected"), false),
+                (Some("1"), true),
+                (Some("true"), true),
+                (Some("yes"), true),
+                (Some("on"), true),
+                (Some("  TrUe \n"), true),
+            ] {
+                let mut command =
+                    std::process::Command::new(std::env::current_exe().expect("test executable"));
+                command.args([
+                    "--exact",
+                    "anthropic::tests::anthropic_provider_streams_sse_messages",
+                    "--nocapture",
+                ]);
+                command.env(EXPECT_BUDGET, expected.to_string());
+                command.env_remove("DEPRECATED_ANTHROPIC_THINKING_BUDGET");
+                if let Some(value) = value {
+                    command.env("DEPRECATED_ANTHROPIC_THINKING_BUDGET", value);
+                }
+                let output = command.output().expect("run environment case");
+                assert!(
+                    output.status.success(),
+                    "value {value:?}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let expected_budget = expected_budget == "true";
         let captured = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let base_url = spawn_stream_server(captured.clone()).await;
         let provider = AnthropicProvider::new("test-key", base_url).expect("anthropic provider");
@@ -412,10 +475,26 @@ mod tests {
         assert!(request_text.starts_with("POST /v1/messages HTTP/1.1"));
         assert!(request_text.contains("x-api-key: test-key"));
         assert!(request_text.contains("anthropic-version: 2023-06-01"));
-        assert!(request_text.contains("anthropic-beta: interleaved-thinking-2025-05-14"));
+        assert_eq!(
+            request_text.contains("anthropic-beta: interleaved-thinking-2025-05-14"),
+            expected_budget
+        );
 
         let body: Value = serde_json::from_slice(&captured[headers_end + 4..]).expect("parse body");
         assert_eq!(body["stream"], true);
+        if expected_budget {
+            assert_eq!(
+                body["thinking"],
+                json!({"type": "enabled", "budget_tokens": 4096})
+            );
+            assert!(body.get("output_config").is_none());
+        } else {
+            assert_eq!(
+                body["thinking"],
+                json!({"type": "adaptive", "display": "summarized"})
+            );
+            assert_eq!(body["output_config"], json!({"effort": "medium"}));
+        }
     }
 
     /// Anthropic now shares the resilience wrapper: an HTTP 429 with a
