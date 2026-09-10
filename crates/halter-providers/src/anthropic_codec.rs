@@ -112,7 +112,6 @@ fn encode_request_with_options(
         body.insert("tools".to_owned(), Value::Array(encode_tools(request)));
     }
     if let Some(thinking) = encode_thinking(
-        &request.model.model,
         request.model.reasoning,
         request.model.max_output_tokens,
         options.thinking_mode,
@@ -593,7 +592,6 @@ struct EncodedThinking {
 }
 
 fn encode_thinking(
-    model: &str,
     reasoning: Option<ReasoningEffort>,
     max_output_tokens: Option<u32>,
     thinking_mode: ThinkingMode,
@@ -604,10 +602,7 @@ fn encode_thinking(
     }
     if thinking_mode == ThinkingMode::Adaptive {
         let mut output_config = Map::new();
-        output_config.insert(
-            "effort".to_owned(),
-            json!(adaptive_effort_for_model(model, reasoning)),
-        );
+        output_config.insert("effort".to_owned(), json!(adaptive_effort(reasoning)));
         return Some(EncodedThinking {
             thinking: json!({
                 "type": "adaptive",
@@ -649,7 +644,7 @@ fn encode_thinking(
     })
 }
 
-fn adaptive_effort_for_model(model: &str, reasoning: ReasoningEffort) -> &'static str {
+fn adaptive_effort(reasoning: ReasoningEffort) -> &'static str {
     match reasoning {
         // `None` is removed before adaptive encoding. Keep this arm total so
         // the wire mapping remains a plain, auditable function.
@@ -657,8 +652,7 @@ fn adaptive_effort_for_model(model: &str, reasoning: ReasoningEffort) -> &'stati
         ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
-        ReasoningEffort::Xhigh if model.to_ascii_lowercase().contains("claude-opus-4-7") => "xhigh",
-        ReasoningEffort::Xhigh => "high",
+        ReasoningEffort::Xhigh => "xhigh",
         ReasoningEffort::Max => "max",
     }
 }
@@ -1120,12 +1114,7 @@ mod tests {
             (ReasoningEffort::Max, Some("max")),
         ];
         for (effort, expected) in cases {
-            let encoded = encode_thinking(
-                "claude-opus-4-7-latest",
-                Some(effort),
-                Some(16_384),
-                ThinkingMode::Adaptive,
-            );
+            let encoded = encode_thinking(Some(effort), Some(16_384), ThinkingMode::Adaptive);
             assert_eq!(
                 encoded
                     .as_ref()
@@ -1136,15 +1125,7 @@ mod tests {
                 "effort: {effort:?}"
             );
         }
-        assert!(
-            encode_thinking(
-                "claude-opus-4-7-latest",
-                None,
-                Some(16_384),
-                ThinkingMode::Adaptive
-            )
-            .is_none()
-        );
+        assert!(encode_thinking(None, Some(16_384), ThinkingMode::Adaptive).is_none());
     }
 
     #[test]
@@ -1154,13 +1135,9 @@ mod tests {
             (ReasoningEffort::Max, 8_192),
         ];
         for (effort, expected) in cases {
-            let encoded = encode_thinking(
-                "claude-legacy",
-                Some(effort),
-                Some(16_384),
-                ThinkingMode::DeprecatedBudget,
-            )
-            .expect("thinking");
+            let encoded =
+                encode_thinking(Some(effort), Some(16_384), ThinkingMode::DeprecatedBudget)
+                    .expect("thinking");
             assert_eq!(encoded.thinking["budget_tokens"], expected);
             assert_eq!(encoded.output_config, None);
         }
@@ -1280,16 +1257,21 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_models_use_current_anthropic_thinking_shape() {
-        let mut request = sample_request(Vec::new());
-        request.model.model = "claude-opus-4-7-latest".to_owned();
-        request.model.reasoning = Some(ReasoningEffort::Xhigh);
+    fn adaptive_xhigh_transmits_verbatim_regardless_of_model() {
+        // Regression: xhigh used to clamp to "high" for every model except
+        // claude-opus-4-7. The adaptive effort ladder is model-independent.
+        for model in ["claude-opus-4-7-latest", "claude-fable-5", "custom-model"] {
+            let mut request = sample_request(Vec::new());
+            request.model.model = model.to_owned();
+            request.model.reasoning = Some(ReasoningEffort::Xhigh);
 
-        let body = encode_stream_request(&request, None, ThinkingMode::Adaptive).expect("encode");
+            let body =
+                encode_stream_request(&request, None, ThinkingMode::Adaptive).expect("encode");
 
-        assert_eq!(body["thinking"]["type"], "adaptive");
-        assert_eq!(body["thinking"]["display"], "summarized");
-        assert_eq!(body["output_config"]["effort"], "xhigh");
+            assert_eq!(body["thinking"]["type"], "adaptive", "{model}");
+            assert_eq!(body["thinking"]["display"], "summarized", "{model}");
+            assert_eq!(body["output_config"]["effort"], "xhigh", "{model}");
+        }
     }
 
     #[test]
