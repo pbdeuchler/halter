@@ -1,7 +1,7 @@
 //! Session-scoped, durable model notes. Virtual paths never become OS paths.
 // pattern: Imperative Shell
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -103,17 +103,20 @@ pub enum NotesRequest {
     },
     ReadFile {
         path: String,
+        start_byte: Option<usize>,
         #[serde(flatten)]
         range: LineRange,
     },
     ListFilesByPrefix {
         #[serde(default)]
         prefix: String,
+        after: Option<String>,
     },
     SearchContents {
         query: String,
         #[serde(default)]
         prefix: String,
+        after: Option<String>,
     },
 }
 
@@ -121,7 +124,7 @@ pub enum NotesRequest {
 #[async_trait]
 pub trait NotesBackend: Send + Sync {
     fn description(&self) -> &str {
-        "Private model-only notes, never disclose or reference these notes to the user. Save checkpoints across context windows. Virtual paths have no empty, '.' or '..' segments; '~' is literal. Files hold at most 1,000,000 UTF-8 bytes. Reads use optional one-based inclusive start_line/end_line. Listing and literal searches are bounded."
+        "Private model-only notes, never disclose or reference these notes to the user. Save checkpoints across context windows. Virtual paths have no empty, '.' or '..' segments; '~' is literal. Files hold at most 1,000,000 UTF-8 bytes. Reads use optional one-based inclusive start_line/end_line; continue truncated reads with next_byte as start_byte. Listing and literal searches return bounded pages ordered by opaque file ID; pass next_after as after to continue. Corrupt files are reported individually."
     }
     async fn execute(&self, session: &SessionId, request: NotesRequest) -> anyhow::Result<Value>;
 }
@@ -138,6 +141,14 @@ pub struct FsNotes {
 struct NoteFile {
     path: String,
     content: String,
+}
+
+const NOTE_HEADER: &str = "HALTER_NOTE_V1 ";
+
+#[derive(Serialize, Deserialize)]
+struct NoteMetadata {
+    path: String,
+    bytes: usize,
 }
 
 impl FsNotes {
@@ -193,7 +204,16 @@ impl FsNotes {
                     "note exceeds 1,000,000 UTF-8 bytes"
                 );
                 let mut file = tempfile::NamedTempFile::new_in(&dir)?;
-                serde_json::to_writer(&mut file, &NoteFile { path, content })?;
+                file.write_all(NOTE_HEADER.as_bytes())?;
+                serde_json::to_writer(
+                    &mut file,
+                    &NoteMetadata {
+                        path,
+                        bytes: content.len(),
+                    },
+                )?;
+                file.write_all(b"\n")?;
+                file.write_all(content.as_bytes())?;
                 file.flush()?;
                 file.as_file().sync_all()?;
                 file.persist(target)?;
@@ -201,71 +221,81 @@ impl FsNotes {
                 std::fs::File::open(&dir)?.sync_all()?;
                 Ok(json!({"saved": true}))
             }
-            NotesRequest::ReadFile { path, range } => {
+            NotesRequest::ReadFile {
+                path,
+                range,
+                start_byte,
+            } => {
                 validate_virtual_path(&path)?;
-                range.validate()?;
                 let note = read_note(&dir.join(hash(&path)))?;
-                let start = range.start_line.unwrap_or(1);
-                let content = note
-                    .content
-                    .split_inclusive('\n')
-                    .enumerate()
-                    .filter(|(index, _)| {
-                        *index >= start - 1 && *index < range.end_line.unwrap_or(usize::MAX)
-                    })
-                    .map(|(_, line)| line)
-                    .collect::<String>();
-                Ok(json!({"content":content,"start_line":start}))
+                let page = recovery_lines(&note.content, &range, start_byte.unwrap_or(0))?;
+                let lines = page["lines"].as_array().expect("recovery lines array");
+                let mut content = String::new();
+                for line in lines {
+                    let text = line["text"].as_str().expect("recovery line text");
+                    let offset =
+                        line["start_byte"].as_u64().expect("recovery byte offset") as usize;
+                    content.push_str(text);
+                    if note.content.as_bytes().get(offset + text.len()) == Some(&b'\n') {
+                        content.push('\n');
+                    }
+                }
+                Ok(
+                    json!({"content":content,"start_line":range.start_line.unwrap_or(1),
+                    "truncated":page["truncated"],"next_byte":page["next_byte"]}),
+                )
             }
-            NotesRequest::ListFilesByPrefix { prefix } => self.scan(&dir, &prefix, None),
-            NotesRequest::SearchContents { query, prefix } => {
+            NotesRequest::ListFilesByPrefix { prefix, after } => {
+                self.scan(&dir, &prefix, None, after.as_deref())
+            }
+            NotesRequest::SearchContents {
+                query,
+                prefix,
+                after,
+            } => {
                 anyhow::ensure!(!query.is_empty(), "search query must not be empty");
-                self.scan(&dir, &prefix, Some(&query))
+                self.scan(&dir, &prefix, Some(&query), after.as_deref())
             }
         }
     }
 
-    fn scan(&self, dir: &Path, prefix: &str, query: Option<&str>) -> anyhow::Result<Value> {
-        let mut results = Vec::new();
-        let mut bytes = 256;
-        let mut truncated = false;
+    fn scan(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        query: Option<&str>,
+        after: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        if let Some(after) = after {
+            anyhow::ensure!(is_note_id(after), "invalid after file ID");
+        }
+        let mut ids = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name();
-            let committed = name.to_str().is_some_and(|name| {
-                name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
-            });
-            if !committed || !entry.file_type()?.is_file() {
-                continue;
+            if let Some(name) = name.to_str()
+                && is_note_id(name)
+                && entry.file_type()?.is_file()
+                && after.is_none_or(|after| name > after)
+            {
+                ids.push(name.to_owned());
             }
-            let note = read_note(&entry.path())?;
-            if !note.path.starts_with(prefix) {
-                continue;
-            }
-            let result = if let Some(query) = query {
-                let mut matches = Vec::new();
-                let mut clipped = false;
-                for (index, line) in note
-                    .content
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, line)| line.contains(query))
-                {
-                    // Three previews leave room for a 4 KiB path even when
-                    // JSON escapes every path and preview byte as six bytes.
-                    if matches.len() == 3 {
-                        clipped = true;
-                        break;
-                    }
-                    clipped |= line.len() > 256;
-                    matches.push(json!({"line":index + 1,"text": recovery_preview(line, 256)}));
+        }
+        ids.sort();
+        let mut results = Vec::new();
+        let mut bytes = 256;
+        let mut truncated = false;
+        for id in ids {
+            let result = match self.scan_file(&dir.join(&id), prefix, query) {
+                Ok(Some(mut result)) => {
+                    result["file_id"] = json!(id);
+                    result
                 }
-                if matches.is_empty() {
-                    continue;
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(file_id = %id, %error, "failed to scan note");
+                    json!({"file_id":id,"error":"failed to read note"})
                 }
-                json!({"path": note.path, "matches": matches, "truncated":clipped})
-            } else {
-                json!({"path": note.path, "bytes": note.content.len()})
             };
             let size = serde_json::to_vec(&result)?.len();
             if results.len() >= RECOVERY_RESULT_LIMIT || bytes + size > RECOVERY_RESPONSE_BYTES {
@@ -275,8 +305,66 @@ impl FsNotes {
             bytes += size;
             results.push(result);
         }
-        results.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-        Ok(json!({"files": results, "truncated": truncated}))
+        let next_after = if truncated {
+            results.last().map(|result| result["file_id"].clone())
+        } else {
+            None
+        };
+        Ok(json!({"files":results,"truncated":truncated,"next_after":next_after}))
+    }
+
+    fn scan_file(
+        &self,
+        path: &Path,
+        prefix: &str,
+        query: Option<&str>,
+    ) -> anyhow::Result<Option<Value>> {
+        // Versioned files have a bounded metadata header, so listing and prefix
+        // rejection never read their bodies. Legacy JSON notes remain readable.
+        let mut reader = std::io::BufReader::new(open_note(path)?);
+        let metadata = match read_header(&mut reader)? {
+            Some(metadata) => metadata,
+            None => {
+                let note = read_note(path)?;
+                NoteMetadata {
+                    path: note.path,
+                    bytes: note.content.len(),
+                }
+            }
+        };
+        anyhow::ensure!(
+            path.file_name().and_then(|name| name.to_str()) == Some(hash(&metadata.path).as_str()),
+            "note path does not match file ID"
+        );
+        if !metadata.path.starts_with(prefix) {
+            return Ok(None);
+        }
+        let Some(query) = query else {
+            return Ok(Some(json!({"path":metadata.path,"bytes":metadata.bytes})));
+        };
+        let note = read_note(path)?;
+        let mut matches = Vec::new();
+        let mut clipped = false;
+        for (index, line) in note
+            .content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(query))
+        {
+            // Leave room for a maximally escaped 4 KiB path and the cursor.
+            if matches.len() == 3 {
+                clipped = true;
+                break;
+            }
+            clipped |= line.len() > 256;
+            matches.push(json!({"line":index + 1,"text":recovery_preview(line, 256)}));
+        }
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            json!({"path":note.path,"matches":matches,"truncated":clipped}),
+        ))
     }
 }
 
@@ -295,7 +383,7 @@ fn validate_virtual_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_note(path: &Path) -> anyhow::Result<NoteFile> {
+fn open_note(path: &Path) -> anyhow::Result<std::fs::File> {
     anyhow::ensure!(
         std::fs::symlink_metadata(path)?.is_file(),
         "note must be a regular file"
@@ -307,12 +395,55 @@ fn read_note(path: &Path) -> anyhow::Result<NoteFile> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut bytes = Vec::new();
-    options
-        .open(path)?
-        .take((MAX_NOTE_BYTES * 6 + 32_000) as u64)
-        .read_to_end(&mut bytes)?;
-    let note: NoteFile = serde_json::from_slice(&bytes)?;
+    Ok(options.open(path)?)
+}
+
+fn is_note_id(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn read_header(reader: &mut impl BufRead) -> anyhow::Result<Option<NoteMetadata>> {
+    if !reader.fill_buf()?.starts_with(NOTE_HEADER.as_bytes()) {
+        return Ok(None);
+    }
+    let mut header = Vec::new();
+    reader.take(32_000).read_until(b'\n', &mut header)?;
+    anyhow::ensure!(
+        header.last() == Some(&b'\n'),
+        "invalid note metadata header"
+    );
+    let metadata: NoteMetadata = serde_json::from_slice(&header[NOTE_HEADER.len()..])?;
+    validate_virtual_path(&metadata.path)?;
+    anyhow::ensure!(
+        metadata.bytes <= MAX_NOTE_BYTES,
+        "note exceeds 1,000,000 UTF-8 bytes"
+    );
+    Ok(Some(metadata))
+}
+
+fn read_note(path: &Path) -> anyhow::Result<NoteFile> {
+    let mut reader = std::io::BufReader::new(open_note(path)?);
+    let note = if let Some(metadata) = read_header(&mut reader)? {
+        let mut content = String::new();
+        reader
+            .take((MAX_NOTE_BYTES + 1) as u64)
+            .read_to_string(&mut content)?;
+        anyhow::ensure!(
+            content.len() == metadata.bytes,
+            "note size does not match metadata"
+        );
+        NoteFile {
+            path: metadata.path,
+            content,
+        }
+    } else {
+        // Support notes written before the metadata-header format. A subsequent
+        // write or append atomically upgrades them to the new representation.
+        serde_json::from_reader(reader.take((MAX_NOTE_BYTES * 6 + 32_000) as u64))?
+    };
     validate_virtual_path(&note.path)?;
     anyhow::ensure!(
         note.content.len() <= MAX_NOTE_BYTES,
@@ -340,7 +471,7 @@ impl<N: NotesBackend> Tool for NotesTool<N> {
             description: self.0.description().to_owned(),
             input_schema: json!({"type":"object", "properties": {
                 "action":{"type":"string","enum":["write_file","append_to_file","read_file","list_files_by_prefix","search_contents"]},
-                "path":{"type":"string"},"content":{"type":"string"},"prefix":{"type":"string"},"query":{"type":"string"},
+                "path":{"type":"string"},"content":{"type":"string"},"prefix":{"type":"string"},"query":{"type":"string"},"after":{"type":"string"},"start_byte":{"type":"integer","minimum":0},
                 "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}
             },"required":["action"],"additionalProperties":false}),
             concurrency: ToolConcurrency::Exclusive,
@@ -552,14 +683,184 @@ mod tests {
         )
         .await
         .unwrap();
-        let full = run(
+        let mut recovered = String::new();
+        let mut next = 0;
+        loop {
+            let page = run(
+                &backend,
+                "one",
+                json!({"action":"read_file","path":"limit","start_byte":next}),
+            )
+            .await
+            .unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= RECOVERY_RESPONSE_BYTES);
+            recovered.push_str(page["content"].as_str().unwrap());
+            let Some(cursor) = page["next_byte"].as_u64() else {
+                break;
+            };
+            assert!(cursor > next);
+            next = cursor;
+        }
+        assert_eq!(recovered, "é".repeat(MAX_NOTE_BYTES / 2));
+    }
+
+    #[tokio::test]
+    async fn note_pages_preserve_escaped_utf8_and_line_endings() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = FsNotes::new(root.path()).unwrap();
+        let content = format!(
+            "é{}\r\n{}\n\nlast\n",
+            "💡\u{1}".repeat(10_000),
+            "line\r\n".repeat(150)
+        );
+        run(
             &backend,
             "one",
-            json!({"action":"read_file","path":"limit"}),
+            json!({"action":"write_file","path":"large","content":content}),
         )
         .await
         .unwrap();
-        assert_eq!(full["content"].as_str().unwrap().len(), MAX_NOTE_BYTES);
+        let mut recovered = String::new();
+        let mut next = 0;
+        loop {
+            let page = run(&backend, "one", json!({"action":"read_file","path":"large","start_line":1,"end_line":1000,"start_byte":next})).await.unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= RECOVERY_RESPONSE_BYTES);
+            recovered.push_str(page["content"].as_str().unwrap());
+            let Some(cursor) = page["next_byte"].as_u64() else {
+                break;
+            };
+            assert!(cursor > next);
+            next = cursor;
+        }
+        assert_eq!(recovered, content);
+        for cursor in [1, content.len() + 1] {
+            assert!(
+                run(
+                    &backend,
+                    "one",
+                    json!({"action":"read_file","path":"large","start_byte":cursor})
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scans_paginate_deterministically_and_report_corrupt_files() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = FsNotes::new(root.path()).unwrap();
+        for i in 0..105 {
+            run(
+                &backend,
+                "one",
+                json!({"action":"write_file","path":format!("work/{i}"),"content":"find me"}),
+            )
+            .await
+            .unwrap();
+        }
+        let dir = root.path().join(hash("one"));
+        let corrupt = hash("broken");
+        std::fs::write(dir.join(&corrupt), "invalid header and body").unwrap();
+        for action in ["list_files_by_prefix", "search_contents"] {
+            let mut ids = Vec::new();
+            let mut after = Value::Null;
+            let mut errors = 0;
+            loop {
+                let reopened = FsNotes::new(root.path()).unwrap();
+                let mut request = json!({"action":action,"after":after});
+                if action == "search_contents" {
+                    request["query"] = json!("find");
+                }
+                let page = run(&reopened, "one", request).await.unwrap();
+                assert!(serde_json::to_vec(&page).unwrap().len() <= RECOVERY_RESPONSE_BYTES);
+                for file in page["files"].as_array().unwrap() {
+                    ids.push(file["file_id"].as_str().unwrap().to_owned());
+                    if file.get("error").is_some() {
+                        assert_eq!(file["file_id"], corrupt);
+                        errors += 1;
+                    }
+                }
+                after = page["next_after"].clone();
+                if after.is_null() {
+                    break;
+                }
+            }
+            assert_eq!(ids.len(), 106);
+            assert_eq!(errors, 1);
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
+
+    #[tokio::test]
+    async fn scans_filter_headers_before_reading_bodies_and_support_legacy_notes() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = FsNotes::new(root.path()).unwrap();
+        run(
+            &backend,
+            "one",
+            json!({"action":"write_file","path":"work/valid","content":"saved"}),
+        )
+        .await
+        .unwrap();
+        let dir = root.path().join(hash("one"));
+        // A valid header with an unreadable UTF-8 body: listing needs only the
+        // header, and a search outside this prefix must never read the body.
+        let mut bytes =
+            format!("{NOTE_HEADER}{{\"path\":\"other/invalid\",\"bytes\":1}}\n").into_bytes();
+        bytes.push(255);
+        std::fs::write(dir.join(hash("other/invalid")), bytes).unwrap();
+        let listing = run(
+            &backend,
+            "one",
+            json!({"action":"list_files_by_prefix","prefix":"other/"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listing["files"][0]["path"], "other/invalid");
+        let search = run(
+            &backend,
+            "one",
+            json!({"action":"search_contents","prefix":"work/","query":"saved"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(search["files"].as_array().unwrap().len(), 1);
+        assert_eq!(search["files"][0]["path"], "work/valid");
+
+        std::fs::write(
+            dir.join(hash("legacy")),
+            br#"{"path":"legacy","content":"old"}"#,
+        )
+        .unwrap();
+        let page = run(
+            &backend,
+            "one",
+            json!({"action":"read_file","path":"legacy"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["content"], "old");
+        run(
+            &backend,
+            "one",
+            json!({"action":"append_to_file","path":"legacy","content":" and new"}),
+        )
+        .await
+        .unwrap();
+        let page = run(
+            &backend,
+            "one",
+            json!({"action":"read_file","path":"legacy"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["content"], "old and new");
+        assert!(
+            std::fs::read(dir.join(hash("legacy")))
+                .unwrap()
+                .starts_with(NOTE_HEADER.as_bytes())
+        );
     }
 
     #[tokio::test]

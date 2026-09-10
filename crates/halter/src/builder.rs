@@ -41,6 +41,23 @@ use crate::{CompiledResources, LoadedPlugin, LoadedSkill, ResourceCompiler};
 #[cfg(feature = "sqlite")]
 use halter_session::SqliteSessionStore;
 
+fn clean_window_notes_root(config: &HarnessConfig) -> PathBuf {
+    config
+        .context
+        .notes_root
+        .as_ref()
+        .map(|root| expand_path(root))
+        .unwrap_or_else(|| {
+            config
+                .sessions
+                .sqlite_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|parent| expand_path(parent).join("notes"))
+                .unwrap_or_else(|| std::env::temp_dir().join("halter").join("notes"))
+        })
+}
+
 #[derive(Default)]
 /// Builder for assembling a [`Halter`] runtime from config, resources, tools, and stores.
 pub struct HalterBuilder {
@@ -247,23 +264,10 @@ impl HalterBuilder {
         let compaction = match compaction {
             Some(strategy) => strategy,
             None if resolved_context.compaction == CompactionStrategyKind::CleanWindow => {
-                let root = config
-                    .context
-                    .notes_root
-                    .as_ref()
-                    .map(|root| expand_path(root))
-                    .unwrap_or_else(|| {
-                        config
-                            .sessions
-                            .sqlite_path
-                            .as_ref()
-                            .and_then(|path| path.parent())
-                            .map(|parent| expand_path(parent).join("notes"))
-                            .unwrap_or_else(|| std::env::temp_dir().join("halter").join("notes"))
-                    });
+                let root = clean_window_notes_root(&config);
                 Arc::new(CleanWindow::new(
                     halter_tools::FsNotes::new(root)?,
-                    StoreSearch(sessions.clone()),
+                    StoreSearch::new(sessions.clone()),
                 ))
             }
             None => configured_compaction(resolved_context.compaction, &models)?,
@@ -271,7 +275,7 @@ impl HalterBuilder {
         let tools = Arc::new(ToolRuntime::new());
         register_builtin_tools(&tools, &config.tools.enabled);
         // Strategy tools sit between the built-ins and explicitly supplied
-        // tools, so a `with_tool` entry of the same name still wins.
+        // tools. CleanWindow recovery names are reserved; other explicit tools win.
         if compaction.window_policy() == WindowPolicy::CleanWindow {
             for tool in &custom_tools {
                 anyhow::ensure!(
@@ -1949,6 +1953,72 @@ mod tests {
                     case.name
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_window_rejects_replacement_recovery_tools() {
+        struct NamedTool(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for NamedTool {
+            fn spec(&self) -> halter_protocol::ToolSpec {
+                let mut spec = halter_tools::TaskTool.spec();
+                spec.name = self.0.into();
+                spec
+            }
+            async fn execute(
+                &self,
+                _: halter_tools::ToolContext,
+                _: serde_json::Value,
+            ) -> anyhow::Result<halter_protocol::ToolResult> {
+                unreachable!("replacement recovery tool must be rejected at build time")
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["notes", "session_search", "new_context"] {
+            let mut config = openai_config(Some("test-key"));
+            config.context.compaction = CompactionStrategyKind::CleanWindow;
+            config.context.notes_root = Some(temp.path().join("notes"));
+            let result = HalterBuilder::default()
+                .with_config(config)
+                .with_resource_snapshot(ResourceSnapshot::empty())
+                .with_tool(Arc::new(NamedTool(name)))
+                .build()
+                .await;
+            let error = result.err().expect("reserved tool name accepted");
+            assert!(
+                error.to_string().contains(
+                    "override recovery tools through NotesBackend and SessionSearchBackend"
+                ),
+                "{name}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_window_notes_root_follows_configured_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let sqlite = temp.path().join("store/sessions.db");
+        let explicit = temp.path().join("custom");
+        for (notes, database, expected) in [
+            (
+                Some(explicit.clone()),
+                Some(sqlite.clone()),
+                explicit.clone(),
+            ),
+            (Some(explicit.clone()), None, explicit),
+            (None, Some(sqlite), temp.path().join("store/notes")),
+            (
+                None,
+                Some(PathBuf::from("sessions.db")),
+                PathBuf::from("notes"),
+            ),
+            (None, None, std::env::temp_dir().join("halter/notes")),
+        ] {
+            let mut config = openai_config(Some("test-key"));
+            config.context.notes_root = notes;
+            config.sessions.sqlite_path = database;
+            assert_eq!(clean_window_notes_root(&config), expected);
         }
     }
 

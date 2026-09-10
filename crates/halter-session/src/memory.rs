@@ -145,6 +145,19 @@ impl SessionStore for InMemorySessionStore {
         debug!(session_count = sessions.len(), "listing in-memory sessions");
         Ok(sessions)
     }
+
+    async fn replay_after(
+        &self,
+        session_id: &SessionId,
+        after_sequence: u64,
+    ) -> anyhow::Result<Vec<SessionEvent>> {
+        let state = self.state.read().await;
+        let Some(events) = state.events.get(&session_id.0) else {
+            return Ok(Vec::new());
+        };
+        let start = events.partition_point(|event| event.sequence() <= after_sequence);
+        Ok(events[start..].to_vec())
+    }
 }
 
 #[cfg(test)]

@@ -398,7 +398,7 @@ an actionable configuration error instead of repeatedly wiping the window.
 
 | Tool | Actions and limits |
 | --- | --- |
-| `notes` | `write_file`, `append_to_file`, `read_file`, `list_files_by_prefix`, `search_contents`. Virtual paths reject empty, `.` and `..` segments; `~` is literal. Files hold at most 1,000,000 UTF-8 bytes. Reads return the full file or an inclusive one-based line range. Listings and literal searches return bounded results; use prefixes to narrow them. |
+| `notes` | `write_file`, `append_to_file`, `read_file`, `list_files_by_prefix`, `search_contents`. Virtual paths reject empty, `.` and `..` segments; `~` is literal. Files hold at most 1,000,000 UTF-8 bytes. Reads cover the full file or an inclusive one-based line range in bounded pages; pass `next_byte` as `start_byte` to continue, including within long lines. Listings and literal searches paginate in stable file-ID order with `next_after` passed as `after`; use prefixes to narrow them. Each response is at most 32,000 serialized bytes. Corrupt files appear as individual error entries. |
 | `session_search` | `list_windows`, `list_items`, `read_item`, `search_contents`. Includes all committed windows, including the live one. Items use stable opaque IDs derived from window and event sequence. Filter by window, role, or tool; paginate with `next_after` passed as `after`. Reads use one-based inclusive line ranges. Responses cap rows and bytes; continue a truncated read, including within long lines, by passing `next_byte` as `start_byte`. |
 | `new_context` | Takes `{}`. Save notes before calling it. |
 
@@ -412,7 +412,7 @@ use halter::session::{SessionStore, SqliteSessionStore};
 
 # fn example() -> anyhow::Result<()> {
 let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open("sessions.db")?);
-let strategy = CleanWindow::new(FsNotes::new("notes")?, StoreSearch(store.clone()));
+let strategy = CleanWindow::new(FsNotes::new("notes")?, StoreSearch::new(store.clone()));
 let builder = halter::Halter::builder()
     .with_session_store(store)
     .with_compaction(Arc::new(strategy));
@@ -425,8 +425,14 @@ This example requires the `sqlite` feature. Supply implementations of
 storage; each trait also exposes `description()`. The default filesystem
 backend hashes session IDs and virtual paths into private storage filenames,
 uses atomic replacement for writes, and fixes its root independently of
-session working directories. `StoreSearch` reads the event log on each query;
-very long logs may benefit from an indexed custom backend.
+session working directories. A bounded metadata header lets scans filter by
+prefix without reading unrelated file bodies; listings read only metadata.
+Legacy JSON notes remain readable and upgrade on their next write or append.
+`StoreSearch::new(store)` caches the most recently queried session and indexes
+only events committed after its cached sequence. Switching sessions evicts the
+cache. Window listings follow chronological ordinal order, including empty
+windows. Text searches still scan the indexed history; very long logs may
+benefit from a custom backend with a text-search index.
 
 The context manager then plans the request from the (possibly compacted)
 state: the full transcript window, the carried prefix, prompt segments, and

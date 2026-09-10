@@ -27,12 +27,13 @@
 //! Runtime bookkeeping fields (`file_view_cache`, `pending_tool_calls`,
 //! `fired_hook_ids`, `appended_prompt_segments`, `compaction_notifications`,
 //! `lineage`, hook latches, and provider-chaining fields) are deliberately
-//! *not* event-covered: they are
-//! carried by the checkpoint, which the runtime writes on every
-//! state-changing commit. The one exception is that `ContextCompacted`
-//! effects also reset `last_response_id` / `messages_seen_by_provider`,
-//! mirroring the runtime's compaction rules so a mid-replay view is not left
-//! pointing at a provider response chain that predates the rewrite.
+//! generally carried by the checkpoint, which the runtime writes on every
+//! state-changing commit. Compaction and rollover events reset
+//! `last_response_id`, `messages_seen_by_provider`, and
+//! `compaction_notifications`. Rollover additionally clears
+//! `appended_prompt_segments` and `file_view_cache`. These event-covered
+//! resets keep replay from retaining bookkeeping from a previous window;
+//! ordinary updates to those fields still depend on the checkpoint.
 //!
 //! The store conformance suite locks the invariant in: after any sequence of
 //! commits, folding the full log over a default state must agree with the

@@ -18,6 +18,9 @@ once a `1.0.0` line is cut.
   within the harness process; notes and stored history support session resume.
   Public `NotesBackend` / `SessionSearchBackend` traits override storage and
   descriptions. `context.notes_root` configures the filesystem root.
+  Recovery reads are paginated within 32,000-byte responses. Notes scans use
+  metadata headers, stable file-ID cursors, and per-file corruption errors;
+  history queries incrementally index new events and list windows chronologically.
   **API additions affecting exhaustive matches and struct literals:**
   `CompactionStrategyKind::CleanWindow`, `CompactionTrigger::Rollover`,
   `SessionEventPayload::ContextWindowRolledOver`, and `ContextConfig::notes_root`.

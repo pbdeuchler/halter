@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use halter_protocol::{Message, SessionId, ToolConcurrency, ToolResult, ToolSpec};
-use halter_session::{SessionStore, history_items};
+use halter_session::{SessionHistory, SessionStore};
 use halter_tools::{
     LineRange, RECOVERY_RESPONSE_BYTES, RECOVERY_RESULT_LIMIT, Tool, ToolContext, recovery_lines,
     recovery_preview as preview,
@@ -50,7 +50,27 @@ pub trait SessionSearchBackend: Send + Sync {
     ) -> anyhow::Result<Value>;
 }
 
-pub struct StoreSearch(pub Arc<dyn SessionStore>);
+/// Caches the most recently queried session and indexes only newly committed
+/// events. Switching sessions evicts the cache, bounding retained session data.
+pub struct StoreSearch {
+    store: Arc<dyn SessionStore>,
+    cache: tokio::sync::Mutex<Option<CachedHistory>>,
+}
+
+struct CachedHistory {
+    session: SessionId,
+    sequence: u64,
+    history: SessionHistory,
+}
+
+impl StoreSearch {
+    pub fn new(store: Arc<dyn SessionStore>) -> Self {
+        Self {
+            store,
+            cache: Default::default(),
+        }
+    }
+}
 
 #[async_trait]
 impl SessionSearchBackend for StoreSearch {
@@ -59,22 +79,43 @@ impl SessionSearchBackend for StoreSearch {
         session: &SessionId,
         request: SessionSearchRequest,
     ) -> anyhow::Result<Value> {
-        let events = self.0.replay(session).await?;
-        let history = history_items(&events);
+        let mut cache = self.cache.lock().await;
+        if cache
+            .as_ref()
+            .is_none_or(|cached| &cached.session != session)
+        {
+            *cache = Some(CachedHistory {
+                session: session.clone(),
+                sequence: 0,
+                history: SessionHistory::default(),
+            });
+        }
+        let cached = cache.as_mut().expect("history cache initialized");
+        let events = self.store.replay_after(session, cached.sequence).await?;
+        cached.history.extend(&events);
+        if let Some(event) = events.last() {
+            cached.sequence = event.sequence();
+        }
+        let history = cached.history.items();
         match request {
             SessionSearchRequest::ListWindows { after } => {
-                let mut windows = std::collections::BTreeMap::new();
-                windows.insert("window:0".to_owned(), 0usize);
-                for item in &history {
+                let mut windows = std::collections::HashMap::new();
+                for item in history {
                     *windows.entry(item.window_id.clone()).or_default() += 1;
                 }
-                if let Some(after) = &after {
-                    anyhow::ensure!(windows.contains_key(after), "unknown after window ID");
-                }
-                let rows = windows
-                    .into_iter()
-                    .filter(|(id, _)| after.as_ref().is_none_or(|after| id > after))
-                    .map(|(id, item_count)| json!({"window_id": id, "item_count": item_count}));
+                let start = match after {
+                    Some(after) => {
+                        let ordinal = window_ordinal(&after, cached.history.current_window())
+                            .ok_or_else(|| anyhow::anyhow!("unknown after window ID"))?;
+                        ordinal + 1
+                    }
+                    None => 0,
+                };
+                let rows = (start..=cached.history.current_window()).map(|ordinal| {
+                    let id = format!("window:{ordinal}");
+                    let item_count = windows.get(&id).copied().unwrap_or(0usize);
+                    json!({"window_id": id, "item_count": item_count})
+                });
                 bounded_rows(rows)
             }
             SessionSearchRequest::ReadItem {
@@ -111,8 +152,7 @@ impl SessionSearchBackend for StoreSearch {
                 };
                 if let Some(window) = &window {
                     anyhow::ensure!(
-                        history.iter().any(|item| &item.window_id == window)
-                            || window == "window:0",
+                        window_ordinal(window, cached.history.current_window()).is_some(),
                         "unknown window ID"
                     );
                 }
@@ -147,6 +187,11 @@ impl SessionSearchBackend for StoreSearch {
             }
         }
     }
+}
+
+fn window_ordinal(id: &str, current: u64) -> Option<u64> {
+    let ordinal = id.strip_prefix("window:")?.parse::<u64>().ok()?;
+    (ordinal <= current && id == format!("window:{ordinal}")).then_some(ordinal)
 }
 
 fn bounded_rows(rows: impl Iterator<Item = Value>) -> anyhow::Result<Value> {
@@ -228,10 +273,145 @@ mod tests {
     };
     use halter_session::{InMemorySessionStore, StoredSession};
 
+    #[derive(Default)]
+    struct ObservedStore {
+        inner: InMemorySessionStore,
+        cursors: std::sync::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait]
+    impl SessionStore for ObservedStore {
+        async fn create_session(&self, session: StoredSession) -> anyhow::Result<()> {
+            self.inner.create_session(session).await
+        }
+        async fn load_session(&self, session: &SessionId) -> anyhow::Result<Option<StoredSession>> {
+            self.inner.load_session(session).await
+        }
+        async fn commit(
+            &self,
+            session: &SessionId,
+            snapshot: Option<Arc<halter_protocol::ResourceSnapshot>>,
+            expected: Option<u64>,
+            state: Option<halter_protocol::SessionState>,
+            events: Vec<PendingEvent>,
+        ) -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
+            self.inner
+                .commit(session, snapshot, expected, state, events)
+                .await
+        }
+        async fn replay(
+            &self,
+            _: &SessionId,
+        ) -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
+            panic!("recovery must query only events after its cached sequence")
+        }
+        async fn replay_after(
+            &self,
+            session: &SessionId,
+            after: u64,
+        ) -> anyhow::Result<Vec<halter_protocol::SessionEvent>> {
+            self.cursors.lock().unwrap().push(after);
+            self.inner.replay_after(session, after).await
+        }
+        async fn list_sessions(&self) -> anyhow::Result<Vec<SessionBlueprint>> {
+            self.inner.list_sessions().await
+        }
+    }
+
     #[tokio::test]
-    async fn search_is_literal_paginated_and_validates_recovery_ids() {
+    async fn history_cache_tracks_new_commits_and_lists_windows_in_numeric_order() {
+        let store = Arc::new(ObservedStore::default());
+        let session = create_session(store.as_ref()).await;
+        let other = create_session(store.as_ref()).await;
+        let search = StoreSearch::new(store.clone());
+        let windows = || SessionSearchRequest::ListWindows { after: None };
+        let empty = search.execute(&session, windows()).await.unwrap();
+        assert_eq!(
+            empty["items"],
+            json!([{"window_id":"window:0","item_count":0}])
+        );
+        let events = (0..101)
+            .map(|_| {
+                PendingEvent::new(
+                    session.clone(),
+                    Delivery::Lossless,
+                    SessionEventPayload::ContextWindowRolledOver {
+                        summary: "rollover".into(),
+                        effects: Box::new(halter_protocol::CompactionEventEffects {
+                            messages: vec![],
+                            compacted_prefix: vec![],
+                            usage: Default::default(),
+                        }),
+                    },
+                )
+            })
+            .collect();
+        store
+            .commit(&session, None, Some(0), None, events)
+            .await
+            .unwrap();
+        let first = search.execute(&session, windows()).await.unwrap();
+        let ids: Vec<_> = first["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["window_id"].as_str().unwrap())
+            .collect();
+        let expected: Vec<_> = (0..100)
+            .map(|ordinal| format!("window:{ordinal}"))
+            .collect();
+        assert_eq!(ids, expected);
+        let second = search
+            .execute(
+                &session,
+                SessionSearchRequest::ListWindows {
+                    after: Some(first["next_after"].as_str().unwrap().into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second["items"],
+            json!([
+                {"window_id":"window:100","item_count":0},
+                {"window_id":"window:101","item_count":0}
+            ])
+        );
+        store
+            .commit(
+                &session,
+                None,
+                Some(101),
+                None,
+                vec![PendingEvent::new(
+                    session.clone(),
+                    Delivery::Lossless,
+                    SessionEventPayload::MessageItem {
+                        message: Message::User(UserMessage::text("new request")),
+                    },
+                )],
+            )
+            .await
+            .unwrap();
+        let items = || SessionSearchRequest::ListItems {
+            window_id: Some("window:101".into()),
+            role: None,
+            tool: None,
+            after: None,
+        };
+        let live = search.execute(&session, items()).await.unwrap();
+        assert_eq!(live["items"][0]["preview"], "new request");
+        assert_eq!(search.execute(&session, items()).await.unwrap(), live);
+        assert_eq!(search.execute(&other, windows()).await.unwrap(), empty);
+        assert_eq!(search.execute(&session, items()).await.unwrap(), live);
+        assert_eq!(
+            *store.cursors.lock().unwrap(),
+            vec![0, 0, 101, 101, 102, 0, 0]
+        );
+    }
+
+    async fn create_session(store: &dyn SessionStore) -> SessionId {
         let session = SessionId::new();
-        let store = Arc::new(InMemorySessionStore::default());
         store
             .create_session(StoredSession::new(
                 SessionBlueprint {
@@ -251,6 +431,13 @@ mod tests {
             ))
             .await
             .unwrap();
+        session
+    }
+
+    #[tokio::test]
+    async fn search_is_literal_paginated_and_validates_recovery_ids() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let session = create_session(store.as_ref()).await;
         let events = (0..150)
             .map(|i| {
                 PendingEvent::new(
@@ -268,7 +455,7 @@ mod tests {
             .commit(&session, None, Some(0), None, events)
             .await
             .unwrap();
-        let search = StoreSearch(store);
+        let search = StoreSearch::new(store);
         let first = search
             .execute(
                 &session,

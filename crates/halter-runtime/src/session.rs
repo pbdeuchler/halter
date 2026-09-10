@@ -6835,7 +6835,7 @@ mod tests {
             services.tools.register(Arc::new(halter_tools::TaskTool));
             let strategy = CleanWindow::new(
                 FsNotes::new(root.join("notes")).unwrap(),
-                StoreSearch(services.sessions.clone()),
+                StoreSearch::new(services.sessions.clone()),
             );
             for tool in strategy.tools() {
                 services.tools.register(tool);
@@ -6955,7 +6955,7 @@ mod tests {
                     &folded,
                     &stored.state
                 ));
-                let search = StoreSearch(services.sessions.clone());
+                let search = StoreSearch::new(services.sessions.clone());
                 let found = search
                     .execute(
                         session.session_id(),
@@ -7012,12 +7012,48 @@ mod tests {
                         session.session_id(),
                         NotesRequest::ReadFile {
                             path: "checkpoint".to_owned(),
+                            start_byte: None,
                             range: Default::default(),
                         },
                     )
                     .await;
                 assert_eq!(saved.is_ok(), matches!(mode, "cooperates" | "notes_only"));
             }
+        }
+
+        #[tokio::test]
+        async fn failed_new_context_does_not_wipe_the_window() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![
+                vec![("new_context", json!({"unexpected": true}))],
+                vec![],
+            ]));
+            let runtime = SessionRuntime::new(clean_services(provider.clone(), temp.path()));
+            let session = new_session(&runtime, temp.path()).await;
+            let events = session
+                .submit_turn(Turn::user("keep this request"))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(events.iter().any(|event| matches!(
+                &event.payload, SessionEventPayload::MessageItem { message: Message::Tool(result) }
+                    if result.error.is_some()
+            )));
+            assert!(!events.iter().any(|event| matches!(
+                event.payload,
+                SessionEventPayload::ContextWindowRolledOver { .. }
+            )));
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    SessionEventPayload::TurnCompleted { .. }
+                ))
+            );
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(latest_user_text(&requests[1].messages), "keep this request");
         }
 
         #[tokio::test]

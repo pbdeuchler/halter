@@ -8,7 +8,7 @@
 
 mod history;
 mod memory;
-pub use history::{HistoryItem, history_items};
+pub use history::{HistoryItem, SessionHistory, history_items};
 #[cfg(feature = "sqlite")]
 mod sqlite;
 

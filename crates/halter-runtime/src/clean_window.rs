@@ -78,7 +78,6 @@ impl<N: NotesBackend + 'static, S: SessionSearchBackend + 'static> CompactionStr
         &self,
         mut ctx: CompactionContext<'_>,
     ) -> anyhow::Result<Option<CompactionEffects>> {
-        let count = ctx.state().messages.len();
         if !matches!(
             ctx.trigger(),
             CompactionTrigger::Rollover { requested: true }
@@ -131,6 +130,7 @@ impl<N: NotesBackend + 'static, S: SessionSearchBackend + 'static> CompactionStr
                 }
             }
         }
+        let count = ctx.state().messages.len();
         Ok(Some(CompactionEffects {
             messages: vec![Message::User(UserMessage::text(CLEAN_WINDOW_BOOTSTRAP))],
             compacted_context: Default::default(),
@@ -176,7 +176,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let strategy = CleanWindow::new(
             FsNotes::new(root.path()).unwrap(),
-            StoreSearch(Arc::new(halter_session::InMemorySessionStore::default())),
+            StoreSearch::new(Arc::new(halter_session::InMemorySessionStore::default())),
         );
         let session = halter_protocol::SessionId::new();
         let mut delivered = std::collections::BTreeSet::new();
