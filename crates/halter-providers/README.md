@@ -99,9 +99,19 @@ That is the core abstraction boundary.
 
 The canonical reasoning levels are `none`, `minimal`, `low`, `medium`,
 `high`, `xhigh`, and `max`. OpenAI-compatible request bodies preserve the
-configured value. Anthropic disables thinking for `none`, maps `minimal` to
-`low`, preserves `max` for adaptive-thinking models, and caps `max` at the
-legacy 8,192-token budget for older models.
+configured value. Anthropic uses adaptive thinking for every model when reasoning
+is requested. It disables thinking for `none`, maps `minimal` to `low`, and
+preserves `max`. It sends `xhigh` for Opus 4.7 and maps it to `high` for other models.
+
+Token-budget thinking is deprecated. To use it, set
+`DEPRECATED_ANTHROPIC_THINKING_BUDGET=1` before constructing the provider.
+The flag also accepts `true`, `yes`, and `on`, ignoring case and surrounding
+whitespace. Unset, empty, and all other values select adaptive thinking.
+This opt-in applies to every Anthropic model and emits a deprecation warning.
+Legacy budgets remain capped at 8,192 tokens and below `max_output_tokens`;
+thinking is omitted when that limit is unset or at most 1,024. Adaptive thinking
+does not require an explicit token budget. Models or endpoints that require
+the older API must use the flag; Halter does not automatically fall back.
 
 ---
 
