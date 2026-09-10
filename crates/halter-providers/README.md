@@ -101,7 +101,9 @@ The canonical reasoning levels are `none`, `minimal`, `low`, `medium`,
 `high`, `xhigh`, and `max`. OpenAI-compatible request bodies preserve the
 configured value. Anthropic uses adaptive thinking for every model when reasoning
 is requested. It disables thinking for `none`, maps `minimal` to `low`, and
-preserves `max`. It sends `xhigh` for Opus 4.7 and maps it to `high` for other models.
+transmits every other level verbatim — the effort ladder is model-independent,
+matching adaptive thinking's own contract. Callers are responsible for
+requesting only levels their model supports.
 
 Token-budget thinking is deprecated. To use it, set
 `DEPRECATED_ANTHROPIC_THINKING_BUDGET=1` before constructing the provider.
