@@ -55,6 +55,25 @@ pub struct CompactionEffects {
 }
 
 impl CompactionEffects {
+    pub(crate) fn apply_for_policy(
+        self,
+        state: &mut SessionState,
+        policy: crate::WindowPolicy,
+    ) -> (CompactionResult, SessionEventPayload) {
+        if policy == crate::WindowPolicy::Compact {
+            return self.apply(state);
+        }
+        let payload = SessionEventPayload::ContextWindowRolledOver {
+            summary: self.result.summary.clone(),
+            effects: Box::new(CompactionEventEffects {
+                messages: self.messages,
+                compacted_prefix: self.compacted_context.into_items(),
+                usage: self.usage,
+            }),
+        };
+        halter_protocol::fold::apply_event(state, &payload);
+        (self.result, payload)
+    }
     /// Apply the rewrite to session state and return the result together
     /// with the `ContextCompacted` payload that records it.
     ///

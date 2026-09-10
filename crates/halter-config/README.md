@@ -403,7 +403,8 @@ caps it, and which strategy does the rewrite. Both thresholds are optional.
 [context]
 compaction_threshold = 180000    # default: models.default.max_input_tokens - 20000
 max_tokens = 200000              # default: models.default.max_input_tokens
-compaction = "model_summary"     # default; or "provider_default"
+compaction = "model_summary"     # default; or "provider_default", "clean_window"
+# notes_root = "~/.local/share/halter/notes" # optional CleanWindow storage
 ```
 
 Derivation, applied by `HarnessConfig::resolved_context` (`ContextConfig::resolve`):
@@ -424,6 +425,23 @@ Derivation, applied by `HarnessConfig::resolved_context` (`ContextConfig::resolv
 - `provider_default`: the provider's native compaction rewrites the context.
   The default model's provider must support it; `HalterBuilder::build` fails
   otherwise, so a misconfiguration never waits for the first compaction.
+- `clean_window`: the model saves its own continuity in `notes` and `task`,
+  then recovers with `session_search`. Reminders fire once per window at
+  50% and 75% of the threshold. Above 90%, the runtime requests a checkpoint
+  and wipes the conversation even if the model ignores it. `new_context`
+  requests an earlier wipe. The turn continues from a recovery prompt.
+
+`notes_root` is fixed when the harness is built; changing a session's working
+directory does not move its notes. With an explicit `sessions.sqlite_path`,
+the default is a `notes` directory beside that file. Otherwise it is
+`<system temporary directory>/halter/notes`. Set an explicit durable root for
+sessions that must survive temporary-directory cleanup, and reuse it on
+resume. Notes writes do not require adding this root to `allowed_write_roots`.
+
+CleanWindow reserves `notes`, `session_search`, and `new_context`, including
+when built-ins are disabled. Override storage and descriptions through
+`NotesBackend` and `SessionSearchBackend`; replacing those names with
+`with_tool` is rejected. See the [runtime API](../halter-runtime/README.md#cleanwindow).
 
 Validation rules, checked on the resolved values (`HarnessConfig::validate`
 runs them whenever the threshold is derivable):

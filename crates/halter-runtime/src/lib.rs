@@ -6,7 +6,13 @@
 //! assembly and tests.
 // pattern: Functional Core
 
+mod clean_window;
 mod compaction;
+mod session_search;
+pub use clean_window::{
+    CLEAN_WINDOW_BOOTSTRAP, CLEAN_WINDOW_PROMPT, CleanWindow, ROLLOVER_REMINDER,
+};
+pub use session_search::{SessionSearchBackend, SessionSearchRequest, StoreSearch};
 mod compaction_strategy;
 mod context;
 mod event_bus;
@@ -27,7 +33,7 @@ mod turn_registry;
 pub use compaction::{ContextCapExceeded, ContextSettings};
 pub use compaction_strategy::{
     CompactionBoundary, CompactionContext, CompactionNotification, CompactionStrategy,
-    CompactionTrigger, compaction_instructions,
+    CompactionTrigger, WindowPolicy, compaction_instructions,
 };
 pub use context::{
     CompactionEffects, ContextManager, DefaultContextManager, prompt_segments,

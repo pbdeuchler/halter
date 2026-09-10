@@ -541,7 +541,9 @@ compaction_threshold = 200_000
 # max_tokens = 260_000
 # "model_summary" (default): the model writes a context checkpoint and the next
 # window starts from it. "provider_default": the provider's native compaction.
+# "clean_window": recover through notes, task, and session_search after a wipe.
 compaction = "model_summary"
+# notes_root = "~/.local/share/halter/notes" # optional, for clean_window
 
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]
@@ -758,6 +760,7 @@ fn build_config() -> anyhow::Result<HarnessConfig> {
             compaction_threshold: Some(200_000),
             max_tokens: None,
             compaction: CompactionStrategyKind::ModelSummary,
+            notes_root: None,
         },
         tools: ToolsConfig {
             enabled: vec![

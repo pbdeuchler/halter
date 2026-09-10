@@ -5,6 +5,7 @@
 // pattern: Functional Core
 
 mod builtin;
+mod notes;
 mod policy;
 mod runtime;
 mod session_store;
@@ -24,6 +25,10 @@ pub use builtin::fs_lock::PathLockMap;
 pub use builtin::{
     EditTool, GlobTool, GrepTool, InMemoryTaskStore, ProcessTool, ReadTool, ShellTool, Task,
     TaskList, TaskStatus, TaskStore, TaskSummary, TaskTool, WriteTool, register_builtin_tools,
+};
+pub use notes::{
+    FsNotes, LineRange, MAX_NOTE_BYTES, NotesBackend, NotesRequest, NotesTool,
+    RECOVERY_RESPONSE_BYTES, RECOVERY_RESULT_LIMIT, recovery_lines, recovery_preview,
 };
 pub use policy::{
     CanonicalPath, DefaultToolPolicy, LoopbackAllow, Pid, PolicyError, PolicySettings, ShellMode,

@@ -70,10 +70,12 @@ pub mod compaction {
     pub use halter_config::CompactionStrategyKind;
     pub use halter_protocol::TokenLedger;
     pub use halter_runtime::{
-        CompactionBoundary, CompactionContext, CompactionEffects, CompactionNotification,
-        CompactionStrategy, CompactionTrigger, ContextCapExceeded, ContextSettings, ModelSummary,
-        ProviderDefault, compaction_instructions,
+        CleanWindow, CompactionBoundary, CompactionContext, CompactionEffects,
+        CompactionNotification, CompactionStrategy, CompactionTrigger, ContextCapExceeded,
+        ContextSettings, ModelSummary, ProviderDefault, SessionSearchBackend, SessionSearchRequest,
+        StoreSearch, WindowPolicy, compaction_instructions,
     };
+    pub use halter_tools::{FsNotes, LineRange, NotesBackend, NotesRequest};
 }
 
 /// Built-in default prompts and helpers for installing them.

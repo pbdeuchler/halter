@@ -1110,6 +1110,7 @@ fn default_factory_config() -> HarnessConfig {
             compaction_threshold: Some(DEFAULT_SESSION_COMPACTION_THRESHOLD),
             max_tokens: None,
             compaction: CompactionStrategyKind::default(),
+            notes_root: None,
         },
         tools: ToolsConfig {
             enabled: factory_example_tools()

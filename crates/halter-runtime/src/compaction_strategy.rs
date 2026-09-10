@@ -22,6 +22,8 @@ use crate::session::SessionHandle;
 /// Why a compaction pass is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionTrigger<'a> {
+    /// Runtime-owned CleanWindow rollover, voluntary or forced by the ledger.
+    Rollover { requested: bool },
     /// The token ledger reached `context.compaction_threshold`. A failure
     /// degrades the turn to an uncompacted context with a warning event.
     Automatic,
@@ -39,7 +41,7 @@ impl<'a> CompactionTrigger<'a> {
     #[must_use]
     pub fn custom_instructions(self) -> Option<&'a str> {
         match self {
-            Self::Automatic => None,
+            Self::Automatic | Self::Rollover { .. } => None,
             Self::Manual {
                 custom_instructions,
             } => custom_instructions,
@@ -272,6 +274,11 @@ impl<'a> CompactionContext<'a> {
             .push_event(self.events, SessionEventPayload::MessageItem { message });
     }
 
+    pub fn warn(&mut self, message: String) {
+        self.session
+            .push_event(self.events, SessionEventPayload::Warning { message });
+    }
+
     /// Run one inference over the current transcript with the session's
     /// static prefix and tools, exactly as a turn would build it, so the
     /// request shares the turn's prompt cache. The reply is recorded in the
@@ -297,6 +304,10 @@ impl<'a> CompactionContext<'a> {
                 SessionEventPayload::ContextProjectionUpdated { request_tokens },
             );
         }
+        self.session
+            .services()
+            .context
+            .check_cap(self.state.token_ledger.effective_tokens())?;
         let (plan, prompt) = self
             .session
             .plan_and_assemble(self.blueprint, &self.snapshot, self.state, &self.observed)
@@ -368,7 +379,9 @@ impl<'a> CompactionContext<'a> {
 /// session's [`TokenLedger`](halter_protocol::TokenLedger); at the next
 /// consistent boundary — no assistant tool call still awaiting its result —
 /// a ledger at or past `context.compaction_threshold` invokes
-/// [`compact`](Self::compact). A strategy cannot move or veto that trigger;
+/// [`compact`](Self::compact). `WindowPolicy::CleanWindow` selects the runtime's
+/// alternative rule: rollover strictly above 90%, or after `new_context`.
+/// A strategy cannot move or veto its policy's trigger;
 /// [`context_boundary`](Self::context_boundary) only lets it speak to the
 /// model as the window fills. **Server-side or provider-automatic
 /// compaction is never used.** A strategy must not enable a provider's own
@@ -380,9 +393,14 @@ impl<'a> CompactionContext<'a> {
 /// configuration rather than per-session state; per-session facts and
 /// actions go through [`CompactionContext`].
 pub trait CompactionStrategy: Send + Sync {
+    /// Select a runtime-owned trigger policy; strategies do not set thresholds.
+    fn window_policy(&self) -> WindowPolicy {
+        WindowPolicy::Compact
+    }
     /// Tools the strategy needs on every session. `HalterBuilder::build`
     /// registers them after the built-ins and before `with_tool` entries, so
-    /// an explicitly supplied tool of the same name wins.
+    /// an explicitly supplied tool of the same name wins. CleanWindow's
+    /// recovery tools are reserved; override its typed backends instead.
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         Vec::new()
     }
@@ -415,6 +433,13 @@ pub trait CompactionStrategy: Send + Sync {
         &self,
         ctx: CompactionContext<'_>,
     ) -> anyhow::Result<Option<CompactionEffects>>;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowPolicy {
+    #[default]
+    Compact,
+    CleanWindow,
 }
 
 #[cfg(test)]

@@ -59,3 +59,4 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
