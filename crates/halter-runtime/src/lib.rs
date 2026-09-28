@@ -9,10 +9,12 @@
 mod clean_window;
 mod compaction;
 mod session_search;
+mod skills;
 pub use clean_window::{
     CLEAN_WINDOW_BOOTSTRAP, CLEAN_WINDOW_PROMPT, CleanWindow, ROLLOVER_REMINDER,
 };
 pub use session_search::{SessionSearchBackend, SessionSearchRequest, StoreSearch};
+pub use skills::{SKILL_TOOL_NAME, skill_index_segment};
 mod compaction_strategy;
 mod context;
 mod event_bus;
@@ -53,8 +55,7 @@ pub use hooks_runtime::{
 pub use prompt::{
     DefaultPromptAssembler, PromptAssembler, appended_system_prompt_segment,
     coding_agent_prompt_segment, default_coding_agent_prompt, default_compaction_prompt,
-    default_system_prompt, default_system_prompt_segment, skill_prompt_segment,
-    system_prompt_segment,
+    default_system_prompt, default_system_prompt_segment, system_prompt_segment,
 };
 pub use session::{
     HalterSession, ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit,

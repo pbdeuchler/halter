@@ -249,10 +249,11 @@ impl<'a> CompactionContext<'a> {
         crate::context::prompt_segments(self.blueprint, self.state, &self.snapshot)
     }
 
-    /// Specs of every tool registered on the runtime.
+    /// Specs of every tool the turn offers: the registered tools, plus
+    /// `skill` when the snapshot has skills.
     #[must_use]
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
-        self.session.services().tools.specs()
+        crate::skills::tool_specs(self.session.services().tools.specs(), &self.snapshot)
     }
 
     /// Append a message to the transcript and record it in the event log.

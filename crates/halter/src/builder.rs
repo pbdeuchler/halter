@@ -27,7 +27,8 @@ use halter_providers::{
 use halter_runtime::{
     CleanWindow, CompactionStrategy, ContextSettings, DefaultContextManager,
     DefaultPromptAssembler, EventBus, HalterSession, ModelSummary, ProviderDefault, ResourceHandle,
-    RuntimeServices, SessionInit, SessionRuntime, StoreSearch, TraceRecorder, WindowPolicy,
+    RuntimeServices, SKILL_TOOL_NAME, SessionInit, SessionRuntime, StoreSearch, TraceRecorder,
+    WindowPolicy,
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
@@ -286,6 +287,10 @@ impl HalterBuilder {
             }
         }
         for tool in compaction.tools().into_iter().chain(custom_tools) {
+            anyhow::ensure!(
+                tool.spec().name.0 != SKILL_TOOL_NAME,
+                "failed to build halter runtime: tool name '{SKILL_TOOL_NAME}' is reserved for skill loading"
+            );
             tools.register(tool);
         }
 
@@ -1957,23 +1962,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_window_rejects_replacement_recovery_tools() {
-        struct NamedTool(&'static str);
-        #[async_trait::async_trait]
-        impl Tool for NamedTool {
-            fn spec(&self) -> halter_protocol::ToolSpec {
-                let mut spec = halter_tools::TaskTool.spec();
-                spec.name = self.0.into();
-                spec
-            }
-            async fn execute(
-                &self,
-                _: halter_tools::ToolContext,
-                _: serde_json::Value,
-            ) -> anyhow::Result<halter_protocol::ToolResult> {
-                unreachable!("replacement recovery tool must be rejected at build time")
+    async fn builder_reserves_skill_tool_name() {
+        for (name, rejected) in [(SKILL_TOOL_NAME, true), ("my_tool", false)] {
+            let result = HalterBuilder::default()
+                .with_config(openai_config(Some("test-key")))
+                .with_resource_snapshot(ResourceSnapshot::empty())
+                .with_tool(Arc::new(NamedTool(name)))
+                .build()
+                .await;
+
+            match (result, rejected) {
+                (Err(error), true) => assert!(
+                    error.to_string().contains("reserved for skill loading"),
+                    "{error:#}"
+                ),
+                (Ok(_), false) => {}
+                (result, _) => panic!("{name}: unexpected {:?}", result.err()),
             }
         }
+    }
+
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for NamedTool {
+        fn spec(&self) -> halter_protocol::ToolSpec {
+            let mut spec = halter_tools::TaskTool.spec();
+            spec.name = self.0.into();
+            spec
+        }
+        async fn execute(
+            &self,
+            _: halter_tools::ToolContext,
+            _: serde_json::Value,
+        ) -> anyhow::Result<halter_protocol::ToolResult> {
+            unreachable!("builder tests never execute tools")
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_window_rejects_replacement_recovery_tools() {
         let temp = tempfile::tempdir().unwrap();
         for name in ["notes", "session_search", "new_context"] {
             let mut config = openai_config(Some("test-key"));

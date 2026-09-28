@@ -8,27 +8,10 @@ use halter_protocol::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::prompt::skill_prompt_segment;
-
-/// Build one prompt segment per skill loaded into the resource snapshot,
-/// in skill-name order so the resulting prefix is stable across rebuilds.
-/// Snapshot order is already deterministic (`IndexMap`), but we still sort
-/// by name to be defensive against future loader changes.
-fn skill_prompt_segments(snapshot: &ResourceSnapshot) -> Vec<PromptSegment> {
-    let mut entries: Vec<(&str, &str)> = snapshot
-        .skills
-        .values()
-        .map(|skill| (skill.name.as_str(), skill.body.as_str()))
-        .collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-    entries
-        .into_iter()
-        .map(|(name, body)| skill_prompt_segment(name, body))
-        .collect()
-}
+use crate::skills::skill_index;
 
 /// Prompt segments the next request carries: the session's system-prompt
-/// seed, loaded skills, and hook-appended context, in that order.
+/// seed, the skill index, and hook-appended context, in that order.
 #[must_use]
 pub fn prompt_segments(
     blueprint: &SessionBlueprint,
@@ -36,7 +19,7 @@ pub fn prompt_segments(
     snapshot: &ResourceSnapshot,
 ) -> Vec<PromptSegment> {
     let mut segments = blueprint.system_prompt_seed.clone();
-    segments.extend(skill_prompt_segments(snapshot));
+    segments.extend(skill_index(snapshot));
     segments.extend(state.appended_prompt_segments.clone());
     segments
 }
