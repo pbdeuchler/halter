@@ -63,7 +63,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 17 | `file_view_cache` is dead state. | 70% | fixed |
 | 18 | The trace recorder is not reopened on resume. | 70% | fixed |
 | 19 | sqlite runs `synchronous=NORMAL`, so the last commits can be lost on power failure. | 60% | fixed |
-| 20 | The legacy token-ledger migration doesn't match the fold. | 60% | open |
+| 20 | The legacy token-ledger migration doesn't match the fold. | 60% | wontfix (transient; converges at the next provider report) |
 | 21 | During a live parent turn, subagent hooks read `fired_hook_ids` from the parent's last checkpoint, not the turn's in-memory set. A `once` SubagentStart hook can fire twice across two spawns in one turn. State converges (the ids are unioned on commit), but the hook runs twice. | 80% | fixed |
 
 ## Target architecture
@@ -211,3 +211,10 @@ Entries are oldest first.
   - Cost: one WAL fsync per commit. A commit is one event batch, a few per turn, which is small next to model latency.
   - Test: `writer_connection_is_durable_and_constrained` (journal_mode, synchronous, foreign_keys). It failed on `NORMAL`.
   - Residual: on macOS, `fsync` doesn't flush the drive's write cache; that would need `PRAGMA fullfsync`, at about 10ms or more per commit. I left it off. Read-only pool connections never write, so they don't need the pragma.
+
+- **#20 wontfix.** Confirmed, but it is bounded.
+  - Scope: a checkpoint written by v0.5 or earlier, with `accounting_version` 0.
+  - What happens: at the next `ContextProjectionUpdated`, `prepare_request` re-estimates the ledger from the transcript. A fold of the whole log instead keeps the last provider report as its anchor.
+  - The two differ only until the next assistant reply with usage. `record` then resets `authoritative`, `inferred` and the anchor identically in both, and they agree exactly from there. Both values in between are estimates, and the re-estimate is the documented migration.
+  - An exact fix would have to log the migrated ledger, which in practice means logging a copy of the transcript. That is too much for one request's estimate on pre-v0.6 sessions.
+  - Test: `legacy_ledgers_rejoin_the_fold_at_the_next_provider_report` asserts the divergence after the projection and the user message, and the match after the report. The fold module docs say the same.

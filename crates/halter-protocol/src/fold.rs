@@ -22,7 +22,10 @@
 //!   assistant messages, appended or only recorded.
 //! - `token_ledger` — advanced by every `MessageItem` through
 //!   [`SessionState::append`], rebuilt from `ContextCompacted` effects, and
-//!   put back by `ContextRestored`, exactly as the runtime does.
+//!   put back by `ContextRestored`, exactly as the runtime does. A
+//!   checkpoint from before ledger accounting re-estimates its ledger at the
+//!   next request, so it matches a whole-log fold again only from the next
+//!   provider report on.
 //! - `context_window` — advanced by each state-rewriting compaction.
 //! - `subagents` — upserted by [`SessionEventPayload::SubagentUpdated`],
 //!   ignoring a record whose generation is older than the one held.
@@ -387,6 +390,64 @@ mod tests {
         assert_eq!(state.compacted_prefix, before.compacted_prefix);
         assert_eq!(state.token_ledger, before.token_ledger);
         assert_eq!(state.usage_so_far, usage(10, 5), "billed usage is kept");
+    }
+
+    /// A checkpoint from before ledger accounting (≤ v0.5) re-estimates its
+    /// ledger at the next request, while a fold of the whole log keeps the
+    /// last provider report. The two agree again at the next report.
+    #[test]
+    fn legacy_ledgers_rejoin_the_fold_at_the_next_provider_report() {
+        let history = [
+            SessionEventPayload::MessageItem {
+                message: Message::User(UserMessage::text("before the upgrade")),
+            },
+            SessionEventPayload::MessageItem {
+                message: assistant_message("reply", Some(usage(900, 100))),
+            },
+        ];
+        let mut from_log = SessionState::default();
+        for payload in &history {
+            apply_event(&mut from_log, payload);
+        }
+        let mut from_checkpoint = SessionState {
+            token_ledger: TokenLedger {
+                accounting_version: 0,
+                ..from_log.token_ledger
+            },
+            ..from_log.clone()
+        };
+
+        // (tail event, whether the two states agree after it)
+        for (payload, agree) in [
+            (
+                SessionEventPayload::ContextProjectionUpdated {
+                    request_tokens: 250,
+                },
+                false,
+            ),
+            (
+                SessionEventPayload::MessageItem {
+                    message: Message::User(UserMessage::text("after the upgrade")),
+                },
+                false,
+            ),
+            (
+                SessionEventPayload::MessageItem {
+                    message: assistant_message("reply", Some(usage(1_200, 50))),
+                },
+                true,
+            ),
+        ] {
+            apply_event(&mut from_log, &payload);
+            apply_event(&mut from_checkpoint, &payload);
+            assert_eq!(
+                covered_state_matches(&from_log, &from_checkpoint),
+                agree,
+                "{payload:?}\nlog: {:?}\ncheckpoint: {:?}",
+                from_log.token_ledger,
+                from_checkpoint.token_ledger
+            );
+        }
     }
 
     #[test]
