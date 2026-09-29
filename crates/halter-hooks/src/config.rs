@@ -127,6 +127,9 @@ pub struct HookHandler {
     pub timeout: Duration,
     pub status_message: Option<String>,
     pub if_condition: Option<String>,
+    /// Run at most once per session. Fired handlers are remembered by their
+    /// position (plugin, event, group and index), so reordering or inserting
+    /// hooks can make a `once` hook run again or never.
     pub once: bool,
     pub config: HookHandlerConfig,
 }

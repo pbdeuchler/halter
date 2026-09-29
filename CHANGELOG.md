@@ -10,6 +10,8 @@ once a `1.0.0` line is cut.
 
 ### Added
 
+- `ToolSessionStore::has_process_state`: whether this process holds a shell, pty or browser session for a session.
+- `resume` tells the model when process state is gone: if the session used `shell`, `pty` or `browser` since its last resume and this process holds none of their state, it appends a system message saying the shell directory, environment, pty sessions and browser pages were reset.
 - `halter_session::default_db_path()` (sqlite feature): the path `SqliteSessionStore::open_default()` opens.
 - `RuntimeServices::session_leases`: a per-session write lease. A turn, `compact`, `shutdown` or `resume` holds it for its whole duration, and a second writer on the same session waits instead of racing on the commit head. Custom `RuntimeServices` literals must add `session_leases: Arc::new(SessionLeases::default())`.
 - `SessionState::open_turn`: the turn that has started but not finished. `SessionState` literals must add `open_turn: None` (or use `..Default::default()`).

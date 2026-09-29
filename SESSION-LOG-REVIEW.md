@@ -50,7 +50,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 9 | `SessionEventPayload` has no catch-all variant and the log has no schema version, so an older binary cannot read a newer log (and the reverse fails silently). | 90% | fixed |
 | 10 | Resume rebinds to the current resources and ignores the stored snapshot, while manual compact uses the stored one. Per-turn model overrides are not logged. | 80% | fixed |
 | 11 | Out-of-turn writers (`notify`, `compact`, `shutdown`, `resume`) fail an in-flight turn on the conflict check. | 90% | fixed |
-| 12 | Shell, pty and browser state and stateful Function hooks reset silently on resume. Once-hook ids are positional, so reordering hooks re-fires or suppresses them. | 75% | open |
+| 12 | Shell, pty and browser state and stateful Function hooks reset silently on resume. Once-hook ids are positional, so reordering hooks re-fires or suppresses them. | 75% | fixed (reset notice) / wontfix (positional ids, documented) |
 | 13 | The notes root falls back to the temp dir, so notes don't survive a reboot. | 70% | fixed |
 | 14 | Model-judge panel sessions are orphaned: their usage never reaches the parent, and the injected advisory is not logged. | 75% | fixed |
 
@@ -218,3 +218,16 @@ Entries are oldest first.
   - The two differ only until the next assistant reply with usage. `record` then resets `authoritative`, `inferred` and the anchor identically in both, and they agree exactly from there. Both values in between are estimates, and the re-estimate is the documented migration.
   - An exact fix would have to log the migrated ledger, which in practice means logging a copy of the transcript. That is too much for one request's estimate on pre-v0.6 sessions.
   - Test: `legacy_ledgers_rejoin_the_fold_at_the_next_provider_report` asserts the divergence after the projection and the user message, and the match after the report. The fold module docs say the same.
+
+- **#12 closed** as the user decided: tell the model about lost state, and keep positional once ids with documentation.
+  - Resume notice:
+    - `mark_resumed` folds the log. A `SessionResumed` clears the flag, and a `ToolExecutionStarted` for `shell`, `pty` or `browser` sets it.
+    - If the flag is set and `ToolSessionStore::has_process_state` is false (slots are created on first use, so false means another process held them), resume appends a `System` `MessageItem` through `apply_event`, so the fold stays in parity. The message says the shell directory, env and variables, pty sessions and browser pages were reset.
+    - The notice is not repeated on a second resume with no use in between, and it is skipped in a same-process resume that still holds the state.
+  - Tests:
+    - `resume_tells_the_model_when_process_state_was_lost` (no stateful tool, shell, browser, shell still live; each resumes twice and checks fold parity). It failed before the fix, and a mutation that drops the `SessionResumed` reset fails it.
+    - `process_state_is_held_once_a_stateful_slot_exists`.
+  - Positional once ids: documented on `HookHandler::once`, `Hook::once` and in the runtime README's `resume` section.
+  - Residual:
+    - State inside Function hooks and custom tools is not detected; the README says that is the embedder's job.
+    - A slot that exists but is empty (for example a shell session that has already exited) counts as held, so no notice is sent. That is conservative.

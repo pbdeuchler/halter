@@ -500,6 +500,14 @@ Resumes a previously persisted session.
 
 Use this when you have a durable session store and want continuity across process restarts.
 
+What the log cannot carry is reset. If the session used the `shell`, `pty` or
+`browser` tool since it was last resumed and this process holds none of that
+state, resume appends a system message telling the model its shell directory,
+environment and variables, pty sessions and browser pages are gone. State
+kept inside Function hooks or custom tools is the embedder's to restore.
+`once` hooks are remembered by position, so reorder hooks between runs only
+if re-firing (or skipping) them is acceptable.
+
 ### `list_sessions()`
 
 Returns the session inventory known to the backing store.

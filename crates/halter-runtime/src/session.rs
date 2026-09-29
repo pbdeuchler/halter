@@ -2465,12 +2465,39 @@ impl SessionHandle {
         self.services
             .tool_sessions
             .restore_task_session(&self.session_id, TaskList::from_results(task_results));
-        let events = close_interrupted_turn(&mut stored.state)
+        // Shell, pty and browser state cannot be persisted. Tell the model
+        // it is gone when it was used since the last resume and this process
+        // does not hold it.
+        let used_process_state = log.iter().fold(false, |used, event| match &event.payload {
+            SessionEventPayload::SessionResumed => false,
+            SessionEventPayload::ToolExecutionStarted { call } => {
+                used || PROCESS_STATE_TOOLS.contains(&call.name.0.as_str())
+            }
+            _ => used,
+        });
+        let notice = (used_process_state
+            && !self
+                .services
+                .tool_sessions
+                .has_process_state(&self.session_id))
+        .then(|| SessionEventPayload::MessageItem {
+            message: Message::System(SystemMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                text: PROCESS_STATE_RESET_NOTICE.into(),
+            }),
+        });
+        let mut events = close_interrupted_turn(&mut stored.state);
+        events.extend(close_interrupted_subagents(
+            &mut stored.state,
+            live_subagents,
+        ));
+        if let Some(payload) = notice {
+            halter_protocol::fold::apply_event(&mut stored.state, &payload);
+            events.push(payload);
+        }
+        let events = events
             .into_iter()
-            .chain(close_interrupted_subagents(
-                &mut stored.state,
-                live_subagents,
-            ))
             .chain([SessionEventPayload::SessionResumed])
             .map(|payload| self.make_event(payload))
             .collect();
@@ -2950,6 +2977,13 @@ fn tool_result_kind(result: &ToolResult) -> &'static str {
         ToolResult::Json { .. } => "json",
     }
 }
+
+/// Built-in tools whose state lives in the process and is lost on restart.
+const PROCESS_STATE_TOOLS: [&str; 3] = ["shell", "pty", "browser"];
+
+const PROCESS_STATE_RESET_NOTICE: &str = "This session was resumed in a new process, so its \
+    process state is gone: the shell's working directory, environment and variables, open pty \
+    sessions and browser pages were reset. Re-establish any of them you still need.";
 
 /// Close the turn a stopped process left open, returning the `TurnFailed`
 /// that records it. Callers must hold the session's write lease, so no turn
@@ -8417,6 +8451,74 @@ mod tests {
             }),
             "trace should include committed subagent delta events even when forwarding is off:\n{contents}"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_tells_the_model_when_process_state_was_lost() {
+        let is_notice = |message: &Message| matches!(message, Message::System(system) if system.text.contains("process state"));
+        // (case, tool the log shows, whether this process still holds its
+        // state, notices after two resumes)
+        for (case, tool, live, notices) in [
+            ("no stateful tool", "read", false, 0),
+            ("shell, new process", "shell", false, 1),
+            ("browser, new process", "browser", false, 1),
+            ("shell still live", "shell", true, 0),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            let id = session.session_id().clone();
+            let stored = services.sessions.load_session(&id).await.unwrap().unwrap();
+            services
+                .sessions
+                .commit(
+                    &id,
+                    None,
+                    Some(stored.head_sequence),
+                    None,
+                    vec![
+                        session.make_event(SessionEventPayload::ToolExecutionStarted {
+                            call: ToolCall {
+                                id: ToolCallId::from("call-1"),
+                                name: ToolName::from(tool),
+                                arguments: serde_json::json!({}),
+                            },
+                        }),
+                    ],
+                )
+                .await
+                .expect("seed tool call");
+            if live {
+                let _ = services.tool_sessions.shell_session(&id);
+            }
+
+            // The second resume adds nothing: the model was already told.
+            for _ in 0..2 {
+                runtime.resume(&id).await.expect("resume").expect("found");
+            }
+
+            let stored = services.sessions.load_session(&id).await.unwrap().unwrap();
+            let folded = halter_protocol::fold::fold_events(
+                SessionState::default(),
+                &session.replay().await.expect("replay"),
+            );
+            assert_eq!(
+                stored
+                    .state
+                    .messages
+                    .iter()
+                    .filter(|m| is_notice(m))
+                    .count(),
+                notices,
+                "{case}: {:?}",
+                stored.state.messages
+            );
+            assert!(
+                halter_protocol::fold::covered_state_matches(&folded, &stored.state),
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]

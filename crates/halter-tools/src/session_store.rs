@@ -50,6 +50,19 @@ impl ToolSessionStore {
             .clone()
     }
 
+    /// Whether this process holds a shell, pty or browser session for
+    /// `session_id`. Slots are created on first use, so `false` means that
+    /// state, if the session ever had it, died with an earlier process.
+    #[must_use]
+    pub fn has_process_state(&self, session_id: &SessionId) -> bool {
+        let held = self.shell_sessions.contains_key(&session_id.0);
+        #[cfg(feature = "pty")]
+        let held = held || self.pty_sessions.contains_key(&session_id.0);
+        #[cfg(feature = "browser-tools")]
+        let held = held || self.browser_sessions.contains_key(&session_id.0);
+        held
+    }
+
     /// Install `list` as this session's task list unless the process already
     /// holds one, which is newer than anything rebuilt from the log.
     pub fn restore_task_session(&self, session_id: &SessionId, list: TaskList) {
@@ -79,5 +92,39 @@ impl ToolSessionStore {
             .entry(session_id.0.clone())
             .or_insert_with(|| Arc::new(TokioMutex::new(None)))
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_state_is_held_once_a_stateful_slot_exists() {
+        let session = SessionId::from("held");
+        // (slot first used, whether that counts as process state)
+        #[allow(unused_mut)]
+        let mut cases = vec![("none", false), ("task", false), ("shell", true)];
+        #[cfg(feature = "pty")]
+        cases.push(("pty", true));
+        #[cfg(feature = "browser-tools")]
+        cases.push(("browser", true));
+        for (slot, held) in cases {
+            let store = ToolSessionStore::default();
+            match slot {
+                "task" => drop(store.task_session(&session)),
+                "shell" => drop(store.shell_session(&session)),
+                #[cfg(feature = "pty")]
+                "pty" => drop(store.pty_session(&session)),
+                #[cfg(feature = "browser-tools")]
+                "browser" => drop(store.browser_session(&session)),
+                _ => {}
+            }
+            assert_eq!(store.has_process_state(&session), held, "{slot}");
+            assert!(
+                !store.has_process_state(&SessionId::from("other")),
+                "{slot}: other sessions hold nothing"
+            );
+        }
     }
 }
