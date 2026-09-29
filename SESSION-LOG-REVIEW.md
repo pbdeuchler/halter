@@ -46,7 +46,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | # | Finding | Confidence | Status |
 |---|---------|-----------:|--------|
 | 7 | `MessageItem` means both "append to transcript" (fold) and "logged only" (`CompactionContext::record`/`infer`). A custom strategy that uses `record` breaks fold parity. | 90% | fixed |
-| 8 | sqlite `load_session` and `replay_after` are separate reads, so a concurrent commit in between produces a spurious `exceeds advertised head` error. | 80% | open |
+| 8 | sqlite `load_session` and `replay_after` are separate reads, so a concurrent commit in between produces a spurious `exceeds advertised head` error. | 80% | fixed |
 | 9 | `SessionEventPayload` has no catch-all variant and the log has no schema version, so an older binary cannot read a newer log (and the reverse fails silently). | 90% | open |
 | 10 | Resume rebinds to the current resources and ignores the stored snapshot, while manual compact uses the stored one. Per-turn model overrides are not logged. | 80% | open |
 | 11 | Out-of-turn writers (`notify`, `compact`, `shutdown`, `resume`) fail an in-flight turn on the conflict check. | 90% | fixed |
@@ -144,3 +144,7 @@ Entries are oldest first.
     - `recorded_messages_count_usage_without_entering_the_transcript` (fold, table);
     - `indexes_appended_and_recorded_messages_only` (history, table).
   - Residual: a strategy that `append`s an inferred reply (instead of `append_unlogged`) logs it twice and double-counts its usage in the fold. This is documented on `append_unlogged`, not enforced. It adds to #9: a pre-change binary cannot read logs that contain the new variant.
+
+- **#8 fixed.** It was not sqlite-specific. `hydrate_stored_session` (runtime) reads the tail with a second `replay_after` call after `load_session`, and any backend can commit in between. The tail is now cut at the loaded `head_sequence` (`take_while`). The events after it belong to a later state, and the caller's own commit conflicts on them through `expected_head_sequence`.
+  - The explicit "exceeds advertised head" check is gone. An overlong tail from a malformed backend still fails the final "tail ended at sequence N, expected head" check, and the validation case now asserts that.
+  - Test: `hydrate_folds_event_log_tail_onto_checkpoint` now also commits between load and hydrate, and expects hydration as of the loaded head. It failed before the fix with the reported error.

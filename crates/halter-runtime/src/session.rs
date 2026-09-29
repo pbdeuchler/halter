@@ -3148,9 +3148,14 @@ pub(crate) async fn hydrate_stored_session(
     if stored.head_sequence == stored.state_sequence {
         return Ok(());
     }
+    // Events past the loaded head were committed after the load; the
+    // writer's own commit conflicts on them.
     let tail = store
         .replay_after(&stored.blueprint.session_id, stored.state_sequence)
-        .await?;
+        .await?
+        .into_iter()
+        .take_while(|event| event.sequence() <= stored.head_sequence)
+        .collect::<Vec<_>>();
     validate_replay_tail(stored, &tail)?;
     debug!(
         session_id = %stored.blueprint.session_id,
@@ -3194,14 +3199,6 @@ fn validate_replay_tail(stored: &StoredSession, tail: &[SessionEvent]) -> anyhow
                 session_id.0,
                 expected_sequence,
                 event.sequence()
-            );
-        }
-        if event.sequence() > stored.head_sequence {
-            anyhow::bail!(
-                "failed to hydrate session '{}': replay sequence {} exceeds advertised head {}",
-                session_id.0,
-                event.sequence(),
-                stored.head_sequence
             );
         }
         last_sequence = event.sequence();
@@ -4197,6 +4194,35 @@ mod tests {
             .await
             .expect("hydrate again");
         assert_eq!(stored.state, before);
+
+        // A commit landing between the load and the tail read is not part of
+        // what was loaded; the writer's own commit will conflict on it.
+        let mut stale = store
+            .load_session(&session_id)
+            .await
+            .expect("load")
+            .expect("exists");
+        store
+            .commit(
+                &session_id,
+                None,
+                Some(1),
+                None,
+                vec![PendingEvent::new(
+                    session_id.clone(),
+                    Delivery::Lossless,
+                    SessionEventPayload::MessageItem {
+                        message: Message::User(UserMessage::text("concurrent")),
+                    },
+                )],
+            )
+            .await
+            .expect("concurrent commit");
+        super::hydrate_stored_session(&store, &mut stale)
+            .await
+            .expect("hydrate as of the loaded head");
+        assert_eq!(stale.state.messages.len(), 1);
+        assert_eq!(stale.state_sequence, 1);
     }
 
     #[test]
@@ -4280,7 +4306,7 @@ mod tests {
                 state_sequence: 1,
                 head_sequence: 2,
                 tail: vec![event("validated-session", 2), event("validated-session", 3)],
-                expected_error: Some("exceeds advertised head 2"),
+                expected_error: Some("ended at sequence 3, expected head 2"),
             },
             Case {
                 name: "foreign session",

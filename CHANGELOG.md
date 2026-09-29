@@ -27,6 +27,7 @@ once a `1.0.0` line is cut.
 - A `fork_context` subagent no longer starts from a transcript that ends in the parent's unanswered `spawn_agent` call, which strict providers reject. The inherited in-flight calls get a result saying the parent handles them.
 - The `task` todo list survives `resume`. It is rebuilt from the session log. Previously a resumed session in a new process started with an empty list, although compaction and clean-window rollover promise that todos persist.
 - Replaying the log of a compaction pass that talked to the model and then gave up no longer adds the pass's messages to the transcript. `MessageItem` used to mean both "append" and "only logged", so the fold disagreed with the checkpoint. It also means a compaction summary is no longer taken as a subagent's output or as the CLI's final result.
+- Loading a session no longer fails with `replay sequence N exceeds advertised head` when another commit lands between reading the checkpoint and reading the log tail. Hydration stops at the head it loaded.
 - A resumed parent keeps its subagents ([#210](https://github.com/pbdeuchler/halter/issues/210)). The registry is rebuilt from the parent's log, so `wait_agent`, `send_input` and `close_agent` work in a new process. A child that was running when its process stopped comes back `Cancelled` with an interrupted error, and `send_input` continues it.
 
 ## [0.6.0] - 2026-09-28
