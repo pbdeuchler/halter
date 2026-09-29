@@ -122,10 +122,10 @@ fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<CompiledResou
     );
 
     let mut snapshot = ResourceSnapshot::empty();
+    // Hooks live outside the snapshot, so their revisions join the snapshot's
+    // own serialised form in the content hash below.
     let mut revision_hasher = Sha256::new();
-
     for skill in skills {
-        revision_hasher.update(skill.revision.as_bytes());
         snapshot.skills.insert(
             SkillName::from(skill.name.clone()),
             SkillDef {
@@ -172,13 +172,10 @@ fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<CompiledResou
         .collect::<Vec<_>>();
 
     for plugin in plugins {
-        revision_hasher.update(plugin.manifest.name.as_bytes());
-        revision_hasher.update(plugin.manifest.version.as_bytes());
         for hooks_file in &plugin.hooks {
             revision_hasher.update(hooks_file.revision.as_bytes());
         }
         for agent in &plugin.agents {
-            revision_hasher.update(agent.revision.as_bytes());
             snapshot.agents.insert(
                 AgentName::from(agent.name.clone()),
                 AgentDef {
@@ -196,6 +193,8 @@ fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<CompiledResou
         path: PathBuf::from("generated://resource-compiler"),
         body: "Resources were compiled before runtime instantiation.".to_owned(),
     });
+    revision_hasher
+        .update(serde_json::to_vec(&snapshot).context("failed to serialize resource snapshot")?);
     snapshot.revision = Revision::from(format!("{:x}", revision_hasher.finalize()));
     info!(revision = %snapshot.revision, "compiled resource snapshot");
     Ok(CompiledResources {
@@ -873,5 +872,50 @@ description: says hello
             "agent prompt should contain rendered root path: {}",
             agent_a.prompt
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_revision_tracks_every_serialized_field() {
+        async fn compile(dir: &Path, description: &str) -> ResourceSnapshot {
+            let skill_dir = dir.join("skills/rev");
+            fs::create_dir_all(&skill_dir).expect("create skill dir");
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: rev\ndescription: {description}\n---\n\nSame body.\n"),
+            )
+            .expect("write skill");
+            let mut config = HarnessConfig::default();
+            config.resources.skills.roots = vec![dir.join("skills")];
+            ResourceCompiler::from_config(&config)
+                .compile()
+                .await
+                .expect("compile resources")
+                .snapshot
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = compile(&temp.path().join("a"), "one").await;
+        // (case, other snapshot, revisions should match)
+        let cases = [
+            (
+                "identical inputs",
+                compile(&temp.path().join("a"), "one").await,
+                true,
+            ),
+            (
+                "description only",
+                compile(&temp.path().join("b"), "two").await,
+                false,
+            ),
+            (
+                "skill root only",
+                compile(&temp.path().join("c"), "one").await,
+                false,
+            ),
+        ];
+        for (case, other, same) in cases {
+            assert_eq!(base.revision == other.revision, same, "{case}");
+            assert_eq!(base == other, same, "{case}: revision must imply content");
+        }
     }
 }

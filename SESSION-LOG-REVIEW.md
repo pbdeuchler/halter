@@ -35,7 +35,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | # | Finding | Confidence | Status |
 |---|---------|-----------:|--------|
 | 1 | Subagent Start/Stop hook dispatch commits into the parent log mid-turn, so the parent's next `flush_turn_progress` fails with `event log advanced concurrently` (reproduced: `expected head 4, found 6` for Start, `8, found 10` for Stop). | 99% | open |
-| 2 | The resource snapshot revision hashes only `skill.revision`, plugin name/version, hooks revision and agent revision. v0.6 added `SkillDef.root`, so a skill-bearing snapshot now serialises differently under the same revision. sqlite `store_snapshot` bails with `revision already exists with different data`, so every commit on an upgraded store fails. | 85% | open |
+| 2 | The resource snapshot revision hashes only `skill.revision`, plugin name/version, hooks revision and agent revision. v0.6 added `SkillDef.root`, so a skill-bearing snapshot now serialises differently under the same revision. sqlite `store_snapshot` bails with `revision already exists with different data`, so every commit on an upgraded store fails. | 85% | fixed |
 | 3 | Dangling turns. A failed final commit only calls `live.emit_error` and never writes `TurnFailed`. Shutdown aborts and crashes leave `TurnStarted` open. Resume never reconciles an open turn. | 95% | open |
 | 4 | A crash during tool execution loses the log record of side effects and usage. The assistant tool-call message and tool results commit only after the whole batch. `pending_tool_calls` is inserted and removed with no commit in between, so it is never persisted non-empty. | 90% | open |
 | 5 | The task list (`ToolSessionStore::task_sessions`) lives only in memory, but the compaction strategies promise that todos survive compaction and rollover. Resume loses it. | 95% | open |
@@ -81,3 +81,9 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 ## Log
 
 Entries are newest first.
+
+- **#2 fixed.** `ResourceCompiler` now hashes the serialised snapshot plus the
+  hook file revisions, so any stored field (skill `root`, `description`,
+  manifest fields) changes the revision. Test:
+  `snapshot_revision_tracks_every_serialized_field`. Older stores keep their
+  old rows. New compiles land under new keys, so nothing needs migrating.

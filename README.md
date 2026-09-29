@@ -443,7 +443,7 @@ The manifest must include non-empty string fields `name` and `version`. Optional
 
 Plugin `skills` entries can point at a single skill directory containing `SKILL.md` or at a directory tree that should be searched recursively for skills. Plugin `agents` entries can point at one prompt file or a directory of prompt files; each file becomes an agent named after its file stem. Hooks are loaded from the manifest's `hooks` path, or from `hooks/hooks.json` when the manifest omits `hooks`. Hook parse failures are retained as hook warnings instead of aborting the whole resource compile.
 
-Compiled resources use stable identifiers. Skill ids are based on the canonical skill path, plugin ids are based on plugin name, version, and canonical plugin path, and the final resource snapshot revision is derived from loaded skill revisions, rendered agent prompt revisions, plugin name/version pairs, and hook revisions. Skill bodies and agent prompts are rendered before their revisions are computed, so changing an alias expansion (e.g., loading the same plugin through a different absolute root) produces a different snapshot revision.
+Compiled resources use stable identifiers. Skill ids are based on the canonical skill path, plugin ids are based on plugin name, version, and canonical plugin path, and the final resource snapshot revision is a SHA-256 of the serialised snapshot plus hook file revisions, so any change to a stored field yields a new revision. Session stores key persisted snapshots by that revision. Skill bodies and agent prompts are rendered before hashing, so changing an alias expansion (e.g., loading the same plugin through a different absolute root) produces a different snapshot revision.
 
 #### Bundled agent plugins
 
