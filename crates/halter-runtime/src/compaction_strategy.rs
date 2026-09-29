@@ -256,10 +256,11 @@ impl<'a> CompactionContext<'a> {
         crate::skills::tool_specs(self.session.services().tools.specs(), &self.snapshot)
     }
 
-    /// Append a message to the transcript and record it in the event log.
+    /// Append a message to the transcript and log it.
     pub fn append(&mut self, message: Message) {
         self.state.append(message.clone());
-        self.record(message);
+        self.session
+            .push_event(self.events, SessionEventPayload::MessageItem { message });
     }
 
     /// Append a message to the transcript without recording it. For a reply
@@ -269,10 +270,13 @@ impl<'a> CompactionContext<'a> {
         self.state.append(message);
     }
 
-    /// Record a message in the event log without changing the transcript.
+    /// Record a message in the event log, as `MessageRecorded`, without
+    /// changing the transcript.
     pub fn record(&mut self, message: Message) {
-        self.session
-            .push_event(self.events, SessionEventPayload::MessageItem { message });
+        self.session.push_event(
+            self.events,
+            SessionEventPayload::MessageRecorded { message },
+        );
     }
 
     pub fn warn(&mut self, message: String) {

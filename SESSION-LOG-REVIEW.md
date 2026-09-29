@@ -45,7 +45,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 
 | # | Finding | Confidence | Status |
 |---|---------|-----------:|--------|
-| 7 | `MessageItem` means both "append to transcript" (fold) and "logged only" (`CompactionContext::record`/`infer`). A custom strategy that uses `record` breaks fold parity. | 90% | open |
+| 7 | `MessageItem` means both "append to transcript" (fold) and "logged only" (`CompactionContext::record`/`infer`). A custom strategy that uses `record` breaks fold parity. | 90% | fixed |
 | 8 | sqlite `load_session` and `replay_after` are separate reads, so a concurrent commit in between produces a spurious `exceeds advertised head` error. | 80% | open |
 | 9 | `SessionEventPayload` has no catch-all variant and the log has no schema version, so an older binary cannot read a newer log (and the reverse fails silently). | 90% | open |
 | 10 | Resume rebinds to the current resources and ignores the stored snapshot, while manual compact uses the stored one. Per-turn model overrides are not logged. | 80% | open |
@@ -135,3 +135,12 @@ Entries are oldest first.
     - Recording is best-effort: a failed dispatch logs a warning, and the in-memory registry stays authoritative for the process.
     - Two processes resuming the same parent can both think the other's agents are interrupted, because the lease is process-local.
     - The child session is not reconciled on resume; the child's own open turn is closed when `send_input` starts its next turn (#3).
+
+- **#7 fixed.** Added `SessionEventPayload::MessageRecorded`, a message that is logged but not in the transcript. `CompactionContext::record` and `infer` emit it; `append` keeps `MessageItem`. The fold counts a recorded assistant reply's usage (the runtime does too) and does not append it.
+  - The real divergence was wider than custom strategies. `ModelSummary`'s own `infer` reply was a `MessageItem`. So any pass that inferred and then returned `Ok(None)` or `Err` without touching the transcript left the fold one message ahead: no `ContextRestored` was written, because the live window hadn't changed.
+  - Side fixes: `extract_subagent_output` and the CLI's final-result tracker take the last assistant `MessageItem`. A compaction summary inferred at the end of a turn no longer counts as either. `history.rs` (session search) indexes both variants, so failed compaction exchanges stay searchable.
+  - Tests:
+    - `turn_commits_keep_fold_and_checkpoint_in_agreement_across_compaction` is now a table. It adds a strategy that records, infers and gives up, and it fails when the fold appends recorded messages;
+    - `recorded_messages_count_usage_without_entering_the_transcript` (fold, table);
+    - `indexes_appended_and_recorded_messages_only` (history, table).
+  - Residual: a strategy that `append`s an inferred reply (instead of `append_unlogged`) logs it twice and double-counts its usage in the fold. This is documented on `append_unlogged`, not enforced. It adds to #9: a pre-change binary cannot read logs that contain the new variant.

@@ -982,6 +982,12 @@ pub enum SessionEventPayload {
     MessageItem {
         message: Message,
     },
+    /// A message logged without entering the transcript, such as a
+    /// compaction pass's own exchange with the model. The fold counts an
+    /// assistant reply's usage and nothing else.
+    MessageRecorded {
+        message: Message,
+    },
     /// Updates the non-transcript portion of the context projection. Emitted
     /// when prompt segments or tool declarations change, including the first
     /// request after loading a legacy snapshot.

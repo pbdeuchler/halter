@@ -6039,48 +6039,60 @@ mod tests {
 
     #[tokio::test]
     async fn turn_commits_keep_fold_and_checkpoint_in_agreement_across_compaction() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
-        install_context_settings(&mut services, tiny_context_settings(None));
-        Arc::get_mut(&mut services)
-            .expect("unique services")
-            .compaction = Arc::new(WipingCompaction);
-        let runtime = SessionRuntime::new(services.clone());
-        let session = new_session(&runtime, temp.path()).await;
+        let strategies: [(&str, Arc<dyn crate::CompactionStrategy>); 2] = [
+            ("compacts", Arc::new(WipingCompaction)),
+            (
+                "talks to the model, then gives up",
+                Arc::new(AbandonedCompaction),
+            ),
+        ];
+        for (name, strategy) in strategies {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+            install_context_settings(&mut services, tiny_context_settings(None));
+            Arc::get_mut(&mut services)
+                .expect("unique services")
+                .compaction = strategy;
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
 
-        for prompt in ["x".repeat(150), "y".repeat(150)] {
-            session
-                .submit_turn(Turn::user(prompt))
+            for prompt in ["x".repeat(150), "y".repeat(150)] {
+                session
+                    .submit_turn(Turn::user(prompt))
+                    .await
+                    .expect("submit turn")
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("collect events");
+            }
+
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
                 .await
-                .expect("submit turn")
-                .try_collect::<Vec<_>>()
+                .expect("load")
+                .expect("exists");
+            let replayed = services
+                .sessions
+                .replay(session.session_id())
                 .await
-                .expect("collect events");
+                .expect("replay");
+            assert!(
+                replayed.iter().any(|event| matches!(
+                    event.payload,
+                    SessionEventPayload::ContextCompacted { .. }
+                        | SessionEventPayload::MessageRecorded { .. }
+                )),
+                "{name}: a compaction pass ran"
+            );
+            let folded = halter_protocol::fold::fold_events(SessionState::default(), &replayed);
+            assert!(
+                halter_protocol::fold::covered_state_matches(&folded, &stored.state),
+                "{name}: folded log diverged from checkpoint\nfolded: {folded:?}\ncheckpoint: {:?}",
+                stored.state
+            );
+            assert_eq!(folded.token_ledger, stored.state.token_ledger, "{name}");
         }
-
-        let stored = services
-            .sessions
-            .load_session(session.session_id())
-            .await
-            .expect("load")
-            .expect("exists");
-        let replayed = services
-            .sessions
-            .replay(session.session_id())
-            .await
-            .expect("replay");
-        assert!(
-            replayed
-                .iter()
-                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
-        );
-        let folded = halter_protocol::fold::fold_events(SessionState::default(), &replayed);
-        assert!(
-            halter_protocol::fold::covered_state_matches(&folded, &stored.state),
-            "folded log diverged from checkpoint\nfolded: {folded:?}\ncheckpoint: {:?}",
-            stored.state
-        );
-        assert_eq!(folded.token_ledger, stored.state.token_ledger);
     }
 
     /// Settings under which the fake provider's first reply crosses the
@@ -6156,6 +6168,24 @@ mod tests {
                 },
                 usage: Usage::default(),
             }))
+        }
+    }
+
+    /// Strategy that logs a request, asks the model, and then declines to
+    /// compact, leaving the transcript as it was.
+    struct AbandonedCompaction;
+
+    #[async_trait]
+    impl crate::CompactionStrategy for AbandonedCompaction {
+        async fn compact(
+            &self,
+            mut ctx: crate::CompactionContext<'_>,
+        ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+            ctx.record(Message::User(halter_protocol::UserMessage::text(
+                "summarize",
+            )));
+            ctx.infer().await?;
+            Ok(None)
         }
     }
 
@@ -6722,7 +6752,7 @@ mod tests {
         // reached the transcript...
         assert!(events.iter().any(|event| matches!(
             &event.payload,
-            SessionEventPayload::MessageItem { message: Message::Assistant(assistant) }
+            SessionEventPayload::MessageRecorded { message: Message::Assistant(assistant) }
                 if assistant.parts.iter().any(|part| matches!(
                     part,
                     AssistantPart::ToolCall(call) if call.name.0 == "write"

@@ -14,6 +14,7 @@ once a `1.0.0` line is cut.
 - `SessionState::open_turn`: the turn that has started but not finished. `SessionState` literals must add `open_turn: None` (or use `..Default::default()`).
 - `TaskList::from_results` and `ToolSessionStore::restore_task_session`, which rebuild a session's task list from the `task` tool results in its log.
 - `SessionEventPayload::SubagentUpdated`, `SubagentRecord` and `SessionState::subagents`: the parent's log records each subagent's status and generation. `SessionState` literals must add `subagents: Default::default()` (or use `..Default::default()`).
+- `SessionEventPayload::MessageRecorded`: a message in the log that is not in the transcript. `CompactionContext::record` and `infer` now emit it instead of `MessageItem`. Log readers that want a compaction pass's exchange with the model must match both variants.
 
 ### Fixed
 
@@ -25,6 +26,7 @@ once a `1.0.0` line is cut.
 - Tool calls are checkpointed before each batch runs and again after its results, so a crash mid-tool no longer loses the assistant's tool calls, the turn's usage, or earlier batches' results. When the turn is closed, calls left without a result get an error result saying whether they may have run.
 - A `fork_context` subagent no longer starts from a transcript that ends in the parent's unanswered `spawn_agent` call, which strict providers reject. The inherited in-flight calls get a result saying the parent handles them.
 - The `task` todo list survives `resume`. It is rebuilt from the session log. Previously a resumed session in a new process started with an empty list, although compaction and clean-window rollover promise that todos persist.
+- Replaying the log of a compaction pass that talked to the model and then gave up no longer adds the pass's messages to the transcript. `MessageItem` used to mean both "append" and "only logged", so the fold disagreed with the checkpoint. It also means a compaction summary is no longer taken as a subagent's output or as the CLI's final result.
 - A resumed parent keeps its subagents ([#210](https://github.com/pbdeuchler/halter/issues/210)). The registry is rebuilt from the parent's log, so `wait_agent`, `send_input` and `close_agent` work in a new process. A child that was running when its process stopped comes back `Cancelled` with an interrupted error, and `send_input` continues it.
 
 ## [0.6.0] - 2026-09-28

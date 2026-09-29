@@ -39,7 +39,8 @@ impl SessionHistory {
     pub fn extend(&mut self, events: &[SessionEvent]) {
         for event in events {
             let messages: &[Message] = match &event.payload {
-                SessionEventPayload::MessageItem { message } => std::slice::from_ref(message),
+                SessionEventPayload::MessageItem { message }
+                | SessionEventPayload::MessageRecorded { message } => std::slice::from_ref(message),
                 SessionEventPayload::ContextCompacted {
                     effects: Some(effects),
                     ..
@@ -97,6 +98,38 @@ impl SessionHistory {
                     text,
                 });
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use halter_protocol::{Delivery, PendingEvent, SessionId, UserMessage};
+
+    use super::*;
+
+    #[test]
+    fn indexes_appended_and_recorded_messages_only() {
+        let message = || Message::User(UserMessage::text("summarize"));
+        let cases = [
+            (
+                "appended",
+                SessionEventPayload::MessageItem { message: message() },
+                1,
+            ),
+            (
+                "recorded",
+                SessionEventPayload::MessageRecorded { message: message() },
+                1,
+            ),
+            ("not a message", SessionEventPayload::SessionStarted, 0),
+        ];
+        for (name, payload, indexed) in cases {
+            let event = PendingEvent::new(SessionId::from("session"), Delivery::Lossless, payload)
+                .into_committed(1);
+            let items = history_items(&[event]);
+            assert_eq!(items.len(), indexed, "{name}");
+            assert!(items.iter().all(|item| item.text == "summarize"), "{name}");
         }
     }
 }

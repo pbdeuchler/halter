@@ -72,7 +72,9 @@ impl JsonResultTracker {
 #[must_use]
 pub fn strip_signatures_from_session_event(event: &SessionEvent) -> SessionEvent {
     let mut event = event.clone();
-    if let SessionEventPayload::MessageItem { message } = &mut event.payload {
+    if let SessionEventPayload::MessageItem { message }
+    | SessionEventPayload::MessageRecorded { message } = &mut event.payload
+    {
         strip_signatures_from_message(message);
     }
     event

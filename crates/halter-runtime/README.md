@@ -323,9 +323,10 @@ never used.
 The strategy owns *what happens*. `compact(ctx)` receives a
 `CompactionContext` that reads the session (state, ledger, prompt segments,
 tool specs, the default model and its provider) and can act through the
-runtime: `append` puts a message in the transcript and the event log, `infer`
-runs one inference with the turn's own static prefix (so it shares the prompt
-cache), and `execute_tool_calls` runs tools through hooks and policy. It
+runtime: `append` puts a message in the transcript and the event log
+(`MessageItem`), `record` logs one without touching the transcript
+(`MessageRecorded`), `infer` runs one inference with the turn's own static
+prefix (so it shares the prompt cache) and records its reply, and `execute_tool_calls` runs tools through hooks and policy. It
 returns the replacement window and compacted prefix as `CompactionEffects`,
 which `apply` writes through the same `halter_protocol::fold::apply_event`
 replay uses, so live and replayed sessions agree. Strategies can also

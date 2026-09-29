@@ -12,13 +12,14 @@
 //! The fold reproduces the *domain* fields of [`SessionState`] — the ones
 //! that define conversational context and telemetry:
 //!
-//! - `messages` — appended by [`SessionEventPayload::MessageItem`], replaced
+//! - `messages` — appended by [`SessionEventPayload::MessageItem`] (never by
+//!   [`SessionEventPayload::MessageRecorded`]), replaced
 //!   by [`SessionEventPayload::ContextCompacted`] when it carries
 //!   [`CompactionEventEffects`] and by [`SessionEventPayload::ContextRestored`].
 //! - `compacted_prefix` — replaced by `ContextCompacted` and `ContextRestored`
 //!   effects.
 //! - `usage_so_far` — accumulated (saturating) from the `usage` stamped on
-//!   assistant messages.
+//!   assistant messages, appended or only recorded.
 //! - `token_ledger` — advanced by every `MessageItem` through
 //!   [`SessionState::append`], rebuilt from `ContextCompacted` effects, and
 //!   put back by `ContextRestored`, exactly as the runtime does.
@@ -49,13 +50,16 @@ use crate::{Message, SessionEvent, SessionEventPayload, SessionState};
 /// tool output chunks — are no-ops.
 pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
     match payload {
-        SessionEventPayload::MessageItem { message } => {
+        SessionEventPayload::MessageItem { message }
+        | SessionEventPayload::MessageRecorded { message } => {
             if let Message::Assistant(assistant) = message
                 && let Some(usage) = &assistant.usage
             {
                 state.usage_so_far.saturating_accumulate(usage);
             }
-            state.append(message.clone());
+            if matches!(payload, SessionEventPayload::MessageItem { .. }) {
+                state.append(message.clone());
+            }
         }
         SessionEventPayload::ContextProjectionUpdated { request_tokens } => {
             let compacted_prefix = &state.compacted_prefix;
@@ -213,6 +217,37 @@ mod tests {
                 ..TokenLedger::default()
             }
         );
+    }
+
+    #[test]
+    fn recorded_messages_count_usage_without_entering_the_transcript() {
+        let cases = [
+            (
+                "user",
+                Message::User(UserMessage::text("summarize")),
+                usage(0, 0),
+            ),
+            (
+                "assistant with usage",
+                assistant_message("gist", Some(usage(10, 5))),
+                usage(10, 5),
+            ),
+            (
+                "assistant without usage",
+                assistant_message("gist", None),
+                usage(0, 0),
+            ),
+        ];
+        for (name, message, expected_usage) in cases {
+            let mut state = SessionState::default();
+            apply_event(
+                &mut state,
+                &SessionEventPayload::MessageRecorded { message },
+            );
+            assert!(state.messages.is_empty(), "{name}");
+            assert_eq!(state.token_ledger, TokenLedger::default(), "{name}");
+            assert_eq!(state.usage_so_far, expected_usage, "{name}");
+        }
     }
 
     #[test]

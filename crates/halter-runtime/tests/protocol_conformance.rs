@@ -126,6 +126,9 @@ fn session_event_payload_variants_have_stable_kind() {
         SessionEventPayload::TurnStarted {
             turn_id: TurnId::from("t1"),
         },
+        SessionEventPayload::MessageRecorded {
+            message: Message::User(halter_protocol::UserMessage::text("summarize")),
+        },
         SessionEventPayload::MessageItem {
             message: Message::Assistant(AssistantMessage {
                 id: MessageId::new(),
@@ -220,6 +223,7 @@ fn session_event_payload_variants_have_stable_kind() {
             SessionEventPayload::Warning { .. } => "warning",
             SessionEventPayload::TurnStarted { .. } => "turn_started",
             SessionEventPayload::MessageItem { .. } => "message_item",
+            SessionEventPayload::MessageRecorded { .. } => "message_recorded",
             SessionEventPayload::ContextProjectionUpdated { .. } => "context_projection_updated",
             SessionEventPayload::ContextRestored { .. } => "context_restored",
             SessionEventPayload::DeltaItem { .. } => "delta_item",
