@@ -6,7 +6,7 @@ description: Use when cutting a release of the Halter crates — bumping version
 # Releasing the Halter crates
 
 A release is: pick a version, bump every manifest, write the CHANGELOG entry, land it
-on `master`, tag it, let CI publish, verify, then create the GitHub release.
+on `main`, tag it, let CI publish, verify, then create the GitHub release.
 
 **Pushing a `v*` tag is irreversible.** `.github/workflows/publish.yml` fires on
 `push: tags: ["v*"]` and publishes to crates.io, where versions can be yanked but never
@@ -164,19 +164,19 @@ CRATE_RELEASE_BASE_REF="$LAST" bin/crate-release-candidates | cut -d'|' -f1,2
 That last line is the publish set. Reconcile it against the CHANGELOG's "Published crates" list —
 a mismatch means one of the two is wrong, and it is usually the changelog.
 
-## 6. Land on master and get CI green
+## 6. Land on main and get CI green
 
 Commit as a dedicated release commit (`Bump crate versions for vX.Y.Z`), or fold the bump into
 the feature commit when the release exists to ship that one change — both patterns are in the
-history. Push to `master` and wait for CI:
+history. Push to `main` and wait for CI:
 
 ```bash
-gh run list --branch master --limit 5 \
+gh run list --branch main --limit 5 \
   --json displayTitle,status,conclusion,headSha,workflowName \
   --jq '.[] | "\(.headSha[0:7])  \(.workflowName)  \(.status)/\(.conclusion // "-")  \(.displayTitle)"'
 ```
 
-**Do not tag until CI is green on the exact release commit.** Publishing from a red master
+**Do not tag until CI is green on the exact release commit.** Publishing from a red main
 ships a broken version permanently.
 
 ## 7. Tag — hand this to the user
