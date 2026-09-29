@@ -52,7 +52,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 11 | Out-of-turn writers (`notify`, `compact`, `shutdown`, `resume`) fail an in-flight turn on the conflict check. | 90% | fixed |
 | 12 | Shell, pty and browser state and stateful Function hooks reset silently on resume. Once-hook ids are positional, so reordering hooks re-fires or suppresses them. | 75% | open |
 | 13 | The notes root falls back to the temp dir, so notes don't survive a reboot. | 70% | open |
-| 14 | Model-judge panel sessions are orphaned: their usage never reaches the parent, and the injected advisory is not logged. | 75% | open |
+| 14 | Model-judge panel sessions are orphaned: their usage never reaches the parent, and the injected advisory is not logged. | 75% | fixed |
 
 ### Low
 
@@ -177,3 +177,11 @@ Entries are oldest first.
     - `once_hooks_fire_once_across_out_of_turn_dispatches` (no writer, or queued behind a turn); it failed with 2 runs before the fix;
     - `queued_hook_ids_unions_the_queued_dispatches`.
   - Residual: two out-of-turn dispatches that run at the same time can still both fire a `once` hook, because the check and the mark aren't atomic (e.g. two children finishing at once, each running SubagentStop). `spawn_agent` is `Exclusive`, so spawns in one turn are ordered and fixed.
+
+- **#14 fixed.** Diagnosis narrowed: panel sessions are persisted as child sessions (`parent_session_id` = parent) and keep their own usage, as subagents do. The actual gaps were the synthesis inference and the advisory itself.
+  - `run_panel_synthesis` returns `(text, usage)`, summed over its rounds, with the last `UsageUpdate` of each message counting.
+  - `run_full_turn_deliberation` returns the synthesis as an `AssistantMessage` carrying that usage, plus the guidance `UserMessage`. `run_turn` logs both as `MessageRecorded` through `apply_event`, so the fold's `usage_so_far` counts the synthesis, and adds the usage to `turn_usage`.
+  - Tests:
+    - `full_turn_judge_logs_its_synthesis_and_guidance` (guided or fallback; checks the logged messages are not in the transcript, the usage, and fold/checkpoint parity). It replaces the two earlier judge tests, and a mutation that drops the recording fails it.
+    - `run_panel_synthesis_sums_the_usage_of_every_round`.
+  - Residual: the OneShot judge (provider seam) still drops the usage of its panel and synthesis calls, because a provider stream has only one usage per message. The parent log doesn't name the panel session ids; they are found through their `parent_session_id`.

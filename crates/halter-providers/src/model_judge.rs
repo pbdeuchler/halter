@@ -21,7 +21,7 @@ use halter_protocol::{
     AssistantMessage, AssistantPart, BlockId, Message, MessageId, ModelId, PanelIsolation,
     ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
     ProviderRequest, ReplayMeta, ResolvedModel, StopReason, StreamEvent, ToolCall,
-    ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolResultMessage, ToolSpec,
+    ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolResultMessage, ToolSpec, Usage,
     UserMessage,
 };
 use serde_json::{Value, json};
@@ -145,7 +145,8 @@ impl Provider for ModelJudgeProvider {
         }
 
         match run_panel_synthesis(&self.synthesis, &request, &candidates, &cancel).await {
-            Ok(synthesis) => self.run_default(&request, Some(synthesis), cancel).await,
+            // The provider seam has no place to report the synthesis usage.
+            Ok((synthesis, _usage)) => self.run_default(&request, Some(synthesis), cancel).await,
             Err(error) => {
                 warn!(
                     target: MODEL_JUDGE_TRACE_TARGET,
@@ -287,7 +288,8 @@ impl ModelJudgeProvider {
     }
 }
 
-/// Rank and judge a set of panel responses, returning the synthesis text.
+/// Rank and judge a set of panel responses, returning the synthesis text and
+/// the usage of every synthesis round.
 ///
 /// Shared by both judge forms: the OneShot [`ModelJudgeProvider`] collects each
 /// [`Candidate`] from a single inference, while the runtime's FullTurn judge
@@ -301,8 +303,9 @@ pub async fn run_panel_synthesis(
     base: &ProviderRequest,
     candidates: &[Candidate],
     cancel: &CancellationToken,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Usage)> {
     let mut messages = base.messages.clone();
+    let mut usage = Usage::default();
     messages.push(Message::User(UserMessage::text(synthesis_instructions(
         candidates,
     ))));
@@ -324,6 +327,7 @@ pub async fn run_panel_synthesis(
         let collected = collect_message(events)
             .await
             .map_err(|error| anyhow::anyhow!("model-judge synthesis stream failed: {error}"))?;
+        usage.saturating_accumulate(&collected.usage);
 
         let rank_call = collected
             .tool_calls
@@ -346,7 +350,7 @@ pub async fn run_panel_synthesis(
                 synthesis = %synthesis_text,
                 "model-judge synthesis message"
             );
-            return Ok(synthesis_text.to_owned());
+            return Ok((synthesis_text.to_owned(), usage));
         }
 
         // No synthesis text yet. If the model ranked, acknowledge the tool
@@ -389,6 +393,8 @@ pub async fn run_panel_synthesis(
 struct CollectedMessage {
     text: String,
     tool_calls: Vec<ToolCall>,
+    /// The last usage the provider reported for this message.
+    usage: Usage,
 }
 
 struct PartialToolCall {
@@ -403,6 +409,7 @@ async fn collect_message(
 ) -> Result<CollectedMessage, ProviderError> {
     let mut text = String::new();
     let mut partials: Vec<PartialToolCall> = Vec::new();
+    let mut usage = Usage::default();
 
     while let Some(item) = events.next().await {
         match item? {
@@ -422,6 +429,7 @@ async fn collect_message(
                     partial.arguments.push_str(&delta);
                 }
             }
+            StreamEvent::UsageUpdate { usage: updated } => usage = updated,
             StreamEvent::Error { error } => return Err(error),
             _ => {}
         }
@@ -436,7 +444,11 @@ async fn collect_message(
         })
         .collect();
 
-    Ok(CollectedMessage { text, tool_calls })
+    Ok(CollectedMessage {
+        text,
+        tool_calls,
+        usage,
+    })
 }
 
 fn parse_tool_arguments(raw: &str) -> Value {
@@ -757,6 +769,16 @@ mod tests {
             events.push(Ok(StreamEvent::TextEnd { id: block }));
         }
 
+        // Usage updates are cumulative: the last one is the message's usage.
+        for (input_tokens, output_tokens) in [(1, 1), (10, 2)] {
+            events.push(Ok(StreamEvent::UsageUpdate {
+                usage: Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..Usage::default()
+                },
+            }));
+        }
         events.push(Ok(StreamEvent::MessageEnd {
             id: message_id,
             stop_reason: StopReason::EndTurn,
@@ -1132,7 +1154,7 @@ mod tests {
         .await
         .expect("synthesis succeeds");
 
-        assert_eq!(result, "A is the strongest outcome");
+        assert_eq!(result.0, "A is the strongest outcome");
         let synthesis_reqs = synthesis_reqs.lock().unwrap();
         assert_eq!(synthesis_reqs.len(), 1);
         let judge_prompt = synthesis_reqs[0]
@@ -1148,6 +1170,40 @@ mod tests {
         assert!(judge_prompt.contains(MODEL_JUDGE_RANK_TOOL));
         assert_eq!(synthesis_reqs[0].tools.len(), 1);
         assert_eq!(synthesis_reqs[0].tools[0].name.0, MODEL_JUDGE_RANK_TOOL);
+    }
+
+    #[tokio::test]
+    async fn run_panel_synthesis_sums_the_usage_of_every_round() {
+        let answer = || ScriptedResponse {
+            text: Some("A".to_owned()),
+            tool: None,
+        };
+        let empty = || ScriptedResponse {
+            text: None,
+            tool: None,
+        };
+        // (case, scripted rounds, expected input and output tokens)
+        type Case = (&'static str, Vec<ScriptedResponse>, (u64, u64));
+        let cases: [Case; 2] = [
+            ("one round", vec![answer()], (10, 2)),
+            ("retried once", vec![empty(), answer()], (20, 4)),
+        ];
+        for (case, rounds, (input, output)) in cases {
+            let (synthesis, _) = sequenced_member("synthesis", rounds);
+            let (_, usage) = run_panel_synthesis(
+                &synthesis,
+                &sample_request(),
+                &[Candidate::new("panel-a", "panel-a", "outcome")],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect(case);
+            assert_eq!(
+                (usage.input_tokens, usage.output_tokens),
+                (input, output),
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]

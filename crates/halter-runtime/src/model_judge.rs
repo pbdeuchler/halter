@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use halter_protocol::{
-    AssembledPrompt, Message, PanelIsolation, ProviderRequest, ResourceSnapshot, SessionBlueprint,
-    SessionId, SubagentEventForwarding, Turn, TurnId,
+    AssembledPrompt, AssistantMessage, AssistantPart, Message, MessageId, PanelIsolation,
+    ProviderRequest, ReplayMeta, ResourceSnapshot, SessionBlueprint, SessionId, StopReason,
+    SubagentEventForwarding, Turn, TurnId, UserMessage,
 };
 use halter_providers::{
     Candidate, FullTurnJudgePlan, FullTurnPanelist, MODEL_JUDGE_TRACE_TARGET, run_panel_synthesis,
@@ -68,9 +69,13 @@ pub(crate) struct FullTurnInputs {
     pub user_text: String,
 }
 
-/// Run the FullTurn panel and synthesis, returning advisory guidance for the
-/// default model. Returns `None` when no panelist produced a usable outcome, in
-/// which case `run_turn` proceeds with the plain default model.
+/// The synthesis reply and the guidance built from it.
+pub(crate) type Deliberation = (AssistantMessage, UserMessage);
+
+/// Run the FullTurn panel and synthesis, returning the synthesis reply (with
+/// its usage) and the advisory guidance built from it for the default model.
+/// Returns `None` when no panelist produced a usable outcome, in which case
+/// `run_turn` proceeds with the plain default model.
 ///
 /// Returns a boxed `Send` future rather than an `async fn`: deliberation runs
 /// panel turns, which run turns, which (via the parent's turn spawn) would make
@@ -80,7 +85,7 @@ pub(crate) fn run_full_turn_deliberation(
     inputs: FullTurnInputs,
     plan: Arc<FullTurnJudgePlan>,
     cancel: CancellationToken,
-) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+) -> Pin<Box<dyn Future<Output = Option<Deliberation>> + Send>> {
     Box::pin(async move {
         if plan.panel.is_empty() {
             return None;
@@ -152,7 +157,17 @@ pub(crate) fn run_full_turn_deliberation(
         }
 
         match run_panel_synthesis(&plan.synthesis, &synthesis_base, &candidates, &cancel).await {
-            Ok(synthesis) => Some(synthesis),
+            Ok((text, usage)) => Some((
+                AssistantMessage {
+                    id: MessageId::new(),
+                    created_at: chrono::Utc::now(),
+                    parts: vec![AssistantPart::Text { text: text.clone() }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Some(usage),
+                    replay_meta: ReplayMeta::default(),
+                },
+                halter_providers::synthesis_guidance_message(&text),
+            )),
             Err(error) => {
                 warn!(
                     target: MODEL_JUDGE_TRACE_TARGET,

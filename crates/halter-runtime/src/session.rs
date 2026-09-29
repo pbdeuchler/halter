@@ -1299,8 +1299,9 @@ impl SessionHandle {
             // FullTurn model-judge: on the opening inference of the turn, fan the
             // user message out to the panel as full sub-sessions, synthesize their
             // outcomes, and inject the result as advisory guidance for the default
-            // model. Non-persisted and first-step only — the default's own output
-            // carries the influence forward through the rest of the turn.
+            // model. The synthesis and the guidance are logged, not transcribed,
+            // and first-step only — the default's own output carries the
+            // influence forward through the rest of the turn.
             let mut request_messages = plan.messages.clone();
             if provider_iterations == 1
                 && let Some(judge) = self
@@ -1319,16 +1320,23 @@ impl SessionHandle {
                     turn_id: turn.id.clone(),
                     user_text: turn.user_message.plain_text(),
                 };
-                if let Some(advisory) = crate::model_judge::run_full_turn_deliberation(
+                if let Some((synthesis, guidance)) = crate::model_judge::run_full_turn_deliberation(
                     inputs,
                     judge,
                     turn_cancel.child_token(),
                 )
                 .await
                 {
-                    request_messages.push(Message::User(
-                        halter_providers::synthesis_guidance_message(&advisory),
-                    ));
+                    if let Some(usage) = &synthesis.usage {
+                        turn_usage.saturating_accumulate(usage);
+                    }
+                    let guidance = Message::User(guidance);
+                    for message in [Message::Assistant(synthesis), guidance.clone()] {
+                        let payload = SessionEventPayload::MessageRecorded { message };
+                        halter_protocol::fold::apply_event(&mut state, &payload);
+                        self.push_event(&mut events, payload);
+                    }
+                    request_messages.push(guidance);
                 }
             }
 
@@ -9812,6 +9820,7 @@ mod tests {
                     delta: reply.clone(),
                 }));
                 events.push(Ok(StreamEvent::TextEnd { id: block }));
+                events.push(Ok(StreamEvent::UsageUpdate { usage: usage(7, 3) }));
             }
             events.push(Ok(StreamEvent::MessageEnd {
                 id: message_id,
@@ -9872,68 +9881,81 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn full_turn_judge_injects_synthesis_guidance_on_opening_step() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let default_provider = Arc::new(RecordingFakeProvider::new(Some("default answer")));
-        let default_requests = default_provider.requests.clone();
-        let panel_provider = Arc::new(RecordingFakeProvider::new(Some("panel outcome")));
-        let synthesis_provider = Arc::new(RecordingFakeProvider::new(Some("synthesis verdict")));
-
-        let services = full_turn_judge_services(
-            temp.path(),
-            default_provider,
-            panel_provider,
-            synthesis_provider,
-        );
-        let runtime = SessionRuntime::new(services);
-        let session = new_session(&runtime, temp.path()).await;
-        session
-            .submit_turn(Turn::user("plan the work"))
-            .await
-            .expect("submit turn")
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect events");
-
-        let requests = default_requests.lock().unwrap();
-        assert!(
-            request_carries_synthesis_guidance(&requests),
-            "default model should receive the panel synthesis as advisory guidance"
-        );
+    fn usage(input_tokens: u64, output_tokens: u64) -> Usage {
+        Usage {
+            input_tokens,
+            output_tokens,
+            ..Usage::default()
+        }
     }
 
     #[tokio::test]
-    async fn full_turn_judge_falls_back_when_panels_produce_no_outcome() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let default_provider = Arc::new(RecordingFakeProvider::new(Some("default answer")));
-        let default_requests = default_provider.requests.clone();
-        // The panelist returns an empty assistant message, so there is no outcome
-        // to synthesize and deliberation must fall back to the plain default.
-        let panel_provider = Arc::new(RecordingFakeProvider::new(None));
-        let synthesis_provider = Arc::new(RecordingFakeProvider::new(Some("unused verdict")));
+    async fn full_turn_judge_logs_its_synthesis_and_guidance() {
+        // (case, panel reply, default model guided, recorded messages, usage)
+        type Case = (&'static str, Option<&'static str>, bool, usize, Usage);
+        let cases: [Case; 2] = [
+            // The default and the synthesis replies each report (7, 3).
+            ("guided", Some("panel outcome"), true, 2, usage(14, 6)),
+            // An empty panel outcome leaves nothing to synthesize.
+            ("no panel outcome", None, false, 0, usage(7, 3)),
+        ];
+        for (case, panel_reply, guided, recorded, expected_usage) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let default_provider = Arc::new(RecordingFakeProvider::new(Some("default answer")));
+            let default_requests = default_provider.requests.clone();
+            let services = full_turn_judge_services(
+                temp.path(),
+                default_provider,
+                Arc::new(RecordingFakeProvider::new(panel_reply)),
+                Arc::new(RecordingFakeProvider::new(Some("synthesis verdict"))),
+            );
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            session
+                .submit_turn(Turn::user("plan the work"))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
 
-        let services = full_turn_judge_services(
-            temp.path(),
-            default_provider,
-            panel_provider,
-            synthesis_provider,
-        );
-        let runtime = SessionRuntime::new(services);
-        let session = new_session(&runtime, temp.path()).await;
-        session
-            .submit_turn(Turn::user("plan the work"))
-            .await
-            .expect("submit turn")
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect events");
-
-        let requests = default_requests.lock().unwrap();
-        assert!(
-            !request_carries_synthesis_guidance(&requests),
-            "with no panel outcomes the default model should run without guidance"
-        );
+            assert_eq!(
+                request_carries_synthesis_guidance(&default_requests.lock().unwrap()),
+                guided,
+                "{case}"
+            );
+            let log = services
+                .sessions
+                .replay(session.session_id())
+                .await
+                .expect("replay");
+            let logged = log
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    SessionEventPayload::MessageRecorded { message } => Some(message),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(logged.len(), recorded, "{case}");
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("session");
+            assert!(
+                logged
+                    .iter()
+                    .all(|message| !stored.state.messages.contains(message)),
+                "{case}: logged, not transcribed"
+            );
+            assert_eq!(stored.state.usage_so_far, expected_usage, "{case}");
+            let folded = halter_protocol::fold::fold_events(SessionState::default(), &log);
+            assert!(
+                halter_protocol::fold::covered_state_matches(&folded, &stored.state),
+                "{case}: the log rebuilds the checkpoint"
+            );
+        }
     }
 
     #[tokio::test]

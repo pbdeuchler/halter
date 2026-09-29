@@ -633,7 +633,10 @@ guidance on the default model's opening inference of the turn. The default model
 then runs its own full turn, owning the real, user-visible execution. Heavier,
 but each panelist actually investigates the task rather than only describing what
 it would do. Panelists are advisory — their work is scratch exploration that
-feeds the judge, not the shipped result.
+feeds the judge, not the shipped result. Each panelist turn is stored as a
+child session of the parent. The synthesis reply and the guidance built from
+it go into the parent's log as `MessageRecorded` (logged, not part of the
+transcript), and the synthesis usage counts toward the parent's turn.
 
 `panel_isolation` controls how FullTurn panelist sub-sessions are sandboxed
 (ignored under `one_shot`):
