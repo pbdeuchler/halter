@@ -61,7 +61,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 15 | `run_parent_hook_dispatch` can commit zero events with `Some(state)`. | 90% | fixed |
 | 16 | `compaction_notifications` is updated by `context_boundary` without an event. | 90% | fixed |
 | 17 | `file_view_cache` is dead state. | 70% | fixed |
-| 18 | The trace recorder is not reopened on resume. | 70% | open |
+| 18 | The trace recorder is not reopened on resume. | 70% | fixed |
 | 19 | sqlite runs `synchronous=NORMAL`, so the last commits can be lost on power failure. | 60% | open |
 | 20 | The legacy token-ledger migration doesn't match the fold. | 60% | open |
 | 21 | During a live parent turn, subagent hooks read `fired_hook_ids` from the parent's last checkpoint, not the turn's in-memory set. A `once` SubagentStart hook can fire twice across two spawns in one turn. State converges (the ids are unioned on commit), but the hook runs twice. | 80% | fixed |
@@ -188,3 +188,14 @@ Entries are oldest first.
 
 - **#17 fixed.** Confirmed dead: nothing inserted into `file_view_cache`. It was only copied into `ContextPlan::file_views`, which nothing read. Removed the field, the plan field, the five types behind them, and the fold's clear on rollover. Legacy checkpoints that carry the field still deserialize (serde ignores it), and the compacted-context test's legacy JSON keeps it to show that.
   - Residual: pre-#9 binaries can't load checkpoints written from now on, since the field was required. They already can't read the newer event kinds, so nothing new is lost.
+
+- **#18 fixed.** Confirmed only across processes: within one process the writer is never closed (`EvictionGuard` no longer closes it), so a same-process resume kept tracing. A new process lost every event after resume, and the only open path, `create_session_seeded`, used `File::create`, which would have truncated.
+  - `TraceRecorder::open_session` does nothing if the session already has a writer. It opens a root trace for appending and writes `trace_header` only when the file is empty.
+  - `mark_resumed` calls it.
+  - `SubagentControl::restore` calls the new `attach` to alias each restored child to the parent's writer without writing another header. Restored children run turns through `HalterSession::new`, not `resume`.
+  - Tests:
+    - `resumed_sessions_keep_tracing` (same process, or after a restart; one header, and traced sequences equal the log). The restart case failed before the fix with sequences 9–14 missing.
+    - `reopening_a_session_appends_without_a_second_header` (same or fresh recorder). The truncating mutation fails it.
+    - `attach_aliases_a_child_only_when_its_parent_is_open`.
+    - `restored_subagents_take_input_and_close` now also asserts that the child's post-restart events reach the parent's trace. The attach mutation fails it.
+  - Residual: events committed while no process had the session open (for example a store-level `commit` by another tool) are still missing from the live trace. `export_trace()` stays the source of truth.

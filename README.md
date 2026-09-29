@@ -578,6 +578,8 @@ backend = "memory"
 # Optional. When set, halter writes a `<session_id>.txt` JSONL trace per session
 # into this directory: one header line followed by every committed SessionEvent,
 # tailed live as the session runs (plus pre-commit `pending_event` preview lines).
+# A resumed session keeps appending to the same file, and so do its restored
+# subagents.
 # The same committed-line view is always available after the fact from the
 # session store via `session.export_trace()`, with or without this setting.
 # traces_dir = "/tmp/halter/traces"

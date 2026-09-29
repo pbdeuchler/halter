@@ -2441,6 +2441,13 @@ impl SessionHandle {
             return Ok(None);
         };
         hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
+        if let Some(recorder) = &self.services.trace_recorder {
+            recorder.open_session(
+                &self.session_id,
+                stored.blueprint.parent_session_id.as_ref(),
+                &stored.blueprint,
+            )?;
+        }
         stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
         // The task list lives in the tool store; the log holds every result
         // that changed it.
@@ -8410,6 +8417,79 @@ mod tests {
             }),
             "trace should include committed subagent delta events even when forwarding is off:\n{contents}"
         );
+    }
+
+    #[tokio::test]
+    async fn resumed_sessions_keep_tracing() {
+        // (case, whether the resume runs in a fresh process)
+        for (case, restart) in [("same process", false), ("after a restart", true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let traces_dir = temp.path().join("traces");
+            let recorder = || {
+                Some(Arc::new(
+                    crate::TraceRecorder::open(traces_dir.clone()).expect("trace recorder"),
+                ))
+            };
+            let traced = |recorder| {
+                test_support::configured_services_with_runtime_and_trace(
+                    Arc::new(FakeProvider::default()),
+                    temp.path(),
+                    SubagentEventForwarding::Off,
+                    100_000,
+                    recorder,
+                )
+            };
+            let services = traced(recorder());
+            let runtime = SessionRuntime::new(services.clone());
+            let id = new_session(&runtime, temp.path())
+                .await
+                .session_id()
+                .clone();
+            let run = |session: HalterSession| async move {
+                session
+                    .submit_turn(Turn::user("hello"))
+                    .await
+                    .expect("submit")
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("turn");
+                session
+            };
+            run(runtime.resume(&id).await.expect("resume").expect("found")).await;
+
+            let runtime = if restart {
+                let mut restarted = traced(recorder());
+                Arc::get_mut(&mut restarted).expect("unique").sessions = services.sessions.clone();
+                SessionRuntime::new(restarted)
+            } else {
+                runtime
+            };
+            let session = run(runtime.resume(&id).await.expect("resume").expect("found")).await;
+
+            let contents = std::fs::read_to_string(traces_dir.join(format!("{}.txt", id.0)))
+                .expect("read trace");
+            let lines = contents
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+                .collect::<Vec<_>>();
+            let headers = lines
+                .iter()
+                .filter(|line| line["kind"] == "trace_header")
+                .count();
+            let traced_sequences = lines
+                .iter()
+                .filter_map(|line| line.get("sequence").and_then(serde_json::Value::as_u64))
+                .collect::<Vec<_>>();
+            let logged_sequences = session
+                .replay()
+                .await
+                .expect("replay")
+                .iter()
+                .map(SessionEvent::sequence)
+                .collect::<Vec<_>>();
+            assert_eq!(headers, 1, "{case}:\n{contents}");
+            assert_eq!(traced_sequences, logged_sequences, "{case}:\n{contents}");
+        }
     }
 
     #[tokio::test]

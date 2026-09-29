@@ -227,6 +227,10 @@ derived from the store, it works for any persisted session whether or not
 `traces_dir` was configured while it ran. Also available store-level as
 `export_session_trace(store, session_id)`.
 
+The live trace survives resume: `resume` reopens `<session_id>.txt` for
+appending (writing the header only for a new file), and each restored
+subagent rejoins its parent's trace without a second `subagent_header`.
+
 ### `notify(...)`
 
 Injects runtime notifications into the session stream.

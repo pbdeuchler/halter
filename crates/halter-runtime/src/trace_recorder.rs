@@ -1,7 +1,7 @@
 // pattern: Imperative Shell
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{LineWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -28,8 +28,10 @@ use crate::trace_format::{RootTraceHeader, SubagentTraceHeader};
 #[derive(Debug)]
 pub struct TraceRecorder {
     dir: PathBuf,
-    writers: Mutex<HashMap<SessionId, Arc<Mutex<LineWriter<File>>>>>,
+    writers: Mutex<HashMap<SessionId, SessionWriter>>,
 }
+
+type SessionWriter = Arc<Mutex<LineWriter<File>>>;
 
 impl TraceRecorder {
     /// Creates the trace directory if it does not already exist and returns a
@@ -57,30 +59,37 @@ impl TraceRecorder {
         })
     }
 
-    /// Opens or attaches a trace stream for `session_id`.
+    /// Opens or attaches a trace stream for `session_id`; a no-op when it
+    /// already has one.
     ///
-    /// When `parent_session_id` is `None` (root session), creates
-    /// `<session_id>.txt` and writes a `trace_header` line. When it is `Some`
-    /// and the parent already has an active writer, the subagent is aliased
-    /// to that writer — no new file is created — and a `subagent_header`
-    /// marker line is appended so that readers can reconstruct the session
-    /// tree from a single trace file. If the parent's writer is missing
-    /// (already closed, never opened), the subagent's events are silently
-    /// dropped: no orphan trace file is produced.
+    /// When `parent_session_id` is `None` (root session), opens
+    /// `<session_id>.txt` for appending and writes a `trace_header` line if
+    /// the file is new, so a session resumed by a later process keeps
+    /// extending its trace. When it is `Some` and the parent already has an
+    /// active writer, the subagent is aliased to that writer — no new file is
+    /// created — and a `subagent_header` marker line is appended so that
+    /// readers can reconstruct the session tree from a single trace file. If
+    /// the parent's writer is missing (already closed, never opened), the
+    /// subagent's events are silently dropped: no orphan trace file is
+    /// produced.
     pub fn open_session(
         &self,
         session_id: &SessionId,
         parent_session_id: Option<&SessionId>,
         blueprint: &SessionBlueprint,
     ) -> anyhow::Result<()> {
+        let open = self
+            .writers
+            .lock()
+            .map_err(|_| {
+                anyhow::anyhow!("trace recorder writer map mutex poisoned during open_session")
+            })?
+            .contains_key(session_id);
+        if open {
+            return Ok(());
+        }
         if let Some(parent_id) = parent_session_id {
-            let parent_writer = {
-                let writers = self.writers.lock().map_err(|_| {
-                    anyhow::anyhow!("trace recorder writer map mutex poisoned during open_session")
-                })?;
-                writers.get(parent_id).cloned()
-            };
-            let Some(parent_writer) = parent_writer else {
+            let Some(parent_writer) = self.attach(session_id, parent_id)? else {
                 warn!(
                     session_id = %session_id,
                     parent_session_id = %parent_id,
@@ -92,22 +101,15 @@ impl TraceRecorder {
             let mut line =
                 serde_json::to_vec(&header).context("failed to serialize subagent trace header")?;
             line.push(b'\n');
-            {
-                let mut writer = parent_writer.lock().map_err(|_| {
+            parent_writer
+                .lock()
+                .map_err(|_| {
                     anyhow::anyhow!(
                         "trace recorder file mutex poisoned during open_session for subagent"
                     )
-                })?;
-                writer
-                    .write_all(&line)
-                    .context("failed to append subagent header to trace file")?;
-            }
-            let mut writers = self.writers.lock().map_err(|_| {
-                anyhow::anyhow!(
-                    "trace recorder writer map mutex poisoned during open_session for subagent"
-                )
-            })?;
-            writers.insert(session_id.clone(), parent_writer);
+                })?
+                .write_all(&line)
+                .context("failed to append subagent header to trace file")?;
             debug!(
                 session_id = %session_id,
                 parent_session_id = %parent_id,
@@ -117,21 +119,57 @@ impl TraceRecorder {
         }
 
         let path = self.session_path(session_id);
-        let file = File::create(&path)
-            .with_context(|| format!("failed to create trace file {}", path.display()))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open trace file {}", path.display()))?;
+        let is_new = file
+            .metadata()
+            .with_context(|| format!("failed to stat trace file {}", path.display()))?
+            .len()
+            == 0;
         let mut writer = LineWriter::new(file);
-        let header = RootTraceHeader::new(session_id, blueprint);
-        let mut line = serde_json::to_vec(&header).context("failed to serialize trace header")?;
-        line.push(b'\n');
-        writer
-            .write_all(&line)
-            .with_context(|| format!("failed to write trace header to {}", path.display()))?;
-        let mut writers = self.writers.lock().map_err(|_| {
-            anyhow::anyhow!("trace recorder writer map mutex poisoned during open_session")
-        })?;
-        writers.insert(session_id.clone(), Arc::new(Mutex::new(writer)));
-        debug!(session_id = %session_id, path = %path.display(), "opened session trace file");
+        if is_new {
+            let header = RootTraceHeader::new(session_id, blueprint);
+            let mut line =
+                serde_json::to_vec(&header).context("failed to serialize trace header")?;
+            line.push(b'\n');
+            writer
+                .write_all(&line)
+                .with_context(|| format!("failed to write trace header to {}", path.display()))?;
+        }
+        self.writers
+            .lock()
+            .map_err(|_| {
+                anyhow::anyhow!("trace recorder writer map mutex poisoned during open_session")
+            })?
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(writer)));
+        debug!(session_id = %session_id, path = %path.display(), is_new, "opened session trace file");
         Ok(())
+    }
+
+    /// Aliases `session_id` to its parent's writer without writing a header,
+    /// for a subagent whose header an earlier process already wrote. Returns
+    /// the writer, or `None` when the parent has none.
+    pub(crate) fn attach(
+        &self,
+        session_id: &SessionId,
+        parent_session_id: &SessionId,
+    ) -> anyhow::Result<Option<SessionWriter>> {
+        let mut writers = self.writers.lock().map_err(|_| {
+            anyhow::anyhow!("trace recorder writer map mutex poisoned during attach")
+        })?;
+        let Some(parent_writer) = writers.get(parent_session_id).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            writers
+                .entry(session_id.clone())
+                .or_insert(parent_writer)
+                .clone(),
+        ))
     }
 
     /// Appends a `pending_event` preview line to the session's trace file as
@@ -521,6 +559,75 @@ mod tests {
             entries.is_empty(),
             "no orphan trace file should be written: {entries:?}"
         );
+    }
+
+    #[test]
+    fn reopening_a_session_appends_without_a_second_header() {
+        // (case, whether the reopen uses a fresh recorder, as after a restart)
+        for (case, restart) in [("same recorder", false), ("fresh recorder", true)] {
+            let temp = tempdir().expect("tempdir");
+            let first = TraceRecorder::open(temp.path().to_path_buf()).expect("recorder");
+            let id = SessionId::from("session-a");
+            first
+                .open_session(&id, None, &blueprint(&id))
+                .expect("open session");
+            first.record(&warning_event(&id, 1, "before"));
+            let fresh;
+            let second = if restart {
+                first.close_session(&id);
+                fresh = TraceRecorder::open(temp.path().to_path_buf()).expect("recorder");
+                &fresh
+            } else {
+                &first
+            };
+            second
+                .open_session(&id, None, &blueprint(&id))
+                .expect("reopen session");
+            second.record(&warning_event(&id, 2, "after"));
+            second.close_session(&id);
+
+            let contents =
+                std::fs::read_to_string(temp.path().join("session-a.txt")).expect("read trace");
+            let kinds = contents
+                .lines()
+                .map(|line| {
+                    let line: serde_json::Value = serde_json::from_str(line).expect("json");
+                    line.get("sequence")
+                        .map_or_else(|| line["kind"].to_string(), ToString::to_string)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(kinds, ["\"trace_header\"", "1", "2"], "{case}:\n{contents}");
+        }
+    }
+
+    #[test]
+    fn attach_aliases_a_child_only_when_its_parent_is_open() {
+        // (case, whether the parent has a writer)
+        for (case, parent_open) in [("open parent", true), ("unknown parent", false)] {
+            let temp = tempdir().expect("tempdir");
+            let recorder = TraceRecorder::open(temp.path().to_path_buf()).expect("recorder");
+            let parent_id = SessionId::from("session-parent");
+            let child_id = SessionId::from("session-child");
+            if parent_open {
+                recorder
+                    .open_session(&parent_id, None, &blueprint(&parent_id))
+                    .expect("open parent session");
+            }
+
+            let attached = recorder.attach(&child_id, &parent_id).expect("attach");
+            recorder.record(&warning_event(&child_id, 1, "from-child"));
+            recorder.close_session(&parent_id);
+
+            assert_eq!(attached.is_some(), parent_open, "{case}");
+            let contents =
+                std::fs::read_to_string(temp.path().join("session-parent.txt")).unwrap_or_default();
+            assert!(!contents.contains("subagent_header"), "{case}:\n{contents}");
+            assert_eq!(
+                contents.contains("from-child"),
+                parent_open,
+                "{case}:\n{contents}"
+            );
+        }
     }
 
     #[test]

@@ -116,6 +116,13 @@ impl RuntimeSubagentControl {
     ) {
         let mut registry = self.inner.registry.lock().await;
         for SubagentRecord { status, generation } in records {
+            // Restored children run turns without a resume, so they rejoin
+            // the parent's trace here.
+            if let Some(recorder) = &self.inner.services.trace_recorder
+                && let Err(error) = recorder.attach(&status.session_id, parent)
+            {
+                warn!(session_id = %status.session_id, error = %error, "failed to reattach subagent trace");
+            }
             registry
                 .entries
                 .entry(status.agent_id.0.clone())
@@ -1228,7 +1235,16 @@ mod tests {
         .await
         .expect("child turn started");
 
-        let runtime = restarted(&services, Arc::new(RecordingProvider::new(Arc::default())));
+        // The restarted process traces, so the restored child must rejoin
+        // the parent's trace.
+        let traces = tempfile::tempdir().expect("tempdir");
+        let mut restarted = test_services(Arc::new(RecordingProvider::new(Arc::default())));
+        let unique = Arc::get_mut(&mut restarted).expect("unique");
+        unique.sessions = services.sessions.clone();
+        unique.trace_recorder = Some(Arc::new(
+            crate::TraceRecorder::open(traces.path().to_path_buf()).expect("recorder"),
+        ));
+        let runtime = SessionRuntime::new(restarted);
         runtime
             .resume(&parent.blueprint.session_id)
             .await
@@ -1261,6 +1277,14 @@ mod tests {
         assert_eq!(
             waited.last_message.as_deref(),
             Some("child reply [subagent/model]")
+        );
+        let trace = std::fs::read_to_string(traces.path().join("parent.txt")).expect("trace");
+        assert!(
+            trace.lines().any(|line| {
+                let line: serde_json::Value = serde_json::from_str(line).expect("json");
+                line.get("sequence").is_some() && line["session_id"] == spawned.session_id.0
+            }),
+            "{trace}"
         );
 
         control

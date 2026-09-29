@@ -28,6 +28,7 @@ once a `1.0.0` line is cut.
 - The snapshot revision is now a hash of the whole serialised snapshot. Previously v0.6 snapshots with skills (whose new `SkillDef.root` field was not hashed) collided with stored rows and failed every sqlite commit with `revision already exists with different data`.
 - `SubagentStart` and `SubagentStop` hooks, and `notify`, no longer fail the parent's in-flight turn with `event log advanced concurrently`. Their dispatches queue behind the turn and commit right after it.
 - The CLI drains in-flight turns before running session-end hooks.
+- The live trace now survives resume. `resume` reopened nothing, so a session resumed by a new process lost every later event; `TraceRecorder::open_session` truncated the file on create; and restored subagents never rejoined the parent's trace. `open_session` now appends (header only for a new file) and is a no-op for an open session; `resume` calls it, and restored subagents are aliased to the parent's writer.
 - A turn whose final commit fails is now recorded as `TurnFailed`. Previously the log was left with an unmatched `TurnStarted`.
 - A turn interrupted by a crash, abort or shutdown is closed with a cancelled `TurnFailed` on the next `resume` or turn, so the log never keeps a dangling turn.
 - Tool calls are checkpointed before each batch runs and again after its results, so a crash mid-tool no longer loses the assistant's tool calls, the turn's usage, or earlier batches' results. When the turn is closed, calls left without a result get an error result saying whether they may have run.
