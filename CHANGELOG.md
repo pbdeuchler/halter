@@ -16,6 +16,7 @@ once a `1.0.0` line is cut.
 - `SessionEventPayload::SubagentUpdated`, `SubagentRecord` and `SessionState::subagents`: the parent's log records each subagent's status and generation. `SessionState` literals must add `subagents: Default::default()` (or use `..Default::default()`).
 - `SessionEventPayload::TurnStarted` carries the turn's `default_model` and `subagent_model` overrides, so the log says which models ran each turn. Older logs read as no override. **Breaking:** exhaustive `TurnStarted { turn_id }` patterns need `..`.
 - `SESSION_LOG_FORMAT` and `SessionEventPayload::Unknown`. The sqlite store stamps each session with the log format that wrote it and refuses commits to a session stamped newer than the running build. Event kinds a build does not know decode as `Unknown`, which the fold skips, so older builds can still read and list newer logs. **Breaking:** exhaustive matches on `SessionEventPayload` need an `Unknown` arm.
+- `SessionEventPayload::CompactionNotified`: records the id of each compaction-strategy notification delivered in the current window, ahead of its `MessageItem`.
 - `SessionEventPayload::MessageRecorded`: a message in the log that is not in the transcript. `CompactionContext::record` and `infer` now emit it instead of `MessageItem`. Log readers that want a compaction pass's exchange with the model must match both variants.
 
 ### Fixed
@@ -29,6 +30,7 @@ once a `1.0.0` line is cut.
 - A `fork_context` subagent no longer starts from a transcript that ends in the parent's unanswered `spawn_agent` call, which strict providers reject. The inherited in-flight calls get a result saying the parent handles them.
 - The `task` todo list survives `resume`. It is rebuilt from the session log. Previously a resumed session in a new process started with an empty list, although compaction and clean-window rollover promise that todos persist.
 - Replaying the log of a compaction pass that talked to the model and then gave up no longer adds the pass's messages to the transcript. `MessageItem` used to mean both "append" and "only logged", so the fold disagreed with the checkpoint. It also means a compaction summary is no longer taken as a subagent's output or as the CLI's final result.
+- Which compaction notifications a window has already delivered is now in the log (`CompactionNotified`), not only in the checkpoint, so replaying the log rebuilds it and no notification repeats.
 - Manual `compact` now runs against the current resources and stores them, as turns do. It used the snapshot stored at the last turn.
 - Loading a session no longer fails with `replay sequence N exceeds advertised head` when another commit lands between reading the checkpoint and reading the log tail. Hydration stops at the head it loaded.
 - A resumed parent keeps its subagents ([#210](https://github.com/pbdeuchler/halter/issues/210)). The registry is rebuilt from the parent's log, so `wait_agent`, `send_input` and `close_agent` work in a new process. A child that was running when its process stopped comes back `Cancelled` with an interrupted error, and `send_input` continues it.

@@ -967,7 +967,8 @@ pub struct RestoredContext {
 /// Version of the session log encoding this build writes. Persistent stores
 /// stamp it on each session and refuse to commit to a session stamped newer,
 /// so an older build never appends to a log it cannot fully read. Bump it
-/// when adding an event kind or field that an older fold would misread.
+/// once per release that adds an event kind or field an older fold would
+/// misread.
 pub const SESSION_LOG_FORMAT: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1081,6 +1082,12 @@ pub enum SessionEventPayload {
     /// [`SessionState::subagents`].
     SubagentUpdated {
         record: SubagentRecord,
+    },
+    /// The compaction strategy's notification `id` was delivered in this
+    /// context window; its message follows as a `MessageItem`. Folds into
+    /// [`SessionState::compaction_notifications`].
+    CompactionNotified {
+        id: String,
     },
     /// An event kind this build does not know, written by a newer build.
     /// Read-only paths skip it; the store refuses writes to sessions stamped

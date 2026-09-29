@@ -2042,15 +2042,20 @@ impl SessionHandle {
             if notification.id.trim().is_empty() {
                 anyhow::bail!("failed to evaluate context boundary: notification id is empty");
             }
-            if !state
-                .compaction_notifications
-                .insert(notification.id.clone())
-            {
+            if state.compaction_notifications.contains(&notification.id) {
                 continue;
             }
-            let message = notification.message;
-            state.append(message.clone());
-            self.push_event(events, SessionEventPayload::MessageItem { message });
+            for payload in [
+                SessionEventPayload::CompactionNotified {
+                    id: notification.id,
+                },
+                SessionEventPayload::MessageItem {
+                    message: notification.message,
+                },
+            ] {
+                halter_protocol::fold::apply_event(state, &payload);
+                self.push_event(events, payload);
+            }
         }
 
         let clean_window =
@@ -6017,6 +6022,17 @@ mod tests {
             Message::System(system) if system.text == "Context is half full."
         )));
         assert!(stored.state.compaction_notifications.contains("half-full"));
+
+        let replayed = services
+            .sessions
+            .replay(session.session_id())
+            .await
+            .expect("replay");
+        let folded = halter_protocol::fold::fold_events(SessionState::default(), &replayed);
+        assert_eq!(
+            folded.compaction_notifications, stored.state.compaction_notifications,
+            "the log alone rebuilds the delivered notifications"
+        );
     }
 
     /// Milestones are the strategy's; the compaction that follows is the
@@ -6065,6 +6081,17 @@ mod tests {
         // threshold again, short of 75%.
         assert!(stored.state.compaction_notifications.contains("50-percent"));
         assert!(!stored.state.compaction_notifications.contains("75-percent"));
+
+        let replayed = services
+            .sessions
+            .replay(session.session_id())
+            .await
+            .expect("replay");
+        let folded = halter_protocol::fold::fold_events(SessionState::default(), &replayed);
+        assert_eq!(
+            folded.compaction_notifications, stored.state.compaction_notifications,
+            "the log alone rebuilds the delivered notifications"
+        );
     }
 
     #[tokio::test]

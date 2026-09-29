@@ -199,6 +199,7 @@ fn session_event_payload_variants_have_stable_kind() {
         },
         SessionEventPayload::Lagged { dropped_events: 1 },
         SessionEventPayload::SessionShutdownComplete,
+        SessionEventPayload::CompactionNotified { id: "n".into() },
         SessionEventPayload::Unknown,
         SessionEventPayload::SubagentUpdated {
             record: SubagentRecord {
@@ -244,6 +245,7 @@ fn session_event_payload_variants_have_stable_kind() {
             SessionEventPayload::Lagged { .. } => "lagged",
             SessionEventPayload::SessionShutdownComplete => "session_shutdown_complete",
             SessionEventPayload::SubagentUpdated { .. } => "subagent_updated",
+            SessionEventPayload::CompactionNotified { .. } => "compaction_notified",
             SessionEventPayload::Unknown => "unknown",
         };
         let json = serde_json::to_value(&event.payload).expect("serialize");

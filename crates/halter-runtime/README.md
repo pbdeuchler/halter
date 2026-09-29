@@ -334,6 +334,8 @@ contribute tools and system-prompt segments. At each boundary,
 `context_boundary` receives the session id, logical window, effective counts,
 threshold, and persisted notification ids; it returns exactly-once reminders
 for the current window and nothing else: the trigger stays the runtime's.
+Each delivered reminder is logged as `CompactionNotified { id }` followed by
+its `MessageItem`, so the delivered set replays from the log.
 When a pass returns `Err` or `Ok(None)` after appending, the runtime records a
 `ContextRestored` event that puts the window back; the pass's messages, tool
 runs, and usage stay in the log and the session totals. Install one with

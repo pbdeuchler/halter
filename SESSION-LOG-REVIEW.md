@@ -59,7 +59,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | # | Finding | Confidence | Status |
 |---|---------|-----------:|--------|
 | 15 | `run_parent_hook_dispatch` can commit zero events with `Some(state)`. | 90% | fixed |
-| 16 | `compaction_notifications` is updated by `context_boundary` without an event. | 90% | open |
+| 16 | `compaction_notifications` is updated by `context_boundary` without an event. | 90% | fixed |
 | 17 | `file_view_cache` is dead state. | 70% | open |
 | 18 | The trace recorder is not reopened on resume. | 70% | open |
 | 19 | sqlite runs `synchronous=NORMAL`, so the last commits can be lost on power failure. | 60% | open |
@@ -165,3 +165,8 @@ Entries are oldest first.
     - `unknown_event_kinds_decode_as_unknown_and_known_kinds_stay_strict`;
     - `unknown_events_leave_state_untouched`.
   - Residual: binaries from before this change have no gate and fail on unknown kinds. The stamp only takes effect from this build on. Nothing forces a bump of `SESSION_LOG_FORMAT` when a variant or field is added; that relies on review (the constant's doc says when to bump it).
+
+- **#16 fixed.** `context_boundary` now emits `CompactionNotified { id }` before each notification's `MessageItem`, and runs both through `fold::apply_event`, so the runtime and the fold can't drift apart.
+  - The fold inserts the id. It already cleared the set on state-rewriting compaction. `compaction_notifications` is now a covered field in `covered_state_matches`.
+  - Tests: `strategy_seed_segments_and_boundary_notifications_reach_the_session` and `milestone_notifications_precede_the_runtime_compaction` now fold the replayed log and compare it with the checkpoint; the milestone test covers insert, then clear, then re-insert across a compaction. Both failed before the fix (`{}` vs `{"half-full"}`).
+  - `SESSION_LOG_FORMAT` stays at 1 because format 1 is unreleased. Its doc now says to bump it once per release.

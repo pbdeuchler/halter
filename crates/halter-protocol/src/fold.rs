@@ -26,14 +26,16 @@
 //! - `context_window` — advanced by each state-rewriting compaction.
 //! - `subagents` — upserted by [`SessionEventPayload::SubagentUpdated`],
 //!   ignoring a record whose generation is older than the one held.
+//! - `compaction_notifications` — inserted by
+//!   [`SessionEventPayload::CompactionNotified`], cleared by each
+//!   state-rewriting compaction.
 //!
 //! Runtime bookkeeping fields (`file_view_cache`, `pending_tool_calls`,
-//! `fired_hook_ids`, `appended_prompt_segments`, `compaction_notifications`,
-//! `lineage`, hook latches, and provider-chaining fields) are deliberately
-//! generally carried by the checkpoint, which the runtime writes on every
-//! state-changing commit. Compaction and rollover events reset
-//! `last_response_id`, `messages_seen_by_provider`, and
-//! `compaction_notifications`. Rollover additionally clears
+//! `fired_hook_ids`, `appended_prompt_segments`, `lineage`, hook latches,
+//! and provider-chaining fields) are deliberately generally carried by the
+//! checkpoint, which the runtime writes on every state-changing commit.
+//! Compaction and rollover events reset `last_response_id` and
+//! `messages_seen_by_provider`. Rollover additionally clears
 //! `appended_prompt_segments` and `file_view_cache`. These event-covered
 //! resets keep replay from retaining bookkeeping from a previous window;
 //! ordinary updates to those fields still depend on the checkpoint.
@@ -114,6 +116,9 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         | SessionEventPayload::Lagged { .. }
         | SessionEventPayload::SessionShutdownComplete
         | SessionEventPayload::Unknown => {}
+        SessionEventPayload::CompactionNotified { id } => {
+            state.compaction_notifications.insert(id.clone());
+        }
         SessionEventPayload::SubagentUpdated { record } => {
             let id = &record.status.agent_id;
             if state
@@ -149,6 +154,7 @@ pub fn covered_state_matches(a: &SessionState, b: &SessionState) -> bool {
         && a.token_ledger == b.token_ledger
         && a.context_window == b.context_window
         && a.subagents == b.subagents
+        && a.compaction_notifications == b.compaction_notifications
 }
 
 #[cfg(test)]
