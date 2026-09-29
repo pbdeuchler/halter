@@ -94,7 +94,10 @@ pub trait SessionStore: Send + Sync {
     /// sequence equals it — a concurrent writer that appended anything since
     /// the caller loaded loses the race. Events receive gap-free monotonic
     /// sequences starting at the head + 1. When `state` is supplied it is
-    /// written as a checkpoint stamped with the post-append head. All
+    /// written as a checkpoint stamped with the post-append head. Persistent
+    /// backends stamp each session with the newest
+    /// `halter_protocol::SESSION_LOG_FORMAT` that wrote to it and refuse
+    /// commits to a session stamped newer than this build. All
     /// backends must implement the same semantics; the shared conformance
     /// suite in `tests/store_conformance.rs` locks this in.
     async fn commit(

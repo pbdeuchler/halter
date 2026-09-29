@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use halter_protocol::{
-    Delivery, PendingEvent, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload,
-    SessionId, SessionState,
+    Delivery, PendingEvent, ResourceSnapshot, SESSION_LOG_FORMAT, SessionBlueprint, SessionEvent,
+    SessionEventPayload, SessionId, SessionState,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use tracing::{debug, info};
@@ -59,6 +59,12 @@ SET state_sequence = COALESCE(
     0
 );
 "#,
+    ),
+    // log_format stamps the newest SESSION_LOG_FORMAT that has written to a
+    // session. Pre-existing sessions predate the stamp and read as 0.
+    (
+        3,
+        "ALTER TABLE sessions ADD COLUMN log_format INTEGER NOT NULL DEFAULT 0;",
     ),
 ];
 
@@ -315,8 +321,9 @@ fn create_session_with_conn(conn: &mut Connection, session: StoredSession) -> Re
             blueprint,
             state,
             snapshot_revision,
-            created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            created_at,
+            log_format
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             session_id.as_str(),
             parent_session_id,
@@ -324,6 +331,7 @@ fn create_session_with_conn(conn: &mut Connection, session: StoredSession) -> Re
             state_json,
             snapshot_revision.as_str(),
             created_at,
+            SESSION_LOG_FORMAT,
         ],
     ) {
         Ok(_) => {}
@@ -413,11 +421,11 @@ fn commit_with_conn(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start sqlite commit transaction")?;
 
-    let blueprint_json = tx
+    let (blueprint_json, log_format) = tx
         .query_row(
-            "SELECT blueprint FROM sessions WHERE session_id = ?1",
+            "SELECT blueprint, log_format FROM sessions WHERE session_id = ?1",
             [session_id.0.as_str()],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
         )
         .optional()
         .with_context(|| format!("failed to load session '{}'", session_id.0))?
@@ -427,6 +435,22 @@ fn commit_with_conn(
                 session_id.0
             )
         })?;
+
+    if log_format > SESSION_LOG_FORMAT {
+        anyhow::bail!(
+            "failed to commit session '{}': its log was written by a newer halter \
+             (log format {log_format}, this build writes {SESSION_LOG_FORMAT}); \
+             upgrade halter to resume it",
+            session_id.0
+        );
+    }
+    if log_format < SESSION_LOG_FORMAT {
+        tx.execute(
+            "UPDATE sessions SET log_format = ?2 WHERE session_id = ?1",
+            params![session_id.0.as_str(), SESSION_LOG_FORMAT],
+        )
+        .with_context(|| format!("failed to stamp log format for session '{}'", session_id.0))?;
+    }
 
     // The IMMEDIATE transaction holds the write lock, so the head read here
     // cannot race another writer; gap-free monotonic sequences follow.
@@ -1067,6 +1091,67 @@ mod tests {
             .expect_err("duplicate create should fail");
 
         assert!(error.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn commit_gates_on_and_raises_the_log_format_stamp() {
+        let stamp_of = |store: &SqliteSessionStore| {
+            store
+                .writer
+                .lock()
+                .expect("writer")
+                .query_row("SELECT log_format FROM sessions", [], |row| {
+                    row.get::<_, u32>(0)
+                })
+                .expect("stamp")
+        };
+        // (case, stamp before commit, commit accepted)
+        let cases = [
+            ("legacy unstamped", 0, true),
+            ("current", SESSION_LOG_FORMAT, true),
+            ("newer build", SESSION_LOG_FORMAT + 1, false),
+        ];
+        for (case, stamp, accepted) in cases {
+            let store = SqliteSessionStore::open(":memory:").expect("open sqlite store");
+            let session = test_session("gate", "revision-a");
+            let session_id = session.blueprint.session_id.clone();
+            store.create_session(session).await.expect("create");
+            assert_eq!(
+                stamp_of(&store),
+                SESSION_LOG_FORMAT,
+                "{case}: create stamps"
+            );
+            store
+                .writer
+                .lock()
+                .expect("writer")
+                .execute("UPDATE sessions SET log_format = ?1", [stamp])
+                .expect("restamp");
+
+            let outcome = store
+                .commit(
+                    &session_id,
+                    None,
+                    None,
+                    None,
+                    vec![test_event("gate", Delivery::Lossless)],
+                )
+                .await;
+            assert_eq!(outcome.is_ok(), accepted, "{case}");
+            if let Err(error) = outcome {
+                assert!(
+                    error.to_string().contains("newer halter"),
+                    "{case}: {error}"
+                );
+            }
+            let expected_stamp = if accepted { SESSION_LOG_FORMAT } else { stamp };
+            assert_eq!(stamp_of(&store), expected_stamp, "{case}");
+            assert_eq!(
+                store.replay(&session_id).await.expect("replay").len(),
+                usize::from(accepted),
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]

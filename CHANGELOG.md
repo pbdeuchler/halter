@@ -15,6 +15,7 @@ once a `1.0.0` line is cut.
 - `TaskList::from_results` and `ToolSessionStore::restore_task_session`, which rebuild a session's task list from the `task` tool results in its log.
 - `SessionEventPayload::SubagentUpdated`, `SubagentRecord` and `SessionState::subagents`: the parent's log records each subagent's status and generation. `SessionState` literals must add `subagents: Default::default()` (or use `..Default::default()`).
 - `SessionEventPayload::TurnStarted` carries the turn's `default_model` and `subagent_model` overrides, so the log says which models ran each turn. Older logs read as no override. **Breaking:** exhaustive `TurnStarted { turn_id }` patterns need `..`.
+- `SESSION_LOG_FORMAT` and `SessionEventPayload::Unknown`. The sqlite store stamps each session with the log format that wrote it and refuses commits to a session stamped newer than the running build. Event kinds a build does not know decode as `Unknown`, which the fold skips, so older builds can still read and list newer logs. **Breaking:** exhaustive matches on `SessionEventPayload` need an `Unknown` arm.
 - `SessionEventPayload::MessageRecorded`: a message in the log that is not in the transcript. `CompactionContext::record` and `infer` now emit it instead of `MessageItem`. Log readers that want a compaction pass's exchange with the model must match both variants.
 
 ### Fixed

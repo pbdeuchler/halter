@@ -112,7 +112,8 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         | SessionEventPayload::TurnCompleted { .. }
         | SessionEventPayload::TurnFailed { .. }
         | SessionEventPayload::Lagged { .. }
-        | SessionEventPayload::SessionShutdownComplete => {}
+        | SessionEventPayload::SessionShutdownComplete
+        | SessionEventPayload::Unknown => {}
         SessionEventPayload::SubagentUpdated { record } => {
             let id = &record.status.agent_id;
             if state
@@ -217,6 +218,20 @@ mod tests {
                 ..TokenLedger::default()
             }
         );
+    }
+
+    #[test]
+    fn unknown_events_leave_state_untouched() {
+        let mut state = SessionState::default();
+        apply_event(
+            &mut state,
+            &SessionEventPayload::MessageItem {
+                message: assistant_message("kept", Some(usage(3, 2))),
+            },
+        );
+        let before = state.clone();
+        apply_event(&mut state, &SessionEventPayload::Unknown);
+        assert_eq!(state, before);
     }
 
     #[test]

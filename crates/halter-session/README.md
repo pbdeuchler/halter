@@ -230,6 +230,14 @@ This gives it the ingredients for:
 - durable snapshotting
 - append-oriented event replay
 
+Each session row carries a `log_format` stamp: the newest
+`halter_protocol::SESSION_LOG_FORMAT` that has written to it. A commit to a
+session stamped newer than the running build fails with an "upgrade halter"
+error, so an older binary never appends to a log it cannot fully read.
+Reads still work: event kinds the build does not know decode as
+`SessionEventPayload::Unknown`, and the fold skips them. Sessions from before
+the stamp read as 0 and are stamped on their next commit.
+
 ### Example
 
 ```rust

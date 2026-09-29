@@ -964,6 +964,12 @@ pub struct RestoredContext {
     pub token_ledger: TokenLedger,
 }
 
+/// Version of the session log encoding this build writes. Persistent stores
+/// stamp it on each session and refuse to commit to a session stamped newer,
+/// so an older build never appends to a log it cannot fully read. Bump it
+/// when adding an event kind or field that an older fold would misread.
+pub const SESSION_LOG_FORMAT: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 /// Event payload emitted by the session runtime.
@@ -1076,6 +1082,11 @@ pub enum SessionEventPayload {
     SubagentUpdated {
         record: SubagentRecord,
     },
+    /// An event kind this build does not know, written by a newer build.
+    /// Read-only paths skip it; the store refuses writes to sessions stamped
+    /// with a newer [`SESSION_LOG_FORMAT`], so it never folds into a commit.
+    #[serde(other)]
+    Unknown,
 }
 
 /// An event that has been committed to the session store and therefore has
@@ -2383,6 +2394,32 @@ mod tests {
                 encoded,
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn unknown_event_kinds_decode_as_unknown_and_known_kinds_stay_strict() {
+        // (case, encoded payload, decoded kind or None for a decode error)
+        let cases = [
+            (
+                "newer kind",
+                serde_json::json!({"kind": "from_the_future", "field": 1}),
+                Some(SessionEventPayload::Unknown),
+            ),
+            (
+                "known kind",
+                serde_json::json!({"kind": "session_started"}),
+                Some(SessionEventPayload::SessionStarted),
+            ),
+            (
+                "known kind, malformed body",
+                serde_json::json!({"kind": "lagged"}),
+                None,
+            ),
+        ];
+        for (name, encoded, expected) in cases {
+            let decoded = serde_json::from_value::<SessionEventPayload>(encoded).ok();
+            assert_eq!(decoded, expected, "{name}");
         }
     }
 

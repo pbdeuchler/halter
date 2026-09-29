@@ -47,7 +47,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 |---|---------|-----------:|--------|
 | 7 | `MessageItem` means both "append to transcript" (fold) and "logged only" (`CompactionContext::record`/`infer`). A custom strategy that uses `record` breaks fold parity. | 90% | fixed |
 | 8 | sqlite `load_session` and `replay_after` are separate reads, so a concurrent commit in between produces a spurious `exceeds advertised head` error. | 80% | fixed |
-| 9 | `SessionEventPayload` has no catch-all variant and the log has no schema version, so an older binary cannot read a newer log (and the reverse fails silently). | 90% | open |
+| 9 | `SessionEventPayload` has no catch-all variant and the log has no schema version, so an older binary cannot read a newer log (and the reverse fails silently). | 90% | fixed |
 | 10 | Resume rebinds to the current resources and ignores the stored snapshot, while manual compact uses the stored one. Per-turn model overrides are not logged. | 80% | fixed |
 | 11 | Out-of-turn writers (`notify`, `compact`, `shutdown`, `resume`) fail an in-flight turn on the conflict check. | 90% | fixed |
 | 12 | Shell, pty and browser state and stateful Function hooks reset silently on resume. Once-hook ids are positional, so reordering hooks re-fires or suppresses them. | 75% | open |
@@ -156,3 +156,12 @@ Entries are oldest first.
     - `turn_default_model_override_selects_overridden_provider` asserts the logged override;
     - `turn_started_records_overrides_and_reads_older_logs` (older JSON reads as no override; round-trips).
   - Residual: the log doesn't say which snapshot revision each turn used; only the latest snapshot is stored with the session. Exhaustive `TurnStarted { turn_id }` patterns break (the software-factory example was fixed).
+
+- **#9 fixed** ("gate plus tolerant reader").
+  - `halter_protocol::SESSION_LOG_FORMAT` is set to 1. Sqlite migration 3 adds `sessions.log_format` (default 0). `create_session` stamps the current format, and each commit raises the stamp to the current format and refuses sessions stamped newer, before anything is written. The in-memory store has no gate: it cannot outlive its process, so no other build can write to it.
+  - `SessionEventPayload::Unknown` (`#[serde(other)]`) lets an older build read a newer log. Unknown kinds decode as `Unknown`, which the fold ignores, while a known kind with a malformed body still fails to decode. Resuming such a session fails at the first commit (`SessionResumed`) with an "upgrade halter" error.
+  - Tests:
+    - `commit_gates_on_and_raises_the_log_format_stamp` (legacy, current, newer; a mutation that disables the gate fails it);
+    - `unknown_event_kinds_decode_as_unknown_and_known_kinds_stay_strict`;
+    - `unknown_events_leave_state_untouched`.
+  - Residual: binaries from before this change have no gate and fail on unknown kinds. The stamp only takes effect from this build on. Nothing forces a bump of `SESSION_LOG_FORMAT` when a variant or field is added; that relies on review (the constant's doc says when to bump it).
