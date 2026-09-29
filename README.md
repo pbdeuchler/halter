@@ -546,6 +546,9 @@ compaction_threshold = 200_000
 # "clean_window": recover through notes, task, and session_search after a wipe.
 compaction = "model_summary"
 # notes_root = "~/.local/share/halter/notes" # optional, for clean_window
+# Without it, notes sit in a `notes` dir beside the sqlite database (the
+# default one too). Memory sessions and custom stores get the temp dir, so a
+# custom durable store should set notes_root.
 
 [policy]
 allowed_write_roots = ["./", "/tmp/halter"]

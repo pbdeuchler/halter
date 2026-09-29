@@ -24,7 +24,7 @@ use thiserror::Error;
 
 pub use memory::InMemorySessionStore;
 #[cfg(feature = "sqlite")]
-pub use sqlite::SqliteSessionStore;
+pub use sqlite::{SqliteSessionStore, default_db_path};
 
 #[derive(Debug, Clone)]
 /// Persisted session record loaded by a [`SessionStore`].

@@ -42,21 +42,19 @@ use crate::{CompiledResources, LoadedPlugin, LoadedSkill, ResourceCompiler};
 #[cfg(feature = "sqlite")]
 use halter_session::SqliteSessionStore;
 
-fn clean_window_notes_root(config: &HarnessConfig) -> PathBuf {
-    config
-        .context
-        .notes_root
-        .as_ref()
-        .map(|root| expand_path(root))
-        .unwrap_or_else(|| {
-            config
-                .sessions
-                .sqlite_path
-                .as_ref()
-                .and_then(|path| path.parent())
-                .map(|parent| expand_path(parent).join("notes"))
-                .unwrap_or_else(|| std::env::temp_dir().join("halter").join("notes"))
-        })
+/// Notes sit beside a sqlite store so they last as long as its sessions;
+/// memory sessions die with the process, and their notes go to the temp dir.
+fn clean_window_notes_root(config: &HarnessConfig) -> anyhow::Result<PathBuf> {
+    let database = match (&config.context.notes_root, &config.sessions.sqlite_path) {
+        (Some(root), _) => return Ok(expand_path(root)),
+        (None, Some(path)) => expand_path(path),
+        #[cfg(feature = "sqlite")]
+        (None, None) if config.sessions.backend == SessionBackend::Sqlite => {
+            halter_session::default_db_path()?
+        }
+        (None, None) => return Ok(std::env::temp_dir().join("halter").join("notes")),
+    };
+    Ok(database.parent().unwrap_or(Path::new("")).join("notes"))
 }
 
 #[derive(Default)]
@@ -265,7 +263,7 @@ impl HalterBuilder {
         let compaction = match compaction {
             Some(strategy) => strategy,
             None if resolved_context.compaction == CompactionStrategyKind::CleanWindow => {
-                let root = clean_window_notes_root(&config);
+                let root = clean_window_notes_root(&config)?;
                 Arc::new(CleanWindow::new(
                     halter_tools::FsNotes::new(root)?,
                     StoreSearch::new(sessions.clone()),
@@ -2029,25 +2027,56 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let sqlite = temp.path().join("store/sessions.db");
         let explicit = temp.path().join("custom");
-        for (notes, database, expected) in [
+        #[cfg(feature = "sqlite")]
+        let durable = SessionBackend::Sqlite;
+        #[cfg(not(feature = "sqlite"))]
+        let durable = SessionBackend::Memory;
+        #[allow(unused_mut)]
+        let mut cases = vec![
             (
                 Some(explicit.clone()),
                 Some(sqlite.clone()),
+                durable.clone(),
                 explicit.clone(),
             ),
-            (Some(explicit.clone()), None, explicit),
-            (None, Some(sqlite), temp.path().join("store/notes")),
+            (Some(explicit.clone()), None, durable.clone(), explicit),
+            (
+                None,
+                Some(sqlite),
+                durable.clone(),
+                temp.path().join("store/notes"),
+            ),
             (
                 None,
                 Some(PathBuf::from("sessions.db")),
+                durable.clone(),
                 PathBuf::from("notes"),
             ),
-            (None, None, std::env::temp_dir().join("halter/notes")),
-        ] {
+            (
+                None,
+                None,
+                SessionBackend::Memory,
+                std::env::temp_dir().join("halter/notes"),
+            ),
+        ];
+        // A default sqlite store keeps its notes beside it, not in the temp dir.
+        #[cfg(feature = "sqlite")]
+        cases.push((
+            None,
+            None,
+            SessionBackend::Sqlite,
+            halter_session::default_db_path()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("notes"),
+        ));
+        for (notes, database, backend, expected) in cases {
             let mut config = openai_config(Some("test-key"));
             config.context.notes_root = notes;
             config.sessions.sqlite_path = database;
-            assert_eq!(clean_window_notes_root(&config), expected);
+            config.sessions.backend = backend;
+            assert_eq!(clean_window_notes_root(&config).unwrap(), expected);
         }
     }
 

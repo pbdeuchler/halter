@@ -778,7 +778,7 @@ fn unix_timestamp_seconds() -> Result<i64> {
 /// 2. Platform fallback:
 ///    - Windows: `%LOCALAPPDATA%/halter/sessions.db`
 ///    - Unix:    `$HOME/.local/share/halter/sessions.db`
-fn default_db_path() -> Result<PathBuf> {
+pub fn default_db_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path).join("halter").join("sessions.db"));
     }

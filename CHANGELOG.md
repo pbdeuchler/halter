@@ -10,6 +10,7 @@ once a `1.0.0` line is cut.
 
 ### Added
 
+- `halter_session::default_db_path()` (sqlite feature): the path `SqliteSessionStore::open_default()` opens.
 - `RuntimeServices::session_leases`: a per-session write lease. A turn, `compact`, `shutdown` or `resume` holds it for its whole duration, and a second writer on the same session waits instead of racing on the commit head. Custom `RuntimeServices` literals must add `session_leases: Arc::new(SessionLeases::default())`.
 - `SessionState::open_turn`: the turn that has started but not finished. `SessionState` literals must add `open_turn: None` (or use `..Default::default()`).
 - `TaskList::from_results` and `ToolSessionStore::restore_task_session`, which rebuild a session's task list from the `task` tool results in its log.
@@ -28,6 +29,7 @@ once a `1.0.0` line is cut.
 - The snapshot revision is now a hash of the whole serialised snapshot. Previously v0.6 snapshots with skills (whose new `SkillDef.root` field was not hashed) collided with stored rows and failed every sqlite commit with `revision already exists with different data`.
 - `SubagentStart` and `SubagentStop` hooks, and `notify`, no longer fail the parent's in-flight turn with `event log advanced concurrently`. Their dispatches queue behind the turn and commit right after it.
 - The CLI drains in-flight turns before running session-end hooks.
+- CleanWindow notes for a default sqlite store (`backend = "sqlite"` with no `sqlite_path`) now sit beside the default database instead of in the temp dir, so they survive a reboot like the sessions that refer to them.
 - The live trace now survives resume. `resume` reopened nothing, so a session resumed by a new process lost every later event; `TraceRecorder::open_session` truncated the file on create; and restored subagents never rejoined the parent's trace. `open_session` now appends (header only for a new file) and is a no-op for an open session; `resume` calls it, and restored subagents are aliased to the parent's writer.
 - A turn whose final commit fails is now recorded as `TurnFailed`. Previously the log was left with an unmatched `TurnStarted`.
 - A turn interrupted by a crash, abort or shutdown is closed with a cancelled `TurnFailed` on the next `resume` or turn, so the log never keeps a dangling turn.

@@ -206,7 +206,8 @@ Use it when you want:
 Important constructors:
 
 - `SqliteSessionStore::open(path)`
-- `SqliteSessionStore::open_default()`
+- `SqliteSessionStore::open_default()`, which opens `default_db_path()`
+  (`$XDG_DATA_HOME/halter/sessions.db`, else the platform data dir)
 
 ### Concurrency model
 

@@ -51,7 +51,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 10 | Resume rebinds to the current resources and ignores the stored snapshot, while manual compact uses the stored one. Per-turn model overrides are not logged. | 80% | fixed |
 | 11 | Out-of-turn writers (`notify`, `compact`, `shutdown`, `resume`) fail an in-flight turn on the conflict check. | 90% | fixed |
 | 12 | Shell, pty and browser state and stateful Function hooks reset silently on resume. Once-hook ids are positional, so reordering hooks re-fires or suppresses them. | 75% | open |
-| 13 | The notes root falls back to the temp dir, so notes don't survive a reboot. | 70% | open |
+| 13 | The notes root falls back to the temp dir, so notes don't survive a reboot. | 70% | fixed |
 | 14 | Model-judge panel sessions are orphaned: their usage never reaches the parent, and the injected advisory is not logged. | 75% | fixed |
 
 ### Low
@@ -199,3 +199,10 @@ Entries are oldest first.
     - `attach_aliases_a_child_only_when_its_parent_is_open`.
     - `restored_subagents_take_input_and_close` now also asserts that the child's post-restart events reach the parent's trace. The attach mutation fails it.
   - Residual: events committed while no process had the session open (for example a store-level `commit` by another tool) are still missing from the live trace. `export_trace()` stays the source of truth.
+
+- **#13 fixed.** Diagnosis narrowed: an explicit `sqlite_path` already put notes beside the database. The gap was `backend = "sqlite"` with no path: the store opened the default database in the data dir, but the notes went to the temp dir, so a reboot lost the notes of every surviving session.
+  - `clean_window_notes_root` now derives notes from `halter_session::default_db_path()` in that case. That function was private and is now exported.
+  - It is fallible (missing `HOME`), and the builder propagates the error. `open_default` would fail the same way.
+  - Memory sessions keep temp-dir notes, since the notes don't outlive the sessions.
+  - Test: `clean_window_notes_root_follows_configured_precedence` gained a backend column and a "default sqlite" row. A mutation that drops the new arm fails it.
+  - Residual: a custom store passed through `with_session_store` still gets temp-dir notes, because the builder can't tell whether that store is durable. This is documented in the README and should be set via `notes_root`. I considered defaulting everything to the data dir and rejected it: in-memory tests and embedders would leave notes in `$HOME`.
