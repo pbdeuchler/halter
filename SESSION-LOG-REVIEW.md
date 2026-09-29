@@ -14,7 +14,7 @@ This file doubles as the burn-down tracker. Each finding has a status:
 
 The log is not authoritative. The `SessionState` checkpoint is.
 `halter_protocol::fold::apply_event` covers only `messages`,
-`compacted_prefix`, `usage_so_far`, `token_ledger` and `context_window`.
+`compacted_prefix`, `usage_so_far`, `token_ledger` and `context_window` (and, since #6, `subagents`).
 `covered_state_matches` compares only those fields. Hydration folds the tail
 after `state_sequence` onto the checkpoint. Because every write path that
 produces events also writes a full checkpoint, that tail is almost always
@@ -39,7 +39,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 3 | Dangling turns. A failed final commit only calls `live.emit_error` and never writes `TurnFailed`. Shutdown aborts and crashes leave `TurnStarted` open. Resume never reconciles an open turn. | 95% | fixed |
 | 4 | A crash during tool execution loses the log record of side effects and usage. The assistant tool-call message and tool results commit only after the whole batch. `pending_tool_calls` is inserted and removed with no commit in between, so it is never persisted non-empty. | 90% | fixed |
 | 5 | The task list (`ToolSessionStore::task_sessions`) lives only in memory, but the compaction strategies promise that todos survive compaction and rollover. Resume loses it. | 95% | fixed |
-| 6 | `fork_context` children start with the parent's messages, which end in an unanswered spawn `tool_use` (strict providers reject this). The inherited state is not in the child's log. The registry itself is in memory only (#210). | 85% | partial |
+| 6 | `fork_context` children start with the parent's messages, which end in an unanswered spawn `tool_use` (strict providers reject this). The inherited state is not in the child's log. The registry itself is in memory only (#210). | 85% | fixed |
 
 ### Medium
 
@@ -118,3 +118,20 @@ Entries are oldest first.
 
 - **#6 partial: the fork's unanswered `tool_use` is fixed.** `build_subagent_state` with `fork_context` now answers the parent's in-flight tool calls (the spawn among them). It reuses `answer_unresolved_tool_calls`, which now takes the result text. The child sees "result delivered to the parent session; this session is the subagent it forked". Test: `forked_state_answers_the_parents_in_flight_tool_calls` (fork mid-spawn, fork without tool calls, no fork).
   - Still open: the inherited state lives only in the child's creation checkpoint, not its log (target architecture item 2). The registry is in memory only (#210).
+
+- **#6 fixed: the subagent registry is in the parent's log (#210).** `SessionEventPayload::SubagentUpdated { record }` carries a `SubagentRecord` (status plus generation). It is the first `SessionState` field the fold owns since the review began: `SessionState::subagents` is an upsert, and a record older than the held generation is ignored.
+  - One variant, not one per transition. The status's `state` already says which transition it was.
+  - `RuntimeSubagentControl` records the agent at turn start (spawn and `send_input`), turn finish and close. The start record is written before the turn task is spawned, so the same generation's finish always lands after it. The dispatch goes through the lease inbox as `OutOfTurn::Subagent`.
+  - The lease holder drains subagent records at every `flush_turn_progress`, not only at release. Records touch no transcript, so this is safe mid-turn. A spawn's record therefore commits with the tool result that hands the model its agent id, so no orphan sweep is needed. Hook dispatches still wait for release.
+  - `resume` runs under the lease, in this order: it collects the agent ids this process holds; `mark_resumed` cancels every `Running` record not among them, with "interrupted: the process stopped before this subagent's turn finished; use send_input to continue", in the same commit as `SessionResumed`; then `RuntimeSubagentControl::restore` registers the missing agents with `running: None`.
+  - Tests:
+    - `subagent_records_older_than_the_held_generation_are_ignored` (fold, table);
+    - `resume_rebuilds_subagents_from_the_parent_log` (table: finished before the stop, running at the stop, still running in this process; the log agrees with the registry);
+    - `restored_subagents_take_input_and_close` (`send_input` continues an interrupted child in a new process, `close` records `Closed`, and input to a closed agent fails);
+    - `the_holder_takes_subagent_records_and_leaves_hooks` (lease, table);
+    - `subagent_lifecycle_hooks_queue_behind_the_parent_turn` now also asserts the record commits before `TurnCompleted` and that the checkpoint holds the finished child.
+  - Residual:
+    - The fork's inherited state is still only in the child's creation checkpoint, not its log.
+    - Recording is best-effort: a failed dispatch logs a warning, and the in-memory registry stays authoritative for the process.
+    - Two processes resuming the same parent can both think the other's agents are interrupted, because the lease is process-local.
+    - The child session is not reconciled on resume; the child's own open turn is closed when `send_input` starts its next turn (#3).

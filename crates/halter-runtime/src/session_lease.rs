@@ -7,12 +7,14 @@
 // the lease instead of racing it on `expected_head_sequence`, and are
 // committed when the lease is released. With no lease held they commit
 // immediately, under the same lock, so a writer cannot start mid-commit.
+// Subagent records touch no transcript, so the holder also takes them at each
+// of its own commits (`take_subagent_records`) rather than at release.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::Future;
 
-use halter_protocol::SessionId;
+use halter_protocol::{SessionId, SubagentRecord};
 use tokio::sync::{Mutex, Notify};
 use tracing::warn;
 
@@ -20,10 +22,16 @@ use crate::ExecutedHookDispatch;
 use crate::session::SessionHandle;
 
 #[derive(Default)]
-/// Per-session write leases plus the hook dispatches queued behind them.
+/// Per-session write leases plus the writes queued behind them.
 pub struct SessionLeases {
-    held: Mutex<HashMap<SessionId, Vec<ExecutedHookDispatch>>>,
+    held: Mutex<HashMap<SessionId, Vec<OutOfTurn>>>,
     released: Notify,
+}
+
+/// A write that originated outside the session's writer.
+pub(crate) enum OutOfTurn {
+    Hooks(ExecutedHookDispatch),
+    Subagent(SubagentRecord),
 }
 
 impl SessionLeases {
@@ -49,7 +57,7 @@ impl SessionLeases {
         commit: F,
     ) -> anyhow::Result<()>
     where
-        F: FnOnce(Vec<ExecutedHookDispatch>) -> Fut,
+        F: FnOnce(Vec<OutOfTurn>) -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
     {
         let mut held = self.held.lock().await;
@@ -62,16 +70,35 @@ impl SessionLeases {
         outcome
     }
 
+    /// Take the subagent records queued behind the lease, for the holder
+    /// to fold into its next commit.
+    pub(crate) async fn take_subagent_records(
+        &self,
+        session_id: &SessionId,
+    ) -> Vec<SubagentRecord> {
+        let mut held = self.held.lock().await;
+        let Some(queued) = held.get_mut(session_id) else {
+            return Vec::new();
+        };
+        queued
+            .extract_if(.., |write| matches!(write, OutOfTurn::Subagent(_)))
+            .filter_map(|write| match write {
+                OutOfTurn::Subagent(record) => Some(record),
+                OutOfTurn::Hooks(_) => None,
+            })
+            .collect()
+    }
+
     /// Queue `dispatch` behind the lease holder, or commit it now when the
     /// session has no writer.
     pub(crate) async fn dispatch<F, Fut>(
         &self,
         session_id: &SessionId,
-        dispatch: ExecutedHookDispatch,
+        dispatch: OutOfTurn,
         commit: F,
     ) -> anyhow::Result<()>
     where
-        F: FnOnce(Vec<ExecutedHookDispatch>) -> Fut,
+        F: FnOnce(Vec<OutOfTurn>) -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
     {
         let mut held = self.held.lock().await;
@@ -131,10 +158,14 @@ mod tests {
 
     type CommitResult = fn() -> anyhow::Result<()>;
 
+    fn hooks() -> OutOfTurn {
+        OutOfTurn::Hooks(ExecutedHookDispatch::default())
+    }
+
     fn committer(
         count: Arc<AtomicUsize>,
         result: CommitResult,
-    ) -> impl FnOnce(Vec<ExecutedHookDispatch>) -> std::future::Ready<anyhow::Result<()>> {
+    ) -> impl FnOnce(Vec<OutOfTurn>) -> std::future::Ready<anyhow::Result<()>> {
         move |dispatches| {
             count.fetch_add(dispatches.len(), Ordering::SeqCst);
             std::future::ready(result())
@@ -188,11 +219,7 @@ mod tests {
         leases.acquire(&session).await;
         for _ in 0..2 {
             leases
-                .dispatch(
-                    &session,
-                    ExecutedHookDispatch::default(),
-                    committer(committed.clone(), || Ok(())),
-                )
+                .dispatch(&session, hooks(), committer(committed.clone(), || Ok(())))
                 .await
                 .expect("queue");
         }
@@ -225,11 +252,7 @@ mod tests {
         ];
         for (case, result, ok) in cases {
             let outcome = leases
-                .dispatch(
-                    &session,
-                    ExecutedHookDispatch::default(),
-                    committer(committed.clone(), result),
-                )
+                .dispatch(&session, hooks(), committer(committed.clone(), result))
                 .await;
             assert_eq!(outcome.is_ok(), ok, "{case}");
         }
@@ -254,9 +277,7 @@ mod tests {
 
         leases.acquire(&session).await;
         leases
-            .dispatch(&session, ExecutedHookDispatch::default(), |_| async {
-                Ok(())
-            })
+            .dispatch(&session, hooks(), |_| async { Ok(()) })
             .await
             .expect("queue");
         assert!(
@@ -271,5 +292,51 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), leases.acquire(&session))
             .await
             .expect("failed release still frees the lease");
+    }
+    #[tokio::test]
+    async fn the_holder_takes_subagent_records_and_leaves_hooks() {
+        let record = || {
+            OutOfTurn::Subagent(SubagentRecord {
+                status: halter_protocol::SubagentStatus {
+                    agent_id: halter_protocol::AgentId::from("agent"),
+                    session_id: SessionId::from("child"),
+                    agent_type: None,
+                    task: "task".to_owned(),
+                    state: halter_protocol::SubagentState::Running,
+                    last_message: None,
+                    usage: None,
+                    error: None,
+                },
+                generation: 1,
+            })
+        };
+        // (case, lease held, queued writes, records taken, hooks left for release)
+        type Case = (&'static str, bool, Vec<fn() -> OutOfTurn>, usize, usize);
+        let cases: [Case; 3] = [
+            ("no writer", false, Vec::new(), 0, 0),
+            ("hooks only", true, vec![hooks], 0, 1),
+            ("mixed", true, vec![record, hooks, record], 2, 1),
+        ];
+        for (case, held, queued, taken, left) in cases {
+            let leases = SessionLeases::default();
+            let session = SessionId::new();
+            if held {
+                leases.acquire(&session).await;
+            }
+            for write in queued {
+                leases
+                    .dispatch(&session, write(), |_| async { Ok(()) })
+                    .await
+                    .expect("queue");
+            }
+            let records = leases.take_subagent_records(&session).await;
+            assert_eq!(records.len(), taken, "{case}");
+            let committed = Arc::new(AtomicUsize::new(0));
+            leases
+                .release(&session, committer(committed.clone(), || Ok(())))
+                .await
+                .expect("release");
+            assert_eq!(committed.load(Ordering::SeqCst), left, "{case}");
+        }
     }
 }

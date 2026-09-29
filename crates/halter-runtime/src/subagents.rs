@@ -1,6 +1,6 @@
 // pattern: Imperative Shell
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use halter_protocol::{
     AgentId, AgentName, CloseSubagentRequest, CloseSubagentResponse, SendSubagentInputRequest,
-    SessionId, SpawnSubagentRequest, SubagentState, SubagentStatus, Turn, TurnId, Usage,
-    WaitSubagentRequest, WaitSubagentResponse,
+    SessionId, SpawnSubagentRequest, SubagentRecord, SubagentState, SubagentStatus, Turn, TurnId,
+    Usage, WaitSubagentRequest, WaitSubagentResponse,
 };
 use halter_tools::{SubagentControl, SubagentParentContext};
 use tokio::sync::{Mutex, Notify};
@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::session::create_session_seeded;
+use crate::session_lease::OutOfTurn;
 use crate::subagent_session::{
     build_subagent_session_init, build_subagent_state, extract_subagent_output,
     extract_subagent_usage,
@@ -47,6 +48,8 @@ struct SubagentRegistry {
 }
 
 struct RegisteredSubagent {
+    /// The session whose log records this agent.
+    parent: SessionId,
     status: SubagentStatus,
     generation: u64,
     running: Option<RunningTurn>,
@@ -94,6 +97,51 @@ impl RuntimeSubagentControl {
         }
     }
 
+    /// Ids of every agent this process knows, whatever its parent.
+    pub(crate) async fn agent_ids(&self) -> HashSet<AgentId> {
+        let registry = self.inner.registry.lock().await;
+        registry
+            .entries
+            .values()
+            .map(|entry| entry.status.agent_id.clone())
+            .collect()
+    }
+
+    /// Register the agents `parent`'s log recorded, keeping any entry this
+    /// process already holds.
+    pub(crate) async fn restore(
+        &self,
+        parent: &SessionId,
+        records: impl IntoIterator<Item = SubagentRecord>,
+    ) {
+        let mut registry = self.inner.registry.lock().await;
+        for SubagentRecord { status, generation } in records {
+            registry
+                .entries
+                .entry(status.agent_id.0.clone())
+                .or_insert_with(|| RegisteredSubagent {
+                    parent: parent.clone(),
+                    status,
+                    generation,
+                    running: None,
+                });
+        }
+        drop(registry);
+        self.signal_change();
+    }
+
+    /// Append an agent's new status to its parent's log.
+    async fn record(&self, parent: SessionId, status: SubagentStatus, generation: u64) {
+        let record = OutOfTurn::Subagent(SubagentRecord { status, generation });
+        let dispatched = match HalterSession::new(self.inner.services.clone(), parent.clone()) {
+            Ok(session) => session.dispatch_out_of_turn(record).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = dispatched {
+            warn!(session_id = %parent, error = %error, "failed to record subagent status");
+        }
+    }
+
     fn signal_change(&self) {
         self.inner.version.fetch_add(1, Ordering::SeqCst);
         self.inner.changed.notify_waiters();
@@ -101,7 +149,7 @@ impl RuntimeSubagentControl {
 
     async fn reserve_subagent_slot(
         &self,
-        parent_depth: u32,
+        parent: &SubagentParentContext,
         agent_id: &AgentId,
         status: SubagentStatus,
     ) -> anyhow::Result<()> {
@@ -113,7 +161,7 @@ impl RuntimeSubagentControl {
             self.inner
                 .services
                 .policy
-                .check_subagent_spawn_typed(parent_depth, active)
+                .check_subagent_spawn_typed(parent.blueprint.subagent_depth, active)
                 .await?;
 
             let mut registry = self.inner.registry.lock().await;
@@ -124,6 +172,7 @@ impl RuntimeSubagentControl {
             registry.entries.insert(
                 agent_id.0.clone(),
                 RegisteredSubagent {
+                    parent: parent.blueprint.session_id.clone(),
                     status,
                     generation: 0,
                     running: None,
@@ -157,7 +206,7 @@ impl RuntimeSubagentControl {
             .await?
             .and_then(|stored| stored.blueprint.parent_session_id);
         let cancel = CancellationToken::new();
-        let (generation, status) = {
+        let (parent, generation, status) = {
             let mut registry = self.inner.registry.lock().await;
             let entry = registry.entries.get_mut(&agent_id.0).with_context(|| {
                 format!(
@@ -186,8 +235,10 @@ impl RuntimeSubagentControl {
             entry.status.last_message = None;
             entry.status.usage = None;
             entry.status.error = None;
-            (entry.generation, entry.status.clone())
+            (entry.parent.clone(), entry.generation, entry.status.clone())
         };
+        // Before the turn is spawned, so its outcome is recorded after it.
+        self.record(parent, status.clone(), generation).await;
 
         let services = self.inner.services.clone();
         let task_agent_id = agent_id.clone();
@@ -383,7 +434,9 @@ impl RuntimeSubagentControl {
             state = ?entry.status.state,
             "completed subagent turn"
         );
+        let (parent, status) = (entry.parent.clone(), entry.status.clone());
         drop(registry);
+        self.record(parent, status, generation).await;
         self.signal_change();
     }
 
@@ -437,7 +490,9 @@ impl RuntimeSubagentControl {
         }
         // The parent is mid-turn (this runs inside its spawn tool call), so
         // the dispatch queues behind the parent turn instead of racing it.
-        session.dispatch_out_of_turn(dispatch).await
+        session
+            .dispatch_out_of_turn(crate::session_lease::OutOfTurn::Hooks(dispatch))
+            .await
     }
 
     async fn run_subagent_stop_hooks(
@@ -487,7 +542,9 @@ impl RuntimeSubagentControl {
         )
         .await?;
         let block_reason = dispatch.merged.block_reason.clone();
-        session.dispatch_out_of_turn(dispatch).await?;
+        session
+            .dispatch_out_of_turn(crate::session_lease::OutOfTurn::Hooks(dispatch))
+            .await?;
         Ok(block_reason)
     }
 
@@ -528,7 +585,7 @@ impl SubagentControl for RuntimeSubagentControl {
             error: None,
         };
 
-        self.reserve_subagent_slot(parent.blueprint.subagent_depth, &agent_id, status.clone())
+        self.reserve_subagent_slot(parent, &agent_id, status.clone())
             .await?;
 
         if let Err(error) = create_session_seeded(
@@ -662,7 +719,7 @@ impl SubagentControl for RuntimeSubagentControl {
     }
 
     async fn close(&self, request: CloseSubagentRequest) -> anyhow::Result<CloseSubagentResponse> {
-        let previous_status = {
+        let (previous_status, parent, status, generation) = {
             let mut registry = self.inner.registry.lock().await;
             let entry = registry
                 .entries
@@ -683,8 +740,14 @@ impl SubagentControl for RuntimeSubagentControl {
             entry.status.state = SubagentState::Closed;
             entry.status.error = closed_running_turn
                 .then(|| "closed by close_agent (work was cancelled)".to_owned());
-            previous
+            (
+                previous,
+                entry.parent.clone(),
+                entry.status.clone(),
+                entry.generation,
+            )
         };
+        self.record(parent, status, generation).await;
 
         warn!(
             agent_id = %previous_status.agent_id,
@@ -760,7 +823,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{DefaultContextManager, DefaultPromptAssembler, EventBus, ResourceHandle};
+    use crate::{
+        DefaultContextManager, DefaultPromptAssembler, EventBus, ResourceHandle, SessionRuntime,
+    };
 
     #[tokio::test]
     async fn spawn_and_wait_complete_child_session() {
@@ -1029,6 +1094,216 @@ mod tests {
         );
     }
 
+    fn spawn_request(message: &str) -> SpawnSubagentRequest {
+        SpawnSubagentRequest {
+            message: message.to_owned(),
+            agent_type: None,
+            fork_context: false,
+            model: None,
+        }
+    }
+
+    /// Another process over `services`' store, with nothing in memory.
+    fn restarted(services: &Arc<RuntimeServices>, provider: Arc<dyn Provider>) -> SessionRuntime {
+        let mut restarted = test_services(provider);
+        Arc::get_mut(&mut restarted).expect("unique").sessions = services.sessions.clone();
+        SessionRuntime::new(restarted)
+    }
+
+    async fn status_of(
+        control: &Arc<dyn SubagentControl>,
+        agent: &AgentId,
+        timeout_ms: u64,
+    ) -> SubagentStatus {
+        let waited = control
+            .wait(WaitSubagentRequest {
+                targets: vec![agent.clone()],
+                timeout_ms: Some(timeout_ms),
+            })
+            .await
+            .expect("the agent is registered");
+        waited
+            .status
+            .into_iter()
+            .chain(waited.target_statuses)
+            .next()
+            .expect("status")
+    }
+
+    async fn last_recorded(services: &Arc<RuntimeServices>) -> Option<SubagentStatus> {
+        let log = services
+            .sessions
+            .replay(&SessionId::from("parent"))
+            .await
+            .expect("replay");
+        log.into_iter().rev().find_map(|event| match event.payload {
+            halter_protocol::SessionEventPayload::SubagentUpdated { record } => Some(record.status),
+            _ => None,
+        })
+    }
+
+    /// #210: a resumed parent rebuilds its subagents from its own log.
+    #[tokio::test]
+    async fn resume_rebuilds_subagents_from_the_parent_log() {
+        fn completes() -> Arc<dyn Provider> {
+            Arc::new(RecordingProvider::new(Arc::default()))
+        }
+        fn pends() -> Arc<dyn Provider> {
+            Arc::new(PendingProvider)
+        }
+        let interrupted = Some(crate::session::INTERRUPTED_SUBAGENT);
+        type Case = (
+            &'static str,
+            fn() -> Arc<dyn Provider>,
+            bool,
+            SubagentState,
+            Option<&'static str>,
+        );
+        let cases: [Case; 3] = [
+            (
+                "finished before the stop",
+                completes,
+                true,
+                SubagentState::Completed,
+                None,
+            ),
+            (
+                "running at the stop",
+                pends,
+                true,
+                SubagentState::Cancelled,
+                interrupted,
+            ),
+            (
+                "running in this process",
+                pends,
+                false,
+                SubagentState::Running,
+                None,
+            ),
+        ];
+        for (name, provider, restart, state, error) in cases {
+            let services = test_services(provider());
+            let parent = parent_context();
+            store_parent_session(&services, &parent).await;
+            let first = SessionRuntime::new(services.clone());
+            let agent = first
+                .subagent_control()
+                .spawn(&parent, spawn_request("task"))
+                .await
+                .expect("spawn")
+                .agent_id;
+            let settle = if state == SubagentState::Completed {
+                5_000
+            } else {
+                50
+            };
+            status_of(&first.subagent_control(), &agent, settle).await;
+
+            let resumed = if restart {
+                restarted(&services, provider())
+            } else {
+                first
+            };
+            resumed
+                .resume(&parent.blueprint.session_id)
+                .await
+                .expect("resume")
+                .expect("found");
+
+            let status = status_of(&resumed.subagent_control(), &agent, 50).await;
+            assert_eq!(
+                (status.state, status.error.as_deref()),
+                (state, error),
+                "{name}"
+            );
+            assert_eq!(
+                status.last_message.is_some(),
+                state == SubagentState::Completed,
+                "{name}"
+            );
+            assert_eq!(last_recorded(&services).await, Some(status), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_subagents_take_input_and_close() {
+        let services = test_services(Arc::new(PendingProvider));
+        let parent = parent_context();
+        store_parent_session(&services, &parent).await;
+        let spawned = SessionRuntime::new(services.clone())
+            .subagent_control()
+            .spawn(&parent, spawn_request("task"))
+            .await
+            .expect("spawn");
+        let agent = spawned.agent_id;
+        // The first process stops once the child's turn is under way.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while services
+                .sessions
+                .load_session(&spawned.session_id)
+                .await
+                .expect("load")
+                .is_none_or(|stored| stored.state.open_turn.is_none())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child turn started");
+
+        let runtime = restarted(&services, Arc::new(RecordingProvider::new(Arc::default())));
+        runtime
+            .resume(&parent.blueprint.session_id)
+            .await
+            .expect("resume")
+            .expect("found");
+        let control = runtime.subagent_control();
+        assert_eq!(
+            status_of(&control, &agent, 50).await.state,
+            SubagentState::Cancelled
+        );
+
+        let input = |message: &str| SendSubagentInputRequest {
+            target: agent.clone(),
+            message: message.to_owned(),
+        };
+        control
+            .send_input(input("continue"))
+            .await
+            .expect("send_input");
+        let waited = control
+            .wait(WaitSubagentRequest {
+                targets: vec![agent.clone()],
+                timeout_ms: Some(5_000),
+            })
+            .await
+            .expect("wait")
+            .status
+            .expect("finished");
+        assert_eq!(waited.state, SubagentState::Completed, "{:?}", waited.error);
+        assert_eq!(
+            waited.last_message.as_deref(),
+            Some("child reply [subagent/model]")
+        );
+
+        control
+            .close(CloseSubagentRequest {
+                target: agent.clone(),
+            })
+            .await
+            .expect("close");
+        assert_eq!(
+            last_recorded(&services).await.map(|status| status.state),
+            Some(SubagentState::Closed)
+        );
+        let error = control
+            .send_input(input("again"))
+            .await
+            .expect_err("closed agents take no input");
+        assert!(error.to_string().contains("is closed"), "{error}");
+    }
+
     #[tokio::test]
     async fn spawn_respects_depth_policy() {
         let services = test_services(Arc::new(RecordingProvider::new(Arc::new(Mutex::new(
@@ -1283,6 +1558,7 @@ mod tests {
             registry.entries.insert(
                 "agent".to_owned(),
                 RegisteredSubagent {
+                    parent: SessionId::from("parent"),
                     status: SubagentStatus {
                         agent_id: AgentId::from("agent"),
                         session_id: SessionId::from("child"),

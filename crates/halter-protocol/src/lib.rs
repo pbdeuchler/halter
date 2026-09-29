@@ -758,6 +758,15 @@ pub struct CloseSubagentRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// A parent session's durable record of one subagent.
+pub struct SubagentRecord {
+    pub status: SubagentStatus,
+    /// Turn counter that fences stale writes: every turn start and close
+    /// increments it, and the fold ignores a record older than the one held.
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// Snapshot of a subagent's visible state.
 pub struct SubagentStatus {
     pub agent_id: AgentId,
@@ -1048,6 +1057,12 @@ pub enum SessionEventPayload {
         dropped_events: u64,
     },
     SessionShutdownComplete,
+    /// A subagent of this session changed state: a turn started (spawn or
+    /// `send_input`), a turn finished, or the agent was closed. Folds into
+    /// [`SessionState::subagents`].
+    SubagentUpdated {
+        record: SubagentRecord,
+    },
 }
 
 /// An event that has been committed to the session store and therefore has
@@ -1638,6 +1653,9 @@ pub struct SessionState {
     /// process stopped mid-turn; the runtime closes it with `TurnFailed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_turn: Option<TurnId>,
+    /// Subagents this session spawned, folded from `SubagentUpdated`.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub subagents: IndexMap<AgentId, SubagentRecord>,
 }
 
 fn legacy_token_ledger() -> TokenLedger {

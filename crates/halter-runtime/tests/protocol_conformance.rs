@@ -14,10 +14,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use halter_protocol::{
-    ApiKind, AssistantMessage, AssistantPart, Delivery, DeltaItem, HookHandlerType, HookRunStatus,
-    HookRunSummary, Message, MessageId, ModelId, ModelRole, PluginId, ProviderKind, ProviderName,
-    ResolvedModel, SessionEvent, SessionEventPayload, SessionId, StopReason, ToolCall, ToolCallId,
-    ToolConcurrency, ToolExecutionOutcome, ToolName, ToolResult, TurnId, Usage,
+    AgentId, ApiKind, AssistantMessage, AssistantPart, Delivery, DeltaItem, HookHandlerType,
+    HookRunStatus, HookRunSummary, Message, MessageId, ModelId, ModelRole, PluginId, ProviderKind,
+    ProviderName, ResolvedModel, SessionEvent, SessionEventPayload, SessionId, StopReason,
+    SubagentRecord, SubagentState, SubagentStatus, ToolCall, ToolCallId, ToolConcurrency,
+    ToolExecutionOutcome, ToolName, ToolResult, TurnId, Usage,
 };
 use halter_providers::{FakeProvider, ModelRegistry};
 
@@ -193,6 +194,21 @@ fn session_event_payload_variants_have_stable_kind() {
         },
         SessionEventPayload::Lagged { dropped_events: 1 },
         SessionEventPayload::SessionShutdownComplete,
+        SessionEventPayload::SubagentUpdated {
+            record: SubagentRecord {
+                status: SubagentStatus {
+                    agent_id: AgentId::from("a1"),
+                    session_id: SessionId::from("child"),
+                    agent_type: None,
+                    task: "t".into(),
+                    state: SubagentState::Running,
+                    last_message: None,
+                    usage: None,
+                    error: None,
+                },
+                generation: 1,
+            },
+        },
     ];
 
     for payload in payloads {
@@ -220,6 +236,7 @@ fn session_event_payload_variants_have_stable_kind() {
             SessionEventPayload::TurnFailed { .. } => "turn_failed",
             SessionEventPayload::Lagged { .. } => "lagged",
             SessionEventPayload::SessionShutdownComplete => "session_shutdown_complete",
+            SessionEventPayload::SubagentUpdated { .. } => "subagent_updated",
         };
         let json = serde_json::to_value(&event.payload).expect("serialize");
         assert_eq!(

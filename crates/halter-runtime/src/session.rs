@@ -1,6 +1,6 @@
 // pattern: Imperative Shell
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -10,13 +10,14 @@ use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
 use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
-    AssembledPrompt, AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash,
+    AgentId, AssembledPrompt, AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash,
     ContextPlan, Delivery, HookSessionStartSource, HookWarning, Message, MessageId, ModelId,
     ObservedState, PendingEvent, PendingToolCall, PromptSegment, PromptSegmentId,
     PromptSegmentKind, ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, ResourceSnapshot,
     SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
-    StreamEvent, SubagentEventForwarding, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome,
-    ToolResult, ToolResultMessage, Turn, TurnId, Usage, Volatility,
+    StreamEvent, SubagentEventForwarding, SubagentRecord, SubagentState, SubagentStatus,
+    SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn,
+    TurnId, Usage, Volatility,
 };
 use halter_providers::{ModelRegistry, Provider};
 
@@ -32,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::model_selection::select_models;
-use crate::session_lease::SessionLease;
+use crate::session_lease::{OutOfTurn, SessionLease};
 use crate::turn_registry::TurnRegistry;
 use crate::{
     CompactionBoundary, CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager,
@@ -518,7 +519,7 @@ fn track_fired_hook_ids(fired_hook_ids: &mut BTreeSet<String>, dispatch: &Execut
 /// Runtime handle used to create, resume, list, and shut down sessions.
 pub struct SessionRuntime {
     services: Arc<RuntimeServices>,
-    subagents: Arc<dyn SubagentControl>,
+    subagents: crate::subagents::RuntimeSubagentControl,
 }
 
 impl SessionRuntime {
@@ -530,9 +531,7 @@ impl SessionRuntime {
                 services.tools.register(tool);
             }
         }
-        let subagents: Arc<dyn SubagentControl> = Arc::new(
-            crate::subagents::RuntimeSubagentControl::new(services.clone()),
-        );
+        let subagents = crate::subagents::RuntimeSubagentControl::new(services.clone());
         Self {
             services,
             subagents,
@@ -542,7 +541,7 @@ impl SessionRuntime {
     /// Subagent control backed by this runtime.
     #[must_use]
     pub fn subagent_control(&self) -> Arc<dyn SubagentControl> {
-        self.subagents.clone()
+        Arc::new(self.subagents.clone())
     }
 
     /// Create and persist a new session.
@@ -568,7 +567,18 @@ impl SessionRuntime {
     /// Resume an existing session and fire resume-time hooks.
     pub async fn resume(&self, session_id: &SessionId) -> anyhow::Result<Option<HalterSession>> {
         let session = HalterSession::new(self.services.clone(), session_id.clone())?;
-        let found = session.leased(session.mark_resumed()).await?;
+        let found = session
+            .leased(async {
+                // Agents this process runs are not interrupted, whatever the
+                // log says.
+                let live = self.subagents.agent_ids().await;
+                let Some(subagents) = session.mark_resumed(&live).await? else {
+                    return Ok(false);
+                };
+                self.subagents.restore(session_id, subagents).await;
+                Ok(true)
+            })
+            .await?;
         debug!(session_id = %session_id, found, "resuming session");
         Ok(found.then_some(session))
     }
@@ -950,7 +960,7 @@ impl SessionHandle {
             run_notification(self, &fired_hook_ids, hook_ctx, notification_type, message).await?;
         // A notification can arrive mid-turn; queue it behind the turn
         // rather than racing its commits.
-        self.dispatch_out_of_turn(dispatch).await
+        self.dispatch_out_of_turn(OutOfTurn::Hooks(dispatch)).await
     }
 
     /// Compact the session immediately using the configured provider.
@@ -1228,7 +1238,7 @@ impl SessionHandle {
             &stored.blueprint,
             snapshot.clone(),
             &mut expected_head,
-            &state,
+            &mut state,
             &mut events,
             live,
         )
@@ -1263,7 +1273,7 @@ impl SessionHandle {
                 &stored.blueprint,
                 snapshot.clone(),
                 &mut expected_head,
-                &state,
+                &mut state,
                 &mut events,
                 live,
             )
@@ -1411,7 +1421,7 @@ impl SessionHandle {
                     &stored.blueprint,
                     snapshot.clone(),
                     &mut expected_head,
-                    &state,
+                    &mut state,
                     &mut events,
                     live,
                 )
@@ -1460,7 +1470,7 @@ impl SessionHandle {
                         &stored.blueprint,
                         snapshot.clone(),
                         &mut expected_head,
-                        &state,
+                        &mut state,
                         &mut events,
                         live,
                     )
@@ -1489,7 +1499,7 @@ impl SessionHandle {
                         &stored.blueprint,
                         snapshot.clone(),
                         &mut expected_head,
-                        &state,
+                        &mut state,
                         &mut events,
                         live,
                     )
@@ -1549,7 +1559,7 @@ impl SessionHandle {
                 &stored.blueprint,
                 snapshot.clone(),
                 &mut expected_head,
-                &state,
+                &mut state,
                 &mut events,
                 live,
             )
@@ -2267,10 +2277,21 @@ impl SessionHandle {
         blueprint: &SessionBlueprint,
         snapshot: Arc<ResourceSnapshot>,
         expected_head: &mut u64,
-        state: &SessionState,
+        state: &mut SessionState,
         events: &mut Vec<PendingEvent>,
         live: &LiveTurnStream,
     ) -> anyhow::Result<()> {
+        // Queued behind this turn by its subagents. Taken here, not at
+        // release, so a spawn's record commits with the tool result that
+        // hands the model its agent id.
+        for record in self
+            .services
+            .session_leases
+            .take_subagent_records(&self.session_id)
+            .await
+        {
+            self.record_subagent(state, events, record);
+        }
         if events.is_empty() {
             return Ok(());
         }
@@ -2300,9 +2321,7 @@ impl SessionHandle {
     pub(crate) async fn release_lease(&self) -> anyhow::Result<()> {
         self.services
             .session_leases
-            .release(&self.session_id, |queued| {
-                self.commit_hook_dispatches(queued)
-            })
+            .release(&self.session_id, |queued| self.commit_out_of_turn(queued))
             .await
     }
 
@@ -2317,24 +2336,18 @@ impl SessionHandle {
         outcome
     }
 
-    /// Hand a hook dispatch that fired outside this session's writer to
-    /// that writer, or commit it now when there is none.
-    pub(crate) async fn dispatch_out_of_turn(
-        &self,
-        dispatch: ExecutedHookDispatch,
-    ) -> anyhow::Result<()> {
+    /// Hand a write that originated outside this session's writer to that
+    /// writer, or commit it now when there is none.
+    pub(crate) async fn dispatch_out_of_turn(&self, dispatch: OutOfTurn) -> anyhow::Result<()> {
         self.services
             .session_leases
             .dispatch(&self.session_id, dispatch, |queued| {
-                self.commit_hook_dispatches(queued)
+                self.commit_out_of_turn(queued)
             })
             .await
     }
 
-    async fn commit_hook_dispatches(
-        &self,
-        dispatches: Vec<ExecutedHookDispatch>,
-    ) -> anyhow::Result<()> {
+    async fn commit_out_of_turn(&self, writes: Vec<OutOfTurn>) -> anyhow::Result<()> {
         let Some(mut stored) = self
             .services
             .sessions
@@ -2346,10 +2359,17 @@ impl SessionHandle {
         hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
         let mut state = stored.state;
         let mut events = Vec::new();
-        for dispatch in &dispatches {
-            self.record_hook_dispatch(&mut events, dispatch);
-            for message in apply_hook_side_effects(&mut state, dispatch) {
-                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+        for write in writes {
+            match write {
+                OutOfTurn::Hooks(dispatch) => {
+                    self.record_hook_dispatch(&mut events, &dispatch);
+                    for message in apply_hook_side_effects(&mut state, &dispatch) {
+                        self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    }
+                }
+                OutOfTurn::Subagent(record) => {
+                    self.record_subagent(&mut state, &mut events, record)
+                }
             }
         }
         // A dispatch where no hook ran changes nothing.
@@ -2370,14 +2390,19 @@ impl SessionHandle {
 
     /// Persist the resume latch and append `SessionResumed`. Returns `false`
     /// when the session does not exist.
-    async fn mark_resumed(&self) -> anyhow::Result<bool> {
+    /// Returns the resumed session's subagents, or `None` for an unknown
+    /// session.
+    async fn mark_resumed(
+        &self,
+        live_subagents: &HashSet<AgentId>,
+    ) -> anyhow::Result<Option<Vec<SubagentRecord>>> {
         let Some(mut stored) = self
             .services
             .sessions
             .load_session(&self.session_id)
             .await?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
         stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
@@ -2399,6 +2424,10 @@ impl SessionHandle {
             .restore_task_session(&self.session_id, TaskList::from_results(task_results));
         let events = close_interrupted_turn(&mut stored.state)
             .into_iter()
+            .chain(close_interrupted_subagents(
+                &mut stored.state,
+                live_subagents,
+            ))
             .chain([SessionEventPayload::SessionResumed])
             .map(|payload| self.make_event(payload))
             .collect();
@@ -2406,12 +2435,12 @@ impl SessionHandle {
             &stored.blueprint,
             None,
             Some(stored.head_sequence),
-            Some(stored.state),
+            Some(stored.state.clone()),
             events,
             None,
         )
         .await?;
-        Ok(true)
+        Ok(Some(stored.state.subagents.into_values().collect()))
     }
 
     async fn commit_turn_failure(
@@ -2463,6 +2492,17 @@ impl SessionHandle {
 
     pub(crate) fn push_event(&self, events: &mut Vec<PendingEvent>, payload: SessionEventPayload) {
         events.push(self.make_event(payload));
+    }
+
+    fn record_subagent(
+        &self,
+        state: &mut SessionState,
+        events: &mut Vec<PendingEvent>,
+        record: SubagentRecord,
+    ) {
+        let payload = SessionEventPayload::SubagentUpdated { record };
+        halter_protocol::fold::apply_event(state, &payload);
+        self.push_event(events, payload);
     }
 
     fn record_hook_dispatch(
@@ -2884,6 +2924,39 @@ fn close_interrupted_turn(state: &mut SessionState) -> Vec<SessionEventPayload> 
     });
     payloads
 }
+
+/// Cancel the subagents whose turns were running in a process that stopped
+/// (any agent missing from `live`), returning the records that say so.
+fn close_interrupted_subagents(
+    state: &mut SessionState,
+    live: &HashSet<AgentId>,
+) -> Vec<SessionEventPayload> {
+    let interrupted = state
+        .subagents
+        .iter()
+        .filter(|(id, held)| {
+            matches!(held.status.state, SubagentState::Running) && !live.contains(*id)
+        })
+        .map(|(_, held)| SubagentRecord {
+            status: SubagentStatus {
+                state: SubagentState::Cancelled,
+                error: Some(INTERRUPTED_SUBAGENT.to_owned()),
+                ..held.status.clone()
+            },
+            generation: held.generation,
+        })
+        .collect::<Vec<_>>();
+    interrupted
+        .into_iter()
+        .map(|record| {
+            let payload = SessionEventPayload::SubagentUpdated { record };
+            halter_protocol::fold::apply_event(state, &payload);
+            payload
+        })
+        .collect()
+}
+
+pub(crate) const INTERRUPTED_SUBAGENT: &str = "interrupted: the process stopped before this subagent's turn finished; use send_input to continue";
 
 /// Why a tool call has no result after its turn stopped: `started` calls
 /// were in `pending_tool_calls` and may have had side effects.
@@ -9789,6 +9862,14 @@ mod tests {
                 hook_at > completed_at,
                 "{event:?}: dispatch queued behind the turn"
             );
+            let recorded_at = log
+                .iter()
+                .position(|e| matches!(e.payload, SessionEventPayload::SubagentUpdated { .. }))
+                .expect("subagent recorded in parent log");
+            assert!(
+                recorded_at < completed_at,
+                "{event:?}: the spawn's record commits with its tool result"
+            );
 
             let stored = services
                 .sessions
@@ -9801,6 +9882,16 @@ mod tests {
                     |message| matches!(message, Message::System(system) if system.text == "hooked")
                 ),
                 "{event:?}: hook side effects reach the parent checkpoint"
+            );
+            assert_eq!(
+                stored
+                    .state
+                    .subagents
+                    .values()
+                    .map(|record| record.status.state)
+                    .collect::<Vec<_>>(),
+                [halter_protocol::SubagentState::Completed],
+                "{event:?}: the checkpoint holds the finished child"
             );
         }
     }

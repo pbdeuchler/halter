@@ -95,6 +95,8 @@ pub fn build_subagent_state(
         compaction_notifications: Default::default(),
         // The parent is mid-turn; its open turn is not the child's.
         open_turn: None,
+        // The parent's subagents are the parent's to control.
+        subagents: Default::default(),
     };
     // The parent forked mid-batch, so its last assistant message ends in
     // tool calls (the spawn among them) whose results only the parent gets.

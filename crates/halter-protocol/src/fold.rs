@@ -23,6 +23,8 @@
 //!   [`SessionState::append`], rebuilt from `ContextCompacted` effects, and
 //!   put back by `ContextRestored`, exactly as the runtime does.
 //! - `context_window` — advanced by each state-rewriting compaction.
+//! - `subagents` — upserted by [`SessionEventPayload::SubagentUpdated`],
+//!   ignoring a record whose generation is older than the one held.
 //!
 //! Runtime bookkeeping fields (`file_view_cache`, `pending_tool_calls`,
 //! `fired_hook_ids`, `appended_prompt_segments`, `compaction_notifications`,
@@ -107,6 +109,16 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         | SessionEventPayload::TurnFailed { .. }
         | SessionEventPayload::Lagged { .. }
         | SessionEventPayload::SessionShutdownComplete => {}
+        SessionEventPayload::SubagentUpdated { record } => {
+            let id = &record.status.agent_id;
+            if state
+                .subagents
+                .get(id)
+                .is_none_or(|held| held.generation <= record.generation)
+            {
+                state.subagents.insert(id.clone(), record.clone());
+            }
+        }
     }
 }
 
@@ -131,6 +143,7 @@ pub fn covered_state_matches(a: &SessionState, b: &SessionState) -> bool {
         && a.usage_so_far == b.usage_so_far
         && a.token_ledger == b.token_ledger
         && a.context_window == b.context_window
+        && a.subagents == b.subagents
 }
 
 #[cfg(test)]
@@ -319,6 +332,60 @@ mod tests {
         assert_eq!(state.compacted_prefix, before.compacted_prefix);
         assert_eq!(state.token_ledger, before.token_ledger);
         assert_eq!(state.usage_so_far, usage(10, 5), "billed usage is kept");
+    }
+
+    #[test]
+    fn subagent_records_older_than_the_held_generation_are_ignored() {
+        let record = |state, generation| crate::SubagentRecord {
+            status: crate::SubagentStatus {
+                agent_id: crate::AgentId::from("agent"),
+                session_id: SessionId::from("child"),
+                agent_type: None,
+                task: "task".to_owned(),
+                state,
+                last_message: None,
+                usage: None,
+                error: None,
+            },
+            generation,
+        };
+        use crate::SubagentState::{Closed, Completed, Running};
+        let cases = [
+            ("first record", None, record(Running, 1), record(Running, 1)),
+            (
+                "same generation",
+                Some(record(Running, 1)),
+                record(Completed, 1),
+                record(Completed, 1),
+            ),
+            (
+                "newer generation",
+                Some(record(Completed, 1)),
+                record(Running, 2),
+                record(Running, 2),
+            ),
+            (
+                "older generation",
+                Some(record(Closed, 2)),
+                record(Completed, 1),
+                record(Closed, 2),
+            ),
+        ];
+        for (name, held, incoming, expected) in cases {
+            let mut state = SessionState::default();
+            if let Some(held) = held {
+                state.subagents.insert(held.status.agent_id.clone(), held);
+            }
+            apply_event(
+                &mut state,
+                &SessionEventPayload::SubagentUpdated { record: incoming },
+            );
+            assert_eq!(
+                state.subagents.values().collect::<Vec<_>>(),
+                [&expected],
+                "{name}"
+            );
+        }
     }
 
     #[test]
