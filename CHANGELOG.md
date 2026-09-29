@@ -20,6 +20,7 @@ once a `1.0.0` line is cut.
 - The CLI drains in-flight turns before running session-end hooks.
 - A turn whose final commit fails is now recorded as `TurnFailed`. Previously the log was left with an unmatched `TurnStarted`.
 - A turn interrupted by a crash, abort or shutdown is closed with a cancelled `TurnFailed` on the next `resume` or turn, so the log never keeps a dangling turn.
+- Tool calls are checkpointed before each batch runs and again after its results, so a crash mid-tool no longer loses the assistant's tool calls, the turn's usage, or earlier batches' results. When the turn is closed, calls left without a result get an error result saying whether they may have run.
 
 ## [0.6.0] - 2026-09-28
 

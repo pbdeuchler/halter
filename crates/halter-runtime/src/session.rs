@@ -349,7 +349,7 @@ impl ToolEventDrain {
 /// publish invariant by forbidding sequence allocation outside the session
 /// store.
 #[derive(Clone)]
-struct LiveTurnStream {
+pub(crate) struct LiveTurnStream {
     tx: mpsc::UnboundedSender<anyhow::Result<SessionEvent>>,
     forwarded_event_cap: Option<u64>,
     forwarded_state: Arc<Mutex<ForwardedEventState>>,
@@ -726,8 +726,8 @@ impl SessionHandle {
             // The lease guarantees no turn is running, so an open turn in the
             // checkpoint is one a crash or abort left behind.
             let mut start_events = close_interrupted_turn(&mut stored.state)
-                .map(|payload| session.make_event(payload))
                 .into_iter()
+                .map(|payload| session.make_event(payload))
                 .collect::<Vec<_>>();
             start_events.push(session.make_event(SessionEventPayload::TurnStarted {
                 turn_id: turn.id.clone(),
@@ -1531,20 +1531,20 @@ impl SessionHandle {
                 "assistant requested tool calls"
             );
 
-            let tool_events = self
-                .execute_tool_calls(
-                    &stored.blueprint,
-                    snapshot.clone(),
-                    turn_cancel.child_token(),
-                    &selected_models.default_model,
-                    &selected_models.subagent_model,
-                    &turn.id,
-                    &mut fired_hook_ids,
-                    &mut state,
-                    tool_calls,
-                )
-                .await?;
-            events.extend(tool_events);
+            self.execute_tool_calls(
+                &stored.blueprint,
+                snapshot.clone(),
+                turn_cancel.child_token(),
+                &selected_models.default_model,
+                &selected_models.subagent_model,
+                &turn.id,
+                &mut fired_hook_ids,
+                &mut state,
+                tool_calls,
+                &mut events,
+                Some((&mut expected_head, live)),
+            )
+            .await?;
             self.flush_turn_progress(
                 &stored.blueprint,
                 snapshot.clone(),
@@ -1569,8 +1569,11 @@ impl SessionHandle {
         fired_hook_ids: &mut BTreeSet<String>,
         state: &mut SessionState,
         tool_calls: Vec<ToolCall>,
-    ) -> anyhow::Result<Vec<PendingEvent>> {
-        let mut events = Vec::new();
+        events: &mut Vec<PendingEvent>,
+        // `Some` inside a turn: each batch is checkpointed before it runs and
+        // after its results. Compaction passes `None` to stay atomic.
+        mut checkpoint: Option<(&mut u64, &LiveTurnStream)>,
+    ) -> anyhow::Result<()> {
         let mut follow_ups = Vec::new();
 
         let tools = self.services.tools.clone();
@@ -1598,9 +1601,9 @@ impl SessionHandle {
                 )
                 .await?;
                 track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
-                self.record_hook_dispatch(&mut events, &pre_dispatch);
+                self.record_hook_dispatch(events, &pre_dispatch);
                 for message in apply_hook_side_effects(state, &pre_dispatch) {
-                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    self.push_event(events, SessionEventPayload::MessageItem { message });
                 }
                 if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
                     call.arguments = updated_input;
@@ -1612,7 +1615,7 @@ impl SessionHandle {
                     "executing tool call"
                 );
                 self.push_event(
-                    &mut events,
+                    events,
                     SessionEventPayload::ToolExecutionStarted { call: call.clone() },
                 );
 
@@ -1631,10 +1634,10 @@ impl SessionHandle {
                     });
                     state.append(message.clone());
                     self.push_event(
-                        &mut events,
+                        events,
                         SessionEventPayload::ToolExecutionCompleted { outcome },
                     );
-                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                    self.push_event(events, SessionEventPayload::MessageItem { message });
                     continue;
                 }
 
@@ -1670,6 +1673,20 @@ impl SessionHandle {
                     context,
                     tool_event_drain,
                 });
+            }
+
+            // Durable before anything runs: a crash mid-batch leaves the
+            // calls in `pending_tool_calls` for recovery to answer.
+            if let Some((expected_head, live)) = &mut checkpoint {
+                self.flush_turn_progress(
+                    blueprint,
+                    snapshot.clone(),
+                    expected_head,
+                    state,
+                    events,
+                    live,
+                )
+                .await?;
             }
 
             // Phase B: dispatch execution. For Exclusive or single-call batches this
@@ -1709,7 +1726,7 @@ impl SessionHandle {
                     .into_iter()
                     .filter_map(|event| tool_runtime_event_payload(&call.id, event))
                 {
-                    self.push_event(&mut events, payload);
+                    self.push_event(events, payload);
                 }
 
                 let (mut content, error) = match execution {
@@ -1750,9 +1767,9 @@ impl SessionHandle {
                     )
                     .await?;
                     track_fired_hook_ids(fired_hook_ids, &post_dispatch);
-                    self.record_hook_dispatch(&mut events, &post_dispatch);
+                    self.record_hook_dispatch(events, &post_dispatch);
                     for message in apply_hook_side_effects(state, &post_dispatch) {
-                        self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                        self.push_event(events, SessionEventPayload::MessageItem { message });
                     }
                     if let Some(updated_output) = post_dispatch.merged.updated_output {
                         content = tool_result_from_hook_value(updated_output);
@@ -1772,9 +1789,9 @@ impl SessionHandle {
                     )
                     .await?;
                     track_fired_hook_ids(fired_hook_ids, &post_dispatch);
-                    self.record_hook_dispatch(&mut events, &post_dispatch);
+                    self.record_hook_dispatch(events, &post_dispatch);
                     for message in apply_hook_side_effects(state, &post_dispatch) {
-                        self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                        self.push_event(events, SessionEventPayload::MessageItem { message });
                     }
                 }
                 let outcome = ToolExecutionOutcome {
@@ -1792,10 +1809,21 @@ impl SessionHandle {
                 state.pending_tool_calls.shift_remove(&call.id);
                 state.append(message.clone());
                 self.push_event(
-                    &mut events,
+                    events,
                     SessionEventPayload::ToolExecutionCompleted { outcome },
                 );
-                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                self.push_event(events, SessionEventPayload::MessageItem { message });
+            }
+            if let Some((expected_head, live)) = &mut checkpoint {
+                self.flush_turn_progress(
+                    blueprint,
+                    snapshot.clone(),
+                    expected_head,
+                    state,
+                    events,
+                    live,
+                )
+                .await?;
             }
         }
 
@@ -1803,10 +1831,10 @@ impl SessionHandle {
         // an assistant's tool calls and their results.
         for message in follow_ups {
             state.append(message.clone());
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+            self.push_event(events, SessionEventPayload::MessageItem { message });
         }
 
-        Ok(events)
+        Ok(())
     }
 
     /// Plan the next provider request over `state`'s transcript and assemble
@@ -2388,12 +2416,19 @@ impl SessionHandle {
             })?;
         hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
         stored.state.open_turn = None;
+        // Tool calls already checkpointed by the failed turn need results
+        // before the turn is closed.
+        let events = answer_unresolved_tool_calls(&mut stored.state)
+            .into_iter()
+            .map(|payload| self.make_event(payload))
+            .chain(failure_events)
+            .collect();
         self.commit_and_publish(
             &stored.blueprint,
             None,
             Some(stored.head_sequence),
             Some(stored.state),
-            failure_events,
+            events,
             Some(live),
         )
         .await?;
@@ -2820,16 +2855,74 @@ fn tool_result_kind(result: &ToolResult) -> &'static str {
 /// Close the turn a stopped process left open, returning the `TurnFailed`
 /// that records it. Callers must hold the session's write lease, so no turn
 /// is actually running.
-fn close_interrupted_turn(state: &mut SessionState) -> Option<SessionEventPayload> {
-    state
-        .open_turn
-        .take()
-        .map(|turn_id| SessionEventPayload::TurnFailed {
-            turn_id,
-            error: "turn interrupted before it completed".to_owned(),
-            cancelled: true,
-            retryable: false,
+fn close_interrupted_turn(state: &mut SessionState) -> Vec<SessionEventPayload> {
+    let Some(turn_id) = state.open_turn.take() else {
+        return Vec::new();
+    };
+    let mut payloads = answer_unresolved_tool_calls(state);
+    payloads.push(SessionEventPayload::TurnFailed {
+        turn_id,
+        error: "turn interrupted before it completed".to_owned(),
+        cancelled: true,
+        retryable: false,
+    });
+    payloads
+}
+
+/// Give every tool call of the last assistant message that has no result an
+/// error result, so the transcript stays valid for the provider and the model
+/// learns the call's fate. Calls in `pending_tool_calls` had started and may
+/// have had side effects; the rest never ran.
+fn answer_unresolved_tool_calls(state: &mut SessionState) -> Vec<SessionEventPayload> {
+    let Some(at) = state
+        .messages
+        .iter()
+        .rposition(|message| matches!(message, Message::Assistant(_)))
+    else {
+        return Vec::new();
+    };
+    let Message::Assistant(assistant) = &state.messages[at] else {
+        unreachable!("rposition matched an assistant message");
+    };
+    let answered: std::collections::HashSet<&halter_protocol::ToolCallId> = state.messages
+        [at + 1..]
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool(result) => Some(&result.call_id),
+            _ => None,
         })
+        .collect();
+    let unresolved: Vec<ToolCall> = assistant_tool_calls(assistant)
+        .into_iter()
+        .filter(|call| !answered.contains(&call.id))
+        .collect();
+    let pending = std::mem::take(&mut state.pending_tool_calls);
+    unresolved
+        .into_iter()
+        .flat_map(|call| {
+            let error = ToolError::new(match pending.contains_key(&call.id) {
+                true => "tool call interrupted while running; it may have partially completed",
+                false => "tool call interrupted before it ran",
+            });
+            let message = Message::Tool(ToolResultMessage {
+                id: MessageId::new(),
+                call_id: call.id.clone(),
+                content: ToolResult::Empty,
+                error: Some(error.clone()),
+                created_at: Utc::now(),
+            });
+            state.append(message.clone());
+            [
+                SessionEventPayload::ToolExecutionCompleted {
+                    outcome: ToolExecutionOutcome {
+                        call,
+                        result: Err(error),
+                    },
+                },
+                SessionEventPayload::MessageItem { message },
+            ]
+        })
+        .collect()
 }
 
 pub(crate) fn apply_hook_side_effects(
@@ -9318,11 +9411,13 @@ mod tests {
 
         async fn execute(
             &self,
-            _context: ToolContext,
+            context: ToolContext,
             _input: serde_json::Value,
         ) -> anyhow::Result<ToolResult> {
-            self.barrier.wait().await;
-            Ok(ToolResult::Empty)
+            tokio::select! {
+                _ = self.barrier.wait() => Ok(ToolResult::Empty),
+                _ = context.cancel.cancelled() => anyhow::bail!("cancelled"),
+            }
         }
     }
 
@@ -9962,5 +10057,242 @@ mod tests {
             let stored = services.sessions.load_session(&id).await.unwrap().unwrap();
             assert_eq!(stored.state.open_turn, None, "{case}");
         }
+    }
+
+    #[test]
+    fn unresolved_tool_calls_get_error_results() {
+        let call = |id: &str| ToolCall {
+            id: ToolCallId::from(id),
+            name: ToolName::from("t"),
+            arguments: json!({}),
+        };
+        let assistant = |ids: &[&str]| {
+            Message::Assistant(AssistantMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: ids
+                    .iter()
+                    .map(|id| AssistantPart::ToolCall(call(id)))
+                    .collect(),
+                stop_reason: None,
+                usage: None,
+                replay_meta: ReplayMeta::default(),
+            })
+        };
+        let result = |id: &str| {
+            Message::Tool(ToolResultMessage {
+                id: MessageId::new(),
+                call_id: ToolCallId::from(id),
+                content: ToolResult::Empty,
+                error: None,
+                created_at: Utc::now(),
+            })
+        };
+        const RAN: &str = "tool call interrupted while running; it may have partially completed";
+        const NOT_RAN: &str = "tool call interrupted before it ran";
+        // (case, transcript, started calls, expected (call id, error))
+        type Case = (
+            &'static str,
+            Vec<Message>,
+            &'static [&'static str],
+            &'static [(&'static str, &'static str)],
+        );
+        let cases: [Case; 5] = [
+            ("empty transcript", vec![], &[], &[]),
+            ("no tool calls", vec![assistant(&[])], &[], &[]),
+            (
+                "all answered",
+                vec![assistant(&["a"]), result("a")],
+                &[],
+                &[],
+            ),
+            (
+                "earlier turn's calls are not revisited",
+                vec![assistant(&["old"]), assistant(&["new"]), result("new")],
+                &[],
+                &[],
+            ),
+            (
+                "started, not started and answered",
+                vec![assistant(&["a", "b", "c"]), result("c")],
+                &["a"],
+                &[("a", RAN), ("b", NOT_RAN)],
+            ),
+        ];
+        for (case, messages, started, expected) in cases {
+            let mut state = SessionState {
+                messages,
+                ..SessionState::default()
+            };
+            for id in started {
+                state.pending_tool_calls.insert(
+                    ToolCallId::from(*id),
+                    PendingToolCall {
+                        call: call(id),
+                        submitted_at: Utc::now(),
+                    },
+                );
+            }
+            let before = state.messages.len();
+
+            let payloads = answer_unresolved_tool_calls(&mut state);
+
+            let outcomes = payloads
+                .iter()
+                .filter_map(|payload| match payload {
+                    SessionEventPayload::ToolExecutionCompleted { outcome } => Some((
+                        outcome.call.id.0.as_str(),
+                        outcome.result.as_ref().unwrap_err().message.as_str(),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(outcomes, expected, "{case}");
+            assert_eq!(
+                payloads.len(),
+                expected.len() * 2,
+                "{case}: result messages"
+            );
+            let appended = state.messages[before..]
+                .iter()
+                .map(|message| match message {
+                    Message::Tool(result) => result.call_id.0.as_str(),
+                    other => panic!("{case}: unexpected {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                appended,
+                expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                "{case}"
+            );
+            assert!(state.pending_tool_calls.is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_batches_are_checkpointed_and_recovered_after_a_crash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = || {
+            Arc::new(ParallelBatchProvider {
+                tool_name: "parallel_barrier",
+            })
+        };
+        let services = configured_services(provider(), temp.path());
+        // Three parties: both tools block until the test joins, which it never does.
+        services.tools.register(Arc::new(BarrierTool {
+            barrier: Arc::new(tokio::sync::Barrier::new(3)),
+            concurrency: ToolConcurrency::ParallelSafe,
+            name: "parallel_barrier",
+        }));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let id = session.session_id().clone();
+        let _running = session
+            .submit_turn(Turn::user("run in parallel"))
+            .await
+            .expect("submit");
+
+        let load = || async { services.sessions.load_session(&id).await.unwrap().unwrap() };
+        let in_flight = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stored = load().await;
+                if stored.state.pending_tool_calls.len() == 2 {
+                    return stored;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("running batch is checkpointed");
+        assert!(in_flight.state.open_turn.is_some());
+        assert!(
+            matches!(in_flight.state.messages.last(), Some(Message::Assistant(_))),
+            "tool_use is durable before the tools run"
+        );
+
+        // A second process over the same store: the first died mid-batch.
+        let mut restarted = configured_services(provider(), temp.path());
+        Arc::get_mut(&mut restarted).expect("unique").sessions = services.sessions.clone();
+        SessionRuntime::new(restarted)
+            .resume(&id)
+            .await
+            .expect("resume")
+            .expect("found");
+
+        let log = services.sessions.replay(&id).await.expect("replay");
+        let tail = log
+            .iter()
+            .skip_while(|event| event.sequence() <= in_flight.head_sequence)
+            .map(|event| match &event.payload {
+                SessionEventPayload::ToolExecutionCompleted { outcome } => {
+                    outcome.result.as_ref().unwrap_err().message.clone()
+                }
+                SessionEventPayload::MessageItem { .. } => "message".to_owned(),
+                SessionEventPayload::TurnFailed { .. } => "turn failed".to_owned(),
+                SessionEventPayload::SessionResumed => "resumed".to_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let ran = "tool call interrupted while running; it may have partially completed";
+        assert_eq!(
+            tail,
+            [ran, "message", ran, "message", "turn failed", "resumed"]
+        );
+        let recovered = load().await.state;
+        assert!(recovered.pending_tool_calls.is_empty());
+        assert_eq!(recovered.open_turn, None);
+        assert!(
+            recovered.messages[recovered.messages.len() - 2..]
+                .iter()
+                .all(|message| matches!(message, Message::Tool(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_checkpointed_tool_batch_answers_its_calls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(
+            Arc::new(ParallelBatchProvider {
+                tool_name: "parallel_barrier",
+            }),
+            temp.path(),
+        );
+        services.tools.register(Arc::new(BarrierTool {
+            barrier: Arc::new(tokio::sync::Barrier::new(3)),
+            concurrency: ToolConcurrency::ParallelSafe,
+            name: "parallel_barrier",
+        }));
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        let id = session.session_id().clone();
+        let cancel = CancellationToken::new();
+        let running = session
+            .submit_turn_with_cancel(Turn::user("run in parallel"), cancel.clone())
+            .await
+            .expect("submit");
+        let load = || async { services.sessions.load_session(&id).await.unwrap().unwrap() };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while load().await.state.pending_tool_calls.len() != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("running batch is checkpointed");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), running.try_collect::<Vec<_>>())
+            .await
+            .expect("cancel ends the turn");
+
+        let mut state = load().await.state;
+        assert_eq!(state.open_turn, None);
+        let results = state
+            .messages
+            .iter()
+            .filter(|message| matches!(message, Message::Tool(_)))
+            .count();
+        assert_eq!(results, 2, "both cancelled calls have results");
+        assert!(state.pending_tool_calls.is_empty());
+        assert!(answer_unresolved_tool_calls(&mut state).is_empty());
     }
 }

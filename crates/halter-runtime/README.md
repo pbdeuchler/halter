@@ -600,7 +600,7 @@ The per-turn stream can also include subagent events when `subagent_event_forwar
 
 Each session has one writer at a time. A turn, `compact`, `shutdown` or `resume` holds the session's write lease for its whole duration; a second one started meanwhile waits for it instead of racing it on `expected_head_sequence`. A writer that re-enters its own session (for example a hook calling `compact` on the session running it) deadlocks, so don't. Hook dispatches that fire outside the writer (`SubagentStart`, `SubagentStop`, `notify`) queue behind the lease and commit, in order, right after the writer releases it (so after the turn's `TurnCompleted`/`TurnFailed`); with no writer they commit immediately. The lease is process-local: two processes writing the same session still surface `SessionCommitConflict` from `halter-session`.
 
-A turn that never finished, because the process crashed or the turn task was aborted, stays open in `SessionState::open_turn`. The next writer (`resume` or the next turn) closes it with `TurnFailed { cancelled: true, retryable: false }` before logging anything else.
+A turn that never finished, because the process crashed or the turn task was aborted, stays open in `SessionState::open_turn`. The next writer (`resume` or the next turn) closes it with `TurnFailed { cancelled: true, retryable: false }` before logging anything else. Tool batches are checkpointed before they run and after their results. Any tool call still without a result when a turn is closed, whether interrupted or failed, gets an error result that says whether it had started (so it may have had side effects) or never ran.
 
 ### Misconfigured subagent depth or model routing
 

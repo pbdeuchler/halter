@@ -352,8 +352,7 @@ impl<'a> CompactionContext<'a> {
         calls: Vec<ToolCall>,
     ) -> anyhow::Result<Vec<Message>> {
         let before = self.state.messages.len();
-        let events = self
-            .session
+        self.session
             .execute_tool_calls(
                 self.blueprint,
                 self.snapshot.clone(),
@@ -364,9 +363,10 @@ impl<'a> CompactionContext<'a> {
                 self.fired_hook_ids,
                 self.state,
                 calls,
+                self.events,
+                None,
             )
             .await?;
-        self.events.extend(events);
         Ok(self.state.messages[before..].to_vec())
     }
 }
