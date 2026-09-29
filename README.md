@@ -911,7 +911,7 @@ Built-in tools include:
 - `edit`
 - `shell`
 - `process`
-- `task` (in-memory todo list scoped to the session)
+- `task` (todo list scoped to the session; rebuilt from the session log on resume)
 
 Optional feature-gated tools include:
 

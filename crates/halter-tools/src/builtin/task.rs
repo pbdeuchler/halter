@@ -81,6 +81,27 @@ impl TaskList {
         Ok(task.clone())
     }
 
+    /// Rebuild a list from this tool's own results, in log order. Every
+    /// result carries the full record of each task it touched (`task` or
+    /// `tasks`), so upserting them reproduces the list, ids included.
+    pub fn from_results<'a>(results: impl IntoIterator<Item = &'a Value>) -> Self {
+        results
+            .into_iter()
+            .flat_map(|result| {
+                let listed = result.get("tasks").and_then(Value::as_array);
+                result
+                    .get("task")
+                    .into_iter()
+                    .chain(listed.into_iter().flatten())
+            })
+            .filter_map(|task| Task::deserialize(task).ok())
+            .fold(Self::default(), |mut list, task| {
+                list.next_id = list.next_id.max(task.id);
+                list.items.insert(task.id, task);
+                list
+            })
+    }
+
     /// Count tasks by status.
     pub fn summary(&self) -> TaskSummary {
         let mut pending = 0u64;
@@ -487,5 +508,64 @@ mod tests {
                 .expect("list A"),
         );
         assert_eq!(listed_a["tasks"].as_array().expect("array").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn from_results_rebuilds_the_list_from_tool_output() {
+        let sessions = Arc::new(ToolSessionStore::default());
+        let context = tool_context(sessions.clone());
+        let mut outputs = Vec::new();
+        for input in [
+            json!({ "action": "create", "subject": "a", "description": "first" }),
+            json!({ "action": "create", "subject": "b" }),
+            json!({ "action": "complete", "id": 1 }),
+            json!({ "action": "list" }),
+        ] {
+            let result = TaskTool.execute(context.clone(), input).await.expect("run");
+            outputs.push(json_value(result));
+        }
+        let live = sessions.task_session(&context.session_id).lock().list();
+        let foreign = [json!({ "task": "not a task" }), json!({ "ok": true })];
+
+        // (case, results in log order, expected tasks)
+        let cases: [(&str, Vec<&Value>, Vec<Task>); 4] = [
+            ("every result", outputs.iter().collect(), live.clone()),
+            (
+                "mutations only",
+                outputs[..3].iter().collect(),
+                live.clone(),
+            ),
+            ("empty log", vec![], vec![]),
+            ("foreign output", foreign.iter().collect(), vec![]),
+        ];
+        for (case, results, expected) in cases {
+            let mut rebuilt = TaskList::from_results(results);
+            assert_eq!(rebuilt.list(), expected, "{case}");
+            let next = rebuilt.create("next".to_owned(), None);
+            assert_eq!(next.id, expected.len() as u64 + 1, "{case}: ids continue");
+        }
+    }
+
+    #[test]
+    fn restore_task_session_never_replaces_a_live_list() {
+        let sessions = ToolSessionStore::default();
+        let session = SessionId::new();
+        let list = |subject: &str| {
+            let mut list = TaskList::default();
+            list.create(subject.to_owned(), None);
+            list
+        };
+
+        sessions.restore_task_session(&session, list("restored"));
+        sessions.restore_task_session(&session, list("ignored"));
+
+        let tasks = sessions.task_session(&session).lock().list();
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["restored"]
+        );
     }
 }

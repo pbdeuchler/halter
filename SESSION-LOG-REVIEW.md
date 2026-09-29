@@ -38,7 +38,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 2 | The resource snapshot revision hashes only `skill.revision`, plugin name/version, hooks revision and agent revision. v0.6 added `SkillDef.root`, so a skill-bearing snapshot now serialises differently under the same revision. sqlite `store_snapshot` bails with `revision already exists with different data`, so every commit on an upgraded store fails. | 85% | fixed (7573143) |
 | 3 | Dangling turns. A failed final commit only calls `live.emit_error` and never writes `TurnFailed`. Shutdown aborts and crashes leave `TurnStarted` open. Resume never reconciles an open turn. | 95% | fixed |
 | 4 | A crash during tool execution loses the log record of side effects and usage. The assistant tool-call message and tool results commit only after the whole batch. `pending_tool_calls` is inserted and removed with no commit in between, so it is never persisted non-empty. | 90% | fixed |
-| 5 | The task list (`ToolSessionStore::task_sessions`) lives only in memory, but the compaction strategies promise that todos survive compaction and rollover. Resume loses it. | 95% | open |
+| 5 | The task list (`ToolSessionStore::task_sessions`) lives only in memory, but the compaction strategies promise that todos survive compaction and rollover. Resume loses it. | 95% | fixed |
 | 6 | `fork_context` children start with the parent's messages, which end in an unanswered spawn `tool_use` (strict providers reject this). The inherited state is not in the child's log. The registry itself is in memory only (#210). | 85% | open |
 
 ### Medium
@@ -109,3 +109,9 @@ Entries are oldest first.
   - It runs when an interrupted turn is closed, and in `commit_turn_failure`, so the transcript never ends in an unanswered `tool_use`.
   - Tests: `unresolved_tool_calls_get_error_results` (table), `tool_batches_are_checkpointed_and_recovered_after_a_crash` (a second process resumes mid-batch), and `cancelling_a_checkpointed_tool_batch_answers_its_calls`.
   - Residual: tool side effects are not idempotent. The model is told a call may have run, and nothing more. The runtime events a tool emits mid-execution are still buffered until its batch ends.
+
+- **#5 fixed.** The log already holds every task mutation, because each `task` tool result carries the full record of each task it touched. So nothing new is persisted.
+  - `TaskList::from_results` folds those results, in log order, back into the list, ids included.
+  - `mark_resumed` replays the log and installs the result with `ToolSessionStore::restore_task_session`. That never replaces a list the process already holds.
+  - Tests: `from_results_rebuilds_the_list_from_tool_output` (table: full log, mutations only, empty, foreign output; ids continue after a rebuild), `restore_task_session_never_replaces_a_live_list`, and `resume_restores_the_task_list_from_the_log` (fresh process vs same process).
+  - Residual: a `PostToolUse` hook that rewrites the task tool's output also rewrites what gets rebuilt. Only `resume` restores the list; a same-process `HalterSession::new` on an existing id shares the in-memory list anyway. `InMemoryTaskStore` and `TaskStore` are unused (`TaskTool` goes through `ToolSessionStore`); they are dead abstractions left for a separate cleanup.

@@ -12,6 +12,7 @@ once a `1.0.0` line is cut.
 
 - `RuntimeServices::session_leases`: a per-session write lease. A turn, `compact`, `shutdown` or `resume` holds it for its whole duration, and a second writer on the same session waits instead of racing on the commit head. Custom `RuntimeServices` literals must add `session_leases: Arc::new(SessionLeases::default())`.
 - `SessionState::open_turn`: the turn that has started but not finished. `SessionState` literals must add `open_turn: None` (or use `..Default::default()`).
+- `TaskList::from_results` and `ToolSessionStore::restore_task_session`, which rebuild a session's task list from the `task` tool results in its log.
 
 ### Fixed
 
@@ -21,6 +22,7 @@ once a `1.0.0` line is cut.
 - A turn whose final commit fails is now recorded as `TurnFailed`. Previously the log was left with an unmatched `TurnStarted`.
 - A turn interrupted by a crash, abort or shutdown is closed with a cancelled `TurnFailed` on the next `resume` or turn, so the log never keeps a dangling turn.
 - Tool calls are checkpointed before each batch runs and again after its results, so a crash mid-tool no longer loses the assistant's tool calls, the turn's usage, or earlier batches' results. When the turn is closed, calls left without a result get an error result saying whether they may have run.
+- The `task` todo list survives `resume`. It is rebuilt from the session log. Previously a resumed session in a new process started with an empty list, although compaction and clean-window rollover promise that todos persist.
 
 ## [0.6.0] - 2026-09-28
 

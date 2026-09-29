@@ -39,15 +39,23 @@ impl ToolSessionStore {
     }
 
     /// Returns the in-memory task list bound to this session, creating it on
-    /// first access. Storage is process-local; persistence (file, sqlite, …)
-    /// can be introduced by replacing this accessor with a swappable backend
-    /// behind a `TaskStore` trait without touching `TaskTool`.
+    /// first access. Storage is process-local: the session log is the durable
+    /// record, and the runtime rebuilds the list from it on resume via
+    /// [`TaskList::from_results`] and [`Self::restore_task_session`].
     #[must_use]
     pub fn task_session(&self, session_id: &SessionId) -> Arc<Mutex<TaskList>> {
         self.task_sessions
             .entry(session_id.0.clone())
             .or_insert_with(|| Arc::new(Mutex::new(TaskList::default())))
             .clone()
+    }
+
+    /// Install `list` as this session's task list unless the process already
+    /// holds one, which is newer than anything rebuilt from the log.
+    pub fn restore_task_session(&self, session_id: &SessionId, list: TaskList) {
+        self.task_sessions
+            .entry(session_id.0.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(list)));
     }
 
     #[cfg(feature = "pty")]

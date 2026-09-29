@@ -22,8 +22,8 @@ use halter_providers::{ModelRegistry, Provider};
 
 use halter_session::{SessionStore, StoredSession};
 use halter_tools::{
-    PathLockMap, SubagentControl, SubagentParentContext, ToolEventSink, ToolPolicy, ToolRuntime,
-    ToolRuntimeEvent, ToolSessionStore,
+    PathLockMap, SubagentControl, SubagentParentContext, TaskList, ToolEventSink, ToolPolicy,
+    ToolRuntime, ToolRuntimeEvent, ToolSessionStore,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -2381,6 +2381,22 @@ impl SessionHandle {
         };
         hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
         stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
+        // The task list lives in the tool store; the log holds every result
+        // that changed it.
+        let log = self.services.sessions.replay(&self.session_id).await?;
+        let task_results = log.iter().filter_map(|event| match &event.payload {
+            SessionEventPayload::ToolExecutionCompleted {
+                outcome:
+                    ToolExecutionOutcome {
+                        call,
+                        result: Ok(ToolResult::Json { value }),
+                    },
+            } if call.name.0 == crate::model_summary::TODO_TOOL_NAME => Some(value),
+            _ => None,
+        });
+        self.services
+            .tool_sessions
+            .restore_task_session(&self.session_id, TaskList::from_results(task_results));
         let events = close_interrupted_turn(&mut stored.state)
             .into_iter()
             .chain([SessionEventPayload::SessionResumed])
@@ -10294,5 +10310,98 @@ mod tests {
         assert_eq!(results, 2, "both cancelled calls have results");
         assert!(state.pending_tool_calls.is_empty());
         assert!(answer_unresolved_tool_calls(&mut state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_restores_the_task_list_from_the_log() {
+        let completed = |name: &str, result: Result<ToolResult, ToolError>| {
+            SessionEventPayload::ToolExecutionCompleted {
+                outcome: ToolExecutionOutcome {
+                    call: ToolCall {
+                        id: ToolCallId::from(name),
+                        name: ToolName::from(name),
+                        arguments: json!({}),
+                    },
+                    result,
+                },
+            }
+        };
+        let task = |id: u64, subject: &str| json!({ "task": { "id": id, "subject": subject, "status": "pending" } });
+        // (case, the resuming process already holds a task list)
+        for (case, live_list) in [("fresh process", false), ("same process", true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            let id = session.session_id().clone();
+            let head = services
+                .sessions
+                .load_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_sequence;
+            services
+                .sessions
+                .commit(
+                    &id,
+                    None,
+                    Some(head),
+                    None,
+                    [
+                        completed(
+                            "task",
+                            Ok(ToolResult::Json {
+                                value: task(1, "logged"),
+                            }),
+                        ),
+                        completed(
+                            "other",
+                            Ok(ToolResult::Json {
+                                value: task(2, "foreign"),
+                            }),
+                        ),
+                        completed("task", Err(ToolError::new("failed"))),
+                    ]
+                    .into_iter()
+                    .map(|payload| session.make_event(payload))
+                    .collect(),
+                )
+                .await
+                .expect("seed log");
+
+            let resumer = match live_list {
+                true => {
+                    services
+                        .tool_sessions
+                        .task_session(&id)
+                        .lock()
+                        .create("live".to_owned(), None);
+                    services.clone()
+                }
+                false => {
+                    let mut fresh =
+                        configured_services(Arc::new(FakeProvider::default()), temp.path());
+                    Arc::get_mut(&mut fresh).expect("unique").sessions = services.sessions.clone();
+                    fresh
+                }
+            };
+            SessionRuntime::new(resumer.clone())
+                .resume(&id)
+                .await
+                .expect("resume")
+                .expect("found");
+
+            let subjects = resumer
+                .tool_sessions
+                .task_session(&id)
+                .lock()
+                .list()
+                .into_iter()
+                .map(|task| task.subject)
+                .collect::<Vec<_>>();
+            let expected = if live_list { ["live"] } else { ["logged"] };
+            assert_eq!(subjects, expected, "{case}");
+        }
     }
 }
