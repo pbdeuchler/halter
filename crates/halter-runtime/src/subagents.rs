@@ -445,26 +445,14 @@ impl RuntimeSubagentControl {
         parent: &SubagentParentContext,
         status: &SubagentStatus,
     ) -> anyhow::Result<()> {
-        let Some(stored) = self
-            .inner
-            .services
-            .sessions
-            .load_session(&parent.blueprint.session_id)
-            .await?
-        else {
-            return Ok(());
-        };
-        let turn_id = TurnId::new();
         let session = HalterSession::new(
             self.inner.services.clone(),
             parent.blueprint.session_id.clone(),
         )?;
-        let fired_hook_ids = stored
-            .state
-            .fired_hook_ids
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
+        let Some((stored, fired_hook_ids)) = session.load_for_out_of_turn_hooks().await? else {
+            return Ok(());
+        };
+        let turn_id = TurnId::new();
         // Parent hook dispatch runs outside any turn scope; the token never
         // fires.
         let hook_cancel = CancellationToken::new();
@@ -502,28 +490,16 @@ impl RuntimeSubagentControl {
         agent_type: Option<&AgentName>,
         child_session_id: &SessionId,
     ) -> anyhow::Result<Option<String>> {
-        let Some(stored) = self
-            .inner
-            .services
-            .sessions
-            .load_session(parent_session_id)
-            .await?
-        else {
+        let session = HalterSession::new(self.inner.services.clone(), parent_session_id.clone())?;
+        let Some((stored, fired_hook_ids)) = session.load_for_out_of_turn_hooks().await? else {
             return Ok(None);
         };
         let turn_id = TurnId::new();
-        let session = HalterSession::new(self.inner.services.clone(), parent_session_id.clone())?;
         let transcript_path = self
             .inner
             .services
             .sessions
             .transcript_path(child_session_id);
-        let fired_hook_ids = stored
-            .state
-            .fired_hook_ids
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
         // Parent hook dispatch runs outside any turn scope; the token never
         // fires.
         let hook_cancel = CancellationToken::new();

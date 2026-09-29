@@ -64,7 +64,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 18 | The trace recorder is not reopened on resume. | 70% | open |
 | 19 | sqlite runs `synchronous=NORMAL`, so the last commits can be lost on power failure. | 60% | open |
 | 20 | The legacy token-ledger migration doesn't match the fold. | 60% | open |
-| 21 | During a live parent turn, subagent hooks read `fired_hook_ids` from the parent's last checkpoint, not the turn's in-memory set. A `once` SubagentStart hook can fire twice across two spawns in one turn. State converges (the ids are unioned on commit), but the hook runs twice. | 80% | open |
+| 21 | During a live parent turn, subagent hooks read `fired_hook_ids` from the parent's last checkpoint, not the turn's in-memory set. A `once` SubagentStart hook can fire twice across two spawns in one turn. State converges (the ids are unioned on commit), but the hook runs twice. | 80% | fixed |
 
 ## Target architecture
 
@@ -170,3 +170,10 @@ Entries are oldest first.
   - The fold inserts the id. It already cleared the set on state-rewriting compaction. `compaction_notifications` is now a covered field in `covered_state_matches`.
   - Tests: `strategy_seed_segments_and_boundary_notifications_reach_the_session` and `milestone_notifications_precede_the_runtime_compaction` now fold the replayed log and compare it with the checkpoint; the milestone test covers insert, then clear, then re-insert across a compaction. Both failed before the fix (`{}` vs `{"half-full"}`).
   - `SESSION_LOG_FORMAT` stays at 1 because format 1 is unreleased. Its doc now says to bump it once per release.
+
+- **#21 fixed.** Diagnosis corrected: the turn's own in-memory set is irrelevant (SubagentStart, SubagentStop and Notification handlers fire only out of turn). The gap was dispatches queued behind the lease and not yet in the checkpoint.
+  - `HalterSession::load_for_out_of_turn_hooks` unions the checkpoint's `fired_hook_ids` with `SessionLeases::queued_hook_ids`. It reads the queue before the load, so a release that commits in between is seen by the load. `notify` and both subagent hook paths use it; `notify` no longer hydrates just to read the fired set.
+  - Tests:
+    - `once_hooks_fire_once_across_out_of_turn_dispatches` (no writer, or queued behind a turn); it failed with 2 runs before the fix;
+    - `queued_hook_ids_unions_the_queued_dispatches`.
+  - Residual: two out-of-turn dispatches that run at the same time can still both fire a `once` hook, because the check and the mark aren't atomic (e.g. two children finishing at once, each running SubagentStop). `spawn_agent` is `Exclusive`, so spawns in one turn are ordered and fixed.

@@ -30,6 +30,7 @@ once a `1.0.0` line is cut.
 - A `fork_context` subagent no longer starts from a transcript that ends in the parent's unanswered `spawn_agent` call, which strict providers reject. The inherited in-flight calls get a result saying the parent handles them.
 - The `task` todo list survives `resume`. It is rebuilt from the session log. Previously a resumed session in a new process started with an empty list, although compaction and clean-window rollover promise that todos persist.
 - Replaying the log of a compaction pass that talked to the model and then gave up no longer adds the pass's messages to the transcript. `MessageItem` used to mean both "append" and "only logged", so the fold disagreed with the checkpoint. It also means a compaction summary is no longer taken as a subagent's output or as the CLI's final result.
+- A `once` hook on `SubagentStart`, `SubagentStop` or `Notification` no longer runs again while its first dispatch is still queued behind the parent's turn (for example across two spawns in one turn).
 - Which compaction notifications a window has already delivered is now in the log (`CompactionNotified`), not only in the checkpoint, so replaying the log rebuilds it and no notification repeats.
 - Manual `compact` now runs against the current resources and stores them, as turns do. It used the snapshot stored at the last turn.
 - Loading a session no longer fails with `replay sequence N exceeds advertised head` when another commit lands between reading the checkpoint and reading the log tail. Hydration stops at the head it loaded.

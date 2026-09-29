@@ -930,18 +930,13 @@ impl SessionHandle {
 
     /// Emit a notification event through notification hooks.
     pub async fn notify(&self, notification_type: &str, message: &str) -> anyhow::Result<()> {
-        let mut stored = self
-            .services
-            .sessions
-            .load_session(&self.session_id)
-            .await?
-            .with_context(|| {
+        let (stored, fired_hook_ids) =
+            self.load_for_out_of_turn_hooks().await?.with_context(|| {
                 format!(
                     "failed to emit notification: unknown session '{}'",
                     self.session_id.0
                 )
             })?;
-        hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
         let turn_id = TurnId::new();
         // Session-level entry point with no turn token: hooks run with a
         // token that never fires.
@@ -952,12 +947,6 @@ impl SessionHandle {
             working_dir: &stored.blueprint.working_dir,
             cancel: &hook_cancel,
         };
-        let fired_hook_ids = stored
-            .state
-            .fired_hook_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
         let dispatch =
             run_notification(self, &fired_hook_ids, hook_ctx, notification_type, message).await?;
         // A notification can arrive mid-turn; queue it behind the turn
@@ -2347,6 +2336,36 @@ impl SessionHandle {
 
     /// Hand a write that originated outside this session's writer to that
     /// writer, or commit it now when there is none.
+    /// The stored session and the `once` hook ids already fired, for a hook
+    /// dispatch outside the writer: the checkpoint's plus those queued
+    /// behind the lease. The queue is read first, so a release that commits
+    /// it in between shows up in the load.
+    pub(crate) async fn load_for_out_of_turn_hooks(
+        &self,
+    ) -> anyhow::Result<Option<(StoredSession, BTreeSet<String>)>> {
+        let queued = self
+            .services
+            .session_leases
+            .queued_hook_ids(&self.session_id)
+            .await;
+        let Some(stored) = self
+            .services
+            .sessions
+            .load_session(&self.session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let fired = stored
+            .state
+            .fired_hook_ids
+            .iter()
+            .cloned()
+            .chain(queued)
+            .collect();
+        Ok(Some((stored, fired)))
+    }
+
     pub(crate) async fn dispatch_out_of_turn(&self, dispatch: OutOfTurn) -> anyhow::Result<()> {
         self.services
             .session_leases
@@ -10103,6 +10122,63 @@ mod tests {
             order.is_sorted(),
             "turn, then queued dispatch, then shutdown: {order:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn once_hooks_fire_once_across_out_of_turn_dispatches() {
+        // (case, a turn holds the lease while both notifications arrive)
+        for (case, held) in [("no writer", false), ("queued behind a turn", true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let started = Arc::new(Notify::new());
+            let mut services = test_support::configured_services(
+                Arc::new(CancellableBlockingProvider {
+                    started: started.clone(),
+                }),
+                temp.path(),
+            );
+            let mut registered = RegisteredHooks::default();
+            registered.register(
+                PluginId::from("internal"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(HookEventName::Notification, |_input| async move {
+                    HookResponse::passthrough()
+                })
+                .with_once(true),
+            );
+            Arc::get_mut(&mut services)
+                .expect("unique")
+                .registered_hooks = Arc::new(registered);
+            let runtime = SessionRuntime::new(services.clone());
+            let session = test_support::new_session(&runtime, temp.path()).await;
+
+            let cancel = CancellationToken::new();
+            let turn = if held {
+                let turn = session
+                    .submit_turn_with_cancel(Turn::user("blocking"), cancel.clone())
+                    .await
+                    .expect("turn");
+                started.notified().await;
+                Some(turn)
+            } else {
+                None
+            };
+            for message in ["first", "second"] {
+                session.notify("info", message).await.expect("notify");
+            }
+            if let Some(turn) = turn {
+                cancel.cancel();
+                let _ = turn.try_collect::<Vec<_>>().await;
+            }
+
+            let runs = session
+                .replay()
+                .await
+                .expect("replay")
+                .iter()
+                .filter(|event| matches!(&event.payload, SessionEventPayload::HookCompleted { run } if run.event_name == "Notification"))
+                .count();
+            assert_eq!(runs, 1, "{case}");
+        }
     }
 
     /// Store whose commits fail whenever they carry `TurnCompleted`.

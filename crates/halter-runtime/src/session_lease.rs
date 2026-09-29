@@ -8,10 +8,12 @@
 // committed when the lease is released. With no lease held they commit
 // immediately, under the same lock, so a writer cannot start mid-commit.
 // Subagent records touch no transcript, so the holder also takes them at each
-// of its own commits (`take_subagent_records`) rather than at release.
+// of its own commits (`take_subagent_records`) rather than at release. Later
+// dispatches read the `once` hook ids of queued ones (`queued_hook_ids`),
+// since the checkpoint has not caught up with them.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 
 use halter_protocol::{SessionId, SubagentRecord};
@@ -86,6 +88,22 @@ impl SessionLeases {
                 OutOfTurn::Subagent(record) => Some(record),
                 OutOfTurn::Hooks(_) => None,
             })
+            .collect()
+    }
+
+    /// The `once` hook ids fired by hook dispatches queued behind the lease,
+    /// which the checkpoint does not hold yet.
+    pub(crate) async fn queued_hook_ids(&self, session_id: &SessionId) -> BTreeSet<String> {
+        let held = self.held.lock().await;
+        held.get(session_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|write| match write {
+                OutOfTurn::Hooks(dispatch) => Some(&dispatch.fired_hook_ids),
+                OutOfTurn::Subagent(_) => None,
+            })
+            .flatten()
+            .cloned()
             .collect()
     }
 
@@ -293,6 +311,47 @@ mod tests {
             .await
             .expect("failed release still frees the lease");
     }
+    #[tokio::test]
+    async fn queued_hook_ids_unions_the_queued_dispatches() {
+        let fired = |ids: &[&str]| {
+            OutOfTurn::Hooks(ExecutedHookDispatch {
+                fired_hook_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+                ..ExecutedHookDispatch::default()
+            })
+        };
+        // (case, lease held, queued writes, expected ids)
+        type Case = (&'static str, bool, Vec<OutOfTurn>, Vec<&'static str>);
+        let cases: [Case; 3] = [
+            ("no writer", false, vec![fired(&["a"])], vec![]),
+            ("nothing fired", true, vec![hooks()], vec![]),
+            (
+                "several dispatches",
+                true,
+                vec![fired(&["b", "a"]), hooks(), fired(&["a", "c"])],
+                vec!["a", "b", "c"],
+            ),
+        ];
+        for (case, held, queued, expected) in cases {
+            let leases = SessionLeases::default();
+            let session = SessionId::new();
+            if held {
+                leases.acquire(&session).await;
+            }
+            for write in queued {
+                leases
+                    .dispatch(&session, write, |_| async { Ok(()) })
+                    .await
+                    .expect("queue");
+            }
+            let ids = leases.queued_hook_ids(&session).await;
+            assert_eq!(
+                ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_holder_takes_subagent_records_and_leaves_hooks() {
         let record = || {
