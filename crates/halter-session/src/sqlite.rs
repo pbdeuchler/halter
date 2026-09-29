@@ -617,7 +617,9 @@ fn list_sessions_with_conn(conn: &Connection) -> Result<Vec<SessionBlueprint>> {
 fn configure_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")
         .context("failed to set sqlite journal mode")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
+    // FULL syncs the WAL on every commit, so a power loss cannot drop a
+    // committed event whose side effects (files, provider calls) happened.
+    conn.pragma_update(None, "synchronous", "FULL")
         .context("failed to set sqlite synchronous mode")?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .context("failed to enable sqlite foreign keys")?;
@@ -848,6 +850,34 @@ mod tests {
                 .await
                 .expect("table exists query");
             assert!(exists, "expected table '{table}' to exist");
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_connection_is_durable_and_constrained() {
+        let dir = tempdir().expect("tempdir");
+        let store =
+            SqliteSessionStore::open(dir.path().join("sessions.db")).expect("open sqlite store");
+        // (pragma, expected value); synchronous 2 is FULL.
+        for (pragma, expected) in [
+            ("journal_mode", "wal"),
+            ("synchronous", "2"),
+            ("foreign_keys", "1"),
+        ] {
+            let value = store
+                .with_conn(move |conn| {
+                    Ok(conn.query_row(&format!("PRAGMA {pragma}"), [], |row| {
+                        row.get::<_, rusqlite::types::Value>(0)
+                    })?)
+                })
+                .await
+                .expect("pragma");
+            let value = match value {
+                rusqlite::types::Value::Integer(value) => value.to_string(),
+                rusqlite::types::Value::Text(value) => value,
+                other => panic!("{pragma}: unexpected {other:?}"),
+            };
+            assert_eq!(value, expected, "{pragma}");
         }
     }
 

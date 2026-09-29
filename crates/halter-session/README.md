@@ -211,7 +211,9 @@ Important constructors:
 
 ### Concurrency model
 
-The database runs in WAL mode. Writes serialize through one writer
+The database runs in WAL mode with `synchronous=FULL`, so every commit is on
+disk before it returns and a power loss cannot drop a committed event. Writes
+serialize through one writer
 connection; reads (`load_session`, `replay`, `list_sessions`) are served by a
 small pool of read-only connections, so they proceed concurrently with each
 other and with an in-flight write. `:memory:` databases skip the pool and

@@ -30,6 +30,7 @@ once a `1.0.0` line is cut.
 - `SubagentStart` and `SubagentStop` hooks, and `notify`, no longer fail the parent's in-flight turn with `event log advanced concurrently`. Their dispatches queue behind the turn and commit right after it.
 - The CLI drains in-flight turns before running session-end hooks.
 - CleanWindow notes for a default sqlite store (`backend = "sqlite"` with no `sqlite_path`) now sit beside the default database instead of in the temp dir, so they survive a reboot like the sessions that refer to them.
+- The sqlite store runs `synchronous=FULL` instead of `NORMAL`. Under `NORMAL`, a power loss or OS crash could drop the last commits, whose side effects (edited files, spent tokens) had already happened. The cost is one WAL fsync per commit.
 - The live trace now survives resume. `resume` reopened nothing, so a session resumed by a new process lost every later event; `TraceRecorder::open_session` truncated the file on create; and restored subagents never rejoined the parent's trace. `open_session` now appends (header only for a new file) and is a no-op for an open session; `resume` calls it, and restored subagents are aliased to the parent's writer.
 - A turn whose final commit fails is now recorded as `TurnFailed`. Previously the log was left with an unmatched `TurnStarted`.
 - A turn interrupted by a crash, abort or shutdown is closed with a cancelled `TurnFailed` on the next `resume` or turn, so the log never keeps a dangling turn.

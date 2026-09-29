@@ -62,7 +62,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 16 | `compaction_notifications` is updated by `context_boundary` without an event. | 90% | fixed |
 | 17 | `file_view_cache` is dead state. | 70% | fixed |
 | 18 | The trace recorder is not reopened on resume. | 70% | fixed |
-| 19 | sqlite runs `synchronous=NORMAL`, so the last commits can be lost on power failure. | 60% | open |
+| 19 | sqlite runs `synchronous=NORMAL`, so the last commits can be lost on power failure. | 60% | fixed |
 | 20 | The legacy token-ledger migration doesn't match the fold. | 60% | open |
 | 21 | During a live parent turn, subagent hooks read `fired_hook_ids` from the parent's last checkpoint, not the turn's in-memory set. A `once` SubagentStart hook can fire twice across two spawns in one turn. State converges (the ids are unioned on commit), but the hook runs twice. | 80% | fixed |
 
@@ -206,3 +206,8 @@ Entries are oldest first.
   - Memory sessions keep temp-dir notes, since the notes don't outlive the sessions.
   - Test: `clean_window_notes_root_follows_configured_precedence` gained a backend column and a "default sqlite" row. A mutation that drops the new arm fails it.
   - Residual: a custom store passed through `with_session_store` still gets temp-dir notes, because the builder can't tell whether that store is durable. This is documented in the README and should be set via `notes_root`. I considered defaulting everything to the data dir and rejected it: in-memory tests and embedders would leave notes in `$HOME`.
+
+- **#19 fixed.** The writer connection now uses `synchronous=FULL`. Under WAL plus NORMAL, an app crash was already safe; only an OS crash or power loss could roll back the last transactions. Those rollbacks were consistent: the log and the checkpoint commit together. But they left the world (files, provider spend) ahead of the log.
+  - Cost: one WAL fsync per commit. A commit is one event batch, a few per turn, which is small next to model latency.
+  - Test: `writer_connection_is_durable_and_constrained` (journal_mode, synchronous, foreign_keys). It failed on `NORMAL`.
+  - Residual: on macOS, `fsync` doesn't flush the drive's write cache; that would need `PRAGMA fullfsync`, at about 10ms or more per commit. I left it off. Read-only pool connections never write, so they don't need the pragma.
