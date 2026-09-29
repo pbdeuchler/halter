@@ -89,6 +89,7 @@ pub struct HookInvocationContext<'a> {
     pub cancel: &'a CancellationToken,
 }
 
+#[derive(Default)]
 /// Completed hook dispatch, including preview and final run summaries.
 pub struct ExecutedHookDispatch {
     pub preview_runs: Vec<HookRunSummary>,
@@ -891,6 +892,7 @@ async fn run_agent(
         // hook agent shutdown. The hook agent's own session lifecycle
         // governs when its turns drain.
         turn_registry: Arc::new(crate::TurnRegistry::new()),
+        session_leases: Arc::new(crate::SessionLeases::default()),
         subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
         subagent_event_forwarding_cap: sess.services().subagent_event_forwarding_cap,
         shell_timeout_secs: sess.services().shell_timeout_secs,

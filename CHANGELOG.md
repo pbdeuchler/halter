@@ -8,6 +8,16 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Added
+
+- `RuntimeServices::session_leases`: a per-session write lease. A turn, `compact`, `shutdown` or `resume` holds it for its whole duration, and a second writer on the same session waits instead of racing on the commit head. Custom `RuntimeServices` literals must add `session_leases: Arc::new(SessionLeases::default())`.
+
+### Fixed
+
+- The snapshot revision is now a hash of the whole serialised snapshot. Previously v0.6 snapshots with skills (whose new `SkillDef.root` field was not hashed) collided with stored rows and failed every sqlite commit with `revision already exists with different data`.
+- `SubagentStart` and `SubagentStop` hooks, and `notify`, no longer fail the parent's in-flight turn with `event log advanced concurrently`. Their dispatches queue behind the turn and commit right after it.
+- The CLI drains in-flight turns before running session-end hooks.
+
 ## [0.6.0] - 2026-09-28
 
 Compaction v2 replaces signal-scored pruning with a session token ledger,

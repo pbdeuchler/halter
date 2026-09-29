@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::model_selection::select_models;
+use crate::session_lease::SessionLease;
 use crate::turn_registry::TurnRegistry;
 use crate::{
     CompactionBoundary, CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager,
@@ -85,6 +86,8 @@ pub struct RuntimeServices {
     pub event_bus: Arc<EventBus>,
     pub parent_streams: Arc<ParentStreamRegistry>,
     pub turn_registry: Arc<TurnRegistry>,
+    /// Per-session write leases; see `session_lease`.
+    pub session_leases: Arc<crate::SessionLeases>,
     pub subagent_event_forwarding: SubagentEventForwarding,
     pub subagent_event_forwarding_cap: u64,
     pub shell_timeout_secs: u64,
@@ -564,49 +567,10 @@ impl SessionRuntime {
 
     /// Resume an existing session and fire resume-time hooks.
     pub async fn resume(&self, session_id: &SessionId) -> anyhow::Result<Option<HalterSession>> {
-        let existing = self.services.sessions.load_session(session_id).await?;
-        debug!(session_id = %session_id, found = existing.is_some(), "resuming session");
-        if let Some(mut stored) = existing {
-            hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
-            let expected_head = stored.head_sequence;
-            stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
-            // The resume commit both persists the latch and appends
-            // `SessionResumed`, so head-sequence concurrency control sees the
-            // mutation: a racing writer conflicts instead of silently losing
-            // its checkpoint.
-            let resumed = PendingEvent::new(
-                session_id.clone(),
-                Delivery::Lossless,
-                SessionEventPayload::SessionResumed,
-            );
-            let committed = self
-                .services
-                .sessions
-                .commit(
-                    session_id,
-                    None,
-                    Some(expected_head),
-                    Some(stored.state),
-                    vec![resumed],
-                )
-                .await?;
-            let forwarding_ancestors =
-                forwarding_ancestors_for_blueprint(&self.services, &stored.blueprint).await;
-            for event in committed {
-                if let Some(recorder) = &self.services.trace_recorder {
-                    recorder.record(&event);
-                }
-                self.services
-                    .parent_streams
-                    .forward_to_ancestors(&forwarding_ancestors, &event);
-                self.services.event_bus.publish(event);
-            }
-            return Ok(Some(HalterSession::new(
-                self.services.clone(),
-                session_id.clone(),
-            )?));
-        }
-        Ok(None)
+        let session = HalterSession::new(self.services.clone(), session_id.clone())?;
+        let found = session.leased(session.mark_resumed()).await?;
+        debug!(session_id = %session_id, found, "resuming session");
+        Ok(found.then_some(session))
     }
 
     /// List persisted session blueprints.
@@ -693,6 +657,10 @@ impl SessionHandle {
             user_part_count = turn.user_message.parts.len(),
             "submitting turn"
         );
+        // Taken before the load so no out-of-turn write lands between the
+        // head this turn reads and the `TurnStarted` it commits. A turn
+        // submitted while another is in flight waits for it.
+        let lease = self.acquire_lease().await;
         let mut stored = self
             .services
             .sessions
@@ -845,6 +813,17 @@ impl SessionHandle {
                     }
                 }
             }
+            // Out-of-turn hook dispatches queued behind this turn are not
+            // part of it, so a failure to commit them is logged rather than
+            // surfaced on the turn stream.
+            if let Err(error) = lease.release().await {
+                error!(
+                    session_id = %session.session_id,
+                    turn_id = %turn.id,
+                    error = %error,
+                    "failed to commit hook dispatches queued behind turn"
+                );
+            }
         });
 
         if let Err(register_error) =
@@ -875,6 +854,10 @@ impl SessionHandle {
 
     /// Shut down this session and run session-end hooks.
     pub async fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
+        self.leased(self.run_shutdown(reason)).await
+    }
+
+    async fn run_shutdown(&self, reason: &str) -> anyhow::Result<()> {
         let mut stored = self
             .services
             .sessions
@@ -944,8 +927,6 @@ impl SessionHandle {
                 )
             })?;
         hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
-        let expected_head = stored.head_sequence;
-        let mut state = stored.state;
         let turn_id = TurnId::new();
         // Session-level entry point with no turn token: hooks run with a
         // token that never fires.
@@ -956,33 +937,30 @@ impl SessionHandle {
             working_dir: &stored.blueprint.working_dir,
             cancel: &hook_cancel,
         };
-        let fired_hook_ids = state
+        let fired_hook_ids = stored
+            .state
             .fired_hook_ids
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
         let dispatch =
             run_notification(self, &fired_hook_ids, hook_ctx, notification_type, message).await?;
-        let mut events = Vec::new();
-        self.record_hook_dispatch(&mut events, &dispatch);
-        for message in apply_hook_side_effects(&mut state, &dispatch) {
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
-        }
-        let _ = self
-            .commit_and_publish(
-                &stored.blueprint,
-                None,
-                Some(expected_head),
-                Some(state),
-                events,
-                None,
-            )
-            .await?;
-        Ok(())
+        // A notification can arrive mid-turn; queue it behind the turn
+        // rather than racing its commits.
+        self.dispatch_out_of_turn(dispatch).await
     }
 
     /// Compact the session immediately using the configured provider.
     pub async fn compact(
+        &self,
+        trigger: &str,
+        custom_instructions: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.leased(self.run_compact(trigger, custom_instructions))
+            .await
+    }
+
+    async fn run_compact(
         &self,
         trigger: &str,
         custom_instructions: Option<&str>,
@@ -2283,6 +2261,108 @@ impl SessionHandle {
         Ok(())
     }
 
+    pub(crate) async fn acquire_lease(&self) -> SessionLease {
+        self.services.session_leases.acquire(&self.session_id).await;
+        SessionLease::new(self.clone())
+    }
+
+    pub(crate) async fn release_lease(&self) -> anyhow::Result<()> {
+        self.services
+            .session_leases
+            .release(&self.session_id, |queued| {
+                self.commit_hook_dispatches(queued)
+            })
+            .await
+    }
+
+    /// Run a session-level operation as this session's sole writer.
+    async fn leased<T>(
+        &self,
+        operation: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        let lease = self.acquire_lease().await;
+        let outcome = operation.await;
+        lease.release().await?;
+        outcome
+    }
+
+    /// Hand a hook dispatch that fired outside this session's writer to
+    /// that writer, or commit it now when there is none.
+    pub(crate) async fn dispatch_out_of_turn(
+        &self,
+        dispatch: ExecutedHookDispatch,
+    ) -> anyhow::Result<()> {
+        self.services
+            .session_leases
+            .dispatch(&self.session_id, dispatch, |queued| {
+                self.commit_hook_dispatches(queued)
+            })
+            .await
+    }
+
+    async fn commit_hook_dispatches(
+        &self,
+        dispatches: Vec<ExecutedHookDispatch>,
+    ) -> anyhow::Result<()> {
+        let Some(mut stored) = self
+            .services
+            .sessions
+            .load_session(&self.session_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
+        let mut state = stored.state;
+        let mut events = Vec::new();
+        for dispatch in &dispatches {
+            self.record_hook_dispatch(&mut events, dispatch);
+            for message in apply_hook_side_effects(&mut state, dispatch) {
+                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+            }
+        }
+        // A dispatch where no hook ran changes nothing.
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.commit_and_publish(
+            &stored.blueprint,
+            None,
+            Some(stored.head_sequence),
+            Some(state),
+            events,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Persist the resume latch and append `SessionResumed`. Returns `false`
+    /// when the session does not exist.
+    async fn mark_resumed(&self) -> anyhow::Result<bool> {
+        let Some(mut stored) = self
+            .services
+            .sessions
+            .load_session(&self.session_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
+        stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
+        let resumed = self.make_event(SessionEventPayload::SessionResumed);
+        self.commit_and_publish(
+            &stored.blueprint,
+            None,
+            Some(stored.head_sequence),
+            Some(stored.state),
+            vec![resumed],
+            None,
+        )
+        .await?;
+        Ok(true)
+    }
+
     async fn commit_turn_failure(
         &self,
         failure_events: Vec<PendingEvent>,
@@ -3275,6 +3355,7 @@ impl Default for RuntimeServices {
             event_bus: Arc::new(EventBus::default()),
             parent_streams: Arc::new(ParentStreamRegistry::default()),
             turn_registry: Arc::new(TurnRegistry::new()),
+            session_leases: Arc::new(crate::SessionLeases::default()),
             subagent_event_forwarding: SubagentEventForwarding::Off,
             subagent_event_forwarding_cap: 100_000,
             shell_timeout_secs: 30,
@@ -9505,6 +9586,161 @@ mod tests {
         assert!(
             !request_carries_synthesis_guidance(&requests),
             "with no panel outcomes the default model should run without guidance"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_lifecycle_hooks_queue_behind_the_parent_turn() {
+        // Both hooks fire while the parent turn is mid-flight: SubagentStart
+        // inside the spawn tool call, SubagentStop when the child finishes
+        // while the parent waits on it. Committing either straight into the
+        // parent log used to fail the parent turn with a head conflict.
+        for event in [HookEventName::SubagentStart, HookEventName::SubagentStop] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut services =
+                test_support::configured_services(Arc::new(SubagentFirehoseProvider), temp.path());
+            let mut registered = RegisteredHooks::default();
+            registered.register(
+                PluginId::from("internal"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(event, |_input| async move {
+                    HookResponse::passthrough().with_system_message("hooked")
+                }),
+            );
+            Arc::get_mut(&mut services)
+                .expect("unique")
+                .registered_hooks = Arc::new(registered);
+            let runtime = SessionRuntime::new(services.clone());
+            install_subagent_tools(&runtime, &services);
+            let session = test_support::new_session(&runtime, temp.path()).await;
+
+            let streamed = session
+                .submit_turn(Turn::user("go"))
+                .await
+                .expect("turn")
+                .try_collect::<Vec<_>>()
+                .await;
+            assert!(
+                streamed.is_ok(),
+                "{event:?}: turn stream failed: {streamed:?}"
+            );
+
+            let log = session.replay().await.expect("replay");
+            let own = |event: &&SessionEvent| event.session_id == *session.session_id();
+            assert!(
+                !log.iter()
+                    .filter(own)
+                    .any(|event| matches!(event.payload, SessionEventPayload::TurnFailed { .. })),
+                "{event:?}: parent turn failed"
+            );
+            let completed_at = log
+                .iter()
+                .position(|e| matches!(e.payload, SessionEventPayload::TurnCompleted { .. }))
+                .expect("turn completed");
+            let hook_at = log
+                .iter()
+                .position(|e| matches!(&e.payload, SessionEventPayload::HookCompleted { run } if run.event_name == event.canonical_name()))
+                .expect("hook recorded in parent log");
+            assert!(
+                hook_at > completed_at,
+                "{event:?}: dispatch queued behind the turn"
+            );
+
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("parent");
+            assert!(
+                stored.state.messages.iter().any(
+                    |message| matches!(message, Message::System(system) if system.text == "hooked")
+                ),
+                "{event:?}: hook side effects reach the parent checkpoint"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_writers_wait_for_the_in_flight_turn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Arc::new(Notify::new());
+        let services = test_support::configured_services(
+            Arc::new(CancellableBlockingProvider {
+                started: started.clone(),
+            }),
+            temp.path(),
+        );
+        let mut registered = RegisteredHooks::default();
+        registered.register(
+            PluginId::from("internal"),
+            RegisteredHookPriority::AfterPlugins,
+            Hook::callback(HookEventName::Notification, |_input| async move {
+                HookResponse::passthrough()
+            }),
+        );
+        let mut services = services;
+        Arc::get_mut(&mut services)
+            .expect("unique")
+            .registered_hooks = Arc::new(registered);
+        let runtime = SessionRuntime::new(services.clone());
+        let session = test_support::new_session(&runtime, temp.path()).await;
+
+        let cancel = CancellationToken::new();
+        let first = session
+            .submit_turn_with_cancel(Turn::user("blocking"), cancel.clone())
+            .await
+            .expect("first turn");
+        started.notified().await;
+
+        // A session-level writer submitted mid-turn waits for the turn,
+        // while an out-of-turn hook dispatch queues and returns at once.
+        let waiting_shutdown = tokio::spawn({
+            let session = session.clone();
+            async move { session.shutdown("test").await }
+        });
+        session
+            .notify("info", "queued")
+            .await
+            .expect("notify queues");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting_shutdown.is_finished(),
+            "shutdown waits for the turn"
+        );
+        let position = |log: &[SessionEvent], wanted: fn(&SessionEventPayload) -> bool| {
+            log.iter().position(|event| wanted(&event.payload))
+        };
+        let notified: fn(&SessionEventPayload) -> bool = |payload| matches!(payload, SessionEventPayload::HookCompleted { run } if run.event_name == "Notification");
+        let log = session.replay().await.expect("replay");
+        assert_eq!(
+            position(&log, notified),
+            None,
+            "dispatch deferred while leased"
+        );
+
+        cancel.cancel();
+        let _ = first.try_collect::<Vec<_>>().await;
+        tokio::time::timeout(Duration::from_secs(2), waiting_shutdown)
+            .await
+            .expect("shutdown runs once the turn releases")
+            .expect("join")
+            .expect("shutdown");
+
+        let log = session.replay().await.expect("replay");
+        let order = [
+            position(&log, |p| {
+                matches!(p, SessionEventPayload::TurnFailed { .. })
+            }),
+            position(&log, notified),
+            position(&log, |p| {
+                matches!(p, SessionEventPayload::SessionShutdownComplete)
+            }),
+        ]
+        .map(|at| at.expect("event committed"));
+        assert!(
+            order.is_sorted(),
+            "turn, then queued dispatch, then shutdown: {order:?}"
         );
     }
 }

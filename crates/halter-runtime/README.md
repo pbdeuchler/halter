@@ -596,9 +596,9 @@ If subscribers are slow, `EventBus` can drop events depending on capacity and do
 
 The per-turn stream can also include subagent events when `subagent_event_forwarding` is enabled for the session. Forwarded events keep the child `session_id`; the configured forwarding cap emits a synthetic `Lagged` event and stops forwarding for that parent turn when exceeded.
 
-### Persistence conflicts
+### Persistence conflicts and the session write lease
 
-If the backing store rejects concurrent commits, the session layer may surface commit conflict errors from `halter-session`.
+Each session has one writer at a time. A turn, `compact`, `shutdown` or `resume` holds the session's write lease for its whole duration; a second one started meanwhile waits for it instead of racing it on `expected_head_sequence`. A writer that re-enters its own session (for example a hook calling `compact` on the session running it) deadlocks, so don't. Hook dispatches that fire outside the writer (`SubagentStart`, `SubagentStop`, `notify`) queue behind the lease and commit, in order, right after the writer releases it (so after the turn's `TurnCompleted`/`TurnFailed`); with no writer they commit immediately. The lease is process-local: two processes writing the same session still surface `SessionCommitConflict` from `halter-session`.
 
 ### Misconfigured subagent depth or model routing
 

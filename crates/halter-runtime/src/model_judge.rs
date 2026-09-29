@@ -317,6 +317,7 @@ fn panel_services(
 
         parent_streams: Arc::new(ParentStreamRegistry::default()),
         turn_registry: Arc::new(TurnRegistry::new()),
+        session_leases: Arc::new(crate::SessionLeases::default()),
         subagent_event_forwarding: SubagentEventForwarding::Off,
         subagent_event_forwarding_cap: parent.subagent_event_forwarding_cap,
         shell_timeout_secs: parent.shell_timeout_secs,

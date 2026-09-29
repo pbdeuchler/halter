@@ -221,26 +221,15 @@ async fn run_once(
     );
     let harness = Halter::from_config_file(path).await?;
     let session = harness.new_session(SessionInit::default()).await?;
-    let result = tokio::select! {
+    let (result, reason) = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received, draining runtime before exit");
-            let _ = session.shutdown("interrupted").await;
-            let report = harness.shutdown(SHUTDOWN_DRAIN).await;
-            info!(
-                drained = report.turns_drained,
-                aborted = report.turns_aborted,
-                timed_out = report.timed_out,
-                "runtime drained on signal"
-            );
-            return Err(anyhow::anyhow!("interrupted by signal"));
+            (Err(anyhow::anyhow!("interrupted by signal")), "interrupted")
         }
-        result = run_once_body(&session, task, output_mode, output) => result,
+        result = run_once_body(&session, task, output_mode, output) => (result, "run_complete"),
     };
-    let session_shutdown = session.shutdown("run_complete").await;
-    let _ = harness.shutdown(SHUTDOWN_DRAIN).await;
-    result?;
-    session_shutdown
+    drain_then_end_session(&harness, &session, result, reason).await
 }
 
 async fn run_once_body(
@@ -280,23 +269,34 @@ async fn chat(path: &Path, output: &mut dyn Write) -> anyhow::Result<()> {
     let harness = Halter::from_config_file(path).await?;
     let session = harness.new_session(SessionInit::default()).await?;
 
-    let result = tokio::select! {
+    let (result, reason) = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received, draining runtime before exit");
-            let _ = session.shutdown("interrupted").await;
-            Err(anyhow::anyhow!("interrupted by signal"))
+            (Err(anyhow::anyhow!("interrupted by signal")), "interrupted")
         }
-        result = chat_body(&session, output) => result,
+        result = chat_body(&session, output) => (result, "chat_complete"),
     };
-    let session_shutdown = session.shutdown("chat_complete").await;
+    drain_then_end_session(&harness, &session, result, reason).await
+}
+
+/// Drain in-flight turns before running session-end hooks: `shutdown` waits
+/// for the session's write lease, which an undrained turn still holds.
+async fn drain_then_end_session(
+    harness: &Halter,
+    session: &HalterSession,
+    result: anyhow::Result<()>,
+    reason: &str,
+) -> anyhow::Result<()> {
     let report = harness.shutdown(SHUTDOWN_DRAIN).await;
     info!(
         drained = report.turns_drained,
         aborted = report.turns_aborted,
         timed_out = report.timed_out,
-        "runtime drained on chat exit"
+        reason,
+        "runtime drained"
     );
+    let session_shutdown = session.shutdown(reason).await;
     result?;
     session_shutdown
 }

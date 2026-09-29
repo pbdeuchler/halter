@@ -9,11 +9,10 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use halter_protocol::{
-    AgentId, AgentName, CloseSubagentRequest, CloseSubagentResponse, PendingEvent,
-    SendSubagentInputRequest, SessionEventPayload, SessionId, SpawnSubagentRequest, SubagentState,
-    SubagentStatus, Turn, TurnId, Usage, WaitSubagentRequest, WaitSubagentResponse,
+    AgentId, AgentName, CloseSubagentRequest, CloseSubagentResponse, SendSubagentInputRequest,
+    SessionId, SpawnSubagentRequest, SubagentState, SubagentStatus, Turn, TurnId, Usage,
+    WaitSubagentRequest, WaitSubagentResponse,
 };
-use halter_session::SessionCommitConflict;
 use halter_tools::{SubagentControl, SubagentParentContext};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -21,7 +20,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::session::{apply_hook_side_effects, create_session_seeded};
+use crate::session::create_session_seeded;
 use crate::subagent_session::{
     build_subagent_session_init, build_subagent_state, extract_subagent_output,
     extract_subagent_usage,
@@ -64,8 +63,6 @@ struct TurnOutcome {
     usage: Option<Usage>,
     error: Option<String>,
 }
-
-const PARENT_HOOK_DISPATCH_MAX_RETRIES: usize = 3;
 
 /// Upper bound on `SubagentStop`-hook-driven turn resubmissions per subagent
 /// task. A hook that returns a `block_reason` resubmits the blocked turn with
@@ -390,109 +387,6 @@ impl RuntimeSubagentControl {
         self.signal_change();
     }
 
-    async fn run_parent_hook_dispatch(
-        &self,
-        parent_session_id: &SessionId,
-        dispatch: crate::ExecutedHookDispatch,
-        block_is_ignored: bool,
-    ) -> anyhow::Result<Option<String>> {
-        for attempt in 0..=PARENT_HOOK_DISPATCH_MAX_RETRIES {
-            let Some(mut stored) = self
-                .inner
-                .services
-                .sessions
-                .load_session(parent_session_id)
-                .await?
-            else {
-                return Ok(None);
-            };
-            crate::session::hydrate_stored_session(
-                self.inner.services.sessions.as_ref(),
-                &mut stored,
-            )
-            .await?;
-
-            let expected_head = stored.head_sequence;
-            let mut next_state = stored.state;
-            let mut events = Vec::new();
-            events.extend(dispatch.preview_runs.iter().cloned().map(|run| {
-                PendingEvent::new(
-                    parent_session_id.clone(),
-                    halter_protocol::Delivery::Lossless,
-                    SessionEventPayload::HookStarted { run },
-                )
-            }));
-            events.extend(dispatch.completed_runs.iter().cloned().map(|run| {
-                PendingEvent::new(
-                    parent_session_id.clone(),
-                    halter_protocol::Delivery::Lossless,
-                    SessionEventPayload::HookCompleted { run },
-                )
-            }));
-            for message in apply_hook_side_effects(&mut next_state, &dispatch) {
-                events.push(PendingEvent::new(
-                    parent_session_id.clone(),
-                    halter_protocol::Delivery::Lossless,
-                    SessionEventPayload::MessageItem { message },
-                ));
-            }
-
-            match self
-                .inner
-                .services
-                .sessions
-                .commit(
-                    parent_session_id,
-                    None,
-                    Some(expected_head),
-                    Some(next_state),
-                    events,
-                )
-                .await
-            {
-                Ok(committed) => {
-                    if block_is_ignored
-                        && (dispatch.merged.block_reason.is_some()
-                            || dispatch.merged.stop_reason.is_some())
-                    {
-                        warn!(
-                            session_id = %parent_session_id,
-                            "hooks.ignored_block"
-                        );
-                    }
-                    for event in committed {
-                        if let Some(recorder) = &self.inner.services.trace_recorder {
-                            recorder.record(&event);
-                        }
-                        self.inner.services.event_bus.publish(event);
-                    }
-                    return Ok(dispatch.merged.block_reason.clone());
-                }
-                Err(error)
-                    if error.downcast_ref::<SessionCommitConflict>().is_some()
-                        && attempt < PARENT_HOOK_DISPATCH_MAX_RETRIES =>
-                {
-                    warn!(
-                        session_id = %parent_session_id,
-                        attempt = attempt + 1,
-                        "hooks.parent_state_conflict_retry"
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        // The loop body always either returns or `continue`s. Reaching this
-        // line means it fell through after exhausting retries; surface that as
-        // an error rather than silently reporting success (the previous shape
-        // returned `Ok(continuation)` and erased the conflict).
-        Err(anyhow::anyhow!(
-            "hook dispatch exhausted {} retries due to session commit conflict",
-            PARENT_HOOK_DISPATCH_MAX_RETRIES
-        ))
-    }
-
     async fn run_subagent_start_hooks(
         &self,
         parent: &SubagentParentContext,
@@ -538,10 +432,12 @@ impl RuntimeSubagentControl {
             &parent.blueprint.session_id,
         )
         .await?;
-        let _ = self
-            .run_parent_hook_dispatch(&parent.blueprint.session_id, dispatch, true)
-            .await?;
-        Ok(())
+        if dispatch.merged.block_reason.is_some() || dispatch.merged.stop_reason.is_some() {
+            warn!(session_id = %parent.blueprint.session_id, "hooks.ignored_block");
+        }
+        // The parent is mid-turn (this runs inside its spawn tool call), so
+        // the dispatch queues behind the parent turn instead of racing it.
+        session.dispatch_out_of_turn(dispatch).await
     }
 
     async fn run_subagent_stop_hooks(
@@ -590,8 +486,9 @@ impl RuntimeSubagentControl {
             transcript_path.as_deref(),
         )
         .await?;
-        self.run_parent_hook_dispatch(parent_session_id, dispatch, false)
-            .await
+        let block_reason = dispatch.merged.block_reason.clone();
+        session.dispatch_out_of_turn(dispatch).await?;
+        Ok(block_reason)
     }
 
     async fn terminal_status_for_targets(
@@ -1219,6 +1116,7 @@ mod tests {
 
             parent_streams: Arc::new(crate::ParentStreamRegistry::default()),
             turn_registry: Arc::new(crate::TurnRegistry::new()),
+            session_leases: Arc::new(crate::SessionLeases::default()),
             subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
             subagent_event_forwarding_cap: 100_000,
             shell_timeout_secs: 30,

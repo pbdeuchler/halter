@@ -25,6 +25,7 @@ mod model_summary;
 mod prompt;
 mod provider_default;
 mod session;
+mod session_lease;
 mod subagent_session;
 mod subagents;
 mod trace_export;
@@ -61,6 +62,7 @@ pub use session::{
     HalterSession, ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit,
     SessionRuntime,
 };
+pub use session_lease::SessionLeases;
 pub use trace_export::export_session_trace;
 pub use trace_recorder::TraceRecorder;
 pub use turn_registry::{ShutdownReport, TurnRegistry, TurnRegistryError};
