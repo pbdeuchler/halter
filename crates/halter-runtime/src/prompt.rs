@@ -104,24 +104,6 @@ pub fn coding_agent_prompt_segment() -> PromptSegment {
     system_prompt_segment(default_coding_agent_prompt())
 }
 
-/// Build a single skill segment from a SkillDef. Skill segments live
-/// between the system prompt and the conversation, and the assembler
-/// places a cache breakpoint after the last one so subsequent turns
-/// re-hit the cache while skills remain unchanged.
-#[must_use]
-pub fn skill_prompt_segment(name: &str, body: &str) -> PromptSegment {
-    let text = format!("# Skill: {name}\n\n{body}");
-    let hash = hash_prompt_text(&text);
-    PromptSegment {
-        id: PromptSegmentId::new(),
-        text,
-        volatility: Volatility::SessionStable,
-        cache_scope: CacheScope::PrefixCacheable,
-        content_hash: hash,
-        kind: PromptSegmentKind::Skill,
-    }
-}
-
 #[async_trait]
 impl PromptAssembler for DefaultPromptAssembler {
     async fn assemble(&self, plan: &ContextPlan) -> anyhow::Result<AssembledPrompt> {
@@ -271,7 +253,7 @@ fn render_message(message: &Message) -> String {
     format!("[{role}:{} bytes]\n{body}", body.len())
 }
 
-fn hash_prompt_text(text: &str) -> ContentHash {
+pub(crate) fn hash_prompt_text(text: &str) -> ContentHash {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -561,7 +543,7 @@ mod tests {
         let assembler = DefaultPromptAssembler;
         let segments = vec![
             system_prompt_segment("base prompt"),
-            skill_prompt_segment("pairs", "play nicely"),
+            crate::skill_index_segment([("pairs", "play nicely")]),
             appended_system_prompt_segment("house rules"),
         ];
         let plan = ContextPlan {
@@ -602,7 +584,9 @@ mod tests {
             vec![
                 "base prompt",
                 "house rules",
-                "# Skill: pairs\n\nplay nicely"
+                crate::skill_index_segment([("pairs", "play nicely")])
+                    .text
+                    .as_str()
             ]
         );
         assert_eq!(assembled.system_segment_count, 2);

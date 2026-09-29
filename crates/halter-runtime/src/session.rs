@@ -1590,11 +1590,16 @@ impl SessionHandle {
         tool_calls: Vec<ToolCall>,
     ) -> anyhow::Result<Vec<PendingEvent>> {
         let mut events = Vec::new();
+        let mut follow_ups = Vec::new();
 
         let tools = self.services.tools.clone();
-        for batch in
-            batch_tool_calls_by_concurrency(|name| tools.concurrency_for(&name.0), tool_calls)
-        {
+        for batch in batch_tool_calls_by_concurrency(
+            |name| match name.0 == crate::SKILL_TOOL_NAME {
+                true => Some(halter_protocol::ToolConcurrency::ReadOnly),
+                false => tools.concurrency_for(&name.0),
+            },
+            tool_calls,
+        ) {
             // Phase A: pre-hook + block check + context build (sequential per call,
             // because each mutates `state` and may change `call.arguments`).
             let mut prepared: Vec<PreparedToolCall> = Vec::with_capacity(batch.len());
@@ -1688,14 +1693,25 @@ impl SessionHandle {
 
             // Phase B: dispatch execution. For Exclusive or single-call batches this
             // is serial; for ReadOnly/ParallelSafe batches of >1, runs concurrently.
+            // `skill` resolves against the snapshot rather than the registry;
+            // its instructions travel as a follow-up user message.
             let tools = self.services.tools.clone();
-            let executions: Vec<anyhow::Result<ToolResult>> =
+            let executions: Vec<anyhow::Result<(ToolResult, Option<Message>)>> =
                 futures::future::join_all(prepared.iter().map(|p| {
                     let tools = tools.clone();
                     let context = p.context.clone();
                     let args = p.call.arguments.clone();
                     let name = p.call.name.0.clone();
-                    async move { tools.execute(&name, context, args).await }
+                    async move {
+                        if name == crate::SKILL_TOOL_NAME {
+                            return crate::skills::load_skill(&context.snapshot, &args)
+                                .map(|(result, message)| (result, Some(message)));
+                        }
+                        tools
+                            .execute(&name, context, args)
+                            .await
+                            .map(|result| (result, None))
+                    }
                 }))
                 .await;
 
@@ -1716,7 +1732,8 @@ impl SessionHandle {
                 }
 
                 let (mut content, error) = match execution {
-                    Ok(result) => {
+                    Ok((result, follow_up)) => {
+                        follow_ups.extend(follow_up);
                         debug!(
                             session_id = %self.session_id,
                             tool_call_id = %call.id,
@@ -1801,6 +1818,13 @@ impl SessionHandle {
             }
         }
 
+        // After every tool result: providers reject a user message between
+        // an assistant's tool calls and their results.
+        for message in follow_ups {
+            state.append(message.clone());
+            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+        }
+
         Ok(events)
     }
 
@@ -1823,7 +1847,7 @@ impl SessionHandle {
                 state,
                 observed,
                 snapshot,
-                &self.services.tools.specs(),
+                &crate::skills::tool_specs(self.services.tools.specs(), snapshot),
             )
             .await?;
         let prompt = self.services.prompt_assembler.assemble(&plan).await?;
@@ -1875,7 +1899,7 @@ impl SessionHandle {
         events: &mut Vec<PendingEvent>,
     ) {
         let segments = crate::context::prompt_segments(blueprint, state, snapshot);
-        let tools = self.services.tools.specs();
+        let tools = crate::skills::tool_specs(self.services.tools.specs(), snapshot);
         let request_tokens = halter_protocol::estimate_request_tokens(&segments, &tools);
         if !state.token_ledger.needs_request_preparation(request_tokens) {
             return;
@@ -7516,6 +7540,127 @@ mod tests {
         assert_eq!(stored.snapshot.revision.0, "reloaded");
     }
 
+    /// Calls `skill` twice in its first reply, then answers "done".
+    struct SkillLoopProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
+    #[async_trait]
+    impl Provider for SkillLoopProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            let first = self.requests.lock().expect("requests").is_empty();
+            self.requests.lock().expect("requests").push(request);
+            Ok(match first {
+                true => tool_calls_stream(vec![
+                    (crate::SKILL_TOOL_NAME, json!({ "name": "review" })),
+                    (crate::SKILL_TOOL_NAME, json!({ "name": "deploy" })),
+                ]),
+                false => text_stream(vec!["done"]),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_tool_lists_skills_and_loads_bodies_as_user_messages() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = SkillLoopProvider {
+            requests: requests.clone(),
+        };
+        let services = configured_services(Arc::new(provider), temp.path());
+        let runtime = SessionRuntime::new(services);
+        let session = new_session(&runtime, temp.path()).await;
+        let mut snapshot = ResourceSnapshot::empty();
+        for name in ["review", "deploy"] {
+            snapshot.skills.insert(
+                halter_protocol::SkillName::from(name),
+                halter_protocol::SkillDef {
+                    name: name.to_owned(),
+                    description: format!("{name} things"),
+                    body: format!("{name} BODY"),
+                    ..Default::default()
+                },
+            );
+        }
+        runtime.replace_resources(snapshot, empty_hooks(), Vec::new());
+
+        session
+            .submit_turn(Turn::user("ship it"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        let first = &requests[0];
+        assert!(first.tools.iter().any(|spec| spec.name.0 == "skill"));
+        assert!(
+            first
+                .prompt
+                .rendered_prefix
+                .contains("- review: review things")
+        );
+        assert!(!first.prompt.rendered_prefix.contains("BODY"));
+        let tail = requests[1]
+            .messages
+            .iter()
+            .rev()
+            .take(4)
+            .rev()
+            .map(|message| match message {
+                Message::Tool(result) => format!("tool:{:?}", result.content),
+                Message::User(user) => format!("user:{}", user.plain_text()),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            tail[0].starts_with("tool:") && !tail[0].contains("BODY"),
+            "{tail:?}"
+        );
+        assert!(
+            tail[1].starts_with("tool:") && !tail[1].contains("BODY"),
+            "{tail:?}"
+        );
+        assert_eq!(
+            tail[2..],
+            [
+                "user:<skill name=\"review\">\nreview BODY\n</skill>",
+                "user:<skill name=\"deploy\">\ndeploy BODY\n</skill>",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_tool_is_absent_without_skills() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider::new(requests.clone(), "ok");
+        let runtime = SessionRuntime::new(configured_services(Arc::new(provider), temp.path()));
+        let session = new_session(&runtime, temp.path()).await;
+
+        session
+            .submit_turn(Turn::user("hi"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let requests = requests.lock().expect("requests");
+        assert!(!requests[0].tools.iter().any(|spec| spec.name.0 == "skill"));
+        assert!(!requests[0].prompt.rendered_prefix.contains("# Skills"));
+    }
+
     #[tokio::test]
     async fn session_init_can_override_subagent_model() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -8248,23 +8393,32 @@ mod tests {
         name: &'static str,
         arguments: serde_json::Value,
     ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        tool_calls_stream(vec![(name, arguments)])
+    }
+
+    fn tool_calls_stream(
+        calls: Vec<(&'static str, serde_json::Value)>,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let message_id = halter_protocol::MessageId::new();
-        let block_id = BlockId::new();
-        let tool_call_id = ToolCallId::new();
-        stream::iter(vec![
-            Ok(StreamEvent::MessageStart {
-                id: message_id.clone(),
-            }),
-            Ok(StreamEvent::ToolCallStart {
-                id: block_id.clone(),
-                tool_call_id,
-                name: ToolName::from(name),
-            }),
-            Ok(StreamEvent::ToolArgsDelta {
-                id: block_id.clone(),
-                delta: arguments.to_string(),
-            }),
-            Ok(StreamEvent::ToolCallEnd { id: block_id }),
+        let calls = calls.into_iter().flat_map(|(name, arguments)| {
+            let block_id = BlockId::new();
+            [
+                Ok(StreamEvent::ToolCallStart {
+                    id: block_id.clone(),
+                    tool_call_id: ToolCallId::new(),
+                    name: ToolName::from(name),
+                }),
+                Ok(StreamEvent::ToolArgsDelta {
+                    id: block_id.clone(),
+                    delta: arguments.to_string(),
+                }),
+                Ok(StreamEvent::ToolCallEnd { id: block_id }),
+            ]
+        });
+        let start = Ok(StreamEvent::MessageStart {
+            id: message_id.clone(),
+        });
+        stream::iter(std::iter::once(start).chain(calls).chain([
             Ok(StreamEvent::UsageUpdate {
                 usage: Usage {
                     input_tokens: 1,
@@ -8278,7 +8432,7 @@ mod tests {
                 stop_reason: StopReason::ToolUse,
                 response_id: None,
             }),
-        ])
+        ]))
         .boxed()
     }
 

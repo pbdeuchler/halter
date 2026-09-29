@@ -427,6 +427,8 @@ Standalone skills are discovered recursively under each skill root:
 
 `SKILL.md` frontmatter is intentionally small. If the file starts with `---`, halter reads `key: value` lines until the next `---`. The loader currently uses `name` and `description`; missing `name` falls back to the directory name, and missing `description` becomes an empty string. The compiled snapshot stores the skill id, name, description, and full `SKILL.md` body. Files under a skill's immediate `scripts/` directory are recorded on the loaded skill, but arbitrary supporting files are not loaded into the compiled snapshot today.
 
+Skills load progressively. The system prompt lists each skill as `- name: description` under a `# Skills` heading, and bodies stay out of it. When the snapshot holds any skills, every request also offers a runtime-owned `skill` tool. When the model calls it with a skill name, the tool result is only an acknowledgement. The body, with its frontmatter stripped, is wrapped in `<skill name="...">` with the skill's base directory. It is appended as a user message after all of that step's tool results, so the cached prefix is unchanged when a skill loads. The index and the tool both come from the live resource snapshot, so `replace_resources` adds or removes skills for later requests. With no skills, neither appears. `tools.enabled` does not control `skill`, and the builder rejects custom or strategy tools with that reserved name.
+
 > [!NOTE]
 > Halter attempts to replicate Codex and Claude Code behavior when parsing plugins for all supported functionality. Right now this is a moving target, so minor bugs and differences may manifest. File an issue or PR to fix any inconsistencies.
 

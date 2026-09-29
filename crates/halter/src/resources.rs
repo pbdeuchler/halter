@@ -133,6 +133,7 @@ fn compile_resources(compiler: ResourceCompiler) -> anyhow::Result<CompiledResou
                 name: skill.name,
                 description: skill.description,
                 body: skill.body,
+                root: skill.root,
             },
         );
     }

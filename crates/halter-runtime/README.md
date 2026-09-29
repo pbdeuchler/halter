@@ -463,7 +463,7 @@ A realistic prompt assembly pass can include:
 - `system_prompt_seed` from `SessionInit`
 - configured prompt overrides
 - compiled resource instructions
-- active skills/plugins
+- the skill index (names and descriptions; bodies arrive as user messages when the model calls `skill`)
 - hook-injected system messages
 - selected conversation history
 
@@ -481,7 +481,7 @@ This is useful when:
 - a project changed instructions on disk
 - you want to reload policy or prompt resources without rebuilding the whole runtime
 
-Existing sessions keep running against the runtime, but new prompt assembly operations use the updated resource set.
+Existing sessions keep running against the runtime, but new prompt assembly operations use the updated resource set. That includes the skill index and whether the `skill` tool is offered.
 
 ---
 

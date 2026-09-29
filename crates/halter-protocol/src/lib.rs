@@ -1677,6 +1677,9 @@ pub struct SkillDef {
     pub name: String,
     pub description: String,
     pub body: String,
+    /// Skill directory, so relative references in `body` resolve.
+    #[serde(default)]
+    pub root: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
