@@ -48,7 +48,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 7 | `MessageItem` means both "append to transcript" (fold) and "logged only" (`CompactionContext::record`/`infer`). A custom strategy that uses `record` breaks fold parity. | 90% | fixed |
 | 8 | sqlite `load_session` and `replay_after` are separate reads, so a concurrent commit in between produces a spurious `exceeds advertised head` error. | 80% | fixed |
 | 9 | `SessionEventPayload` has no catch-all variant and the log has no schema version, so an older binary cannot read a newer log (and the reverse fails silently). | 90% | open |
-| 10 | Resume rebinds to the current resources and ignores the stored snapshot, while manual compact uses the stored one. Per-turn model overrides are not logged. | 80% | open |
+| 10 | Resume rebinds to the current resources and ignores the stored snapshot, while manual compact uses the stored one. Per-turn model overrides are not logged. | 80% | fixed |
 | 11 | Out-of-turn writers (`notify`, `compact`, `shutdown`, `resume`) fail an in-flight turn on the conflict check. | 90% | fixed |
 | 12 | Shell, pty and browser state and stateful Function hooks reset silently on resume. Once-hook ids are positional, so reordering hooks re-fires or suppresses them. | 75% | open |
 | 13 | The notes root falls back to the temp dir, so notes don't survive a reboot. | 70% | open |
@@ -148,3 +148,11 @@ Entries are oldest first.
 - **#8 fixed.** It was not sqlite-specific. `hydrate_stored_session` (runtime) reads the tail with a second `replay_after` call after `load_session`, and any backend can commit in between. The tail is now cut at the loaded `head_sequence` (`take_while`). The events after it belong to a later state, and the caller's own commit conflicts on them through `expected_head_sequence`.
   - The explicit "exceeds advertised head" check is gone. An overlong tail from a malformed backend still fails the final "tail ended at sequence N, expected head" check, and the validation case now asserts that.
   - Test: `hydrate_folds_event_log_tail_onto_checkpoint` now also commits between load and hydrate, and expects hydration as of the loaded head. It failed before the fix with the reported error.
+
+- **#10 fixed.** Rebinding to the current resources is intended (hot-swap), not a resume bug. Every turn does it and stores the snapshot, and `later_turns_commit_latest_resource_snapshot` locks that in. What didn't match was manual `compact`, which ran against the stored snapshot. It now binds to the current resources and stores them.
+  - `TurnStarted` carries the turn's `default_model` and `subagent_model` overrides as given (`None` means the blueprint's). The blueprint plus the log now determine every model used.
+  - Tests:
+    - `later_writers_commit_latest_resource_snapshot` (turn or manual compact);
+    - `turn_default_model_override_selects_overridden_provider` asserts the logged override;
+    - `turn_started_records_overrides_and_reads_older_logs` (older JSON reads as no override; round-trips).
+  - Residual: the log doesn't say which snapshot revision each turn used; only the latest snapshot is stored with the session. Exhaustive `TurnStarted { turn_id }` patterns break (the software-factory example was fixed).

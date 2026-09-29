@@ -741,6 +741,8 @@ impl SessionHandle {
                 .collect::<Vec<_>>();
             start_events.push(session.make_event(SessionEventPayload::TurnStarted {
                 turn_id: turn.id.clone(),
+                default_model: turn.default_model.clone(),
+                subagent_model: turn.subagent_model.clone(),
             }));
             stored.state.open_turn = Some(turn.id.clone());
             let start_head = match session
@@ -990,6 +992,8 @@ impl SessionHandle {
                 )
             })?;
         hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
+        // The current resources, as a turn would use.
+        let snapshot = self.services.resources.snapshot();
         let expected_head = stored.head_sequence;
         let mut state = stored.state;
         let mut events = Vec::new();
@@ -1038,7 +1042,7 @@ impl SessionHandle {
         let compaction = match self
             .compact_via_strategy(
                 &stored.blueprint,
-                stored.snapshot.clone(),
+                snapshot.clone(),
                 &mut state,
                 &mut events,
                 &mut fired_hook_ids,
@@ -1060,7 +1064,7 @@ impl SessionHandle {
                     let _ = self
                         .commit_and_publish(
                             &stored.blueprint,
-                            None,
+                            Some(snapshot),
                             Some(expected_head),
                             Some(state),
                             events,
@@ -1103,7 +1107,7 @@ impl SessionHandle {
         let _ = self
             .commit_and_publish(
                 &stored.blueprint,
-                None,
+                Some(snapshot),
                 Some(expected_head),
                 Some(state),
                 events,
@@ -7865,31 +7869,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_turns_commit_latest_resource_snapshot() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
-        let runtime = SessionRuntime::new(services.clone());
-        let session = new_session(&runtime, temp.path()).await;
+    async fn later_writers_commit_latest_resource_snapshot() {
+        for writer in ["turn", "manual compact"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
 
-        let mut reloaded = ResourceSnapshot::empty();
-        reloaded.revision = halter_protocol::Revision::from("reloaded");
-        runtime.replace_resources(reloaded, empty_hooks(), Vec::new());
+            let mut reloaded = ResourceSnapshot::empty();
+            reloaded.revision = halter_protocol::Revision::from("reloaded");
+            runtime.replace_resources(reloaded, empty_hooks(), Vec::new());
 
-        session
-            .submit_turn(Turn::user("after reload"))
-            .await
-            .expect("submit turn")
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect events");
+            if writer == "turn" {
+                session
+                    .submit_turn(Turn::user("after reload"))
+                    .await
+                    .expect("submit turn")
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("collect events");
+            } else {
+                session.compact("manual", None).await.expect("compact");
+            }
 
-        let stored = services
-            .sessions
-            .load_session(session.session_id())
-            .await
-            .expect("load session")
-            .expect("session exists");
-        assert_eq!(stored.snapshot.revision.0, "reloaded");
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load session")
+                .expect("session exists");
+            assert_eq!(stored.snapshot.revision.0, "reloaded", "{writer}");
+        }
     }
 
     /// Calls `skill` twice in its first reply, then answers "done".
@@ -8083,6 +8093,24 @@ mod tests {
             .expect("collect events");
 
         assert!(default_requests.lock().expect("requests").is_empty());
+        let started = session
+            .replay()
+            .await
+            .expect("replay")
+            .into_iter()
+            .find_map(|event| match event.payload {
+                SessionEventPayload::TurnStarted {
+                    default_model,
+                    subagent_model,
+                    ..
+                } => Some((default_model, subagent_model)),
+                _ => None,
+            });
+        assert_eq!(
+            started,
+            Some((Some(ModelId::from("subagent")), None)),
+            "the log records the turn's override"
+        );
         let subagent_requests = subagent_requests.lock().expect("requests");
         assert_eq!(subagent_requests.len(), 1);
         assert_eq!(subagent_requests[0].model.id, ModelId::from("subagent"));
@@ -10181,6 +10209,8 @@ mod tests {
                         Some(stored.state),
                         vec![session.make_event(SessionEventPayload::TurnStarted {
                             turn_id: dead_turn.clone(),
+                            default_model: None,
+                            subagent_model: None,
                         })],
                     )
                     .await

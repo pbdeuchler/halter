@@ -2352,7 +2352,7 @@ async fn run_session_turn(
             SessionEventPayload::Warning { message } => {
                 warn!(stage = label, warning = %message, "agent warning");
             }
-            SessionEventPayload::TurnStarted { turn_id } => {
+            SessionEventPayload::TurnStarted { turn_id, .. } => {
                 info!(stage = label, turn_id = %turn_id, "agent turn started");
             }
             SessionEventPayload::DeltaItem { delta } => {

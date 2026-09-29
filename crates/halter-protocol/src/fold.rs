@@ -454,6 +454,8 @@ mod tests {
             SessionEventPayload::SessionResumed,
             SessionEventPayload::TurnStarted {
                 turn_id: crate::TurnId::new(),
+                default_model: None,
+                subagent_model: None,
             },
             SessionEventPayload::TurnCompleted {
                 turn_id: crate::TurnId::new(),

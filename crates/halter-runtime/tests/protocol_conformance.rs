@@ -125,6 +125,8 @@ fn session_event_payload_variants_have_stable_kind() {
         },
         SessionEventPayload::TurnStarted {
             turn_id: TurnId::from("t1"),
+            default_model: Some(ModelId::from("override")),
+            subagent_model: None,
         },
         SessionEventPayload::MessageRecorded {
             message: Message::User(halter_protocol::UserMessage::text("summarize")),

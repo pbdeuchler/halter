@@ -978,6 +978,13 @@ pub enum SessionEventPayload {
     },
     TurnStarted {
         turn_id: TurnId,
+        /// The turn's [`Turn::default_model`] override; `None` runs the
+        /// blueprint's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_model: Option<ModelId>,
+        /// The turn's [`Turn::subagent_model`] override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_model: Option<ModelId>,
     },
     MessageItem {
         message: Message,
@@ -2344,6 +2351,39 @@ mod tests {
         let decoded: Turn = serde_json::from_str(&encoded).expect("deserialize turn");
 
         assert_eq!(decoded, turn);
+    }
+
+    #[test]
+    fn turn_started_records_overrides_and_reads_older_logs() {
+        let cases = [
+            (
+                "older log",
+                serde_json::json!({"kind": "turn_started", "turn_id": "t"}),
+                None,
+            ),
+            (
+                "override",
+                serde_json::json!({"kind": "turn_started", "turn_id": "t", "default_model": "fast"}),
+                Some(ModelId::from("fast")),
+            ),
+        ];
+        for (name, encoded, expected) in cases {
+            let decoded: SessionEventPayload = serde_json::from_value(encoded.clone()).expect(name);
+            assert_eq!(
+                decoded,
+                SessionEventPayload::TurnStarted {
+                    turn_id: TurnId::from("t"),
+                    default_model: expected,
+                    subagent_model: None,
+                },
+                "{name}"
+            );
+            assert_eq!(
+                serde_json::to_value(&decoded).expect(name),
+                encoded,
+                "{name}"
+            );
+        }
     }
 
     #[test]

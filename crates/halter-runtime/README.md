@@ -482,7 +482,7 @@ This is useful when:
 - a project changed instructions on disk
 - you want to reload policy or prompt resources without rebuilding the whole runtime
 
-Existing sessions keep running against the runtime, but new prompt assembly operations use the updated resource set. That includes the skill index and whether the `skill` tool is offered.
+Existing sessions keep running against the runtime, but new prompt assembly operations use the updated resource set. That includes the skill index and whether the `skill` tool is offered. Each turn and each manual `compact` binds to the resources current when it starts and stores that snapshot with its commit, so a resumed session runs against the current resources, not the ones it was created with.
 
 ---
 
