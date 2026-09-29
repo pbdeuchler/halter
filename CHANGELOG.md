@@ -8,6 +8,26 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-29
+
+The session log now carries the session. A resumed session, in a new process,
+gets back its subagents, task list, open-turn and tool-call bookkeeping,
+compaction notifications, per-turn models and judge advisories from the log,
+and replaying the log reproduces the checkpoint. Writers on one session are
+serialised behind a write lease instead of failing each other's turns. The
+work came out of a review of the session log prompted by
+[#210](https://github.com/pbdeuchler/halter/issues/210). This is a minor
+release on the pre-1.0 line because it adds variants to the exhaustive
+`SessionEventPayload` enum and changes an existing one, adds fields to public
+structs (`SessionState`, `RuntimeServices`), removes public types, and changes
+`run_panel_synthesis`'s return type.
+
+Published crates: `halter`, `halter-config`, `halter-hooks`,
+`halter-protocol`, `halter-providers`, `halter-runtime`, `halter-session`,
+and `halter-tools`. `halter-cli` also moves to `0.7.0` but remains
+`publish = false`. The vendored `halter-brush-core` (0.5.0) and
+`halter-brush-builtins` (0.2.0) are unchanged.
+
 ### Added
 
 - `ToolSessionStore::has_process_state`: whether this process holds a shell, pty or browser session for a session.
@@ -46,6 +66,34 @@ once a `1.0.0` line is cut.
 - Manual `compact` now runs against the current resources and stores them, as turns do. It used the snapshot stored at the last turn.
 - Loading a session no longer fails with `replay sequence N exceeds advertised head` when another commit lands between reading the checkpoint and reading the log tail. Hydration stops at the head it loaded.
 - A resumed parent keeps its subagents ([#210](https://github.com/pbdeuchler/halter/issues/210)). The registry is rebuilt from the parent's log, so `wait_agent`, `send_input` and `close_agent` work in a new process. A child that was running when its process stopped comes back `Cancelled` with an interrupted error, and `send_input` continues it.
+
+### Upgrading from 0.6
+
+- Exhaustive matches on `SessionEventPayload` need arms for `SubagentUpdated`,
+  `CompactionNotified`, `MessageRecorded` and `Unknown`, and
+  `TurnStarted { turn_id }` patterns need `..` for its new
+  `default_model` / `subagent_model` fields.
+- `SessionState` literals must add `open_turn: None` and
+  `subagents: Default::default()`, and drop `file_view_cache`; or use
+  `..Default::default()`.
+- Custom `RuntimeServices` literals must add
+  `session_leases: Arc::new(SessionLeases::default())`.
+- Code naming `FileViewCache`, `FileViewEntry`, `FileViewSlice`,
+  `ViewedRange`, `LineAnchor` or `ContextPlan::file_views` must drop them;
+  nothing ever filled them.
+- `halter_providers::run_panel_synthesis` returns `(String, Usage)`; take
+  `.0` for the previous value.
+- Code that reads a compaction pass's model exchange from the log must match
+  `MessageRecorded` as well as `MessageItem`.
+- Upgrading is one-way for sqlite stores. 0.7 adds schema migration 3
+  (`sessions.log_format`) and writes events and checkpoints 0.6 cannot read,
+  so do not point a 0.6 build at a database 0.7 has written to. Stores
+  written by 0.6 load unchanged. From 0.7 on, a build refuses to commit to a
+  session stamped by a newer log format instead of corrupting it.
+- A default sqlite store (`backend = "sqlite"`, no `sqlite_path`) now keeps
+  CleanWindow notes in `<data dir>/halter/notes` instead of the temp dir.
+  Move old notes there if you want to keep them, or set
+  `context.notes_root`.
 
 ## [0.6.0] - 2026-09-28
 
