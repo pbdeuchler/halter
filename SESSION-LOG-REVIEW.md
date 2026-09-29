@@ -19,7 +19,7 @@ The log is not authoritative. The `SessionState` checkpoint is.
 after `state_sequence` onto the checkpoint. Because every write path that
 produces events also writes a full checkpoint, that tail is almost always
 empty. The fold is effectively dead code, and about ten `SessionState` fields
-(`file_view_cache`, `appended_prompt_segments`, `pending_tool_calls`,
+(`file_view_cache` [removed, #17], `appended_prompt_segments`, `pending_tool_calls`,
 `lineage`, `fired_hook_ids`, `pending_session_start_source`,
 `pending_warning_messages`, `last_response_id`, `messages_seen_by_provider`,
 `compaction_notifications`) are never derivable from events.
@@ -60,7 +60,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 |---|---------|-----------:|--------|
 | 15 | `run_parent_hook_dispatch` can commit zero events with `Some(state)`. | 90% | fixed |
 | 16 | `compaction_notifications` is updated by `context_boundary` without an event. | 90% | fixed |
-| 17 | `file_view_cache` is dead state. | 70% | open |
+| 17 | `file_view_cache` is dead state. | 70% | fixed |
 | 18 | The trace recorder is not reopened on resume. | 70% | open |
 | 19 | sqlite runs `synchronous=NORMAL`, so the last commits can be lost on power failure. | 60% | open |
 | 20 | The legacy token-ledger migration doesn't match the fold. | 60% | open |
@@ -185,3 +185,6 @@ Entries are oldest first.
     - `full_turn_judge_logs_its_synthesis_and_guidance` (guided or fallback; checks the logged messages are not in the transcript, the usage, and fold/checkpoint parity). It replaces the two earlier judge tests, and a mutation that drops the recording fails it.
     - `run_panel_synthesis_sums_the_usage_of_every_round`.
   - Residual: the OneShot judge (provider seam) still drops the usage of its panel and synthesis calls, because a provider stream has only one usage per message. The parent log doesn't name the panel session ids; they are found through their `parent_session_id`.
+
+- **#17 fixed.** Confirmed dead: nothing inserted into `file_view_cache`. It was only copied into `ContextPlan::file_views`, which nothing read. Removed the field, the plan field, the five types behind them, and the fold's clear on rollover. Legacy checkpoints that carry the field still deserialize (serde ignores it), and the compacted-context test's legacy JSON keeps it to show that.
+  - Residual: pre-#9 binaries can't load checkpoints written from now on, since the field was required. They already can't read the newer event kinds, so nothing new is lost.

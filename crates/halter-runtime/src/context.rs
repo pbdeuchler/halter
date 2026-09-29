@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use halter_protocol::{
-    CompactedContext, CompactionEventEffects, CompactionResult, ContextPlan, FileViewSlice,
-    Message, ObservedState, PromptSegment, ResourceSnapshot, SessionBlueprint, SessionEventPayload,
+    CompactedContext, CompactionEventEffects, CompactionResult, ContextPlan, Message,
+    ObservedState, PromptSegment, ResourceSnapshot, SessionBlueprint, SessionEventPayload,
     SessionState, ToolSpec, TranscriptWindow,
 };
 use sha2::{Digest, Sha256};
@@ -123,18 +123,6 @@ impl ContextManager for DefaultContextManager {
     ) -> anyhow::Result<ContextPlan> {
         let prompt_segments = prompt_segments(blueprint, state, snapshot);
 
-        let file_views = state
-            .file_view_cache
-            .values()
-            .cloned()
-            .map(|entry| FileViewSlice {
-                path: entry.path,
-                full_hash: entry.full_hash,
-                viewed_ranges: entry.viewed_ranges,
-                last_shown_turn: entry.last_shown_turn,
-            })
-            .collect::<Vec<_>>();
-
         let request_tokens = halter_protocol::estimate_request_tokens(&prompt_segments, tool_specs);
         let estimated_tokens = state.token_ledger.projected_tokens(request_tokens);
         let (previous_response_id, new_messages_start) = resolve_response_chain(
@@ -152,7 +140,6 @@ impl ContextManager for DefaultContextManager {
                 elided_message_count: 0,
             },
             compacted_prefix: state.compacted_prefix.clone(),
-            file_views,
 
             elided_tool_results: Vec::new(),
             memory_items: Vec::new(),

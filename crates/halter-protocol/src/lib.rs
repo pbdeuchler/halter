@@ -1506,35 +1506,6 @@ impl CacheBreakpoints {
     }
 }
 
-/// Per-session cache of file ranges already shown to the model.
-pub type FileViewCache = IndexMap<PathBuf, FileViewEntry>;
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-/// Cached metadata for a file view.
-pub struct FileViewEntry {
-    pub path: PathBuf,
-    pub full_hash: ContentHash,
-    pub mtime: Timestamp,
-    pub size: u64,
-    pub viewed_ranges: Vec<ViewedRange>,
-    pub last_shown_turn: TurnId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-/// Inclusive range of file lines previously shown to the model.
-pub struct ViewedRange {
-    pub start_line: u32,
-    pub end_line: u32,
-    pub line_anchors: Vec<LineAnchor>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-/// Small content anchor used to detect shifted viewed ranges.
-pub struct LineAnchor {
-    pub line: u32,
-    pub anchor: [u8; 3],
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// Tool call that has been emitted but not yet answered.
 pub struct PendingToolCall {
@@ -1598,15 +1569,6 @@ impl AsRef<[Value]> for CompactedContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-/// File-view data included in a context plan.
-pub struct FileViewSlice {
-    pub path: PathBuf,
-    pub full_hash: ContentHash,
-    pub viewed_ranges: Vec<ViewedRange>,
-    pub last_shown_turn: TurnId,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 /// Marker describing content omitted from the active context.
 pub struct ElisionMarker {
@@ -1650,7 +1612,6 @@ pub struct SessionState {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub compacted_prefix: Vec<Value>,
-    pub file_view_cache: FileViewCache,
     pub appended_prompt_segments: Vec<PromptSegment>,
     pub pending_tool_calls: IndexMap<ToolCallId, PendingToolCall>,
     pub usage_so_far: Usage,
@@ -1901,7 +1862,6 @@ pub struct ContextPlan {
     pub transcript_window: TranscriptWindow,
     #[serde(default)]
     pub compacted_prefix: Vec<Value>,
-    pub file_views: Vec<FileViewSlice>,
     pub elided_tool_results: Vec<ElisionMarker>,
     pub memory_items: Vec<MemoryItem>,
     pub tool_specs: Vec<ToolSpec>,
@@ -2448,6 +2408,7 @@ mod tests {
             "compacted_prefix": [
                 {"type": "reasoning", "encrypted_content": "summary"}
             ],
+            // Checkpoints written before `file_view_cache` was removed.
             "file_view_cache": {},
             "appended_prompt_segments": [],
             "pending_tool_calls": {},

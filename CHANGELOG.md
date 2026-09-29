@@ -19,6 +19,10 @@ once a `1.0.0` line is cut.
 - `SessionEventPayload::CompactionNotified`: records the id of each compaction-strategy notification delivered in the current window, ahead of its `MessageItem`.
 - `SessionEventPayload::MessageRecorded`: a message in the log that is not in the transcript. `CompactionContext::record` and `infer` now emit it instead of `MessageItem`. Log readers that want a compaction pass's exchange with the model must match both variants.
 
+### Removed
+
+- `SessionState::file_view_cache`, `ContextPlan::file_views` and the `FileViewCache`, `FileViewEntry`, `FileViewSlice`, `ViewedRange` and `LineAnchor` types. Nothing wrote the cache and nothing read the plan field. Stored checkpoints that still carry `file_view_cache` load as before. **Breaking** for code that names them.
+
 ### Fixed
 
 - The snapshot revision is now a hash of the whole serialised snapshot. Previously v0.6 snapshots with skills (whose new `SkillDef.root` field was not hashed) collided with stored rows and failed every sqlite commit with `revision already exists with different data`.

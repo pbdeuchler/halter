@@ -30,13 +30,13 @@
 //!   [`SessionEventPayload::CompactionNotified`], cleared by each
 //!   state-rewriting compaction.
 //!
-//! Runtime bookkeeping fields (`file_view_cache`, `pending_tool_calls`,
-//! `fired_hook_ids`, `appended_prompt_segments`, `lineage`, hook latches,
-//! and provider-chaining fields) are deliberately generally carried by the
+//! Runtime bookkeeping fields (`pending_tool_calls`, `fired_hook_ids`,
+//! `appended_prompt_segments`, `lineage`, hook latches, and
+//! provider-chaining fields) are deliberately generally carried by the
 //! checkpoint, which the runtime writes on every state-changing commit.
 //! Compaction and rollover events reset `last_response_id` and
 //! `messages_seen_by_provider`. Rollover additionally clears
-//! `appended_prompt_segments` and `file_view_cache`. These event-covered
+//! `appended_prompt_segments`. These event-covered
 //! resets keep replay from retaining bookkeeping from a previous window;
 //! ordinary updates to those fields still depend on the checkpoint.
 //!
@@ -82,7 +82,6 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         | SessionEventPayload::ContextWindowRolledOver { effects, .. } => {
             if matches!(payload, SessionEventPayload::ContextWindowRolledOver { .. }) {
                 state.appended_prompt_segments.clear();
-                state.file_view_cache.clear();
             }
             state.usage_so_far.saturating_accumulate(&effects.usage);
             state.messages = effects.messages.clone();
