@@ -22,6 +22,7 @@ once a `1.0.0` line is cut.
 - A turn whose final commit fails is now recorded as `TurnFailed`. Previously the log was left with an unmatched `TurnStarted`.
 - A turn interrupted by a crash, abort or shutdown is closed with a cancelled `TurnFailed` on the next `resume` or turn, so the log never keeps a dangling turn.
 - Tool calls are checkpointed before each batch runs and again after its results, so a crash mid-tool no longer loses the assistant's tool calls, the turn's usage, or earlier batches' results. When the turn is closed, calls left without a result get an error result saying whether they may have run.
+- A `fork_context` subagent no longer starts from a transcript that ends in the parent's unanswered `spawn_agent` call, which strict providers reject. The inherited in-flight calls get a result saying the parent handles them.
 - The `task` todo list survives `resume`. It is rebuilt from the session log. Previously a resumed session in a new process started with an empty list, although compaction and clean-window rollover promise that todos persist.
 
 ## [0.6.0] - 2026-09-28

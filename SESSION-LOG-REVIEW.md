@@ -39,7 +39,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 | 3 | Dangling turns. A failed final commit only calls `live.emit_error` and never writes `TurnFailed`. Shutdown aborts and crashes leave `TurnStarted` open. Resume never reconciles an open turn. | 95% | fixed |
 | 4 | A crash during tool execution loses the log record of side effects and usage. The assistant tool-call message and tool results commit only after the whole batch. `pending_tool_calls` is inserted and removed with no commit in between, so it is never persisted non-empty. | 90% | fixed |
 | 5 | The task list (`ToolSessionStore::task_sessions`) lives only in memory, but the compaction strategies promise that todos survive compaction and rollover. Resume loses it. | 95% | fixed |
-| 6 | `fork_context` children start with the parent's messages, which end in an unanswered spawn `tool_use` (strict providers reject this). The inherited state is not in the child's log. The registry itself is in memory only (#210). | 85% | open |
+| 6 | `fork_context` children start with the parent's messages, which end in an unanswered spawn `tool_use` (strict providers reject this). The inherited state is not in the child's log. The registry itself is in memory only (#210). | 85% | partial |
 
 ### Medium
 
@@ -115,3 +115,6 @@ Entries are oldest first.
   - `mark_resumed` replays the log and installs the result with `ToolSessionStore::restore_task_session`. That never replaces a list the process already holds.
   - Tests: `from_results_rebuilds_the_list_from_tool_output` (table: full log, mutations only, empty, foreign output; ids continue after a rebuild), `restore_task_session_never_replaces_a_live_list`, and `resume_restores_the_task_list_from_the_log` (fresh process vs same process).
   - Residual: a `PostToolUse` hook that rewrites the task tool's output also rewrites what gets rebuilt. Only `resume` restores the list; a same-process `HalterSession::new` on an existing id shares the in-memory list anyway. `InMemoryTaskStore` and `TaskStore` are unused (`TaskTool` goes through `ToolSessionStore`); they are dead abstractions left for a separate cleanup.
+
+- **#6 partial: the fork's unanswered `tool_use` is fixed.** `build_subagent_state` with `fork_context` now answers the parent's in-flight tool calls (the spawn among them). It reuses `answer_unresolved_tool_calls`, which now takes the result text. The child sees "result delivered to the parent session; this session is the subagent it forked". Test: `forked_state_answers_the_parents_in_flight_tool_calls` (fork mid-spawn, fork without tool calls, no fork).
+  - Still open: the inherited state lives only in the child's creation checkpoint, not its log (target architecture item 2). The registry is in memory only (#210).

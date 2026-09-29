@@ -2434,7 +2434,7 @@ impl SessionHandle {
         stored.state.open_turn = None;
         // Tool calls already checkpointed by the failed turn need results
         // before the turn is closed.
-        let events = answer_unresolved_tool_calls(&mut stored.state)
+        let events = answer_unresolved_tool_calls(&mut stored.state, interrupted_tool_call)
             .into_iter()
             .map(|payload| self.make_event(payload))
             .chain(failure_events)
@@ -2875,7 +2875,7 @@ fn close_interrupted_turn(state: &mut SessionState) -> Vec<SessionEventPayload> 
     let Some(turn_id) = state.open_turn.take() else {
         return Vec::new();
     };
-    let mut payloads = answer_unresolved_tool_calls(state);
+    let mut payloads = answer_unresolved_tool_calls(state, interrupted_tool_call);
     payloads.push(SessionEventPayload::TurnFailed {
         turn_id,
         error: "turn interrupted before it completed".to_owned(),
@@ -2885,11 +2885,23 @@ fn close_interrupted_turn(state: &mut SessionState) -> Vec<SessionEventPayload> 
     payloads
 }
 
+/// Why a tool call has no result after its turn stopped: `started` calls
+/// were in `pending_tool_calls` and may have had side effects.
+pub(crate) fn interrupted_tool_call(started: bool) -> &'static str {
+    match started {
+        true => "tool call interrupted while running; it may have partially completed",
+        false => "tool call interrupted before it ran",
+    }
+}
+
 /// Give every tool call of the last assistant message that has no result an
-/// error result, so the transcript stays valid for the provider and the model
-/// learns the call's fate. Calls in `pending_tool_calls` had started and may
-/// have had side effects; the rest never ran.
-fn answer_unresolved_tool_calls(state: &mut SessionState) -> Vec<SessionEventPayload> {
+/// error result explaining its `fate` (given whether the call had started), so
+/// the transcript stays valid for the provider and the model learns what
+/// happened.
+pub(crate) fn answer_unresolved_tool_calls(
+    state: &mut SessionState,
+    fate: fn(bool) -> &'static str,
+) -> Vec<SessionEventPayload> {
     let Some(at) = state
         .messages
         .iter()
@@ -2916,10 +2928,7 @@ fn answer_unresolved_tool_calls(state: &mut SessionState) -> Vec<SessionEventPay
     unresolved
         .into_iter()
         .flat_map(|call| {
-            let error = ToolError::new(match pending.contains_key(&call.id) {
-                true => "tool call interrupted while running; it may have partially completed",
-                false => "tool call interrupted before it ran",
-            });
+            let error = ToolError::new(fate(pending.contains_key(&call.id)));
             let message = Message::Tool(ToolResultMessage {
                 id: MessageId::new(),
                 call_id: call.id.clone(),
@@ -10151,7 +10160,7 @@ mod tests {
             }
             let before = state.messages.len();
 
-            let payloads = answer_unresolved_tool_calls(&mut state);
+            let payloads = answer_unresolved_tool_calls(&mut state, interrupted_tool_call);
 
             let outcomes = payloads
                 .iter()
@@ -10309,7 +10318,7 @@ mod tests {
             .count();
         assert_eq!(results, 2, "both cancelled calls have results");
         assert!(state.pending_tool_calls.is_empty());
-        assert!(answer_unresolved_tool_calls(&mut state).is_empty());
+        assert!(answer_unresolved_tool_calls(&mut state, interrupted_tool_call).is_empty());
     }
 
     #[tokio::test]

@@ -69,7 +69,7 @@ pub fn build_subagent_state(
         };
     }
 
-    SessionState {
+    let mut forked = SessionState {
         messages: parent.state.messages.clone(),
         compacted_prefix: parent.state.compacted_prefix.clone(),
         file_view_cache: parent.state.file_view_cache.clone(),
@@ -95,8 +95,17 @@ pub fn build_subagent_state(
         compaction_notifications: Default::default(),
         // The parent is mid-turn; its open turn is not the child's.
         open_turn: None,
-    }
+    };
+    // The parent forked mid-batch, so its last assistant message ends in
+    // tool calls (the spawn among them) whose results only the parent gets.
+    // Providers reject a transcript that leaves them unanswered.
+    crate::session::answer_unresolved_tool_calls(&mut forked, |_| FORKED_TOOL_CALL);
+    forked
 }
+
+/// Result a forked child sees for the parent's in-flight tool calls.
+const FORKED_TOOL_CALL: &str =
+    "result delivered to the parent session; this session is the subagent it forked";
 
 pub fn extract_subagent_output(events: &[SessionEvent]) -> Option<String> {
     events.iter().rev().find_map(|event| match &event.payload {
@@ -486,5 +495,79 @@ mod tests {
         )];
 
         assert_eq!(extract_subagent_output(&events), Some("done".to_owned()));
+    }
+
+    #[test]
+    fn forked_state_answers_the_parents_in_flight_tool_calls() {
+        use halter_protocol::{
+            MessageId, ReplayMeta, ToolCall, ToolCallId, ToolName, ToolResultMessage, UserMessage,
+        };
+        let spawn = Message::Assistant(AssistantMessage {
+            id: MessageId::new(),
+            created_at: chrono::Utc::now(),
+            parts: vec![AssistantPart::ToolCall(ToolCall {
+                id: ToolCallId::from("spawn"),
+                name: ToolName::from("spawn_agent"),
+                arguments: serde_json::json!({}),
+            })],
+            stop_reason: None,
+            usage: None,
+            replay_meta: ReplayMeta::default(),
+        });
+        let user = Message::User(UserMessage::text("hi"));
+        // (case, parent transcript, fork, result call ids the child gains)
+        let cases: [(&str, Vec<Message>, bool, &[&str]); 3] = [
+            (
+                "fork mid-spawn",
+                vec![user.clone(), spawn.clone()],
+                true,
+                &["spawn"],
+            ),
+            ("fork without tool calls", vec![user.clone()], true, &[]),
+            ("no fork", vec![user, spawn], false, &[]),
+        ];
+        for (case, messages, fork, answered) in cases {
+            let parent = SubagentParentContext {
+                blueprint: SessionBlueprint {
+                    session_id: SessionId::from("parent"),
+                    parent_session_id: None,
+                    default_model: "default".into(),
+                    subagent_model: "subagent".into(),
+                    subagent_event_forwarding: SubagentEventForwarding::Off,
+                    snapshot_revision: Revision::from("revision"),
+                    working_dir: ".".into(),
+                    system_prompt_seed: Vec::new(),
+                    max_turns: None,
+                    subagent_depth: 0,
+                },
+                state: SessionState {
+                    messages: messages.clone(),
+                    ..SessionState::default()
+                },
+                snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+                model: "default".into(),
+                subagent_model: "subagent".into(),
+            };
+
+            let child = build_subagent_state(&parent, &SessionId::from("child"), "task", fork);
+
+            let inherited = if fork { messages.len() } else { 0 };
+            assert_eq!(child.messages[..inherited], messages[..inherited], "{case}");
+            let gained = child.messages[inherited..]
+                .iter()
+                .map(|message| match message {
+                    Message::Tool(ToolResultMessage { call_id, error, .. }) => {
+                        assert_eq!(
+                            error.as_ref().map(|error| error.message.as_str()),
+                            Some(FORKED_TOOL_CALL),
+                            "{case}"
+                        );
+                        call_id.0.as_str()
+                    }
+                    other => panic!("{case}: unexpected {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(gained, answered, "{case}");
+        }
     }
 }
