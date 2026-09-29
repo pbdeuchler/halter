@@ -1633,6 +1633,11 @@ pub struct SessionState {
     /// Notification ids delivered in the current logical window.
     #[serde(default)]
     pub compaction_notifications: BTreeSet<String>,
+    /// Turn whose `TurnStarted` is committed but whose `TurnCompleted` or
+    /// `TurnFailed` is not. Still set when a session loads means the
+    /// process stopped mid-turn; the runtime closes it with `TurnFailed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_turn: Option<TurnId>,
 }
 
 fn legacy_token_ledger() -> TokenLedger {

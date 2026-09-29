@@ -93,6 +93,8 @@ pub fn build_subagent_state(
         ),
         context_window: 0,
         compaction_notifications: Default::default(),
+        // The parent is mid-turn; its open turn is not the child's.
+        open_turn: None,
     }
 }
 

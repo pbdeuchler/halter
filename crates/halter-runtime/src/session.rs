@@ -723,16 +723,23 @@ impl SessionHandle {
             let _parent_stream_registration = parent_stream_registration;
 
             let blueprint = stored.blueprint.clone();
-            let started = session.make_event(SessionEventPayload::TurnStarted {
+            // The lease guarantees no turn is running, so an open turn in the
+            // checkpoint is one a crash or abort left behind.
+            let mut start_events = close_interrupted_turn(&mut stored.state)
+                .map(|payload| session.make_event(payload))
+                .into_iter()
+                .collect::<Vec<_>>();
+            start_events.push(session.make_event(SessionEventPayload::TurnStarted {
                 turn_id: turn.id.clone(),
-            });
+            }));
+            stored.state.open_turn = Some(turn.id.clone());
             let start_head = match session
                 .commit_and_publish(
                     &blueprint,
                     None,
                     Some(stored.head_sequence),
-                    None,
-                    vec![started],
+                    Some(stored.state.clone()),
+                    start_events,
                     Some(live.as_ref()),
                 )
                 .await
@@ -752,65 +759,61 @@ impl SessionHandle {
                 }
             };
 
-            match session
+            let outcome = match session
                 .run_turn(stored, turn.clone(), start_head, task_cancel, live.as_ref())
                 .await
             {
                 Ok(turn_commit) => {
-                    if let Err(error) = session
+                    let mut state = turn_commit.state;
+                    state.open_turn = None;
+                    // A turn whose final commit fails is recorded as failed
+                    // below rather than left open in the log.
+                    session
                         .commit_and_publish(
                             &blueprint,
                             Some(turn_commit.snapshot),
                             Some(turn_commit.expected_head),
-                            Some(turn_commit.state),
+                            Some(state),
                             turn_commit.events,
                             Some(live.as_ref()),
                         )
                         .await
-                    {
-                        error!(
-                            session_id = %session.session_id,
-                            turn_id = %turn.id,
-                            error = %error,
-                            "failed to commit successful turn"
-                        );
-                        live.emit_error(error);
-                    }
+                        .map(|_| ())
                 }
-                Err(error) => {
-                    let provider_error = error.downcast_ref::<ProviderError>();
-                    let retryable = provider_error
-                        .map(|provider_error| provider_error.retryable())
-                        .unwrap_or(false);
-                    let cancelled = task_cancel_status.is_cancelled()
-                        || provider_error.is_some_and(ProviderError::is_cancelled);
+                Err(error) => Err(error),
+            };
+            if let Err(error) = outcome {
+                let provider_error = error.downcast_ref::<ProviderError>();
+                let retryable = provider_error
+                    .map(|provider_error| provider_error.retryable())
+                    .unwrap_or(false);
+                let cancelled = task_cancel_status.is_cancelled()
+                    || provider_error.is_some_and(ProviderError::is_cancelled);
+                error!(
+                    session_id = %session.session_id,
+                    turn_id = %turn.id,
+                    error = %error,
+                    retryable,
+                    cancelled,
+                    "turn failed"
+                );
+                let failure_events = vec![session.make_event(SessionEventPayload::TurnFailed {
+                    turn_id: turn.id.clone(),
+                    error: error.to_string(),
+                    cancelled,
+                    retryable,
+                })];
+                if let Err(commit_error) = session
+                    .commit_turn_failure(failure_events, live.as_ref())
+                    .await
+                {
                     error!(
                         session_id = %session.session_id,
                         turn_id = %turn.id,
-                        error = %error,
-                        retryable,
-                        cancelled,
-                        "turn failed before commit"
+                        error = %commit_error,
+                        "failed to commit failed turn"
                     );
-                    let failure_events =
-                        vec![session.make_event(SessionEventPayload::TurnFailed {
-                            turn_id: turn.id.clone(),
-                            error: error.to_string(),
-                            cancelled,
-                            retryable,
-                        })];
-                    if let Err(commit_error) = session
-                        .commit_turn_failure(failure_events, live.as_ref())
-                        .await
-                    {
-                        error!(
-                            session_id = %session.session_id,
-                            turn_id = %turn.id,
-                            error = %commit_error,
-                            "failed to commit failed turn"
-                        );
-                        live.emit_error(commit_error);
-                    }
+                    live.emit_error(commit_error);
                 }
             }
             // Out-of-turn hook dispatches queued behind this turn are not
@@ -2350,13 +2353,17 @@ impl SessionHandle {
         };
         hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
         stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
-        let resumed = self.make_event(SessionEventPayload::SessionResumed);
+        let events = close_interrupted_turn(&mut stored.state)
+            .into_iter()
+            .chain([SessionEventPayload::SessionResumed])
+            .map(|payload| self.make_event(payload))
+            .collect();
         self.commit_and_publish(
             &stored.blueprint,
             None,
             Some(stored.head_sequence),
             Some(stored.state),
-            vec![resumed],
+            events,
             None,
         )
         .await?;
@@ -2368,7 +2375,7 @@ impl SessionHandle {
         failure_events: Vec<PendingEvent>,
         live: &LiveTurnStream,
     ) -> anyhow::Result<()> {
-        let stored = self
+        let mut stored = self
             .services
             .sessions
             .load_session(&self.session_id)
@@ -2379,11 +2386,13 @@ impl SessionHandle {
                     self.session_id.0
                 )
             })?;
+        hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
+        stored.state.open_turn = None;
         self.commit_and_publish(
             &stored.blueprint,
             None,
             Some(stored.head_sequence),
-            None,
+            Some(stored.state),
             failure_events,
             Some(live),
         )
@@ -2806,6 +2815,21 @@ fn tool_result_kind(result: &ToolResult) -> &'static str {
         ToolResult::Text { .. } => "text",
         ToolResult::Json { .. } => "json",
     }
+}
+
+/// Close the turn a stopped process left open, returning the `TurnFailed`
+/// that records it. Callers must hold the session's write lease, so no turn
+/// is actually running.
+fn close_interrupted_turn(state: &mut SessionState) -> Option<SessionEventPayload> {
+    state
+        .open_turn
+        .take()
+        .map(|turn_id| SessionEventPayload::TurnFailed {
+            turn_id,
+            error: "turn interrupted before it completed".to_owned(),
+            cancelled: true,
+            retryable: false,
+        })
 }
 
 pub(crate) fn apply_hook_side_effects(
@@ -9718,6 +9742,20 @@ mod tests {
             None,
             "dispatch deferred while leased"
         );
+        let open_turn = || async {
+            services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("session")
+                .state
+                .open_turn
+        };
+        assert!(
+            open_turn().await.is_some(),
+            "running turn is checkpointed open"
+        );
 
         cancel.cancel();
         let _ = first.try_collect::<Vec<_>>().await;
@@ -9726,6 +9764,7 @@ mod tests {
             .expect("shutdown runs once the turn releases")
             .expect("join")
             .expect("shutdown");
+        assert_eq!(open_turn().await, None, "cancelled turn is closed");
 
         let log = session.replay().await.expect("replay");
         let order = [
@@ -9742,5 +9781,186 @@ mod tests {
             order.is_sorted(),
             "turn, then queued dispatch, then shutdown: {order:?}"
         );
+    }
+
+    /// Store whose commits fail whenever they carry `TurnCompleted`.
+    #[derive(Default)]
+    struct RejectsTurnCompletionStore {
+        inner: halter_session::InMemorySessionStore,
+    }
+
+    #[async_trait]
+    impl SessionStore for RejectsTurnCompletionStore {
+        async fn create_session(&self, session: StoredSession) -> anyhow::Result<()> {
+            self.inner.create_session(session).await
+        }
+        async fn load_session(&self, id: &SessionId) -> anyhow::Result<Option<StoredSession>> {
+            self.inner.load_session(id).await
+        }
+        async fn commit(
+            &self,
+            id: &SessionId,
+            snapshot: Option<Arc<ResourceSnapshot>>,
+            expected: Option<u64>,
+            state: Option<SessionState>,
+            events: Vec<PendingEvent>,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
+            if events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+            {
+                anyhow::bail!("store rejected turn completion");
+            }
+            self.inner
+                .commit(id, snapshot, expected, state, events)
+                .await
+        }
+        async fn replay(&self, id: &SessionId) -> anyhow::Result<Vec<SessionEvent>> {
+            self.inner.replay(id).await
+        }
+        async fn replay_after(
+            &self,
+            id: &SessionId,
+            after: u64,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
+            self.inner.replay_after(id, after).await
+        }
+        async fn list_sessions(&self) -> anyhow::Result<Vec<SessionBlueprint>> {
+            self.inner.list_sessions().await
+        }
+    }
+
+    fn turn_failures(log: &[SessionEvent]) -> Vec<(TurnId, String)> {
+        log.iter()
+            .filter_map(|event| match &event.payload {
+                SessionEventPayload::TurnFailed { turn_id, error, .. } => {
+                    Some((turn_id.clone(), error.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn turn_whose_final_commit_fails_is_recorded_as_failed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        Arc::get_mut(&mut services).expect("unique").sessions =
+            Arc::new(RejectsTurnCompletionStore::default());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let turn = Turn::user("hello");
+        let streamed = session
+            .submit_turn(turn.clone())
+            .await
+            .expect("submit")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("failure is reported as an event, not a stream error");
+        assert!(
+            streamed
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnFailed { .. }))
+        );
+
+        let log = session.replay().await.expect("replay");
+        let failures = turn_failures(&log);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, turn.id);
+        assert!(failures[0].1.contains("store rejected turn completion"));
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(stored.state.open_turn, None, "failed turn is closed");
+    }
+
+    #[tokio::test]
+    async fn interrupted_turns_are_closed_by_the_next_writer() {
+        #[derive(Clone, Copy, Debug)]
+        enum Recovery {
+            Resume,
+            NextTurn,
+        }
+        // (recovery path, a previous process died mid-turn)
+        let cases = [
+            (Recovery::Resume, true),
+            (Recovery::Resume, false),
+            (Recovery::NextTurn, true),
+            (Recovery::NextTurn, false),
+        ];
+        for (recovery, interrupted) in cases {
+            let case = format!("{recovery:?}, interrupted: {interrupted}");
+            let temp = tempfile::tempdir().expect("tempdir");
+            let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            let id = session.session_id().clone();
+
+            let dead_turn = TurnId::new();
+            if interrupted {
+                // What a crash after `TurnStarted` leaves behind.
+                let mut stored = services.sessions.load_session(&id).await.unwrap().unwrap();
+                stored.state.open_turn = Some(dead_turn.clone());
+                services
+                    .sessions
+                    .commit(
+                        &id,
+                        None,
+                        Some(stored.head_sequence),
+                        Some(stored.state),
+                        vec![session.make_event(SessionEventPayload::TurnStarted {
+                            turn_id: dead_turn.clone(),
+                        })],
+                    )
+                    .await
+                    .expect("seed open turn");
+            }
+
+            let closes: fn(&SessionEventPayload) -> bool = match recovery {
+                Recovery::Resume => {
+                    runtime.resume(&id).await.expect("resume").expect("found");
+                    |payload| matches!(payload, SessionEventPayload::SessionResumed)
+                }
+                Recovery::NextTurn => {
+                    session
+                        .submit_turn(Turn::user("hello"))
+                        .await
+                        .expect("submit")
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .expect("turn");
+                    |payload| matches!(payload, SessionEventPayload::TurnStarted { .. })
+                }
+            };
+
+            let log = session.replay().await.expect("replay");
+            let failures = turn_failures(&log);
+            let expected = if interrupted {
+                vec![dead_turn.clone()]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                failures
+                    .iter()
+                    .map(|(turn, _)| turn.clone())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{case}"
+            );
+            if interrupted {
+                let failed_at = log
+                    .iter()
+                    .position(|e| matches!(e.payload, SessionEventPayload::TurnFailed { .. }))
+                    .unwrap();
+                assert!(closes(&log[failed_at + 1].payload), "{case}: {log:?}");
+            }
+            let stored = services.sessions.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(stored.state.open_turn, None, "{case}");
+        }
     }
 }

@@ -36,7 +36,7 @@ They all race on `expected_head_sequence`, and the loser's turn fails.
 |---|---------|-----------:|--------|
 | 1 | Subagent Start/Stop hook dispatch commits into the parent log mid-turn, so the parent's next `flush_turn_progress` fails with `event log advanced concurrently` (reproduced: `expected head 4, found 6` for Start, `8, found 10` for Stop). | 99% | fixed |
 | 2 | The resource snapshot revision hashes only `skill.revision`, plugin name/version, hooks revision and agent revision. v0.6 added `SkillDef.root`, so a skill-bearing snapshot now serialises differently under the same revision. sqlite `store_snapshot` bails with `revision already exists with different data`, so every commit on an upgraded store fails. | 85% | fixed (7573143) |
-| 3 | Dangling turns. A failed final commit only calls `live.emit_error` and never writes `TurnFailed`. Shutdown aborts and crashes leave `TurnStarted` open. Resume never reconciles an open turn. | 95% | open |
+| 3 | Dangling turns. A failed final commit only calls `live.emit_error` and never writes `TurnFailed`. Shutdown aborts and crashes leave `TurnStarted` open. Resume never reconciles an open turn. | 95% | fixed |
 | 4 | A crash during tool execution loses the log record of side effects and usage. The assistant tool-call message and tool results commit only after the whole batch. `pending_tool_calls` is inserted and removed with no commit in between, so it is never persisted non-empty. | 90% | open |
 | 5 | The task list (`ToolSessionStore::task_sessions`) lives only in memory, but the compaction strategies promise that todos survive compaction and rollover. Resume loses it. | 95% | open |
 | 6 | `fork_context` children start with the parent's messages, which end in an unanswered spawn `tool_use` (strict providers reject this). The inherited state is not in the child's log. The registry itself is in memory only (#210). | 85% | open |
@@ -97,3 +97,9 @@ Entries are oldest first.
   - The CLI now drains in-flight turns before `session.shutdown`.
   - Tests: `subagent_lifecycle_hooks_queue_behind_the_parent_turn` (the original repro, over both hooks), `session_writers_wait_for_the_in_flight_turn`, and `session_lease::tests`.
   - Residual: the lease is process-local, and #21 is new. Out-of-process writers still rely on `SessionCommitConflict`.
+
+- **#3 fixed.** `SessionState::open_turn` is checkpointed with `TurnStarted` and cleared by the turn's final commit or by `commit_turn_failure`.
+  - A failed final commit now goes down the `TurnFailed` path instead of only emitting a live error.
+  - An open turn left by a crash, abort or shutdown is closed with `TurnFailed { cancelled: true, retryable: false }`. The next writer on the session does this: `resume` (before `SessionResumed`) or the next turn (before its `TurnStarted`).
+  - Tests: `turn_whose_final_commit_fails_is_recorded_as_failed`, `interrupted_turns_are_closed_by_the_next_writer` (resume or next turn × interrupted or not), and `open_turn` assertions in `session_writers_wait_for_the_in_flight_turn`.
+  - Residual: `open_turn` is checkpoint-only, like most `SessionState`; the fold does not derive it (target architecture item 2).
