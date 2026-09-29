@@ -8,7 +8,32 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-28
+
+Compaction v2 replaces signal-scored pruning with a session token ledger,
+Halter-owned compaction triggers, a hard context cap, and a public
+`CompactionStrategy` API with three built-in strategies. Skills now load
+progressively through a runtime-owned `skill` tool, and Anthropic requests use
+adaptive thinking for every model. This is a minor release on the pre-1.0 line
+because it changes public function and trait signatures, removes public items,
+adds struct fields, and adds variants to exhaustive public enums; the default
+compaction behavior also changes.
+
+Published crates: `halter`, `halter-config`, `halter-hooks`,
+`halter-protocol`, `halter-providers`, `halter-runtime`, `halter-session`,
+and `halter-tools`. `halter-cli` also moves to `0.6.0` but remains
+`publish = false`. The vendored `halter-brush-core` (0.5.0) and
+`halter-brush-builtins` (0.2.0) are unchanged.
+
 ### Added
+
+- Skills load progressively. The system prompt lists each skill by name and
+  description only; when the resource snapshot holds any skills, every request
+  also offers a runtime-owned `skill` tool. Calling it appends the skill body
+  (frontmatter stripped, tagged with its base directory) as a user message
+  after the step's tool results, so the cached prefix is unchanged. The index
+  and tool track the live snapshot, so `replace_resources` takes effect on
+  later requests. `SkillDef` gained `root`.
 
 - **Compaction v2 (3/3): CleanWindow** (`context.compaction = "clean_window"`).
   Installs `notes`, `session_search`, and `new_context`; reminders fire once
@@ -115,6 +140,14 @@ once a `1.0.0` line is cut.
 
 ### Changed
 
+- Anthropic requests use adaptive thinking for every model when reasoning is
+  requested, and every effort level other than `none`/`minimal` is transmitted
+  verbatim — `xhigh` is no longer clamped to `high` outside `claude-opus-4-7`.
+  Token-budget thinking is deprecated; set
+  `DEPRECATED_ANTHROPIC_THINKING_BUDGET=1` to opt back into it. Halter does not
+  fall back automatically for endpoints that reject adaptive thinking.
+- **Breaking:** the builder reserves the `skill` tool name; custom or strategy
+  tools named `skill` fail `HalterBuilder::build`.
 - **Breaking:** `OpenRouterProvider::new_with_headers` and
   `OpenRouterProvider::new_with_headers_and_resilience` take an additional
   `Option<OpenRouterRouting>` argument after `temperature`. Pass `None` for the
@@ -193,6 +226,35 @@ once a `1.0.0` line is cut.
   now triggers exactly at the configured threshold rather than 100 tokens
   early.
 
+### Upgrading from 0.5
+
+- `ContextConfig`: wrap `compaction_threshold` in `Some(..)`, drop
+  `pre_compaction_target` and `prune_signal_threshold`, and add
+  `max_tokens: None`, `compaction: Default::default()`, and
+  `notes_root: None` (or use `..Default::default()`). A config must set either
+  `context.compaction_threshold` or `models.default.max_input_tokens`.
+- To keep 0.5's provider-native compaction, set
+  `context.compaction = "provider_default"`.
+- `OpenRouterProvider::new_with_headers[_and_resilience]`: pass `None` for the
+  new routing argument after `temperature`.
+- Custom `ContextManager` implementations: `plan` no longer receives a
+  compaction model/provider, and `compact_now` is gone.
+- Custom `Provider` implementations: delete `compaction_window`.
+- Custom `CompactionStrategy` implementations: replace
+  `threshold_notifications` with `context_boundary`.
+- Exhaustive matches on `SessionEventPayload` need `ContextWindowRolledOver`,
+  `ContextProjectionUpdated`, and `ContextRestored` arms; on
+  `CompactionTrigger`, a `Rollover` arm; on `CompactionStrategyKind`,
+  a `CleanWindow` arm.
+- `SessionState::usage_anchor_floor` / `estimate_context_tokens` users read
+  `SessionState::token_ledger` instead; estimator helpers are imported from
+  `halter_protocol`.
+- `resolve_response_chain` takes
+  `(last_response_id, messages_seen_by_provider, total_messages, has_compacted_prefix)`.
+- `SkillDef` literals add `root` (or use `..Default::default()`); rename any
+  tool called `skill`.
+- Anthropic endpoints that only accept budget thinking need
+  `DEPRECATED_ANTHROPIC_THINKING_BUDGET=1`.
 
 ## [0.5.0] - 2026-07-27
 
