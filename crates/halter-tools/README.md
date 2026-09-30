@@ -405,7 +405,8 @@ retains at most 64 job records, including completed jobs, until shutdown.
 
 Session shutdown terminates jobs and awaits their monitors. Unix jobs receive
 TERM, a 500 ms grace period, then KILL for the owned process group and currently
-discoverable descendants. Windows uses native process-tree termination. Commands
+discoverable descendants. Background spawn is currently Unix-only: Windows
+needs command authorization matching its shell grammar before it can be enabled. Commands
 that deliberately escape process-group and ancestry ownership aren't supported.
 Output and live process ownership are process-local: resume doesn't relaunch
 jobs or use saved PIDs to signal processes.

@@ -4648,6 +4648,236 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn failed_initial_rollover_keeps_input_idle_until_an_explicit_retry() {
+            let root = tempfile::tempdir().unwrap();
+            let (provider, mut services, _) = setup(root.path(), false);
+            install_context_settings(
+                &mut services,
+                ContextSettings {
+                    compaction_threshold: 0,
+                    max_tokens: None,
+                },
+            );
+            install_compaction(&mut services, Arc::new(CleanWipe));
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let hook_attempts = attempts.clone();
+            let mut hooks = RegisteredHooks::default();
+            hooks.register(
+                PluginId::from("block-rollover"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(HookEventName::PreCompact, move |_input| {
+                    let attempts = hook_attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        HookResponse::block("rollover unavailable")
+                    }
+                }),
+            );
+            Arc::get_mut(&mut services).unwrap().registered_hooks = Arc::new(hooks);
+            let runtime = SessionRuntime::new(services.clone());
+            let (session, mut events) = runtime
+                .create_session(SessionInit {
+                    working_dir: root.path().to_path_buf(),
+                    ..SessionInit::default()
+                })
+                .await
+                .unwrap();
+            let message = Message::user("retain this task");
+            let id = session.submit(message.clone()).await.unwrap();
+
+            for expected_attempts in [1, 2] {
+                if expected_attempts == 2 {
+                    assert_eq!(session.submit(message.clone()).await.unwrap(), id);
+                }
+                let completed = idle(&mut events).await;
+                assert_eq!(
+                    completed
+                        .iter()
+                        .filter(|event| matches!(
+                            event.payload,
+                            SessionEventPayload::TurnFailed { .. }
+                        ))
+                        .count(),
+                    1,
+                    "a failed execution does not retry accepted input by itself"
+                );
+                assert!(completed.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::TurnFailed { error, cancelled: false, .. }
+                        if error.contains("rollover unavailable")
+                )));
+                let mut stored = services
+                    .sessions
+                    .load_session(session.id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                hydrate_stored_session(services.sessions.as_ref(), &mut stored)
+                    .await
+                    .unwrap();
+                assert_eq!(stored.state.pending_inputs.len(), 1);
+                assert_eq!(stored.state.pending_inputs[0].id, id);
+                assert_eq!(
+                    stored.state.session_status,
+                    halter_protocol::SessionStatus::Idle
+                );
+                assert!(stored.state.open_turn.is_none());
+                assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+                assert!(provider.requests.lock().unwrap().is_empty());
+            }
+            session.shutdown().await.unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn session_stream_preserves_subagent_forwarding_and_parent_replay_cursor() {
+            for (forwarding, cap, prompt) in [
+                (SubagentEventForwarding::Off, 100_000, "single"),
+                (SubagentEventForwarding::All, 2, "many child events"),
+                (SubagentEventForwarding::All, 100_000, "recursive"),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let services = test_support::configured_services_with_runtime(
+                    Arc::new(SubagentFirehoseProvider),
+                    root.path(),
+                    forwarding,
+                    cap,
+                );
+                let runtime = SessionRuntime::new(services.clone());
+                install_subagent_tools(&runtime, &services);
+                let (session, mut events) = runtime
+                    .create_session(SessionInit {
+                        working_dir: root.path().to_path_buf(),
+                        ..SessionInit::default()
+                    })
+                    .await
+                    .unwrap();
+                session.submit(Message::user(prompt)).await.unwrap();
+                let mut observed = idle(&mut events).await;
+                session.shutdown().await.unwrap();
+                observed.extend(events.try_collect::<Vec<_>>().await.unwrap());
+
+                let forwarded = forwarded_events(&observed, session.id());
+                match (forwarding, cap) {
+                    (SubagentEventForwarding::Off, _) => assert!(forwarded.is_empty()),
+                    (SubagentEventForwarding::All, 2) => {
+                        assert_eq!(forwarded.len(), 2);
+                        assert!(observed.iter().any(|event| matches!(
+                            event.payload,
+                            SessionEventPayload::Lagged { dropped_events: 1 }
+                        )));
+                    }
+                    (SubagentEventForwarding::All, _) => {
+                        assert!(
+                            forwarded
+                                .iter()
+                                .any(|event| { event_has_delta_text(event, "grandchild done") })
+                        );
+                    }
+                }
+                let parent_sequences = observed
+                    .iter()
+                    .filter(|event| &event.session_id == session.id())
+                    .map(SessionEvent::sequence)
+                    .collect::<Vec<_>>();
+                let log_sequences = session
+                    .replay()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(SessionEvent::sequence)
+                    .collect::<Vec<_>>();
+                assert_eq!(parent_sequences, log_sequences);
+            }
+        }
+
+        struct ForwardingOverflowProvider;
+
+        #[async_trait]
+        impl Provider for ForwardingOverflowProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn stream(
+                &self,
+                request: ProviderRequest,
+                cancel: CancellationToken,
+            ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>>
+            {
+                if request.model.id.0 == "subagent" {
+                    return Ok(text_stream(vec!["child "; 256]));
+                }
+                SubagentFirehoseProvider.stream(request, cancel).await
+            }
+        }
+
+        #[tokio::test]
+        async fn lagged_child_forwarding_reports_loss_and_keeps_parent_events_lossless() {
+            let root = tempfile::tempdir().unwrap();
+            let services = test_support::configured_services_with_runtime(
+                Arc::new(ForwardingOverflowProvider),
+                root.path(),
+                SubagentEventForwarding::All,
+                100_000,
+            );
+            let runtime = SessionRuntime::new(services.clone());
+            install_subagent_tools(&runtime, &services);
+            let (session, events) = runtime
+                .create_session(SessionInit {
+                    working_dir: root.path().to_path_buf(),
+                    ..SessionInit::default()
+                })
+                .await
+                .unwrap();
+            session.submit(Message::user("single")).await.unwrap();
+            // Hold the public stream until the child has filled its bounded
+            // forwarding channel and the parent has finished execution.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut stored = services
+                        .sessions
+                        .load_session(session.id())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    hydrate_stored_session(services.sessions.as_ref(), &mut stored)
+                        .await
+                        .unwrap();
+                    if stored.state.session_status == halter_protocol::SessionStatus::Idle
+                        && stored.state.open_turn.is_none()
+                        && stored.state.pending_inputs.is_empty()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("parent finishes while event consumption is delayed");
+            session.shutdown().await.unwrap();
+            let observed = events.try_collect::<Vec<_>>().await.unwrap();
+            assert_eq!(forwarded_events(&observed, session.id()).len(), 128);
+            assert!(observed.iter().any(|event| matches!(
+                event.payload,
+                SessionEventPayload::Lagged { dropped_events } if dropped_events > 0
+            )));
+            let parent_sequences = observed
+                .iter()
+                .filter(|event| &event.session_id == session.id())
+                .map(SessionEvent::sequence)
+                .collect::<Vec<_>>();
+            let log_sequences = session
+                .replay()
+                .await
+                .unwrap()
+                .iter()
+                .map(SessionEvent::sequence)
+                .collect::<Vec<_>>();
+            assert_eq!(parent_sequences, log_sequences);
+        }
+
+        #[tokio::test]
         async fn clean_window_delivers_primary_and_correction_before_inference_can_wipe_them() {
             let root = tempfile::tempdir().unwrap();
             let (provider, mut services, calls) = setup(root.path(), false);
@@ -9495,13 +9725,14 @@ mod tests {
 
     #[tokio::test]
     async fn resume_tells_the_model_when_process_state_was_lost() {
-        let is_notice = |message: &Message| matches!(message, Message::System(system) if system.text.contains("process state"));
+        let is_notice = |message: &Message| matches!(message, Message::System(system) if system.text == PROCESS_STATE_RESET_NOTICE);
         // (case, tool the log shows, whether this process still holds its
         // state, notices after two resumes)
         for (case, tool, live, notices) in [
             ("no stateful tool", "read", false, 0),
             ("shell, new process", "shell", false, 1),
             ("browser, new process", "browser", false, 1),
+            ("background, new process", "background", false, 1),
             ("shell still live", "shell", true, 0),
         ] {
             let temp = tempfile::tempdir().expect("tempdir");

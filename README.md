@@ -598,7 +598,7 @@ backend = "memory"
 # session store via `session.export_trace()`, with or without this setting.
 # traces_dir = "/tmp/halter/traces"
 
-# Optional. Keep off unless the caller wants the parent turn stream to include
+# Optional. Keep off unless the caller wants the parent session stream to include
 # raw events from subagents spawned under that parent.
 # subagent_event_forwarding = "off"
 # subagent_event_forwarding = "all"

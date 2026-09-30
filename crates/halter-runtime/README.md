@@ -492,7 +492,8 @@ Existing sessions keep running against the runtime, but new prompt assembly oper
 
 ### `resume_session(session_id)`
 
-Reopens a stored conversation with a fresh handle and event stream, starting idle.\nRecorded tool results remain history; tools and old background processes are not restarted.
+Reopens a stored conversation with a fresh handle and event stream, starting idle.
+Recorded tool results remain history; tools and old background processes are not restarted.
 
 Use this when you have a durable session store and want continuity across process restarts.
 
@@ -612,9 +613,16 @@ provider is called.
 
 ### Event backpressure
 
-The underlying `EventBus` can drop events for slow subscribers. The session\nstream uses committed sequence numbers to recover gaps from storage.
+The underlying `EventBus` can drop events for slow subscribers. The session
+stream uses committed sequence numbers to recover its own events from storage.
 
-The internal execution stream can also include subagent events when `subagent_event_forwarding` is enabled for the session. Forwarded events keep the child `session_id`; the configured forwarding cap emits a synthetic `Lagged` event and stops forwarding for that parent turn when exceeded.
+The session stream also includes subagent events when `subagent_event_forwarding`
+is enabled. Forwarded events keep the child `session_id` and use a bounded,
+128-event buffer. Slow consumers receive a synthetic `Lagged` event when that
+buffer overflows. The configured forwarding cap also emits `Lagged` and stops
+forwarding for the current execution when exceeded. These transient events do
+not advance the parent's replay cursor; recover child history from its log or
+export the parent's trace to include child activity.
 
 ### Persistence conflicts and the session write lease
 

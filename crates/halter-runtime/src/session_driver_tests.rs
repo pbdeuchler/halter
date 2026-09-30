@@ -315,6 +315,7 @@ struct AdmissionFailure {
     store: halter_session::InMemorySessionStore,
     fail: AtomicBool,
     fail_running: AtomicBool,
+    fail_idle: AtomicBool,
     opening: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
 }
 
@@ -352,6 +353,17 @@ impl halter_session::SessionStore for AdmissionFailure {
         {
             anyhow::bail!("execution status commit unavailable");
         }
+        if events.iter().any(|event| {
+            matches!(
+                event.payload,
+                SessionEventPayload::SessionStatusChanged {
+                    status: SessionStatus::Idle
+                }
+            )
+        }) && self.fail_idle.swap(false, Ordering::SeqCst)
+        {
+            anyhow::bail!("idle status commit unavailable");
+        }
         if self.fail.load(Ordering::SeqCst)
             && events
                 .iter()
@@ -377,6 +389,7 @@ async fn failed_admission_is_not_acknowledged_or_recorded_and_can_be_retried() {
         store: Default::default(),
         fail: AtomicBool::new(true),
         fail_running: AtomicBool::new(false),
+        fail_idle: AtomicBool::new(false),
         opening: None,
     });
     let mut services = (*services(Arc::new(FakeProvider::default()))).clone();
@@ -459,6 +472,7 @@ async fn cancelled_open_releases_reservation_and_runtime_shutdown_refuses_delaye
             store: Default::default(),
             fail: AtomicBool::new(false),
             fail_running: AtomicBool::new(false),
+            fail_idle: AtomicBool::new(false),
             opening: Some((started.clone(), release.clone())),
         });
         let mut services = (*services(Arc::new(FakeProvider::default()))).clone();
@@ -509,6 +523,7 @@ async fn driver_storage_failure_closes_stream_cleans_up_and_keeps_input_resumabl
         store: Default::default(),
         fail: AtomicBool::new(false),
         fail_running: AtomicBool::new(true),
+        fail_idle: AtomicBool::new(false),
         opening: None,
     });
     let mut services = (*services(Arc::new(FakeProvider::default()))).clone();
@@ -532,10 +547,12 @@ async fn driver_storage_failure_closes_stream_cleans_up_and_keeps_input_resumabl
         Err(SessionError::Operation(_))
     ));
     assert!(
-        session.replay().await.unwrap().iter().any(|event| matches!(
-            event.payload,
-            SessionEventPayload::SessionShutdownComplete { .. }
-        )),
+        session
+            .replay()
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.payload, SessionEventPayload::SessionShutdownComplete)),
         "cleanup commits use storage after the failed actor stops"
     );
     let (reopened, mut events) = runtime.resume_session(session.id()).await.unwrap();
@@ -544,4 +561,80 @@ async fn driver_storage_failure_closes_stream_cleans_up_and_keeps_input_resumabl
     let delivered = until_status(&mut events, SessionStatus::Idle).await;
     assert!(delivered.iter().any(|event| matches!(&event.payload, SessionEventPayload::MessageItem { message: Message::User(message) } if message.plain_text() == "durable input")));
     reopened.shutdown().await.unwrap();
+}
+
+struct BlockingCompaction {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl crate::CompactionStrategy for BlockingCompaction {
+    async fn compact(
+        &self,
+        context: crate::CompactionContext<'_>,
+    ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+        self.started.notify_one();
+        context.cancel().cancelled().await;
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn compaction_idle_commit_failure_reaches_interrupt_compact_and_stream_after_cleanup() {
+    let started = Arc::new(Notify::new());
+    let store = Arc::new(AdmissionFailure {
+        store: Default::default(),
+        fail: AtomicBool::new(false),
+        fail_running: AtomicBool::new(false),
+        fail_idle: AtomicBool::new(false),
+        opening: None,
+    });
+    let mut services = (*services(Arc::new(FakeProvider::default()))).clone();
+    services.sessions = store.clone();
+    services.compaction = Arc::new(BlockingCompaction {
+        started: started.clone(),
+    });
+    let runtime = SessionRuntime::new(Arc::new(services));
+    let (session, events) = runtime
+        .create_session(SessionInit::default())
+        .await
+        .unwrap();
+    let compact_session = session.clone();
+    let compact = tokio::spawn(async move { compact_session.compact("manual", None).await });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("compaction starts before interruption");
+    store.fail_idle.store(true, Ordering::SeqCst);
+
+    let interrupted = tokio::time::timeout(Duration::from_secs(5), session.interrupt())
+        .await
+        .expect("interrupt settles the failed compaction");
+    let compacted = compact.await.unwrap();
+    for result in [interrupted, compacted] {
+        let error = result.expect_err("failed Idle persistence must reach each caller");
+        assert!(matches!(error, SessionError::Operation(_)));
+        assert!(error.to_string().contains("idle status commit unavailable"));
+    }
+    let stream_error = tokio::time::timeout(Duration::from_secs(5), events.try_collect::<Vec<_>>())
+        .await
+        .expect("failed driver closes its event stream")
+        .expect_err("stream consumers receive the persistence failure");
+    assert!(
+        stream_error
+            .to_string()
+            .contains("idle status commit unavailable")
+    );
+    assert!(matches!(
+        session.shutdown().await,
+        Err(SessionError::Operation(_))
+    ));
+    assert!(
+        session
+            .replay()
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.payload, SessionEventPayload::SessionShutdownComplete)),
+        "interrupt returns only after failed-driver cleanup has committed"
+    );
 }

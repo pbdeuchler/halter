@@ -76,7 +76,7 @@ impl BackgroundJob {
         capacity: usize,
     ) -> anyhow::Result<Arc<Self>> {
         let cwd_path = cwd.path().to_owned();
-        let mut process = shell_command(&command);
+        let mut process = shell_command(&command)?;
         process.current_dir(&cwd_path).env_clear();
         // Deliberately inherit only shell essentials, never service tokens or
         // startup-hook variables. Explicit environment entries are caller-owned.
@@ -240,19 +240,19 @@ impl Drop for BackgroundJob {
 }
 
 #[cfg(unix)]
-fn shell_command(command: &str) -> Command {
+fn shell_command(command: &str) -> anyhow::Result<Command> {
     let mut process = Command::new("/bin/sh");
     process.args(["-c", command]);
-    process
+    Ok(process)
 }
 
-#[cfg(windows)]
-fn shell_command(command: &str) -> Command {
-    // /D disables AutoRun registry commands. Windows has no Unix signal
-    // grace semantics; native kill_tree forcibly terminates descendants.
-    let mut process = Command::new("cmd.exe");
-    process.args(["/D", "/S", "/C", command]);
-    process
+#[cfg(not(unix))]
+fn shell_command(_command: &str) -> anyhow::Result<Command> {
+    // Policy parses shell commands as Bash. cmd.exe uses different quoting
+    // rules, so executing the same string there would bypass authorization.
+    anyhow::bail!(
+        "background spawn is unsupported on this platform: shell command policy requires a Unix shell"
+    )
 }
 
 async fn capture(
@@ -327,4 +327,14 @@ fn signal_job(pid: u32, signal: i32) {
     // Also catch currently discoverable descendants that changed process
     // groups. Daemons escaping ancestry/session ownership remain unsupported.
     kill_tree(pid as i32, signal);
+}
+
+#[cfg(all(test, not(unix)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_rejects_shells_with_unvalidated_command_grammar() {
+        assert!(shell_command("echo 'safe & del sensitive.txt & echo tail'").is_err());
+    }
 }

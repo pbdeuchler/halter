@@ -21,6 +21,7 @@ use crate::session::{HalterSession, RuntimeServices, SessionEventStream, hydrate
 use crate::subagents::RuntimeSubagentControl;
 
 const INBOX_CAPACITY: usize = 128;
+const FORWARDED_EVENT_CAPACITY: usize = 128;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -54,6 +55,7 @@ struct DriverControl {
     tx: mpsc::Sender<Command>,
     closed: CancellationToken,
     services: Arc<RuntimeServices>,
+    forwarded: broadcast::Sender<SessionEvent>,
     failure: std::sync::Mutex<Option<String>>,
 }
 
@@ -259,6 +261,7 @@ impl SessionDrivers {
             tx: tx.clone(),
             closed: CancellationToken::new(),
             services: services.clone(),
+            forwarded: broadcast::channel(FORWARDED_EVENT_CAPACITY).0,
             failure: std::sync::Mutex::new(None),
         });
         let events = session_events(control.clone(), after);
@@ -447,8 +450,13 @@ enum Command {
 
 struct Active {
     cancel: CancellationToken,
-    task: JoinHandle<anyhow::Result<()>>,
+    task: JoinHandle<anyhow::Result<TaskOutcome>>,
     kind: Work,
+}
+
+enum TaskOutcome {
+    Complete,
+    TurnFailed,
 }
 
 enum Work {
@@ -502,16 +510,21 @@ impl Driver {
                     match active.kind {
                         Work::Cleanup => {
                             let status = self.set_status(SessionStatus::Closed).await;
-                            return result.and(status);
+                            return result.map(|_| ()).and(status);
                         }
                         Work::Compact(reply) => {
-                            let status = self.set_status(SessionStatus::Idle).await;
-                            let _ = reply.send(result.and(status).map_err(SessionError::from));
-                            for reply in self.interrupt_waiters.drain(..) { let _ = reply.send(Ok(())); }
-                            continue;
+                            if let Err(error) = self.set_status(SessionStatus::Idle).await {
+                                let _ = reply.send(Err(SessionError::Operation(anyhow::anyhow!("{error:#}"))));
+                                return Err(error);
+                            }
+                            let response = match &result {
+                                Ok(_) => Ok(()),
+                                Err(error) => Err(SessionError::Operation(anyhow::anyhow!("{error:#}"))),
+                            };
+                            let _ = reply.send(response);
                         }
                         Work::Execution => {
-                            if result.is_ok() && !active.cancel.is_cancelled() && !self.closing && !self.pending.is_empty() {
+                            if matches!(result, Ok(TaskOutcome::Complete)) && !active.cancel.is_cancelled() && !self.closing && !self.pending.is_empty() {
                                 self.wake_requested = true;
                             }
                             if let Err(error) = &result {
@@ -522,7 +535,7 @@ impl Driver {
                             }
                         }
                     }
-                    if !self.wake_requested || self.pending.is_empty() || !self.interrupt_waiters.is_empty() {
+                    if self.status != SessionStatus::Idle && (!self.wake_requested || self.pending.is_empty() || !self.interrupt_waiters.is_empty()) {
                         self.set_status(SessionStatus::Idle).await?;
                     }
                     for reply in self.interrupt_waiters.drain(..) {
@@ -623,6 +636,7 @@ impl Driver {
                         executor
                             .compact_with_cancel(&reason, instructions.as_deref(), task_cancel)
                             .await
+                            .map(|()| TaskOutcome::Complete)
                     });
                     self.active = Some(Active {
                         cancel,
@@ -643,12 +657,25 @@ impl Driver {
         let task_cancel = cancel.clone();
         let mut turn = Turn::user("");
         turn.user_message = self.pending[0].clone();
+        let turn_id = turn.id.clone();
+        let session_id = self.control.id.clone();
+        let forwarded = self.control.forwarded.clone();
         let task = tokio::spawn(async move {
-            executor
-                .submit_turn_with_cancel(turn, task_cancel)
-                .await?
-                .try_for_each(|_| async { Ok(()) })
-                .await
+            let mut events = executor.submit_turn_with_cancel(turn, task_cancel).await?;
+            let mut outcome = TaskOutcome::Complete;
+            // Semantic failures are recorded as events. Drain to completion so
+            // cleanup finishes, but do not automatically retry undelivered input.
+            while let Some(event) = events.try_next().await? {
+                if event.session_id != session_id
+                    || matches!(event.payload, SessionEventPayload::Lagged { .. })
+                {
+                    let _ = forwarded.send(event);
+                } else if matches!(event.payload, SessionEventPayload::TurnFailed { turn_id: failed, .. } if failed == turn_id)
+                {
+                    outcome = TaskOutcome::TurnFailed;
+                }
+            }
+            Ok(outcome)
         });
         self.active = Some(Active {
             cancel,
@@ -667,7 +694,10 @@ impl Driver {
             let children = subagents.close_session(&id).await;
             let resources = sessions.shutdown_session(&id).await;
             let hooks = executor.shutdown("session_closed").await;
-            children.and(resources).and(hooks)
+            children
+                .and(resources)
+                .and(hooks)
+                .map(|()| TaskOutcome::Complete)
         });
         self.active = Some(Active {
             cancel: CancellationToken::new(),
@@ -729,13 +759,15 @@ impl Driver {
 struct EventCursor {
     control: Arc<DriverControl>,
     receiver: broadcast::Receiver<SessionEvent>,
+    forwarded: broadcast::Receiver<SessionEvent>,
     sequence: u64,
     buffered: std::collections::VecDeque<SessionEvent>,
 }
 
 fn session_events(control: Arc<DriverControl>, sequence: u64) -> SessionEventStream {
     let receiver = control.services.event_bus.subscribe_raw();
-    stream::try_unfold(EventCursor { control, receiver, sequence, buffered: Default::default() }, |mut cursor| async move {
+    let forwarded = control.forwarded.subscribe();
+    stream::try_unfold(EventCursor { control, receiver, forwarded, sequence, buffered: Default::default() }, |mut cursor| async move {
         loop {
             if let Some(event) = cursor.buffered.pop_front() {
                 cursor.sequence = event.sequence();
@@ -743,6 +775,13 @@ fn session_events(control: Arc<DriverControl>, sequence: u64) -> SessionEventStr
             }
             cursor.buffered.extend(cursor.control.services.sessions.replay_after(&cursor.control.id, cursor.sequence).await?);
             if !cursor.buffered.is_empty() { continue; }
+            match cursor.forwarded.try_recv() {
+                Ok(event) => return Ok(Some((event, cursor))),
+                Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
+                    return Ok(Some((forwarding_lagged_event(dropped), cursor)));
+                },
+                Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {},
+            }
             if cursor.control.closed.is_cancelled() {
                 if let Some(error) = cursor.control.failure.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
                     return Err(anyhow::anyhow!("{error}"));
@@ -753,8 +792,26 @@ fn session_events(control: Arc<DriverControl>, sequence: u64) -> SessionEventStr
                 _ = cursor.control.closed.cancelled() => {},
                 event = cursor.receiver.recv() => {
                     if matches!(event, Err(broadcast::error::RecvError::Closed)) { return Ok(None); }
-                }
+                },
+                event = cursor.forwarded.recv() => {
+                    match event {
+                        Ok(event) => return Ok(Some((event, cursor))),
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            return Ok(Some((forwarding_lagged_event(dropped), cursor)));
+                        },
+                        Err(broadcast::error::RecvError::Closed) => {},
+                    }
+                },
             }
         }
     }).boxed()
+}
+
+fn forwarding_lagged_event(dropped_events: u64) -> SessionEvent {
+    PendingEvent::new(
+        SessionId::from(crate::event_bus::BUS_SESSION_ID),
+        halter_protocol::Delivery::BestEffort,
+        SessionEventPayload::Lagged { dropped_events },
+    )
+    .into_committed(0)
 }
