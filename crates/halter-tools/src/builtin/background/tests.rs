@@ -119,7 +119,7 @@ async fn registered_job_survives_originating_cancellation_and_shutdown_reaps_it(
     let mut context = context(root.path());
     let job = execute(
         &context,
-        json!({"action": "spawn", "command": "printf ready; sleep 30"}),
+        json!({"action": "spawn", "command": "trap '' TERM; sleep 30 & printf ready; wait"}),
     )
     .await;
     let id = job["id"].as_str().unwrap();
@@ -138,11 +138,29 @@ async fn registered_job_survives_originating_cancellation_and_shutdown_reaps_it(
             .len(),
         1
     );
-    context
+    // Retain only a cleanup/status handle: spawning, observing the running
+    // job, and shutting down still exercise the public tool/store behavior.
+    let tracked = context
         .tool_sessions
-        .shutdown_session(&context.session_id)
+        .background_session(&context.session_id)
+        .get(id)
         .await
         .unwrap();
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        context.tool_sessions.shutdown_session(&context.session_id),
+    )
+    .await
+    {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            tracked.request_stop();
+            tracked.wait().await.expect("cleanup of the test-owned job");
+            panic!("session shutdown must terminate its job before natural completion");
+        }
+    }
+    assert_eq!(tracked.summary()["status"]["state"], "exited");
+    assert_eq!(tracked.summary()["status"]["signal"], libc::SIGKILL);
     assert_reaped(job["pid"].as_i64().unwrap() as i32);
     assert!(!context.tool_sessions.has_process_state(&context.session_id));
     // Reopening receives an empty registry rather than a closed registry.
