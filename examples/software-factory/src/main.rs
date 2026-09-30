@@ -26,14 +26,17 @@ use halter_config::{
 use halter_protocol::{
     AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
     ReasoningEffort, SessionEventPayload, ToolCapabilities, ToolConcurrency, ToolName, ToolResult,
-    ToolSpec, Turn, Usage, Volatility,
+    ToolSpec, Usage, Volatility,
 };
 use halter_tools::{Tool, ToolContext};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{process::Command, sync::RwLock};
+use tokio::{
+    process::Command,
+    sync::{Mutex, RwLock},
+};
 use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -706,7 +709,7 @@ async fn main() -> anyhow::Result<()> {
     write_checkpoint(&checkpoint_path, &checkpoint).await?;
 
     info!("shutting down harnesses");
-    let _ = default_session.shutdown("software_factory_complete").await;
+    let _ = default_session.shutdown().await;
     shutdown_all([&default_harness, &implementer, &reviewer, &pr_writer]).await;
     shutdown_all(panel_harnesses.iter().map(|panel| &panel.harness)).await;
     info!("software factory run complete");
@@ -1886,20 +1889,20 @@ fn agent_stage_failure_is_retryable(retryable: bool, cancelled: bool, error: &st
 }
 
 #[derive(Debug)]
-struct AgentStageTurnFailure {
+struct AgentStageFailure {
     label: String,
     error: String,
     retryable: bool,
     cancelled: bool,
 }
 
-impl AgentStageTurnFailure {
+impl AgentStageFailure {
     fn should_retry(&self) -> bool {
         agent_stage_failure_is_retryable(self.retryable, self.cancelled, &self.error)
     }
 }
 
-impl fmt::Display for AgentStageTurnFailure {
+impl fmt::Display for AgentStageFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
@@ -1909,12 +1912,12 @@ impl fmt::Display for AgentStageTurnFailure {
     }
 }
 
-impl StdError for AgentStageTurnFailure {}
+impl StdError for AgentStageFailure {}
 
 fn agent_stage_error_is_retryable(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<AgentStageTurnFailure>().map_or_else(
+    error.downcast_ref::<AgentStageFailure>().map_or_else(
         || inferred_agent_stage_backoff_hint(&error.to_string()).is_some(),
-        AgentStageTurnFailure::should_retry,
+        AgentStageFailure::should_retry,
     )
 }
 
@@ -1933,11 +1936,25 @@ impl FactorySystemPrompt {
     }
 }
 
+/// Keep the single event receiver with a reusable factory conversation.
+struct FactorySession {
+    handle: SessionHandle,
+    events: Mutex<SessionEventStream>,
+}
+
+impl std::ops::Deref for FactorySession {
+    type Target = SessionHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
 async fn create_default_session(
     harness: &Halter,
     worktree: &Path,
     project_system_prompt: Option<&str>,
-) -> anyhow::Result<HalterSession> {
+) -> anyhow::Result<FactorySession> {
     let mut init = SessionInit {
         working_dir: worktree.to_path_buf(),
         system_prompt_seed: vec![FactorySystemPrompt::General.segment()],
@@ -1948,10 +1965,14 @@ async fn create_default_session(
     }
     init.system_prompt_seed
         .push(default_decision_session_prompt_segment());
-    harness
+    let (handle, events) = harness
         .new_session(init)
         .await
-        .context("failed to create default decision session")
+        .context("failed to create default decision session")?;
+    Ok(FactorySession {
+        handle,
+        events: Mutex::new(events),
+    })
 }
 
 fn default_decision_session_prompt_segment() -> PromptSegment {
@@ -2229,7 +2250,7 @@ async fn run_agent_with_prompt_kind(
         project_guidance = project_system_prompt.is_some_and(|prompt| !prompt.trim().is_empty()),
         "starting agent turn"
     );
-    let session = harness
+    let (handle, events) = harness
         .new_session(session_init_with_appended_context(
             worktree,
             system_prompt,
@@ -2238,21 +2259,25 @@ async fn run_agent_with_prompt_kind(
             max_turns,
         )?)
         .await?;
-    let run = run_session_turn(
+    let session = FactorySession {
+        handle,
+        events: Mutex::new(events),
+    };
+    let run = run_session_stage(
         &session,
         label,
-        Turn::user(FACTORY_TURN_USER_MESSAGE),
+        Message::user(FACTORY_TURN_USER_MESSAGE),
         text_requirement,
         None,
     )
     .await;
     info!(stage = label, "shutting down agent session");
-    session.shutdown(label).await?;
+    session.shutdown().await?;
     run
 }
 
 async fn run_existing_session_to_file_with_required_tool(
-    session: &HalterSession,
+    session: &FactorySession,
     label: &str,
     prompt: impl Into<String>,
     output: &StageOutputFile,
@@ -2268,10 +2293,10 @@ async fn run_existing_session_to_file_with_required_tool(
             required_tool = RANK_RESPONSES_TOOL,
             "starting default session file-output turn"
         );
-        let result = run_session_turn(
+        let result = run_session_stage(
             session,
             label,
-            Turn::user(prompt.clone()),
+            Message::user(prompt.clone()),
             AgentTextRequirement::Optional,
             Some(RANK_RESPONSES_TOOL),
         )
@@ -2326,17 +2351,38 @@ async fn run_existing_session_to_file_with_required_tool(
     }
 }
 
-async fn run_session_turn(
-    session: &HalterSession,
+async fn run_session_stage(
+    session: &FactorySession,
     label: &str,
-    turn: Turn,
+    message: Message,
     text_requirement: AgentTextRequirement,
     required_tool: Option<&str>,
 ) -> anyhow::Result<AgentRun> {
-    let mut events = session
-        .submit_turn(turn)
+    let mut events = session.events.lock().await;
+    let message_id = session
+        .submit(message)
         .await
-        .with_context(|| format!("failed to start agent stage {label}"))?;
+        .with_context(|| format!("failed to submit agent stage {label}"))?;
+    collect_session_stage(
+        &mut events,
+        &message_id,
+        label,
+        text_requirement,
+        required_tool,
+    )
+    .await
+}
+
+async fn collect_session_stage(
+    events: &mut SessionEventStream,
+    message_id: &MessageId,
+    label: &str,
+    text_requirement: AgentTextRequirement,
+    required_tool: Option<&str>,
+) -> anyhow::Result<AgentRun> {
+    let mut accepted = false;
+    let mut running = false;
+    let mut completed = false;
     let mut latest_text = None;
     let mut delta_text = String::new();
     let mut usage = Usage::default();
@@ -2345,6 +2391,10 @@ async fn run_session_turn(
     while let Some(event) = events.next().await {
         let event =
             event.with_context(|| format!("failed to read event for agent stage {label}"))?;
+        if !accepted {
+            accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if &message.id == message_id);
+            continue;
+        }
         match event.payload {
             SessionEventPayload::SessionStarted => {
                 info!(stage = label, "agent session started");
@@ -2474,6 +2524,14 @@ async fn run_session_turn(
                     cache_read_input_tokens = usage.cache_read_input_tokens,
                     "agent turn completed"
                 );
+            }
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Running,
+            } => running = true,
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Idle,
+            } if running => {
+                completed = true;
                 break;
             }
             SessionEventPayload::TurnFailed {
@@ -2491,7 +2549,7 @@ async fn run_session_turn(
                     error = %error,
                     "agent turn failed"
                 );
-                return Err(anyhow::Error::new(AgentStageTurnFailure {
+                return Err(anyhow::Error::new(AgentStageFailure {
                     label: label.to_owned(),
                     error,
                     retryable,
@@ -2508,6 +2566,9 @@ async fn run_session_turn(
         }
     }
 
+    if !completed {
+        bail!("session closed before agent stage {label} completed");
+    }
     if let Some(tool) = required_tool {
         match required_tool_completed_count {
             1 => {}
@@ -2604,7 +2665,7 @@ where
 
 async fn select_issue_with_panel_decision(
     panels: &[PanelHarness],
-    default_session: &HalterSession,
+    default_session: &FactorySession,
     worktree: &Path,
     repo: &RepoSlug,
     corpus: &str,
@@ -2644,7 +2705,7 @@ async fn select_issue_with_panel_decision(
 
 async fn create_implementation_plan_with_panel_decision(
     panels: &[PanelHarness],
-    default_session: &HalterSession,
+    default_session: &FactorySession,
     worktree: &Path,
     repo: &RepoSlug,
     selection: &IssueSelection,
@@ -4709,6 +4770,73 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stage_collection_ignores_prior_compaction_and_failure_events() {
+        let Message::User(input) = Message::user("new stage") else {
+            unreachable!()
+        };
+        let input_id = input.id.clone();
+        let Message::User(earlier_input) = Message::user("earlier stage") else {
+            unreachable!()
+        };
+        let payloads = vec![
+            SessionEventPayload::InputAccepted {
+                message: earlier_input,
+            },
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Running,
+            },
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Idle,
+            },
+            SessionEventPayload::TurnFailed {
+                turn_id: halter_protocol::TurnId::from("previous-stage"),
+                error: "previous failure".to_owned(),
+                cancelled: false,
+                retryable: true,
+            },
+            SessionEventPayload::InputAccepted { message: input },
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Running,
+            },
+            SessionEventPayload::MessageItem {
+                message: Message::Assistant(halter_protocol::AssistantMessage {
+                    id: MessageId::new(),
+                    created_at: Utc::now(),
+                    parts: vec![AssistantPart::Text {
+                        text: "new stage result".to_owned(),
+                    }],
+                    stop_reason: Some(halter_protocol::StopReason::EndTurn),
+                    usage: None,
+                    replay_meta: Default::default(),
+                }),
+            },
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Idle,
+            },
+        ];
+        let mut events: SessionEventStream =
+            futures::stream::iter(payloads.into_iter().enumerate().map(|(index, payload)| {
+                Ok(SessionEvent::new_committed(
+                    SessionId::from("factory-session"),
+                    index as u64 + 1,
+                    halter_protocol::Delivery::Lossless,
+                    payload,
+                ))
+            }))
+            .boxed();
+        let result = collect_session_stage(
+            &mut events,
+            &input_id,
+            "new stage",
+            AgentTextRequirement::Required,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text, "new stage result");
+    }
+
     #[test]
     fn agent_stage_failure_retry_detection_covers_flags_and_transient_text() {
         struct Case {
@@ -4826,7 +4954,7 @@ mod tests {
 
     #[test]
     fn agent_stage_turn_failure_display_and_retry_metadata_match() {
-        let retryable = AgentStageTurnFailure {
+        let retryable = AgentStageFailure {
             label: "implementation".to_owned(),
             error: "provider overloaded".to_owned(),
             retryable: false,
@@ -4838,7 +4966,7 @@ mod tests {
         );
         assert!(retryable.should_retry());
 
-        let cancelled = AgentStageTurnFailure {
+        let cancelled = AgentStageFailure {
             cancelled: true,
             ..retryable
         };

@@ -55,6 +55,7 @@ pub struct BrowserSession {
     /// Held to keep the connection alive for the page's lifetime.
     _browser: playwright_rs::protocol::Browser,
     last_url: Option<String>,
+    closed: bool,
 }
 
 impl BrowserSession {
@@ -103,6 +104,7 @@ impl BrowserSession {
             page,
             _browser: browser,
             last_url: None,
+            closed: false,
         })
     }
 
@@ -128,20 +130,29 @@ impl BrowserSession {
 
     /// Eagerly closes the cloud session and the local connection. Idempotent
     /// — safe to call from both the explicit close action and the Drop path.
-    pub async fn close(self) {
+    pub async fn close(mut self) -> anyhow::Result<()> {
         let provider = self.provider.clone();
         let id = self.remote.id.clone();
-        if let Err(err) = self.page.close().await {
+        let page_result = self.page.close().await;
+        if let Err(err) = &page_result {
             debug!(error = %err, "page.close failed during session shutdown");
         }
-        if let Err(err) = provider.close_session(&id).await {
+        let release_result = provider.close_session(&id).await;
+        self.closed = release_result.is_ok();
+        if let Err(err) = &release_result {
             warn!(error = %err, session_id = %id, "failed to release cloud browser session");
         }
+        release_result?;
+        page_result.map_err(|error| anyhow::anyhow!("failed to close browser page: {error}"))?;
+        Ok(())
     }
 }
 
 impl Drop for BrowserSession {
     fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
         // Best-effort: try to release the remote session even when the agent
         // forgot to call `close`. Spawn a detached task because Drop can't
         // await — if no runtime is available (e.g. shutdown), we silently

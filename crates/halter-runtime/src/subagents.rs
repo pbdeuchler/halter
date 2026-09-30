@@ -45,6 +45,7 @@ struct RuntimeSubagentState {
 #[derive(Default)]
 struct SubagentRegistry {
     entries: HashMap<String, RegisteredSubagent>,
+    closing_sessions: HashSet<SessionId>,
 }
 
 struct RegisteredSubagent {
@@ -107,6 +108,96 @@ impl RuntimeSubagentControl {
             .collect()
     }
 
+    /// Stop and settle every descendant owned by this session before cleaning
+    /// up the descendants' persistent tool resources.
+    pub(crate) async fn close_session(&self, session_id: &SessionId) -> anyhow::Result<()> {
+        let (sessions, running, records) = {
+            let mut registry = self.inner.registry.lock().await;
+            let mut sessions = HashSet::from([session_id.clone()]);
+            loop {
+                let descendants = registry
+                    .entries
+                    .values()
+                    .filter(|entry| sessions.contains(&entry.parent))
+                    .map(|entry| entry.status.session_id.clone())
+                    .collect::<Vec<_>>();
+                let before = sessions.len();
+                sessions.extend(descendants);
+                if sessions.len() == before {
+                    break;
+                }
+            }
+            registry.closing_sessions.extend(sessions.iter().cloned());
+            let mut running = Vec::new();
+            let mut records = Vec::new();
+            for entry in registry
+                .entries
+                .values_mut()
+                .filter(|entry| sessions.contains(&entry.parent))
+            {
+                entry.generation = entry.generation.saturating_add(1);
+                if let Some(task) = entry.running.take() {
+                    task.cancel.cancel();
+                    running.push(task.join_handle);
+                }
+                entry.status.state = SubagentState::Closed;
+                entry.status.error = Some("closed by session shutdown".to_owned());
+                records.push((entry.parent.clone(), entry.status.clone(), entry.generation));
+            }
+            (sessions, running, records)
+        };
+        self.signal_change();
+        let mut failure = None;
+        for result in futures::future::join_all(running).await {
+            if let Err(error) = result {
+                failure.get_or_insert_with(|| anyhow::Error::new(error));
+            }
+        }
+        for (parent, status, generation) in records {
+            if let Err(error) = self.record(parent, status, generation).await {
+                failure.get_or_insert(error);
+            }
+        }
+        for child in sessions.iter().filter(|child| *child != session_id) {
+            if let Err(error) = self
+                .inner
+                .services
+                .tool_sessions
+                .shutdown_session(child)
+                .await
+            {
+                failure.get_or_insert(error);
+            }
+            let ended = async {
+                // A reopened parent may still own records for children it ended.
+                let events = self.inner.services.sessions.replay(child).await?;
+                let already_ended = events.iter().rev().find_map(|event| match event.payload {
+                    halter_protocol::SessionEventPayload::SessionShutdownComplete => Some(true),
+                    halter_protocol::SessionEventPayload::SessionStarted
+                    | halter_protocol::SessionEventPayload::SessionResumed => Some(false),
+                    _ => None,
+                }) == Some(true);
+                if !already_ended {
+                    HalterSession::new(self.inner.services.clone(), child.clone())?
+                        .shutdown("parent_session_closed")
+                        .await?;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(error) = ended {
+                failure.get_or_insert(error);
+            }
+        }
+        let mut registry = self.inner.registry.lock().await;
+        for closed in &sessions {
+            registry.closing_sessions.remove(closed);
+        }
+        drop(registry);
+        self.signal_change();
+        failure.map_or(Ok(()), Err)
+    }
+
     /// Register the agents `parent`'s log recorded, keeping any entry this
     /// process already holds.
     pub(crate) async fn restore(
@@ -138,15 +229,21 @@ impl RuntimeSubagentControl {
     }
 
     /// Append an agent's new status to its parent's log.
-    async fn record(&self, parent: SessionId, status: SubagentStatus, generation: u64) {
+    async fn record(
+        &self,
+        parent: SessionId,
+        status: SubagentStatus,
+        generation: u64,
+    ) -> anyhow::Result<()> {
         let record = OutOfTurn::Subagent(SubagentRecord { status, generation });
         let dispatched = match HalterSession::new(self.inner.services.clone(), parent.clone()) {
             Ok(session) => session.dispatch_out_of_turn(record).await,
             Err(error) => Err(error),
         };
-        if let Err(error) = dispatched {
+        if let Err(ref error) = dispatched {
             warn!(session_id = %parent, error = %error, "failed to record subagent status");
         }
+        dispatched
     }
 
     fn signal_change(&self) {
@@ -172,6 +269,12 @@ impl RuntimeSubagentControl {
                 .await?;
 
             let mut registry = self.inner.registry.lock().await;
+            if registry
+                .closing_sessions
+                .contains(&parent.blueprint.session_id)
+            {
+                anyhow::bail!("failed to execute spawn_agent tool: parent session is closing");
+            }
             let active_now = active_subagent_count(&registry);
             if active_now != active {
                 continue;
@@ -247,7 +350,7 @@ impl RuntimeSubagentControl {
             (entry.parent.clone(), entry.generation, entry.status.clone())
         };
         // Before the turn is spawned, so its outcome is recorded after it.
-        self.record(parent, status.clone(), generation).await;
+        let _ = self.record(parent, status.clone(), generation).await;
 
         let services = self.inner.services.clone();
         let task_agent_id = agent_id.clone();
@@ -256,6 +359,17 @@ impl RuntimeSubagentControl {
         let task_cancel = cancel.clone();
         let controller = self.clone();
         let session = HalterSession::new(services.clone(), task_session_id.clone())?;
+        let mut registry = self.inner.registry.lock().await;
+        let can_start = registry.entries.get(&agent_id.0).is_some_and(|entry| {
+            entry.generation == generation && matches!(entry.status.state, SubagentState::Running)
+        });
+        if !can_start {
+            anyhow::bail!(
+                "failed to execute subagent request: agent '{}' closed before execution started",
+                agent_id.0
+            );
+        }
+        // Spawn and registration share the lock so closure always owns the task.
         let join_handle = tokio::spawn(async move {
             controller
                 .run_turn_task(
@@ -271,7 +385,6 @@ impl RuntimeSubagentControl {
                 .await;
         });
 
-        let mut registry = self.inner.registry.lock().await;
         let orphan = register_running_turn(
             &mut registry,
             agent_id,
@@ -284,10 +397,12 @@ impl RuntimeSubagentControl {
         drop(registry);
         if let Some(orphan) = orphan {
             // `close` (or entry removal) raced the spawn before the turn was
-            // registered, so its cancel/abort found nothing to stop. Stop the
-            // freshly spawned task here instead of silently detaching it.
+            // registered. Settle cancellation rather than detaching the task.
             orphan.cancel.cancel();
-            orphan.join_handle.abort();
+            orphan
+                .join_handle
+                .await
+                .context("failed to settle cancelled subagent")?;
         }
         self.signal_change();
         info!(
@@ -446,7 +561,7 @@ impl RuntimeSubagentControl {
         );
         let (parent, status) = (entry.parent.clone(), entry.status.clone());
         drop(registry);
-        self.record(parent, status, generation).await;
+        let _ = self.record(parent, status, generation).await;
         self.signal_change();
     }
 
@@ -724,7 +839,7 @@ impl SubagentControl for RuntimeSubagentControl {
     }
 
     async fn close(&self, request: CloseSubagentRequest) -> anyhow::Result<CloseSubagentResponse> {
-        let (previous_status, parent, status, generation) = {
+        let (previous_status, parent, status, generation, running) = {
             let mut registry = self.inner.registry.lock().await;
             let entry = registry
                 .entries
@@ -738,9 +853,9 @@ impl SubagentControl for RuntimeSubagentControl {
             let previous = entry.status.clone();
             entry.generation = entry.generation.saturating_add(1);
             let closed_running_turn = entry.running.is_some();
-            if let Some(running) = entry.running.take() {
+            let running = entry.running.take();
+            if let Some(running) = &running {
                 running.cancel.cancel();
-                running.join_handle.abort();
             }
             entry.status.state = SubagentState::Closed;
             entry.status.error = closed_running_turn
@@ -750,9 +865,16 @@ impl SubagentControl for RuntimeSubagentControl {
                 entry.parent.clone(),
                 entry.status.clone(),
                 entry.generation,
+                running,
             )
         };
-        self.record(parent, status, generation).await;
+        if let Some(running) = running {
+            running
+                .join_handle
+                .await
+                .context("failed to settle cancelled subagent")?;
+        }
+        let _ = self.record(parent, status, generation).await;
 
         warn!(
             agent_id = %previous_status.agent_id,
@@ -766,7 +888,7 @@ impl SubagentControl for RuntimeSubagentControl {
 
 /// Register `running` for `agent_id` when the entry is still at the spawning
 /// generation and in the `Running` state; otherwise hand the turn back to the
-/// caller as an orphan that must be cancelled and aborted. `close` can race
+/// caller as an orphan that must be cancelled and settled. `close` can race
 /// `start_turn` in the window between task spawn and registration: it bumps
 /// the generation (and may mark the entry `Closed`) but finds no
 /// `RunningTurn` to stop, so the raced spawn would otherwise run a full
@@ -1121,6 +1243,165 @@ mod tests {
             status.error.as_deref(),
             Some("closed by close_agent (work was cancelled)")
         );
+    }
+
+    #[tokio::test]
+    async fn close_session_waits_for_descendants_and_preserves_unrelated_agents() {
+        let services = test_services(Arc::new(PendingProvider));
+        let runtime = SessionRuntime::new(services.clone());
+        let parent = runtime
+            .new_session(crate::SessionInit::default())
+            .await
+            .unwrap();
+        let child = runtime
+            .new_session(crate::SessionInit::default())
+            .await
+            .unwrap();
+        let grandchild = runtime
+            .new_session(crate::SessionInit::default())
+            .await
+            .unwrap();
+        let unrelated = runtime
+            .new_session(crate::SessionInit::default())
+            .await
+            .unwrap();
+        let control = RuntimeSubagentControl::new(services);
+        let cleanup_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (cleanup_started, mut cleanup_events) = tokio::sync::mpsc::channel(2);
+        let child_id = AgentId::from("child");
+        let grandchild_id = AgentId::from("grandchild");
+        let unrelated_id = AgentId::from("unrelated");
+        let unrelated_cancel = CancellationToken::new();
+        let mut registry = control.inner.registry.lock().await;
+        for (agent_id, session_id, parent_id) in [
+            (
+                child_id.clone(),
+                child.session_id().clone(),
+                parent.session_id().clone(),
+            ),
+            (
+                grandchild_id.clone(),
+                grandchild.session_id().clone(),
+                child.session_id().clone(),
+            ),
+            (
+                unrelated_id.clone(),
+                unrelated.session_id().clone(),
+                SessionId::from("other-parent"),
+            ),
+        ] {
+            let cancel = if agent_id == unrelated_id {
+                unrelated_cancel.clone()
+            } else {
+                CancellationToken::new()
+            };
+            let task_cancel = cancel.clone();
+            let release = cleanup_release.clone();
+            let started = cleanup_started.clone();
+            let join_handle = tokio::spawn(async move {
+                task_cancel.cancelled().await;
+                started.send(()).await.unwrap();
+                let _permit = release.acquire().await.unwrap();
+            });
+            registry.entries.insert(
+                agent_id.0.clone(),
+                RegisteredSubagent {
+                    parent: parent_id,
+                    status: SubagentStatus {
+                        agent_id,
+                        session_id,
+                        agent_type: None,
+                        task: "work".to_owned(),
+                        state: SubagentState::Running,
+                        last_message: None,
+                        usage: None,
+                        error: None,
+                    },
+                    generation: 1,
+                    running: Some(RunningTurn {
+                        cancel,
+                        join_handle,
+                    }),
+                },
+            );
+        }
+        drop(registry);
+        let closing = control.clone();
+        let parent_id = parent.session_id().clone();
+        let shutdown = tokio::spawn(async move { closing.close_session(&parent_id).await });
+        for _ in 0..2 {
+            timeout(Duration::from_secs(5), cleanup_events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            !shutdown.is_finished(),
+            "closure must await foreground cleanup"
+        );
+        assert!(!unrelated_cancel.is_cancelled());
+        let registry = control.inner.registry.lock().await;
+        for id in [&child_id, &grandchild_id] {
+            assert_eq!(registry.entries[&id.0].status.state, SubagentState::Closed);
+        }
+        assert_eq!(
+            registry.entries[&unrelated_id.0].status.state,
+            SubagentState::Running
+        );
+        assert!(registry.closing_sessions.contains(parent.session_id()));
+        drop(registry);
+        let mut context = parent_context();
+        context.blueprint.session_id = parent.session_id().clone();
+        let error = control
+            .spawn(
+                &context,
+                spawn_request("late child"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("parent session is closing"));
+        cleanup_release.add_permits(2);
+        timeout(Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        control.close_session(parent.session_id()).await.unwrap();
+        for descendant in [&child, &grandchild] {
+            let events = descendant.replay().await.unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.payload,
+                        halter_protocol::SessionEventPayload::SessionShutdownComplete
+                    ))
+                    .count(),
+                1,
+                "each owned child session ends once"
+            );
+        }
+        assert!(
+            !control
+                .inner
+                .registry
+                .lock()
+                .await
+                .closing_sessions
+                .contains(parent.session_id())
+        );
+        let mut registry = control.inner.registry.lock().await;
+        let running = registry
+            .entries
+            .get_mut(&unrelated_id.0)
+            .unwrap()
+            .running
+            .take()
+            .unwrap();
+        running.join_handle.abort();
+        drop(registry);
+        let _ = running.join_handle.await;
     }
 
     #[tokio::test]

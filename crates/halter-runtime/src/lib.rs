@@ -25,6 +25,9 @@ mod model_summary;
 mod prompt;
 mod provider_default;
 mod session;
+mod session_driver;
+#[cfg(test)]
+mod session_driver_tests;
 mod session_lease;
 mod subagent_session;
 mod subagents;
@@ -58,10 +61,12 @@ pub use prompt::{
     coding_agent_prompt_segment, default_coding_agent_prompt, default_compaction_prompt,
     default_system_prompt, default_system_prompt_segment, system_prompt_segment,
 };
+pub use session::SessionEventStream;
 pub use session::{
     HalterSession, ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit,
     SessionRuntime,
 };
+pub use session_driver::{SessionError, SessionHandle};
 pub use session_lease::SessionLeases;
 pub use trace_export::export_session_trace;
 pub use trace_recorder::TraceRecorder;

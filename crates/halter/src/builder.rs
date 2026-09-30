@@ -16,7 +16,7 @@ use halter_config::{
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
     HookWarning, ModelId, ModelRole, PromptSegmentKind, ProviderCapabilities, ProviderName,
-    ResolvedModel, ResourceSnapshot,
+    ResolvedModel, ResourceSnapshot, SessionId,
 };
 use halter_providers::{
     AnthropicProvider, DefaultProviderErrorClassifier, FullTurnJudgePlan, FullTurnPanelist,
@@ -26,9 +26,9 @@ use halter_providers::{
 };
 use halter_runtime::{
     CleanWindow, CompactionStrategy, ContextSettings, DefaultContextManager,
-    DefaultPromptAssembler, EventBus, HalterSession, ModelSummary, ProviderDefault, ResourceHandle,
-    RuntimeServices, SKILL_TOOL_NAME, SessionInit, SessionRuntime, StoreSearch, TraceRecorder,
-    WindowPolicy,
+    DefaultPromptAssembler, EventBus, ModelSummary, ProviderDefault, ResourceHandle,
+    RuntimeServices, SKILL_TOOL_NAME, SessionError, SessionEventStream, SessionHandle, SessionInit,
+    SessionRuntime, StoreSearch, TraceRecorder, WindowPolicy,
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
@@ -409,9 +409,23 @@ impl Halter {
     /// `prompts.append_system_prompt` is additive: when present, it is inserted
     /// after the resolved base prompt and before any per-session appended
     /// system-prompt segments.
-    pub async fn new_session(&self, init: SessionInit) -> anyhow::Result<HalterSession> {
+    pub async fn new_session(
+        &self,
+        init: SessionInit,
+    ) -> Result<(SessionHandle, SessionEventStream), SessionError> {
         let init = apply_prompt_config(&self.config.prompts, init);
-        self.runtime.new_session(init).await
+        self.runtime.create_session(init).await
+    }
+
+    /// Reopen a stored conversation with a fresh handle and event stream.
+    ///
+    /// The session starts idle. Submit a message to continue execution. Handles
+    /// closed by an earlier shutdown remain closed.
+    pub async fn resume_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(SessionHandle, SessionEventStream), SessionError> {
+        self.runtime.resume_session(session_id).await
     }
 
     /// Replace the live resource snapshot and hook registry for future work.
@@ -1210,6 +1224,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use futures::StreamExt;
     use halter_config::{
         DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS, DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS,
         DEFAULT_PROVIDER_RETRY_BASE_BACKOFF_MS, DEFAULT_PROVIDER_RETRY_DEADLINE_SECS,
@@ -1218,7 +1233,9 @@ mod tests {
         ModelConfig, OpenAiOAuthConfig, ProviderConfig, RequestRetryConfig, ResilienceConfig,
         ResilienceTimeoutsConfig,
     };
-    use halter_protocol::{PluginManifest, ReasoningEffort, SkillId};
+    use halter_protocol::{
+        Message, PluginManifest, ReasoningEffort, SessionEventPayload, SessionStatus, SkillId,
+    };
     use tempfile::tempdir;
 
     use super::*;
@@ -1667,7 +1684,7 @@ mod tests {
             .await
             .expect("build halter");
 
-        halter
+        let (_session, _events) = halter
             .new_session(SessionInit {
                 working_dir: temp.path().to_path_buf(),
                 ..SessionInit::default()
@@ -1676,7 +1693,87 @@ mod tests {
             .expect("create session");
 
         assert_eq!(store.create_calls(), 1);
-        assert_eq!(store.commit_calls(), 1);
+        assert_eq!(store.commit_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn facade_reopens_closed_session_with_fresh_handles_and_stream() {
+        let temp = tempdir().expect("tempdir");
+        let harness = HalterBuilder::default()
+            .with_config(openai_config(Some("test-key")))
+            .with_resource_snapshot(ResourceSnapshot::empty())
+            .build()
+            .await
+            .expect("build halter");
+        let (session, mut events) = harness
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("open session");
+        let session_id = session.id().clone();
+        let stale_handle = session.clone();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.next().await.expect("open stream").expect("event");
+                if matches!(
+                    event.payload,
+                    SessionEventPayload::SessionStatusChanged {
+                        status: SessionStatus::Idle
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("initial idle status");
+        assert!(
+            harness.resume_session(&session_id).await.is_err(),
+            "an open conversation has one driver"
+        );
+        session.shutdown().await.expect("close session");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.next().await {
+                event.expect("shutdown event");
+            }
+        })
+        .await
+        .expect("closed stream");
+
+        let (reopened, mut reopened_events) = harness
+            .resume_session(&session_id)
+            .await
+            .expect("reopen stored session");
+        assert_eq!(reopened.id(), &session_id);
+        assert!(
+            stale_handle
+                .submit(Message::user("stale input"))
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = reopened_events
+                    .next()
+                    .await
+                    .expect("reopened stream")
+                    .expect("event");
+                if matches!(
+                    event.payload,
+                    SessionEventPayload::SessionStatusChanged {
+                        status: SessionStatus::Idle
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("reopened idle status");
+        reopened.shutdown().await.expect("close reopened session");
     }
 
     #[tokio::test]
@@ -1742,7 +1839,7 @@ mod tests {
             .await
             .expect("build halter");
 
-        let session = halter
+        let (session, _events) = halter
             .new_session(SessionInit {
                 working_dir: temp.path().to_path_buf(),
                 ..SessionInit::default()
@@ -1778,7 +1875,7 @@ mod tests {
             .await
             .expect("build halter");
 
-        halter
+        let (_session, _events) = halter
             .new_session(SessionInit {
                 working_dir: temp.path().to_path_buf(),
                 ..SessionInit::default()
@@ -1836,7 +1933,7 @@ mod tests {
             .await
             .expect("build halter");
 
-        halter
+        let (_session, _events) = halter
             .new_session(SessionInit {
                 working_dir: temp.path().to_path_buf(),
                 ..SessionInit::default()
@@ -2095,7 +2192,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let session = halter.new_session(SessionInit::default()).await.unwrap();
+        let (session, _events) = halter.new_session(SessionInit::default()).await.unwrap();
         let stored = store
             .load_session(session.session_id())
             .await
@@ -2138,7 +2235,7 @@ mod tests {
             .build()
             .await
             .expect("build");
-        let session = halter
+        let (session, _events) = halter
             .new_session(SessionInit::default())
             .await
             .expect("session");

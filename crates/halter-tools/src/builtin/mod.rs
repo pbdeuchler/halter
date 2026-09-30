@@ -2,6 +2,7 @@
 
 #[cfg(feature = "ast-tools")]
 pub mod ast;
+pub mod background;
 #[cfg(feature = "browser-tools")]
 pub mod browser;
 pub mod common;
@@ -27,6 +28,7 @@ use crate::{Tool, ToolRuntime};
 
 #[cfg(feature = "ast-tools")]
 pub use ast::AstGrepTool;
+pub use background::BackgroundTool;
 #[cfg(feature = "browser-tools")]
 pub use browser::BrowserTool;
 pub use edit::EditTool;
@@ -55,6 +57,7 @@ pub fn register_builtin_tools(runtime: &ToolRuntime, enabled: &[String]) {
         Arc::new(GrepTool),
         Arc::new(ShellTool),
         Arc::new(ProcessTool),
+        Arc::new(BackgroundTool),
         Arc::new(TaskTool),
     ] {
         let tool_name = tool.spec().name.0;

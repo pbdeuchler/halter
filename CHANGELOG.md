@@ -8,6 +8,12 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `Halter::new_session` now returns a session handle and continuous event stream. Submit user messages with `session.submit(message)`; callers no longer construct a `Turn`. Submission acknowledges committed input, including while a provider or tool is running.
+- `session.interrupt()` waits for execution to stop and its final state to commit. `session.shutdown()` closes that driver and its resources. `Halter::resume_session(id)` reopens the stored conversation with a fresh handle and stream, starting idle.
+- The CLI and software-factory consume session status changes to detect when submitted work becomes idle.
+
 ## [0.8.0] - 2026-09-29
 
 Cancellation now reaches every external call a turn makes. The turn's

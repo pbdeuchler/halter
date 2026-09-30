@@ -30,7 +30,7 @@ This crate is also useful as a reference for how to wire the SDK together. `src/
 
 - `Halter::from_config_file(...)`
 - `SessionInit::default()`
-- `session.submit_turn(...)`
+- `session.submit(Message::user(...))`
 - event streaming and final result extraction
 
 If you are embedding halter in Rust, start with `../halter/README.md`.
@@ -238,7 +238,7 @@ Internally this command does the following:
 2. builds a `Halter`
 3. creates `SessionInit::default()`
 4. reads `--prompt-file` when provided
-5. submits one `Turn::user(task)`
+5. durably submits one `Message::user(task)` and reads until the session becomes idle
 6. prints either the final assistant message or the full event stream
 
 ### Output modes
@@ -340,7 +340,7 @@ halter chat; submit an empty line or press ctrl-d to exit
 
 Behavior:
 
-- each non-empty input line becomes a `Turn::user(...)`
+- each non-empty input line becomes a `Message::user(...)`
 - assistant text deltas are printed as they stream
 - tool output chunks are also printed inline
 - the loop exits on an empty line or EOF
@@ -503,7 +503,7 @@ Each top-level command is a straightforward SDK call:
 - `init` → `generate_starter_config()`
 - `validate` → `load_path(...)`
 - `resources` → `ResourceCompiler::from_config(&config).compile().await`
-- `run` → `Halter::from_config_file(...)`, `new_session(...)`, `submit_turn(...)`
+- `run` → `Halter::from_config_file(...)`, `new_session(...)`, `submit(...)`
 - `chat` → same as `run`, but loops on stdin
 - `config schema` → `export_json_schema()`
 

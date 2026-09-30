@@ -94,6 +94,7 @@ The runtime asks for a tool by name. This crate decides:
 - `GrepTool`
 - `ShellTool`
 - `ProcessTool`
+- `BackgroundTool`
 
 ### Optional tools by Cargo feature
 
@@ -378,6 +379,36 @@ If the model tries to use a program not on the allowlist, you'll get:
 If your workflow needs `python`, `just`, `make`, `npm`, `docker`, or `sort`, add them explicitly to the shell allowlist.
 
 ---
+
+## `background`
+
+Use `background` for managed commands that should survive agent interruption,
+such as a development server. It has four actions:
+
+| Action | Input | Result |
+| --- | --- | --- |
+| `spawn` | `command`, optional `cwd` and `env` | Opaque job ID, PID, command and status |
+| `list` | — | Running and completed job records |
+| `output` | `id`, optional byte `cursor` | Combined stdout/stderr, cursors and truncation flag |
+| `kill` | `id` | Final status after termination and child reaping |
+
+Jobs use independent shells. `cwd` defaults to the session working directory;
+relative paths resolve against it. Persistent shell variables and functions
+aren't inherited. Spawning applies the shell command policy and authorizes the
+working directory through the read policy. The environment contains shell
+essentials plus explicit overrides.
+
+Each job retains the latest 64 KiB of output. `next_cursor` counts all bytes
+produced, including discarded bytes; `truncated` indicates that the requested
+cursor predates retained output. Text uses lossy UTF-8 decoding. A session
+retains at most 64 job records, including completed jobs, until shutdown.
+
+Session shutdown terminates jobs and awaits their monitors. Unix jobs receive
+TERM, a 500 ms grace period, then KILL for the owned process group and currently
+discoverable descendants. Windows uses native process-tree termination. Commands
+that deliberately escape process-group and ancestry ownership aren't supported.
+Output and live process ownership are process-local: resume doesn't relaunch
+jobs or use saved PIDs to signal processes.
 
 ## `process`
 

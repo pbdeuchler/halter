@@ -382,7 +382,7 @@ async fn action_close(context: &ToolContext) -> anyhow::Result<Value> {
     let session_handle = context.tool_sessions.browser_session(&context.session_id);
     let mut guard = session_handle.lock().await;
     if let Some(session) = guard.take() {
-        session.close().await;
+        session.close().await?;
         Ok(json!({ "closed": true }))
     } else {
         Ok(json!({ "closed": false }))

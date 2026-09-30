@@ -14,15 +14,21 @@
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let harness = Halter::from_config_file("halter.toml").await?;
-//!     let session = harness.new_session(SessionInit::default()).await?;
+//!     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 //!
-//!     let mut events = session
-//!         .submit_turn(Turn::user("Summarize this repository"))
-//!         .await?;
+//!     session.submit(Message::user("Summarize this repository")).await?;
 //!
+//!     let mut running = false;
 //!     while let Some(event) = events.next().await {
-//!         println!("{:?}", event?.payload);
+//!         let event = event?;
+//!         println!("{:?}", event.payload);
+//!         match event.payload {
+//!             SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
+//!             SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
+//!             _ => {}
+//!         }
 //!     }
+//!     session.shutdown().await?;
 //!
 //!     Ok(())
 //! }
@@ -44,6 +50,7 @@ pub use halter_config::{
     LoadedOutputStyle, LoadedPlugin, LoadedResourceFile, LoadedSkill, PluginDefaults, PluginLoader,
     SkillLoader,
 };
+pub use halter_runtime::{SessionError, SessionEventStream, SessionHandle};
 pub use resources::{CompiledResources, ResourceCompiler};
 
 pub mod session {
@@ -96,9 +103,14 @@ pub mod prompts {
 pub mod prelude {
     pub use halter_config::{HarnessConfig, PromptsConfig, SystemPromptPreset};
     pub use halter_protocol::{
-        Message, ResourceSnapshot, SessionEvent, SessionEventPayload, SessionId, Turn,
+        Message, MessageId, ResourceSnapshot, SessionEvent, SessionEventPayload, SessionId,
+        SessionStatus,
     };
-    pub use halter_runtime::{HalterSession, SessionInit, SessionRuntime, SubagentEventForwarding};
+    pub use halter_runtime::SessionHandle as HalterSession;
+    pub use halter_runtime::{
+        SessionError, SessionEventStream, SessionHandle, SessionInit, SessionRuntime,
+        SubagentEventForwarding,
+    };
 
     pub use crate::compaction;
     pub use crate::prompts;

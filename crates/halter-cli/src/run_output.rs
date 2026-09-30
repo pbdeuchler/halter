@@ -2,7 +2,7 @@
 
 use clap::Args;
 use halter_protocol::{
-    AssistantMessage, AssistantPart, Message, SessionEvent, SessionEventPayload,
+    AssistantMessage, AssistantPart, Message, SessionEvent, SessionEventPayload, SessionStatus,
 };
 
 #[cfg(test)]
@@ -44,6 +44,7 @@ impl RunOutputArgs {
 #[derive(Debug, Default)]
 pub struct JsonResultTracker {
     final_result: Option<AssistantMessage>,
+    running: bool,
 }
 
 impl JsonResultTracker {
@@ -58,7 +59,15 @@ impl JsonResultTracker {
                 self.final_result = Some(message.clone());
                 Ok(None)
             }
-            SessionEventPayload::TurnCompleted { .. } => self
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Running,
+            } => {
+                self.running = true;
+                Ok(None)
+            }
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Idle,
+            } if self.running => self
                 .final_result
                 .as_ref()
                 .map(Some)
@@ -149,6 +158,11 @@ mod tests {
     #[test]
     fn json_result_tracker_returns_latest_assistant_message_on_completion() {
         let mut tracker = JsonResultTracker::default();
+        tracker
+            .observe(&SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Running,
+            })
+            .unwrap();
         let tool_request = assistant_message("call tool", Some(StopReason::ToolUse));
         let final_result = assistant_message("done", Some(StopReason::EndTurn));
 
@@ -186,9 +200,8 @@ mod tests {
         );
 
         let result = tracker
-            .observe(&SessionEventPayload::TurnCompleted {
-                turn_id: halter_protocol::TurnId::from("turn-1"),
-                usage: Usage::default(),
+            .observe(&SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Idle,
             })
             .expect("turn completed")
             .expect("assistant result");
@@ -213,13 +226,30 @@ mod tests {
     #[test]
     fn json_result_tracker_requires_a_final_assistant_message() {
         let mut tracker = JsonResultTracker::default();
+        tracker
+            .observe(&SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Running,
+            })
+            .unwrap();
         let error = tracker
-            .observe(&SessionEventPayload::TurnCompleted {
-                turn_id: halter_protocol::TurnId::from("turn-1"),
-                usage: Usage::default(),
+            .observe(&SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Idle,
             })
             .expect_err("turn completion without assistant result should fail");
         assert_eq!(error, "failed to capture final assistant result");
+    }
+
+    #[test]
+    fn json_result_tracker_ignores_initial_idle_status() {
+        let mut tracker = JsonResultTracker::default();
+        assert!(
+            tracker
+                .observe(&SessionEventPayload::SessionStatusChanged {
+                    status: SessionStatus::Idle
+                })
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

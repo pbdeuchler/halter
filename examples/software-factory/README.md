@@ -240,7 +240,11 @@ current issue corpus, while still keeping selection bounded to the issues the
 workflow loaded. The default-decision harness also registers `rank_responses`,
 and each synthesis turn must call it before returning the final decision.
 
-All agent turns consume `SessionEventPayload` events. The runner logs tool
+Each agent session keeps one `SessionEventStream`. The runner submits user
+messages and waits for `SessionStatusChanged` to report idle after running;
+it first matches the submission's `InputAccepted` message ID so buffered
+compaction or earlier-stage events cannot finish the new stage. Internal execution events still provide
+usage and failure diagnostics. The runner logs tool
 starts, tool results, warnings, hook runs, compaction, usage, failures, and lagged
 events instead of treating assistant text as the only output channel.
 

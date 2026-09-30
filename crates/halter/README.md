@@ -14,15 +14,21 @@ use halter::prelude::*;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let harness = Halter::from_config_file("halter.toml").await?;
-    let session = harness.new_session(SessionInit::default()).await?;
+    let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 
-    let mut events = session
-        .submit_turn(Turn::user("Summarize this repository"))
-        .await?;
+    session.submit(Message::user("Summarize this repository")).await?;
 
+    let mut running = false;
     while let Some(event) = events.next().await {
-        println!("{:?}", event?.payload);
+        let event = event?;
+        println!("{:?}", event.payload);
+        match event.payload {
+            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
+            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
+            _ => {}
+        }
     }
+    session.shutdown().await?;
 
     Ok(())
 }
@@ -44,6 +50,12 @@ The `halter` crate keeps optional capabilities out of the default build. No feat
 | `profiling`      | Adds the `profile` built-in tool for profiling and instrumentation workflows.                                                            | `inferno`                                                                                                         | Tool name exposed to the model: `profile`.                                                                                                                                        |
 | `full`           | Convenience rollup for the optional built-in tool families.                                                                              | Same extra dependencies as `advanced-tools`, `ast-tools`, `browser-tools`, `image-tools`, `pty`, and `profiling`. | Does not include `sqlite`; enable `sqlite` separately when persistent session storage is needed.                                                                                  |
 | `sqlite`         | Enables SQLite-backed session persistence and the matching config schema.                                                                | `rusqlite`                                                                                                        | Allows `sessions.backend = "sqlite"` and exposes `halter::session::SqliteSessionStore`. The default backend remains memory unless config selects SQLite.                          |
+
+`submit` returns after input is committed to the configured session store. While
+execution is active, further submissions queue for the next safe boundary.
+`interrupt()` waits for cancellation and cleanup without closing the handle.
+`shutdown()` closes the live driver and stream; `harness.resume_session(id)`
+reopens the stored conversation idle with fresh handles.
 
 ## More documentation
 

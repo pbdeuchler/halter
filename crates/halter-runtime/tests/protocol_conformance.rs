@@ -16,9 +16,9 @@ use std::sync::Arc;
 use halter_protocol::{
     AgentId, ApiKind, AssistantMessage, AssistantPart, Delivery, DeltaItem, HookHandlerType,
     HookRunStatus, HookRunSummary, Message, MessageId, ModelId, ModelRole, PluginId, ProviderKind,
-    ProviderName, ResolvedModel, SessionEvent, SessionEventPayload, SessionId, StopReason,
-    SubagentRecord, SubagentState, SubagentStatus, ToolCall, ToolCallId, ToolConcurrency,
-    ToolExecutionOutcome, ToolName, ToolResult, TurnId, Usage,
+    ProviderName, ResolvedModel, SessionEvent, SessionEventPayload, SessionId, SessionStatus,
+    StopReason, SubagentRecord, SubagentState, SubagentStatus, ToolCall, ToolCallId,
+    ToolConcurrency, ToolExecutionOutcome, ToolName, ToolResult, TurnId, Usage,
 };
 use halter_providers::{FakeProvider, ModelRegistry};
 
@@ -201,6 +201,19 @@ fn session_event_payload_variants_have_stable_kind() {
         SessionEventPayload::SessionShutdownComplete,
         SessionEventPayload::CompactionNotified { id: "n".into() },
         SessionEventPayload::Unknown,
+        SessionEventPayload::InputAccepted {
+            message: match Message::user("queued input") {
+                Message::User(message) => message,
+                _ => unreachable!(),
+            },
+        },
+        SessionEventPayload::InputRejected {
+            message_id: MessageId::new(),
+            reason: "invalid input".to_owned(),
+        },
+        SessionEventPayload::SessionStatusChanged {
+            status: SessionStatus::Idle,
+        },
         SessionEventPayload::SubagentUpdated {
             record: SubagentRecord {
                 status: SubagentStatus {
@@ -246,6 +259,9 @@ fn session_event_payload_variants_have_stable_kind() {
             SessionEventPayload::SessionShutdownComplete => "session_shutdown_complete",
             SessionEventPayload::SubagentUpdated { .. } => "subagent_updated",
             SessionEventPayload::CompactionNotified { .. } => "compaction_notified",
+            SessionEventPayload::InputAccepted { .. } => "input_accepted",
+            SessionEventPayload::InputRejected { .. } => "input_rejected",
+            SessionEventPayload::SessionStatusChanged { .. } => "session_status_changed",
             SessionEventPayload::Unknown => "unknown",
         };
         let json = serde_json::to_value(&event.payload).expect("serialize");

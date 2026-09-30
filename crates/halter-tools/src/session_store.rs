@@ -7,6 +7,7 @@ use halter_protocol::SessionId;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::builtin::background::BackgroundRegistry;
 #[cfg(feature = "browser-tools")]
 use crate::builtin::browser::session::BrowserSession;
 #[cfg(feature = "pty")]
@@ -19,6 +20,7 @@ use crate::builtin::task::TaskList;
 pub struct ToolSessionStore {
     shell_sessions: DashMap<String, Arc<TokioMutex<Option<ShellSessionCore>>>>,
     task_sessions: DashMap<String, Arc<Mutex<TaskList>>>,
+    background_sessions: DashMap<String, Arc<BackgroundRegistry>>,
     #[cfg(feature = "pty")]
     pty_sessions: DashMap<String, Arc<Mutex<Option<PtySessionHandle>>>>,
     #[cfg(feature = "browser-tools")]
@@ -26,6 +28,51 @@ pub struct ToolSessionStore {
 }
 
 impl ToolSessionStore {
+    pub(crate) fn background_session(&self, session_id: &SessionId) -> Arc<BackgroundRegistry> {
+        self.background_sessions
+            .entry(session_id.0.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Terminate and await live tool resources after agent execution has
+    /// settled. Runtime admission must remain closed during this operation.
+    /// Task lists are retained; process resources receive fresh slots on reopen.
+    pub async fn shutdown_session(&self, session_id: &SessionId) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        if let Some((_, jobs)) = self.background_sessions.remove(&session_id.0)
+            && let Err(error) = jobs.shutdown().await
+        {
+            errors.push(error.to_string());
+        }
+        if let Some((_, shell)) = self.shell_sessions.remove(&session_id.0)
+            && let Err(error) = crate::builtin::shell::session::shutdown_shell_session(&shell).await
+        {
+            errors.push(error.to_string());
+        }
+        #[cfg(feature = "pty")]
+        if let Some((_, pty)) = self.pty_sessions.remove(&session_id.0)
+            && let Err(error) = crate::builtin::pty::stop_session(&pty).await
+        {
+            errors.push(error.to_string());
+        }
+        #[cfg(feature = "browser-tools")]
+        if let Some((_, browser)) = self.browser_sessions.remove(&session_id.0) {
+            let browser = browser.lock().await.take();
+            if let Some(browser) = browser
+                && let Err(error) = browser.close().await
+            {
+                errors.push(error.to_string());
+            }
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "failed to shut down session tool resources: {}",
+            errors.join("; ")
+        );
+        Ok(())
+    }
+
     /// Return the persistent shell session slot for a halter session.
     #[must_use]
     pub fn shell_session(
@@ -50,12 +97,13 @@ impl ToolSessionStore {
             .clone()
     }
 
-    /// Whether this process holds a shell, pty or browser session for
+    /// Whether this process holds a shell, background, pty or browser session for
     /// `session_id`. Slots are created on first use, so `false` means that
     /// state, if the session ever had it, died with an earlier process.
     #[must_use]
     pub fn has_process_state(&self, session_id: &SessionId) -> bool {
-        let held = self.shell_sessions.contains_key(&session_id.0);
+        let held = self.shell_sessions.contains_key(&session_id.0)
+            || self.background_sessions.contains_key(&session_id.0);
         #[cfg(feature = "pty")]
         let held = held || self.pty_sessions.contains_key(&session_id.0);
         #[cfg(feature = "browser-tools")]

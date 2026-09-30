@@ -199,4 +199,54 @@ mod tests {
             subdir.to_string_lossy()
         );
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_waits_for_foreground_shell_process_group_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let context = tool_context(root.path(), vec!["sh".to_owned()]);
+        let command_context = context.clone();
+        let command = tokio::spawn(async move {
+            ShellTool
+                .execute(
+                    command_context,
+                    json!({"command": "sh -c 'trap \"\" TERM; printf %s \"$$\" > pid; sleep 30'"}),
+                )
+                .await
+        });
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(root.path().join("pid")).await
+                    && let Ok(pid) = pid.parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("foreground shell publishes pid");
+        context.cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), command)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(json_value(result)["cancelled"], true);
+        // SAFETY: signal zero only probes the process created by this test.
+        let exists = unsafe { libc::kill(pid, 0) };
+        assert_eq!(
+            exists, -1,
+            "foreground shell still alive after cancellation returned"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        context
+            .tool_sessions
+            .shutdown_session(&context.session_id)
+            .await
+            .unwrap();
+    }
 }

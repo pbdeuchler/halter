@@ -31,6 +31,41 @@ const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub struct ShellSessionCore {
     pub shell: BrushShell,
+    // Brush executes '&' commands as internal tasks whose child PIDs are
+    // hidden from the outer job record. Retain their inherited run tokens
+    // so session shutdown can stop and join those tasks too.
+    background_cancels: Vec<CancellationToken>,
+}
+
+impl ShellSessionCore {
+    async fn shutdown(mut self) -> anyhow::Result<()> {
+        for cancel in &self.background_cancels {
+            cancel.cancel();
+        }
+        terminate_background_jobs(&self.shell).await;
+        let mut errors = Vec::new();
+        for job in &mut self.shell.jobs_mut().jobs {
+            if let Err(error) = job.wait().await
+                && !matches!(error.kind(), brush_core::error::ErrorKind::Interrupted)
+            {
+                errors.push(error.to_string());
+            }
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "failed to reap persistent shell jobs: {}",
+            errors.join("; ")
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ShellSessionCore {
+    fn drop(&mut self) {
+        for cancel in &self.background_cancels {
+            cancel.cancel();
+        }
+    }
 }
 
 pub struct ShellRunOptions {
@@ -92,8 +127,9 @@ pub async fn run_persistent_shell(
             if !result
                 .as_ref()
                 .is_ok_and(|output| session_keepalive(&output.result))
+                && let Some(shell) = guard.take()
             {
-                *guard = None;
+                shell.shutdown().await?;
             }
             result
         }
@@ -152,11 +188,19 @@ async fn cancel_shell_task(
 }
 
 async fn reset_shell_session(session: &std::sync::Arc<TokioMutex<Option<ShellSessionCore>>>) {
-    let mut guard = session.lock().await;
-    if let Some(shell) = guard.as_ref() {
-        terminate_background_jobs(&shell.shell).await;
+    if let Err(error) = shutdown_shell_session(session).await {
+        tracing::warn!(%error, "failed to reap persistent shell jobs");
     }
-    *guard = None;
+}
+
+pub(crate) async fn shutdown_shell_session(
+    session: &std::sync::Arc<TokioMutex<Option<ShellSessionCore>>>,
+) -> anyhow::Result<()> {
+    let mut guard = session.lock().await;
+    if let Some(shell) = guard.take() {
+        shell.shutdown().await?;
+    }
+    Ok(())
 }
 
 async fn create_session() -> anyhow::Result<ShellSessionCore> {
@@ -196,7 +240,10 @@ async fn create_session() -> anyhow::Result<ShellSessionCore> {
         shell.env_mut().set_global("PATH", variable)?;
     }
 
-    Ok(ShellSessionCore { shell })
+    Ok(ShellSessionCore {
+        shell,
+        background_cancels: Vec::new(),
+    })
 }
 
 async fn run_shell_command(
@@ -260,10 +307,15 @@ async fn run_shell_command(
         activity_tx,
     ));
 
+    let prior_jobs = session.shell.jobs().jobs.len();
     let result = session
         .shell
         .run_string(options.command.clone(), &SourceInfo::default(), &params)
         .await;
+
+    if session.shell.jobs().jobs.len() > prior_jobs {
+        session.background_cancels.push(cancel.clone());
+    }
 
     if cancel.is_cancelled() {
         terminate_background_jobs(&session.shell).await;
@@ -538,7 +590,15 @@ async fn terminate_background_jobs(shell: &BrushShell) {
 }
 
 #[cfg(not(unix))]
-async fn terminate_background_jobs(_shell: &BrushShell) {}
+async fn terminate_background_jobs(shell: &BrushShell) {
+    // Windows has no Unix signal grace period. kill_tree uses native process
+    // termination, followed by the caller awaiting Brush's child handles.
+    for job in &shell.jobs().jobs {
+        if let Some(pid) = job.representative_pid() {
+            kill_tree(pid, KILL_SIGNAL);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

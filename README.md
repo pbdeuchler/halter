@@ -45,16 +45,21 @@ use halter::prelude::*;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let harness = Halter::from_config_file("halter.toml").await?;
-    let session = harness.new_session(SessionInit::default()).await?;
+    let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 
-    let mut events = session
-        .submit_turn(Turn::user("Summarize the session persistence design"))
-        .await?;
+    session.submit(Message::user("Summarize the session persistence design")).await?;
 
+    let mut running = false;
     while let Some(event) = events.next().await {
         let event = event?;
         println!("{:?}", event.payload);
+        match event.payload {
+            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
+            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
+            _ => {}
+        }
     }
+    session.shutdown().await?;
 
     Ok(())
 }
@@ -67,7 +72,7 @@ This code does all of the following:
 - builds providers, tools, hooks, policy, and session storage
 - creates a runtime
 - creates a session
-- executes one turn and streams the resulting events
+- durably accepts input and streams session events until execution becomes idle
 
 ### Detailed events
 
@@ -79,14 +84,15 @@ use halter::prelude::*;
 async fn main() -> anyhow::Result<()> {
     let harness = Halter::from_config_file("halter.toml").await?;
 
-    let session = harness
+    let (session, mut stream) = harness
         .new_session(SessionInit {
             working_dir: std::env::current_dir()?,
             ..SessionInit::default()
         })
         .await?;
 
-    let mut stream = session.submit_turn(Turn::user("List the major crates in this repo")).await?;
+    session.submit(Message::user("List the major crates in this repo")).await?;
+    let mut running = false;
     while let Some(event) = stream.next().await {
         let event = event?;
         match event.payload {
@@ -94,12 +100,16 @@ async fn main() -> anyhow::Result<()> {
             SessionEventPayload::TurnCompleted { usage, .. } => {
                 println!("\nusage: in={} out={}", usage.input_tokens, usage.output_tokens);
             }
+            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
+            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
             SessionEventPayload::TurnFailed { error, .. } => {
                 eprintln!("turn failed: {error}");
             }
             _ => {}
         }
     }
+
+    session.shutdown().await?;
 
     Ok(())
 }
@@ -140,7 +150,8 @@ async fn main() -> anyhow::Result<()> {
     let snapshot = ResourceSnapshot::empty();
 
     let harness = Halter::from_config(config, snapshot).await?;
-    let _session = harness.new_session(SessionInit::default()).await?;
+    let (session, _events) = harness.new_session(SessionInit::default()).await?;
+    session.shutdown().await?;
     Ok(())
 }
 ```
@@ -261,7 +272,7 @@ use halter::prelude::*;
 use halter::prompts;
 
 // Spin up a coding agent in one line:
-let session = harness
+let (session, events) = harness
     .new_session(
         SessionInit::default()
             .with_system_prompt(prompts::default_coding_agent_prompt())
@@ -705,7 +716,9 @@ use halter_config::{
     ProvidersConfig, ResourcesConfig, RuntimeConfig, SearchRoots, SessionBackend,
     SessionsConfig, ShellPolicyConfig, ToolsConfig,
 };
-use halter_protocol::{ReasoningEffort, SkillId, Turn};
+use futures::StreamExt;
+use halter::prelude::*;
+use halter_protocol::{ReasoningEffort, SkillId};
 
 use halter_runtime::SessionInit;
 
@@ -846,10 +859,17 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .await?;
 
-    let session = harness.new_session(SessionInit::default()).await?;
-    let _events = session
-        .submit_turn(Turn::user("Describe the active runtime and available skills"))
-        .await?;
+    let (session, mut events) = harness.new_session(SessionInit::default()).await?;
+    session.submit(Message::user("Describe the active runtime and available skills")).await?;
+    let mut running = false;
+    while let Some(event) = events.next().await {
+        match event?.payload {
+            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
+            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
+            _ => {}
+        }
+    }
+    session.shutdown().await?;
 
     Ok(())
 }
@@ -1027,26 +1047,46 @@ It owns:
 - subagent lineage and coordination
 - session replay/resume
 
-The public session handle is `SessionHandle`; `HalterSession` remains a backwards-compatible alias.
+The SDK returns a cloneable `SessionHandle` and one continuous `SessionEventStream`.
+`HalterSession` aliases this handle in the SDK prelude. Internal execution IDs
+remain in diagnostic events; clients submit messages and control the session.
 
-#### Cancellation
+#### Input, interruption, and reopening
 
-`submit_turn` and `compact` are cancelled only by runtime shutdown. Dropping
-the turn's event stream does **not** cancel the turn. To cancel one yourself,
-pass a `CancellationToken`:
+`submit(Message::user(...)).await` returns the message ID after the session store
+has committed the input. While idle, submission starts execution. While a provider
+or foreground tool is running, input queues and is delivered at the next safe
+conversation boundary. A `MessageItem` event confirms delivery into history.
+Acceptance is durable only as far as the configured store: use SQLite for recovery
+after process exit. An in-memory store lasts only as long as the process.
 
 ```rust
-let cancel = tokio_util::sync::CancellationToken::new();
-let turn = session.submit_turn_with_cancel(request, cancel.clone()).await?;
-// later: cancel.cancel(); the turn fails as cancelled.
+let (session, mut events) = harness.new_session(SessionInit::default()).await?;
+let session_id = session.id().clone();
+session.submit(Message::user("Refactor the parser")).await?;
+session.submit(Message::user("Keep its public API unchanged")).await?;
+session.interrupt().await?;
+session.shutdown().await?;
+
+// A fresh driver starts idle with the stored conversation and pending input.
+let (session, events) = harness.resume_session(&session_id).await?;
+session.submit(Message::user("Continue with the parser tests")).await?;
 ```
 
-`compact_with_cancel(trigger, instructions, cancel)` does the same for
-compaction. The token reaches every external call a turn makes: provider
-requests, rate-limit waits, model-judge panels, hooks, subagent spawn/wait,
-and browser actions. SDK hooks get it as `HookInput::cancel`, and custom
-`SubagentControl` implementations get it on `spawn` and `wait`. Subagents
-themselves outlive their parent turn and stop at runtime shutdown.
+`interrupt()` waits for cancellation, foreground-tool cleanup, and final state
+commits. Earlier accepted input remains recorded but does not restart execution
+until a later submission. Cancellation cannot undo effects already performed by
+a tool. Custom tools must honor the cancellation token and clean up their resources.
+
+`shutdown()` closes the driver, its handles, and its stream, and cleans up owned
+resources. The stored conversation can be reopened; old handles stay closed.
+Reopening restores history and pending input without rerunning tools or launching
+old processes. Dropping an event stream does not stop execution.
+
+The stream stays open through idle periods and interruptions. Consume
+`SessionStatusChanged` events to track `Running`, `Idle`, and `Closed`; a newly
+opened stream includes its initial idle status. Provider deltas and tool output
+retain their existing buffering behavior.
 
 > [!NOTE]
 > halter implements its own compaction strategy. This can be less token efficient than managed compaction from inference providers or frontier harnesses. The goal is a higher-quality context window, which can reduce overall token use throughout the turn and gives halter a consistent baseline across providers and models.

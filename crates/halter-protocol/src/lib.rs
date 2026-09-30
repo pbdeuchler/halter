@@ -606,6 +606,14 @@ pub enum Message {
     Tool(ToolResultMessage),
 }
 
+impl Message {
+    /// Build a text-only user message with a fresh id and current timestamp.
+    #[must_use]
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::User(UserMessage::text(text))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 /// Incremental provider output event.
@@ -969,7 +977,20 @@ pub struct RestoredContext {
 /// so an older build never appends to a log it cannot fully read. Bump it
 /// once per release that adds an event kind or field an older fold would
 /// misread.
-pub const SESSION_LOG_FORMAT: u32 = 1;
+pub const SESSION_LOG_FORMAT: u32 = 2;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+/// Persisted lifecycle state of a session driver.
+pub enum SessionStatus {
+    /// The driver is open and no execution is active.
+    #[default]
+    Idle,
+    /// The driver is executing accepted input.
+    Running,
+    /// The driver has stopped and its handles are closed.
+    Closed,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -980,6 +1001,20 @@ pub enum SessionEventPayload {
     /// resume commits always advance the event log (head-sequence
     /// concurrency control relies on every mutation appending an event).
     SessionResumed,
+    /// Input durably accepted into the session inbox. It enters the
+    /// provider-facing transcript only when delivered as a `MessageItem`.
+    InputAccepted {
+        message: UserMessage,
+    },
+    /// Accepted input removed from the inbox without transcript delivery.
+    InputRejected {
+        message_id: MessageId,
+        reason: String,
+    },
+    /// The session driver changed lifecycle state.
+    SessionStatusChanged {
+        status: SessionStatus,
+    },
     Warning {
         message: String,
     },
@@ -1610,6 +1645,14 @@ pub struct SessionBlueprint {
 /// Mutable state persisted for a session.
 pub struct SessionState {
     pub messages: Vec<Message>,
+    /// Durably accepted input awaiting delivery at a safe conversation
+    /// boundary. Kept outside the replaceable transcript window so context
+    /// compaction cannot discard it.
+    #[serde(default)]
+    pub pending_inputs: Vec<UserMessage>,
+    /// Lifecycle state of the most recently opened session driver.
+    #[serde(default)]
+    pub session_status: SessionStatus,
     #[serde(default)]
     pub compacted_prefix: Vec<Value>,
     pub appended_prompt_segments: Vec<PromptSegment>,
@@ -1661,8 +1704,12 @@ impl SessionState {
     /// Append a message to the transcript and account for it in the token
     /// ledger. The single door for transcript growth: the runtime and the
     /// event fold both go through it, so the ledger never drifts from the
-    /// messages it describes.
+    /// messages it describes. User messages also remove matching accepted
+    /// input from the pending inbox as part of the delivery transition.
     pub fn append(&mut self, message: Message) {
+        if let Message::User(user) = &message {
+            self.pending_inputs.retain(|pending| pending.id != user.id);
+        }
         self.token_ledger.record(&message);
         self.messages.push(message);
     }
@@ -1985,8 +2032,126 @@ pub struct SubagentResult {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn session_status_wire_values_roundtrip_and_match_schema() {
+        let cases = [
+            (SessionStatus::Idle, "idle"),
+            (SessionStatus::Running, "running"),
+            (SessionStatus::Closed, "closed"),
+        ];
+        for (status, wire_value) in cases {
+            let encoded = serde_json::to_value(status).expect("serialize status");
+            assert_eq!(encoded, wire_value);
+            assert_eq!(
+                serde_json::from_value::<SessionStatus>(encoded).expect("deserialize status"),
+                status,
+            );
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(SessionStatus))
+            .expect("serialize status schema");
+        let wire_values: Vec<_> = schema["oneOf"]
+            .as_array()
+            .expect("status variants")
+            .iter()
+            .map(|variant| variant["enum"][0].as_str().expect("status wire value"))
+            .collect();
+        assert_eq!(wire_values, ["idle", "running", "closed"]);
+    }
+
+    #[test]
+    fn inbox_events_have_strict_wire_shapes_and_schema() {
+        let message = UserMessage::text("keep the public API");
+        let cases = [
+            (
+                "input_accepted",
+                SessionEventPayload::InputAccepted {
+                    message: message.clone(),
+                },
+                "message",
+            ),
+            (
+                "input_rejected",
+                SessionEventPayload::InputRejected {
+                    message_id: message.id,
+                    reason: "invalid input".to_owned(),
+                },
+                "message_id",
+            ),
+            (
+                "session_status_changed",
+                SessionEventPayload::SessionStatusChanged {
+                    status: SessionStatus::Running,
+                },
+                "status",
+            ),
+        ];
+        let schema = serde_json::to_value(schemars::schema_for!(SessionEventPayload))
+            .expect("serialize event schema");
+        let variants = schema["oneOf"].as_array().expect("event variants");
+        for (kind, payload, required_field) in cases {
+            let mut encoded = serde_json::to_value(&payload).expect("serialize event");
+            assert_eq!(encoded["kind"], kind);
+            assert_eq!(
+                serde_json::from_value::<SessionEventPayload>(encoded.clone()).unwrap(),
+                payload
+            );
+            let variant = variants
+                .iter()
+                .find(|variant| variant["properties"]["kind"]["enum"][0] == kind)
+                .expect("event kind is represented in schema");
+            let properties = variant["properties"]
+                .as_object()
+                .expect("event schema fields");
+            for key in encoded.as_object().expect("event fields").keys() {
+                assert!(properties.contains_key(key), "{kind}: schema missing {key}");
+            }
+            encoded.as_object_mut().unwrap().remove(required_field);
+            assert!(
+                serde_json::from_value::<SessionEventPayload>(encoded).is_err(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_checkpoints_default_to_an_empty_idle_inbox() {
+        let mut checkpoint = serde_json::to_value(SessionState::default()).unwrap();
+        let fields = checkpoint.as_object_mut().unwrap();
+        fields.remove("pending_inputs");
+        fields.remove("session_status");
+        let restored: SessionState = serde_json::from_value(checkpoint).unwrap();
+        assert!(restored.pending_inputs.is_empty());
+        assert_eq!(restored.session_status, SessionStatus::Idle);
+    }
+
+    proptest! {
+        #[test]
+        fn accepted_input_and_checkpoint_serialization_preserve_content(
+            text in ".{0,128}",
+            reason in ".{0,128}",
+        ) {
+            let message = UserMessage::text(text);
+            for payload in [
+                SessionEventPayload::InputAccepted { message: message.clone() },
+                SessionEventPayload::InputRejected { message_id: message.id.clone(), reason },
+            ] {
+                let encoded = serde_json::to_vec(&payload).unwrap();
+                let decoded: SessionEventPayload = serde_json::from_slice(&encoded).unwrap();
+                prop_assert_eq!(decoded, payload);
+            }
+            let state = SessionState {
+                pending_inputs: vec![message],
+                session_status: SessionStatus::Running,
+                ..SessionState::default()
+            };
+            let restored: SessionState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            prop_assert_eq!(restored, state);
+        }
+    }
 
     #[test]
     fn reasoning_effort_wire_values_roundtrip_and_match_schema() {

@@ -15,6 +15,7 @@ use crate::{Tool, ToolContext, ToolRuntimeEvent};
 
 use super::common::{
     ToolScope, ensure_not_cancelled, optional_string, optional_u64, parse_env_map, required_string,
+    resolve_path,
 };
 use super::process::{kill_process_group, kill_tree, process_group_id};
 
@@ -38,15 +39,18 @@ fn pty_shell_args() -> &'static [&'static str] {
 
 /// Build the env vector that will be set on the spawned PTY after a clear.
 /// Order: allowlisted parent vars first, then caller-supplied overrides.
-/// Pure: takes its inputs (parent env via `std::env::var_os` and the
-/// caller-supplied map) and returns a Vec — no side effects, easy to test.
+/// Takes the parent environment and caller-supplied overrides explicitly so
+/// tests never need to mutate process-wide environment variables.
 fn pty_scrubbed_env(
+    parent: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     overrides: Option<&HashMap<String, String>>,
 ) -> Vec<(String, std::ffi::OsString)> {
     let mut out: Vec<(String, std::ffi::OsString)> = Vec::new();
-    for var in PTY_ENV_ALLOWLIST {
-        if let Some(value) = std::env::var_os(var) {
-            out.push(((*var).to_owned(), value));
+    for (key, value) in parent {
+        if let Some(key) = key.to_str()
+            && PTY_ENV_ALLOWLIST.contains(&key)
+        {
+            out.push((key.to_owned(), value));
         }
     }
     if let Some(overrides) = overrides {
@@ -75,6 +79,8 @@ fn checked_u16(input: &Value, key: &str, default: u16) -> anyhow::Result<u16> {
 /// Handle for an active PTY session stored per halter session.
 pub struct PtySessionHandle {
     control_tx: mpsc::Sender<ControlMessage>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    generation: Arc<()>,
 }
 
 #[derive(Debug)]
@@ -156,6 +162,17 @@ impl Tool for PtyTool {
                     .policy
                     .check_shell_command_strict(&config.command, mode)
                     .await?;
+                let cwd = config
+                    .cwd
+                    .as_deref()
+                    .map(|cwd| resolve_path(&context.working_dir, cwd))
+                    .unwrap_or_else(|| context.working_dir.clone());
+                let cwd = context.policy.check_read_path(&cwd, 0).await?;
+                let config = PtyConfig {
+                    cwd: Some(cwd.path().to_string_lossy().into_owned()),
+                    ..config
+                };
+                ensure_not_cancelled(&context.cancel)?;
                 start_session(session, config, context.emit.clone()).await?;
                 Ok(ToolResult::Json {
                     value: json!({ "started": true }),
@@ -177,7 +194,7 @@ impl Tool for PtyTool {
                 })
             }
             "kill" => {
-                send_control(&session, ControlMessage::Kill)?;
+                stop_session(&session).await?;
                 Ok(ToolResult::Json {
                     value: json!({ "ok": true }),
                 })
@@ -193,38 +210,61 @@ async fn start_session(
     emit: Arc<dyn crate::ToolEventSink>,
 ) -> anyhow::Result<()> {
     let (control_tx, control_rx) = mpsc::channel();
-    // Use a one-shot blocking channel to surface the spawn result
-    // synchronously back to the async caller (finding M40). The blocking
-    // task first opens the pty + spawns the child; only on success does it
-    // publish the session handle and enter the event loop.
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(1);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let session_for_task = Arc::clone(&session);
-    tokio::task::spawn_blocking(move || {
-        let state = match prepare_pty(&config) {
-            Ok(state) => state,
-            Err(error) => {
-                let _ = ready_tx.send(Err(error));
-                return;
-            }
-        };
-        {
+    let generation = Arc::new(());
+    let generation_for_task = generation.clone();
+    {
+        let mut guard = session.lock();
+        anyhow::ensure!(
+            guard.is_none(),
+            "failed to execute pty tool: PTY session already active"
+        );
+        let task = tokio::task::spawn_blocking(move || {
+            let result = match prepare_pty(&config) {
+                Ok(state) => {
+                    let _ = ready_tx.send(Ok(()));
+                    run_pty_loop(state, config.timeout, control_rx, emit)
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                    Ok(())
+                }
+            };
             let mut guard = session_for_task.lock();
-            *guard = Some(PtySessionHandle { control_tx });
-        }
-        let _ = ready_tx.send(Ok(()));
-        let _ = run_pty_loop(state, config.timeout, control_rx, emit);
-        *session_for_task.lock() = None;
-    });
+            if guard
+                .as_ref()
+                .is_some_and(|handle| Arc::ptr_eq(&handle.generation, &generation_for_task))
+            {
+                *guard = None;
+            }
+            result
+        });
+        *guard = Some(PtySessionHandle {
+            control_tx,
+            task,
+            generation,
+        });
+    }
+    ready_rx
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to start PTY session: {error}"))?
+}
 
-    tokio::task::spawn_blocking(move || {
-        ready_rx.recv().unwrap_or_else(|_| {
-            Err(anyhow::anyhow!(
-                "pty tool: spawn task dropped ready channel"
-            ))
-        })
-    })
-    .await
-    .map_err(|err| anyhow::anyhow!("failed to execute pty tool: spawn await failed: {err}"))?
+/// Explicitly stop and join the worker rather than dropping its control slot.
+/// The worker owns the child, reader thread and PTY until cleanup finishes.
+pub(crate) async fn stop_session(
+    session: &Arc<Mutex<Option<PtySessionHandle>>>,
+) -> anyhow::Result<()> {
+    let handle = session.lock().take();
+    if let Some(handle) = handle {
+        let _ = handle.control_tx.send(ControlMessage::Kill);
+        handle
+            .task
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to stop PTY worker: {error}"))??;
+    }
+    Ok(())
 }
 
 fn send_control(
@@ -259,6 +299,9 @@ fn prepare_pty(config: &PtyConfig) -> anyhow::Result<PtyRunState> {
         pixel_height: 0,
     })?;
 
+    #[cfg(unix)]
+    let mut command = CommandBuilder::new("/bin/sh");
+    #[cfg(not(unix))]
     let mut command = CommandBuilder::new("sh");
     for arg in pty_shell_args() {
         command.arg(arg);
@@ -268,16 +311,18 @@ fn prepare_pty(config: &PtyConfig) -> anyhow::Result<PtyRunState> {
         command.cwd(cwd);
     }
     command.env_clear();
-    for (key, value) in pty_scrubbed_env(config.env.as_ref()) {
+    for (key, value) in pty_scrubbed_env(std::env::vars_os(), config.env.as_ref()) {
         command.env(key, value);
     }
 
+    // Allocate fallible IO handles before spawning so an allocation failure
+    // cannot leave an unowned child process behind.
+    let reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
     let child = pair.slave.spawn_command(command)?;
     let child_pid = child.process_id().map(|pid| pid as i32);
     let process_group = child_pid.and_then(process_group_id);
 
-    let reader = pair.master.try_clone_reader()?;
-    let writer = pair.master.take_writer()?;
     Ok(PtyRunState {
         child,
         child_pid,
@@ -307,53 +352,62 @@ fn run_pty_loop(
     let reader_thread = spawn_reader_thread(reader, reader_tx);
     let mut reader_closed = false;
 
-    loop {
-        drain_reader_output(&reader_rx, &emit, &mut reader_closed);
+    let outcome = (|| -> anyhow::Result<()> {
+        loop {
+            drain_reader_output(&reader_rx, &emit, &mut reader_closed);
 
-        match control_rx.recv_timeout(CONTROL_POLL_INTERVAL) {
-            Ok(message) => match message {
-                ControlMessage::Input(input) => {
-                    let _ = writer.write_all(input.as_bytes());
-                    let _ = writer.flush();
-                }
-                ControlMessage::Resize { cols, rows } => {
-                    let _ = master.resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
-                }
-                ControlMessage::Kill => {
+            match control_rx.recv_timeout(CONTROL_POLL_INTERVAL) {
+                Ok(message) => match message {
+                    ControlMessage::Input(input) => {
+                        let _ = writer.write_all(input.as_bytes());
+                        let _ = writer.flush();
+                    }
+                    ControlMessage::Resize { cols, rows } => {
+                        let _ = master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                    ControlMessage::Kill => {
+                        terminate_pty(&mut child, child_pid, process_group);
+                        break;
+                    }
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     terminate_pty(&mut child, child_pid, process_group);
                     break;
                 }
-            },
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if child.try_wait()?.is_some() {
-                    break;
-                }
+            }
+
+            drain_reader_output(&reader_rx, &emit, &mut reader_closed);
+
+            if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
+                terminate_pty(&mut child, child_pid, process_group);
+                break;
+            }
+
+            if reader_closed && child.try_wait()?.is_some() {
+                break;
             }
         }
+        Ok(())
+    })();
 
-        drain_reader_output(&reader_rx, &emit, &mut reader_closed);
-
-        if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
-            terminate_pty(&mut child, child_pid, process_group);
-            break;
-        }
-
-        if reader_closed && child.try_wait()?.is_some() {
-            break;
-        }
+    if outcome.is_err() {
+        terminate_pty(&mut child, child_pid, process_group);
     }
 
     drop(writer);
     drop(master);
-    let _ = child.wait();
-    let _ = reader_thread.join();
+    let waited = child.wait();
+    let joined = reader_thread.join();
     drain_reader_output(&reader_rx, &emit, &mut reader_closed);
+    outcome?;
+    waited?;
+    joined.map_err(|_| anyhow::anyhow!("failed to stop PTY reader: worker panicked"))?;
     Ok(())
 }
 
@@ -489,14 +543,22 @@ mod security_tests {
 
     #[test]
     fn ac1_9_pty_env_is_clear_then_allowlist_then_overrides() {
-        // SAFETY: a deliberately leaky env var that should not survive the scrub.
-        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "leaked") };
-        unsafe { std::env::set_var("PATH", "/usr/bin") };
-
         let mut overrides = HashMap::new();
         overrides.insert("CALLER_OVERRIDE".to_owned(), "yes".to_owned());
 
-        let env = pty_scrubbed_env(Some(&overrides));
+        let env = pty_scrubbed_env(
+            [
+                (
+                    std::ffi::OsString::from("AWS_SECRET_ACCESS_KEY"),
+                    std::ffi::OsString::from("leaked"),
+                ),
+                (
+                    std::ffi::OsString::from("PATH"),
+                    std::ffi::OsString::from("/usr/bin"),
+                ),
+            ],
+            Some(&overrides),
+        );
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
 
         assert!(
@@ -508,8 +570,6 @@ mod security_tests {
             keys.contains(&"CALLER_OVERRIDE"),
             "caller-supplied overrides must survive"
         );
-
-        unsafe { std::env::remove_var("AWS_SECRET_ACCESS_KEY") };
     }
 
     #[tokio::test]
@@ -533,6 +593,70 @@ mod security_tests {
         assert!(
             err.to_string().contains("disabled"),
             "expected ShellDisabled, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_shutdown_waits_for_pty_process_and_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let policy: Arc<dyn ToolPolicy> = Arc::new(DefaultToolPolicy::new(PolicySettings {
+            allowed_read_roots: vec![root.path().to_owned()],
+            allowed_shell_commands: vec!["printf".to_owned(), "sleep".to_owned()],
+            ..PolicySettings::default()
+        }));
+        let mut context = tool_context_with(policy);
+        context.working_dir = root.path().to_owned();
+        PtyTool
+            .execute(
+                context.clone(),
+                json!({"action": "start", "command": "printf '%s' \"$$\" > pid; sleep 30"}),
+            )
+            .await
+            .unwrap();
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(root.path().join("pid")).await
+                    && let Ok(pid) = pid.parse::<i32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("PTY command publishes pid");
+        assert!(
+            PtyTool
+                .execute(
+                    context.clone(),
+                    json!({"action": "start", "command": "sleep 30"})
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("already active")
+        );
+        context.cancel.cancel();
+        assert!(
+            context
+                .tool_sessions
+                .pty_session(&context.session_id)
+                .lock()
+                .is_some()
+        );
+        context
+            .tool_sessions
+            .shutdown_session(&context.session_id)
+            .await
+            .unwrap();
+        assert!(!context.tool_sessions.has_process_state(&context.session_id));
+        // SAFETY: signal zero only probes the process created by this test.
+        let exists = unsafe { libc::kill(pid, 0) };
+        assert_eq!(exists, -1, "PTY process still alive after shutdown");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
         );
     }
 }
