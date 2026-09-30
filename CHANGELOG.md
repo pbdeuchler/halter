@@ -8,6 +8,21 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-29
+
+Cancellation now reaches every external call a turn makes. The turn's
+`CancellationToken` flows through provider HTTP/SSE, rate-limit waits, the
+model judge, hooks, subagent spawn/wait and browser actions, and callers can
+cancel a turn or compaction themselves. This is a minor release on the pre-1.0
+line because `SubagentControl::spawn`/`wait` gain a parameter and `HookInput`
+gains a field.
+
+Published crates: `halter`, `halter-config`, `halter-hooks`,
+`halter-protocol`, `halter-providers`, `halter-runtime`, `halter-session`,
+and `halter-tools`. `halter-cli` also moves to `0.8.0` but remains
+`publish = false`. The vendored `halter-brush-core` (0.5.0) and
+`halter-brush-builtins` (0.2.0) are unchanged.
+
 ### Added
 
 - `SessionHandle::submit_turn_with_cancel` (now public) and `SessionHandle::compact_with_cancel`: run a turn or a compaction under a caller-owned `CancellationToken`, including while waiting for the session's write lease.
