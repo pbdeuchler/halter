@@ -1195,3 +1195,22 @@ The config crate supports a focused set of environment overrides, including:
 These are useful for CI, local overrides, or environment-specific deployment adjustments without duplicating full config files.
 
 ---
+
+## Releasing
+
+Releases are cut from a clean `main` that matches `origin/main`, by a
+repository admin (the rulesets only let admins push to `main` and create tags):
+
+```sh
+bin/release 0.9.0                            # releases the [Unreleased] section
+bin/release --title "Short name" 0.9.0 notes.md   # or a changelog file ("-" for stdin)
+```
+
+The script moves every crate under `crates/` to the new version (vendored
+brush crates keep theirs) and writes the changelog into
+`## [0.9.0] - <date>` in `CHANGELOG.md`. It runs `cargo check`, then shows
+you the diff and the release notes. Nothing is committed until you confirm.
+After you confirm, it commits `Bump crate versions for v0.9.0`, pushes `main`
+and the `v0.9.0` tag together, and creates the GitHub release. The tag push
+runs `publish.yml`, which publishes the changed crates to crates.io. Pass
+`--yes` to skip the prompt.

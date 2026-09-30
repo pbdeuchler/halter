@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: bin/release [--title <title>] [--yes] <version> [changelog-file]
+
+Cut v<version> in one step: bump every crate under crates/ to <version>, move
+the changelog into a "## [<version>] - <date>" section of CHANGELOG.md, commit,
+tag, push, and create the GitHub release. Pushing the tag runs publish.yml,
+which publishes the changed crates to crates.io.
+
+The changelog is the file's contents ("-" reads stdin). Without a file, the
+current [Unreleased] section of CHANGELOG.md is released. Run from a clean
+main that matches origin/main. Nothing is committed until you confirm.
+USAGE
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+title=""
+yes=false
+positional=()
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --title)
+      [[ "$#" -ge 2 ]] || die "--title requires a value"
+      title="$2"
+      shift 2
+      ;;
+    --yes) yes=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+[[ "${#positional[@]}" -ge 1 && "${#positional[@]}" -le 2 ]] || { usage; exit 2; }
+version="${positional[0]}"
+changelog_file="${positional[1]:-}"
+tag="v${version}"
+title="${tag}${title:+ - ${title}}"
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "${repo_root}"
+
+[[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must be X.Y.Z, got ${version}"
+[[ "$(git symbolic-ref --short HEAD)" == main ]] || die "releases are cut from main"
+[[ -z "$(git status --porcelain --untracked-files=no)" ]] || die "commit or stash your changes first"
+git fetch --quiet --tags origin main
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || die "main does not match origin/main"
+if git rev-parse --quiet --verify "refs/tags/${tag}" >/dev/null; then
+  die "${tag} already exists"
+fi
+
+current="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/halter/Cargo.toml)"
+[[ "${current}" != "${version}" && "$(printf '%s\n' "${current}" "${version}" | sort -V | tail -1)" == "${version}" ]] \
+  || die "${version} must be newer than the current ${current}"
+prev_tag="$(git describe --tags --match 'v*' --abbrev=0)"
+
+grep -qx '## \[Unreleased\]' CHANGELOG.md || die "CHANGELOG.md has no '## [Unreleased]' heading"
+unreleased="$(awk '/^## \[/ { if (in_section) exit; in_section = ($0 == "## [Unreleased]"); next } in_section' CHANGELOG.md)"
+if [[ -n "${changelog_file}" ]]; then
+  [[ -z "${unreleased//[[:space:]]/}" ]] \
+    || die "[Unreleased] is not empty; fold it into ${changelog_file} or omit the file to release it"
+  body="$(cat -- "${changelog_file}")"
+else
+  body="${unreleased}"
+fi
+body="$(sed '/./,$!d' <<<"${body}")"
+[[ -n "${body//[[:space:]]/}" ]] || die "the changelog is empty"
+
+# Every edit below is reverted unless the release commit lands.
+trap 'git checkout --quiet -- CHANGELOG.md crates' EXIT
+
+HEADING="## [${version}] - $(date +%Y-%m-%d)" BODY="${body}" awk '
+  $0 == "## [Unreleased]" { print; print ""; print ENVIRON["HEADING"]; print ""; print ENVIRON["BODY"]; print ""; skip = 1; next }
+  skip && /^## \[/ { skip = 0 }
+  !skip
+' CHANGELOG.md >CHANGELOG.md.next
+mv CHANGELOG.md.next CHANGELOG.md
+
+# The workspace crates move in lockstep: each package version and each
+# halter-* path dependency. Vendored crates keep their own versions.
+old="${current//./\\.}"
+sed -i.bak -E \
+  -e "s/^version = \"${old}\"$/version = \"${version}\"/" \
+  -e "/^halter[a-z-]* = \{ path = /s/version = \"${old}\"/version = \"${version}\"/" \
+  crates/*/Cargo.toml
+rm crates/*/Cargo.toml.bak
+
+PLAYWRIGHT_DRIVER_VERSION="${PLAYWRIGHT_DRIVER_VERSION:-1.59.1}" cargo check --workspace --all-features --quiet
+
+bumps="$(bin/crate-release-candidates --base "${prev_tag}" 2>&1 >/dev/null \
+  | sed -n 's/^candidate: \([^ ]*\) [^ ]* (\(.*\))$/- \1 \2/p')"
+[[ -n "${bumps}" ]] || die "no publishable crate version changed"
+notes="Compared against ${prev_tag} ($(git rev-parse --short "${prev_tag}^{commit}")).
+
+Published crate bumps:
+${bumps}
+
+${body}"
+
+git --no-pager diff --stat
+printf '\n%s\n\n%s\n\n' "${title}" "${notes}"
+if [[ "${yes}" != true ]]; then
+  read -r -p "Commit, tag and push ${tag}, then publish to crates.io? [y/N] " answer
+  [[ "${answer}" == [yY] ]] || die "aborted; edits reverted"
+fi
+
+git commit --quiet -m "Bump crate versions for ${tag}" -- CHANGELOG.md crates
+trap - EXIT
+git tag -a "${tag}" -m "${tag}"
+git push --quiet --atomic origin main "refs/tags/${tag}"
+gh release create "${tag}" --verify-tag --title "${title}" --notes "${notes}"
+echo "crates.io publish: $(gh repo view --json url --jq .url)/actions/workflows/publish.yml"
