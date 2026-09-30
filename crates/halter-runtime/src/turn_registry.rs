@@ -1,23 +1,19 @@
 // pattern: Imperative Shell
 //
-// Tracks in-flight turn `JoinHandle`s and per-turn cancellation tokens
-// so the runtime can drain (or abort) outstanding work on shutdown.
-//
-// Pre-Phase-4 the spawned turn loop in `SessionHandle::submit_turn_with_cancel`
-// returned only the live event stream — the `JoinHandle` was dropped on the
-// floor and there was no way to wait for in-flight turns to settle when
-// the host process wanted to exit cleanly. AC2.3 / AC2.4 require that
-// runtime shutdown drain those tasks, with a per-shutdown deadline.
+// Owns actual execution tasks independently of their event-stream consumers.
+// Supervisors retain join handles and share completion with session-level
+// interruption and runtime shutdown, so overlapping waiters cannot detach work.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use halter_protocol::TurnId;
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::sync::watch;
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -38,13 +34,12 @@ pub struct ShutdownReport {
     pub timed_out: bool,
 }
 
-/// Runtime-wide registry of in-flight turn tasks. Each entry pairs a
-/// `JoinHandle` with the `CancellationToken` that controls the turn so
-/// shutdown can both signal cooperative cancellation and reclaim the
-/// handle for `JoinHandle::abort` if the drain deadline expires.
+/// Runtime-wide registry of in-flight execution tasks. Entries hold their
+/// cancellation and abort controls plus a shared completion notification;
+/// supervisors own the actual join handles until execution has settled.
 #[derive(Default)]
 pub struct TurnRegistry {
-    inner: Mutex<TurnRegistryInner>,
+    inner: Arc<Mutex<TurnRegistryInner>>,
     /// Parent of every runtime-issued token, cancelled by `shutdown`, so work
     /// that is not (yet) a registered turn still observes runtime shutdown.
     root: CancellationToken,
@@ -56,9 +51,22 @@ struct TurnRegistryInner {
     shutting_down: bool,
 }
 
+#[derive(Clone)]
 struct RegisteredTurn {
     cancel: CancellationToken,
-    handle: JoinHandle<()>,
+    abort: AbortHandle,
+    complete: watch::Receiver<bool>,
+}
+
+impl RegisteredTurn {
+    async fn wait(&self) {
+        let mut complete = self.complete.clone();
+        while !*complete.borrow_and_update() {
+            if complete.changed().await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 impl TurnRegistry {
@@ -89,9 +97,26 @@ impl TurnRegistry {
             handle.abort();
             return Err(TurnRegistryError::DuplicateTurn(turn_id));
         }
-        inner
-            .in_flight
-            .insert(turn_id, RegisteredTurn { cancel, handle });
+        let abort = handle.abort_handle();
+        let (complete_tx, complete) = watch::channel(false);
+        inner.in_flight.insert(
+            turn_id.clone(),
+            RegisteredTurn {
+                cancel,
+                abort,
+                complete,
+            },
+        );
+        // A supervisor retains the actual task's join handle even when a
+        // shutdown waiter times out. Every cancellation path can observe the
+        // same completion, and aborting a stream consumer cannot detach work.
+        let registry = self.inner.clone();
+        tokio::spawn(async move {
+            let _ = handle.await;
+            complete_tx.send_replace(true);
+            let mut inner = registry.lock().unwrap_or_else(|error| error.into_inner());
+            inner.in_flight.remove(&turn_id);
+        });
         Ok(())
     }
 
@@ -101,12 +126,39 @@ impl TurnRegistry {
         self.root.child_token()
     }
 
+    pub(crate) fn begin_shutdown(&self) {
+        let mut inner = self.lock();
+        inner.shutting_down = true;
+        self.root.cancel();
+        for turn in inner.in_flight.values() {
+            turn.cancel.cancel();
+        }
+    }
+
     /// Remove a turn from the registry. Idempotent: deregistering an
     /// unknown id is a no-op (covers the race where shutdown drains
     /// the entry just before the task body's deregister runs).
     pub fn deregister(&self, turn_id: &TurnId) {
         let mut inner = self.lock();
         inner.in_flight.remove(turn_id);
+    }
+
+    /// Abort the executor itself and wait until its future has been dropped.
+    /// Registration remains discoverable while global shutdown is draining.
+    pub(crate) async fn abort_and_wait(&self, turn_id: &TurnId) {
+        let registered = self.lock().in_flight.get(turn_id).cloned();
+        if let Some(registered) = registered {
+            registered.cancel.cancel();
+            registered.abort.abort();
+            registered.wait().await;
+        }
+    }
+
+    pub(crate) fn abort(&self, turn_id: &TurnId) {
+        if let Some(turn) = self.lock().in_flight.get(turn_id) {
+            turn.cancel.cancel();
+            turn.abort.abort();
+        }
     }
 
     /// Whether shutdown has started and new turns are rejected.
@@ -121,23 +173,31 @@ impl TurnRegistry {
         self.lock().in_flight.len()
     }
 
-    /// Mark the registry as shutting down, cancel every in-flight turn
-    /// token, and wait for the spawned tasks to settle. After `drain`
-    /// elapses any still-running tasks are aborted.
-    pub async fn shutdown(&self, drain: Duration) -> ShutdownReport {
-        let handles = {
-            let mut inner = self.lock();
-            inner.shutting_down = true;
-            self.root.cancel();
+    /// Close admission, cancel in-flight execution, and await settlement.
+    /// `None` waits without a deadline. A finite timeout aborts remaining
+    /// executors; supervisors keep ownership until their futures are dropped.
+    pub async fn shutdown(&self, timeout: impl Into<Option<Duration>>) -> ShutdownReport {
+        // A duration beyond the representable clock range is effectively
+        // unlimited; no reachable runtime instant could exhaust it.
+        let deadline = timeout
+            .into()
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+        self.shutdown_at(deadline).await
+    }
+
+    pub(crate) async fn shutdown_at(&self, deadline: Option<Instant>) -> ShutdownReport {
+        self.begin_shutdown();
+        let turns = {
+            let inner = self.lock();
             let mut taken = Vec::with_capacity(inner.in_flight.len());
-            for (_, registered) in inner.in_flight.drain() {
+            for registered in inner.in_flight.values() {
                 registered.cancel.cancel();
-                taken.push(registered.handle);
+                taken.push(registered.clone());
             }
             taken
         };
 
-        if handles.is_empty() {
+        if turns.is_empty() {
             debug!("turn registry shutdown: no in-flight turns");
             return ShutdownReport {
                 turns_drained: 0,
@@ -146,38 +206,30 @@ impl TurnRegistry {
             };
         }
 
-        debug!(in_flight = handles.len(), drain_ms = %drain.as_millis(), "turn registry shutdown: draining");
-
-        let abort_handles: Vec<_> = handles
-            .iter()
-            .map(tokio::task::JoinHandle::abort_handle)
-            .collect();
-        let total = handles.len();
-        let drained = Arc::new(AtomicUsize::new(0));
-        let drained_in_loop = drained.clone();
-        let join_all = async move {
-            for handle in handles {
-                let _ = handle.await;
-                drained_in_loop.fetch_add(1, Ordering::Relaxed);
+        debug!(in_flight = turns.len(), "turn registry shutdown: draining");
+        let settled = futures::future::join_all(turns.iter().map(RegisteredTurn::wait));
+        tokio::pin!(settled);
+        let elapsed = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
             }
         };
-
-        match tokio::time::timeout(drain, join_all).await {
-            Ok(()) => ShutdownReport {
-                turns_drained: drained.load(Ordering::Relaxed),
+        tokio::select! {
+            _ = &mut settled => ShutdownReport {
+                turns_drained: turns.len(),
                 turns_aborted: 0,
                 timed_out: false,
             },
-            Err(_) => {
-                let drained_count = drained.load(Ordering::Relaxed);
-                let aborted = total - drained_count;
-                for abort_handle in abort_handles {
-                    abort_handle.abort();
+            _ = elapsed => {
+                let drained_count = turns.iter().filter(|turn| *turn.complete.borrow()).count();
+                let aborted = turns.len() - drained_count;
+                for turn in &turns {
+                    turn.abort.abort();
                 }
                 warn!(
                     drained = drained_count,
                     pending = aborted,
-                    drain_ms = %drain.as_millis(),
                     "turn registry shutdown: drain timeout, aborting remaining tasks"
                 );
                 ShutdownReport {
@@ -207,6 +259,50 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn force_abort_remains_available_after_global_shutdown_starts() {
+        let registry = Arc::new(TurnRegistry::new());
+        let turn_id = TurnId::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started, ready) = oneshot::channel();
+        let handle = tokio::spawn({
+            let dropped = dropped.clone();
+            async move {
+                struct Dropped(Arc<AtomicBool>);
+                impl Drop for Dropped {
+                    fn drop(&mut self) {
+                        self.0.store(true, AtomicOrdering::SeqCst);
+                    }
+                }
+                let _dropped = Dropped(dropped);
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+        let cancel = CancellationToken::new();
+        registry
+            .register(turn_id.clone(), cancel.clone(), handle)
+            .unwrap();
+        ready.await.unwrap();
+        let shutdown = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.shutdown(None).await }
+        });
+        cancel.cancelled().await;
+        assert!(
+            !shutdown.is_finished(),
+            "unlimited drain waits for actual execution"
+        );
+        registry.abort_and_wait(&turn_id).await;
+        assert!(
+            dropped.load(AtomicOrdering::SeqCst),
+            "force abort joins the actual execution future"
+        );
+        let report = shutdown.await.unwrap();
+        assert_eq!(report.turns_drained, 1);
+        assert!(!report.timed_out);
+    }
 
     #[tokio::test]
     async fn child_tokens_fire_only_on_shutdown() {

@@ -18,8 +18,8 @@ use halter::prelude::*;
 use halter_config::{export_json_schema, generate_starter_config, load_path};
 use halter_protocol::{AssistantMessage, SessionEvent, SessionEventPayload};
 use run_output::{
-    JsonResultTracker, RunOutputArgs, RunOutputMode, strip_signatures_from_assistant_message,
-    strip_signatures_from_session_event,
+    JsonResultTracker, RunOutputArgs, RunOutputMode, input_completion,
+    strip_signatures_from_assistant_message, strip_signatures_from_session_event,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info};
@@ -239,38 +239,39 @@ async fn run_once_body(
     output_mode: RunOutputMode,
     output: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let message_id = session.submit(Message::user(task)).await?;
+    let submission = session.submit(Message::user(task)).await?;
 
     match output_mode {
         RunOutputMode::StreamingJson => {
-            let mut running = false;
             let mut accepted = false;
             while let Some(event) = events.next().await {
                 let event = event?;
                 write_json_event(output, &event)?;
-                if !accepted {
-                    accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if message.id == message_id);
+                if event.session_id != *session.id() || event.sequence() < submission.sequence {
                     continue;
                 }
-                match event.payload {
-                    SessionEventPayload::SessionStatusChanged {
-                        status: SessionStatus::Running,
-                    } => running = true,
-                    SessionEventPayload::SessionStatusChanged {
-                        status: SessionStatus::Idle,
-                    } if running => return Ok(()),
-                    _ => {}
+                if !accepted {
+                    accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if message.id == submission.message_id);
+                    continue;
+                }
+                if input_completion(&event.payload, &submission.message_id)
+                    .map_err(anyhow::Error::msg)?
+                {
+                    return Ok(());
                 }
             }
             anyhow::bail!("session closed before execution completed")
         }
         RunOutputMode::JsonResult => {
-            let mut tracker = JsonResultTracker::default();
+            let mut tracker = JsonResultTracker::new(submission.message_id.clone());
             let mut accepted = false;
             while let Some(event) = events.next().await {
                 let event = event?;
+                if event.session_id != *session.id() || event.sequence() < submission.sequence {
+                    continue;
+                }
                 if !accepted {
-                    accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if message.id == message_id);
+                    accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if message.id == submission.message_id);
                     continue;
                 }
                 if let Some(result) = tracker
@@ -309,7 +310,7 @@ async fn drain_then_end_session(
     result: anyhow::Result<()>,
     reason: &str,
 ) -> anyhow::Result<()> {
-    let session_shutdown = tokio::time::timeout(SHUTDOWN_DRAIN, session.shutdown()).await;
+    let session_shutdown = session.shutdown(Some(SHUTDOWN_DRAIN)).await;
     let report = harness.shutdown(SHUTDOWN_DRAIN).await;
     info!(
         drained = report.turns_drained,
@@ -319,9 +320,7 @@ async fn drain_then_end_session(
         "runtime drained"
     );
     result?;
-    session_shutdown
-        .context("timed out waiting for session cleanup")?
-        .map_err(Into::into)
+    session_shutdown.map_err(Into::into)
 }
 
 async fn chat_body(
@@ -338,15 +337,25 @@ async fn chat_body(
             continue;
         }
 
-        let message_id = session.submit(Message::user(line)).await?;
+        let submission = session.submit(Message::user(line)).await?;
         let mut accepted = false;
-        let mut running = false;
         let mut completed = false;
         while let Some(event) = events.next().await {
             let event = event?;
-            if !accepted {
-                accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if message.id == message_id);
+            if event.session_id != *session.id() || event.sequence() < submission.sequence {
                 continue;
+            }
+            if !accepted {
+                accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if message.id == submission.message_id);
+                continue;
+            }
+            if input_completion(&event.payload, &submission.message_id)
+                .map_err(anyhow::Error::msg)?
+            {
+                completed = true;
+                writeln!(output).context("failed to write output")?;
+                output.flush().context("failed to flush output")?;
+                break;
             }
             match event.payload {
                 SessionEventPayload::DeltaItem { delta } => {
@@ -357,18 +366,6 @@ async fn chat_body(
                     write!(output, "{}", chunk).context("failed to write output")?;
                     output.flush().context("failed to flush output")?;
                 }
-                SessionEventPayload::SessionStatusChanged {
-                    status: SessionStatus::Running,
-                } => running = true,
-                SessionEventPayload::SessionStatusChanged {
-                    status: SessionStatus::Idle,
-                } if running => {
-                    completed = true;
-                    writeln!(output).context("failed to write output")?;
-                    output.flush().context("failed to flush output")?;
-                    break;
-                }
-                SessionEventPayload::TurnFailed { error, .. } => anyhow::bail!(error),
                 _ => {}
             }
         }

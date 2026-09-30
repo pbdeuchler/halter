@@ -47,19 +47,21 @@ async fn main() -> anyhow::Result<()> {
     let harness = Halter::from_config_file("halter.toml").await?;
     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 
-    session.submit(Message::user("Summarize the session persistence design")).await?;
-
-    let mut running = false;
+    let submission = session.submit(Message::user("Summarize the session persistence design")).await?;
     while let Some(event) = events.next().await {
         let event = event?;
+        if event.session_id != *session.id() || event.sequence() < submission.sequence {
+            continue;
+        }
         println!("{:?}", event.payload);
         match event.payload {
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
+            SessionEventPayload::InputSettled { message_id: id, .. }
+            | SessionEventPayload::InputRejected { message_id: id, .. }
+            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
             _ => {}
         }
     }
-    session.shutdown().await?;
+    session.shutdown(None).await?;
 
     Ok(())
 }
@@ -72,7 +74,7 @@ This code does all of the following:
 - builds providers, tools, hooks, policy, and session storage
 - creates a runtime
 - creates a session
-- durably accepts input and streams session events until execution becomes idle
+- durably accepts input and streams its outcome or deferral
 
 ### Detailed events
 
@@ -91,17 +93,20 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-    session.submit(Message::user("List the major crates in this repo")).await?;
-    let mut running = false;
+    let submission = session.submit(Message::user("List the major crates in this repo")).await?;
     while let Some(event) = stream.next().await {
         let event = event?;
+        if event.session_id != *session.id() || event.sequence() < submission.sequence {
+            continue;
+        }
         match event.payload {
             SessionEventPayload::DeltaItem { delta } => print!("{}", delta.text),
             SessionEventPayload::TurnCompleted { usage, .. } => {
                 println!("\nusage: in={} out={}", usage.input_tokens, usage.output_tokens);
             }
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
+            SessionEventPayload::InputSettled { message_id: id, .. }
+            | SessionEventPayload::InputRejected { message_id: id, .. }
+            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
             SessionEventPayload::TurnFailed { error, .. } => {
                 eprintln!("turn failed: {error}");
             }
@@ -109,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    session.shutdown().await?;
+    session.shutdown(None).await?;
 
     Ok(())
 }
@@ -151,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
 
     let harness = Halter::from_config(config, snapshot).await?;
     let (session, _events) = harness.new_session(SessionInit::default()).await?;
-    session.shutdown().await?;
+    session.shutdown(None).await?;
     Ok(())
 }
 ```
@@ -860,16 +865,20 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
-    session.submit(Message::user("Describe the active runtime and available skills")).await?;
-    let mut running = false;
+    let submission = session.submit(Message::user("Describe the active runtime and available skills")).await?;
     while let Some(event) = events.next().await {
-        match event?.payload {
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
+        let event = event?;
+        if event.session_id != *session.id() || event.sequence() < submission.sequence {
+            continue;
+        }
+        match event.payload {
+            SessionEventPayload::InputSettled { message_id: id, .. }
+            | SessionEventPayload::InputRejected { message_id: id, .. }
+            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
             _ => {}
         }
     }
-    session.shutdown().await?;
+    session.shutdown(None).await?;
 
     Ok(())
 }
@@ -1053,7 +1062,7 @@ remain in diagnostic events; clients submit messages and control the session.
 
 #### Input, interruption, and reopening
 
-`submit(Message::user(...)).await` returns the message ID after the session store
+`submit(Message::user(...)).await` returns a submission receipt after the session store
 has committed the input. While idle, submission starts execution. While a provider
 or foreground tool is running, input queues and is delivered at the next safe
 conversation boundary. A `MessageItem` event confirms delivery into history.
@@ -1065,20 +1074,20 @@ let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 let session_id = session.id().clone();
 session.submit(Message::user("Refactor the parser")).await?;
 session.submit(Message::user("Keep its public API unchanged")).await?;
-session.interrupt().await?;
-session.shutdown().await?;
+session.interrupt(None).await?;
+session.shutdown(None).await?;
 
 // A fresh driver starts idle with the stored conversation and pending input.
 let (session, events) = harness.resume_session(&session_id).await?;
 session.submit(Message::user("Continue with the parser tests")).await?;
 ```
 
-`interrupt()` waits for cancellation, foreground-tool cleanup, and final state
+`interrupt(None)` waits for cancellation, foreground-tool cleanup, and final state
 commits. Earlier accepted input remains recorded but does not restart execution
 until a later submission. Cancellation cannot undo effects already performed by
 a tool. Custom tools must honor the cancellation token and clean up their resources.
 
-`shutdown()` closes the driver, its handles, and its stream, and cleans up owned
+`shutdown(None)` closes the driver, its handles, and its stream, and cleans up owned
 resources. The stored conversation can be reopened; old handles stay closed.
 Reopening restores history and pending input without rerunning tools or launching
 old processes. Dropping an event stream does not stop execution.
@@ -1087,6 +1096,25 @@ The stream stays open through idle periods and interruptions. Consume
 `SessionStatusChanged` events to track `Running`, `Idle`, and `Closed`; a newly
 opened stream includes its initial idle status. Provider deltas and tool output
 retain their existing buffering behavior.
+
+`submit` returns `Submission { message_id, sequence }` after acceptance commits.
+For completion, ignore events before `submission.sequence`, then match
+`submission.message_id` in `InputSettled`; its outcome is `Completed`, `Failed`,
+or `Interrupted`. `InputRejected` reports a hook
+decision, while `InputDeferred` means that input remains queued. Several steering
+messages can share one execution outcome and assistant response. Activity changes
+such as `Running` and `Idle` also cover compaction and do not prove input completed.
+
+When retrying a queued message with the same ID, the receipt identifies its fresh
+`InputAccepted` sequence. Ignore earlier events on a retained stream. Retry
+preserves the original contents and does not duplicate the inbox entry.
+Submitting an already
+settled or rejected ID starts no new work; read its outcome with `replay()`.
+Pass `Some(duration)` to `interrupt` or `shutdown` to set a cooperative cleanup
+deadline; `None` waits without a deadline. Expiry returns `SessionError::TimedOut`
+and requests forced recovery. Call the control method again with `None` to
+await settlement. In-flight storage writes or blocking code may delay settlement;
+a shutting-down session stays fenced until cleanup finishes.
 
 > [!NOTE]
 > halter implements its own compaction strategy. This can be less token efficient than managed compaction from inference providers or frontier harnesses. The goal is a higher-quality context window, which can reduce overall token use throughout the turn and gives halter a consistent baseline across providers and models.

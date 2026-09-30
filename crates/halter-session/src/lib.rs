@@ -108,6 +108,14 @@ pub trait SessionStore: Send + Sync {
         state: Option<SessionState>,
         events: Vec<PendingEvent>,
     ) -> Result<Vec<SessionEvent>>;
+    /// Wait for previously admitted writes, including writes whose caller was
+    /// cancelled. The runtime calls this after stopping an executor and before
+    /// loading its state for recovery. Stores with work that can outlive a
+    /// dropped future must override this barrier; fully cancellable stores need
+    /// no additional synchronization.
+    async fn synchronize(&self, _session_id: &SessionId) -> Result<()> {
+        Ok(())
+    }
     /// Replay committed events for a session in sequence order.
     async fn replay(&self, session_id: &SessionId) -> Result<Vec<SessionEvent>>;
     /// Replay committed events with sequence greater than `after_sequence`,

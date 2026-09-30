@@ -61,7 +61,13 @@ use crate::{Message, SessionEvent, SessionEventPayload, SessionState};
 pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
     match payload {
         SessionEventPayload::InputAccepted { message } => {
-            state.pending_inputs.push(message.clone());
+            if !state
+                .pending_inputs
+                .iter()
+                .any(|pending| pending.id == message.id)
+            {
+                state.pending_inputs.push(message.clone());
+            }
         }
         SessionEventPayload::InputRejected { message_id, .. } => {
             state
@@ -119,6 +125,8 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         SessionEventPayload::ContextCompacted { effects: None, .. }
         | SessionEventPayload::SessionStarted
         | SessionEventPayload::SessionResumed
+        | SessionEventPayload::InputSettled { .. }
+        | SessionEventPayload::InputDeferred { .. }
         | SessionEventPayload::Warning { .. }
         | SessionEventPayload::TurnStarted { .. }
         | SessionEventPayload::DeltaItem { .. }
@@ -298,6 +306,24 @@ mod tests {
                 vec![first.clone(), second.clone()],
                 vec![],
             ),
+            (
+                "deferred input stays queued",
+                SessionEventPayload::InputDeferred {
+                    message_id: first.id.clone(),
+                    reason: crate::InputDeferredReason::Interrupted,
+                },
+                vec![first.clone(), second.clone()],
+                vec![],
+            ),
+            (
+                "settlement is an outcome rather than inbox delivery",
+                SessionEventPayload::InputSettled {
+                    message_id: first.id.clone(),
+                    outcome: crate::InputOutcome::Completed,
+                },
+                vec![first.clone(), second.clone()],
+                vec![],
+            ),
         ];
         for (name, payload, pending_inputs, messages) in cases {
             let mut state = accepted.clone();
@@ -310,6 +336,20 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn retry_acceptance_keeps_one_canonical_queued_message() {
+        let original = UserMessage::text("original task");
+        let mut replacement = UserMessage::text("different task");
+        replacement.id = original.id.clone();
+        let mut state = SessionState::default();
+        for message in [original.clone(), replacement, original.clone()] {
+            apply_event(&mut state, &SessionEventPayload::InputAccepted { message });
+        }
+        assert_eq!(state.pending_inputs, [original]);
+        assert!(state.messages.is_empty());
+        assert_eq!(state.token_ledger, TokenLedger::default());
     }
 
     #[test]
@@ -919,6 +959,14 @@ mod tests {
                 .collect();
             let mut events = vec![];
             for (message, _) in &inputs {
+                events.push(committed(events.len() as u64 + 1, SessionEventPayload::InputAccepted {
+                    message: message.clone(),
+                }));
+                // A deferred input can be explicitly retried before delivery.
+                events.push(committed(events.len() as u64 + 1, SessionEventPayload::InputDeferred {
+                    message_id: message.id.clone(),
+                    reason: crate::InputDeferredReason::Interrupted,
+                }));
                 events.push(committed(events.len() as u64 + 1, SessionEventPayload::InputAccepted {
                     message: message.clone(),
                 }));

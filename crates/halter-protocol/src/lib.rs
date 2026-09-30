@@ -763,6 +763,11 @@ pub struct WaitSubagentRequest {
 /// Request payload for closing a subagent.
 pub struct CloseSubagentRequest {
     pub target: AgentId,
+    /// Bound the caller's wait for cancellation and cleanup. Omit to wait
+    /// without a deadline. Expiry requests forced cleanup; settlement may
+    /// continue after the timeout error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -983,13 +988,34 @@ pub const SESSION_LOG_FORMAT: u32 = 2;
 #[serde(rename_all = "snake_case")]
 /// Persisted lifecycle state of a session driver.
 pub enum SessionStatus {
-    /// The driver is open and no execution is active.
+    /// The driver is open and no execution is active. Input may remain queued.
     #[default]
     Idle,
-    /// The driver is executing accepted input.
+    /// The driver is executing accepted input or compacting the conversation.
     Running,
     /// The driver has stopped and its handles are closed.
     Closed,
+}
+
+/// The execution outcome of input delivered into the conversation.
+/// Multiple inputs delivered during one execution share its outcome.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputOutcome {
+    Completed,
+    Failed { error: String, retryable: bool },
+    Interrupted,
+}
+
+/// Why accepted input is still queued rather than executing.
+/// Deferral preserves the input and permits a later explicit retry.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputDeferredReason {
+    Interrupted,
+    ExecutionFailed { error: String, retryable: bool },
+    Shutdown,
+    Resumed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1003,6 +1029,8 @@ pub enum SessionEventPayload {
     SessionResumed,
     /// Input durably accepted into the session inbox. It enters the
     /// provider-facing transcript only when delivered as a `MessageItem`.
+    /// Explicit retry of a queued ID emits another acceptance boundary with
+    /// its original contents; replay adds that ID to the inbox at most once.
     InputAccepted {
         message: UserMessage,
     },
@@ -1010,6 +1038,18 @@ pub enum SessionEventPayload {
     InputRejected {
         message_id: MessageId,
         reason: String,
+    },
+    /// Delivered input reached an execution outcome. This is the completion
+    /// signal for consumers; driver activity changes are not input outcomes.
+    InputSettled {
+        message_id: MessageId,
+        outcome: InputOutcome,
+    },
+    /// Input remains in the inbox. This notification is not a terminal
+    /// outcome; a later submission can restart execution of the same ID.
+    InputDeferred {
+        message_id: MessageId,
+        reason: InputDeferredReason,
     },
     /// The session driver changed lifecycle state.
     SessionStatusChanged {
@@ -2037,6 +2077,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn close_subagent_timeout_is_optional_and_defaults_to_unlimited() {
+        for input in [
+            serde_json::json!({ "target": "agent-1" }),
+            serde_json::json!({ "target": "agent-1", "timeout_ms": null }),
+        ] {
+            let request: CloseSubagentRequest = serde_json::from_value(input).unwrap();
+            assert_eq!(request.timeout_ms, None);
+            assert_eq!(
+                serde_json::to_value(request).unwrap(),
+                serde_json::json!({ "target": "agent-1" })
+            );
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(CloseSubagentRequest)).unwrap();
+        assert_eq!(schema["required"], serde_json::json!(["target"]));
+        assert!(schema["properties"]["timeout_ms"].is_object());
+    }
+
+    proptest! {
+        #[test]
+        fn close_subagent_request_roundtrips_optional_deadlines(
+            timeout_ms in proptest::option::of(any::<u64>())
+        ) {
+            let request = CloseSubagentRequest {
+                target: AgentId::from("agent-1"),
+                timeout_ms,
+            };
+            let encoded = serde_json::to_value(&request).unwrap();
+            prop_assert_eq!(encoded.get("timeout_ms").is_some(), timeout_ms.is_some());
+            prop_assert_eq!(serde_json::from_value::<CloseSubagentRequest>(encoded).unwrap(), request);
+        }
+    }
+
+    #[test]
     fn session_status_wire_values_roundtrip_and_match_schema() {
         let cases = [
             (SessionStatus::Idle, "idle"),
@@ -2076,10 +2149,26 @@ mod tests {
             (
                 "input_rejected",
                 SessionEventPayload::InputRejected {
-                    message_id: message.id,
+                    message_id: message.id.clone(),
                     reason: "invalid input".to_owned(),
                 },
                 "message_id",
+            ),
+            (
+                "input_settled",
+                SessionEventPayload::InputSettled {
+                    message_id: message.id.clone(),
+                    outcome: InputOutcome::Completed,
+                },
+                "outcome",
+            ),
+            (
+                "input_deferred",
+                SessionEventPayload::InputDeferred {
+                    message_id: message.id,
+                    reason: InputDeferredReason::Interrupted,
+                },
+                "reason",
             ),
             (
                 "session_status_changed",
@@ -2137,7 +2226,14 @@ mod tests {
             let message = UserMessage::text(text);
             for payload in [
                 SessionEventPayload::InputAccepted { message: message.clone() },
-                SessionEventPayload::InputRejected { message_id: message.id.clone(), reason },
+                SessionEventPayload::InputRejected { message_id: message.id.clone(), reason: reason.clone() },
+                SessionEventPayload::InputSettled { message_id: message.id.clone(), outcome: InputOutcome::Completed },
+                SessionEventPayload::InputSettled { message_id: message.id.clone(), outcome: InputOutcome::Failed { error: reason.clone(), retryable: true } },
+                SessionEventPayload::InputSettled { message_id: message.id.clone(), outcome: InputOutcome::Interrupted },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::Interrupted },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::ExecutionFailed { error: reason, retryable: false } },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::Shutdown },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::Resumed },
             ] {
                 let encoded = serde_json::to_vec(&payload).unwrap();
                 let decoded: SessionEventPayload = serde_json::from_slice(&encoded).unwrap();

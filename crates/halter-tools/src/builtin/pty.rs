@@ -81,12 +81,18 @@ pub struct PtySessionHandle {
     control_tx: mpsc::Sender<ControlMessage>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
     generation: Arc<()>,
-    termination: tokio::sync::oneshot::Receiver<Option<PtyTermination>>,
+    termination: PtyTermination,
 }
 
 // A separate killer lets shutdown unblock a worker stuck writing PTY input.
 // Taking the option ensures native process termination happens only once.
-type PtyTermination = Arc<Mutex<Option<PtyChildKiller>>>;
+type PtyTermination = Arc<Mutex<PtyTerminationState>>;
+
+#[derive(Default)]
+struct PtyTerminationState {
+    stopped: bool,
+    killer: Option<PtyChildKiller>,
+}
 
 struct PtyChildKiller {
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -184,7 +190,13 @@ impl Tool for PtyTool {
                     ..config
                 };
                 ensure_not_cancelled(&context.cancel)?;
-                start_session(session, config, context.emit.clone()).await?;
+                start_session(
+                    session,
+                    config,
+                    context.emit.clone(),
+                    context.tool_sessions.process_lifetime(&context.session_id),
+                )
+                .await?;
                 Ok(ToolResult::Json {
                     value: json!({ "started": true }),
                 })
@@ -219,28 +231,32 @@ async fn start_session(
     session: Arc<Mutex<Option<PtySessionHandle>>>,
     config: PtyConfig,
     emit: Arc<dyn crate::ToolEventSink>,
+    lifetime: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     let (control_tx, control_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (termination_tx, termination_rx) = tokio::sync::oneshot::channel();
+    let termination = Arc::new(Mutex::new(PtyTerminationState::default()));
+    let termination_for_task = termination.clone();
     let session_for_task = Arc::clone(&session);
     let generation = Arc::new(());
     let generation_for_task = generation.clone();
     {
         let mut guard = session.lock();
         anyhow::ensure!(
+            !lifetime.is_cancelled(),
+            "failed to execute pty tool: session is closed"
+        );
+        anyhow::ensure!(
             guard.is_none(),
             "failed to execute pty tool: PTY session already active"
         );
         let task = tokio::task::spawn_blocking(move || {
-            let result = match prepare_pty(&config) {
+            let result = match prepare_pty(&config, termination_for_task, &lifetime) {
                 Ok(state) => {
-                    let _ = termination_tx.send(Some(state.termination.clone()));
                     let _ = ready_tx.send(Ok(()));
                     run_pty_loop(state, config.timeout, control_rx, emit)
                 }
                 Err(error) => {
-                    let _ = termination_tx.send(None);
                     let _ = ready_tx.send(Err(error));
                     Ok(())
                 }
@@ -258,7 +274,7 @@ async fn start_session(
             control_tx,
             task,
             generation,
-            termination: termination_rx,
+            termination,
         });
     }
     ready_rx
@@ -274,15 +290,7 @@ pub(crate) async fn stop_session(
     let handle = session.lock().take();
     if let Some(handle) = handle {
         let _ = handle.control_tx.send(ControlMessage::Kill);
-        let killed = match handle.termination.await {
-            Ok(Some(termination)) => {
-                tokio::task::spawn_blocking(move || {
-                    terminate_pty(&termination);
-                })
-                .await
-            }
-            Ok(None) | Err(_) => Ok(()),
-        };
+        let killed = tokio::task::spawn_blocking(move || terminate_pty(&handle.termination)).await;
         // Join even if the independent killer panicked; the worker owns the
         // child wait and reader thread, and both must finish before returning.
         let joined = handle.task.await;
@@ -290,6 +298,15 @@ pub(crate) async fn stop_session(
         joined.map_err(|error| anyhow::anyhow!("failed to stop PTY worker: {error}"))??;
     }
     Ok(())
+}
+
+pub(crate) fn request_stop_session(session: &Arc<Mutex<Option<PtySessionHandle>>>) {
+    if let Some(handle) = session.lock().as_ref() {
+        let _ = handle.control_tx.send(ControlMessage::Kill);
+        // Native termination is independent of the worker's control loop,
+        // which may currently be blocked writing to a full terminal buffer.
+        terminate_pty(&handle.termination);
+    }
 }
 
 fn send_control(
@@ -314,7 +331,11 @@ struct PtyRunState {
     master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
-fn prepare_pty(config: &PtyConfig) -> anyhow::Result<PtyRunState> {
+fn prepare_pty(
+    config: &PtyConfig,
+    termination: PtyTermination,
+    lifetime: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<PtyRunState> {
     let system = native_pty_system();
     let pair = system.openpty(PtySize {
         rows: config.rows,
@@ -346,11 +367,17 @@ fn prepare_pty(config: &PtyConfig) -> anyhow::Result<PtyRunState> {
     let child = pair.slave.spawn_command(command)?;
     let child_pid = child.process_id().map(|pid| pid as i32);
     let process_group = child_pid.and_then(process_group_id);
-    let termination = Arc::new(Mutex::new(Some(PtyChildKiller {
+    let mut control = termination.lock();
+    control.killer = Some(PtyChildKiller {
         killer: child.clone_killer(),
         child_pid,
         process_group,
-    })));
+    });
+    let stopped = control.stopped || lifetime.is_cancelled();
+    drop(control);
+    if stopped {
+        terminate_pty(&termination);
+    }
 
     Ok(PtyRunState {
         child,
@@ -421,7 +448,7 @@ fn run_pty_loop(
                 if child.try_wait()?.is_some() {
                     // Retire the killer while reaping under the same lock,
                     // so concurrent shutdown cannot signal an already reaped PID.
-                    killer.take();
+                    killer.killer.take();
                     break;
                 }
             }
@@ -484,7 +511,9 @@ fn drain_reader_output(
 }
 
 fn terminate_pty(termination: &PtyTermination) {
-    if let Some(mut target) = termination.lock().take() {
+    let mut state = termination.lock();
+    state.stopped = true;
+    if let Some(mut target) = state.killer.take() {
         terminate_pty_child(&mut target.killer, target.child_pid, target.process_group);
     }
 }

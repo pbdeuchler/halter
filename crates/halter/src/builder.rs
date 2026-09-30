@@ -449,15 +449,18 @@ impl Halter {
         &self.config
     }
 
-    /// Drain all in-flight turns and refuse new submissions. Bounded by
-    /// `drain` — tasks still running when the deadline elapses are
-    /// aborted via `JoinHandle::abort`.
+    /// Stop submissions and clean up execution and session resources.
+    /// `None` waits without a deadline; a duration bounds the wait and
+    /// requests forced cancellation when it expires.
     ///
     /// Wire this into your process-level signal handler (e.g.
     /// `tokio::signal::ctrl_c`) so that Ctrl-C does not orphan
     /// half-committed turns.
-    pub async fn shutdown(&self, drain: std::time::Duration) -> halter_runtime::ShutdownReport {
-        self.runtime.shutdown(drain).await
+    pub async fn shutdown(
+        &self,
+        timeout: impl Into<Option<std::time::Duration>>,
+    ) -> halter_runtime::ShutdownReport {
+        self.runtime.shutdown(timeout).await
     }
 }
 
@@ -1734,7 +1737,7 @@ mod tests {
             harness.resume_session(&session_id).await.is_err(),
             "an open conversation has one driver"
         );
-        session.shutdown().await.expect("close session");
+        session.shutdown(None).await.expect("close session");
         tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events.next().await {
                 event.expect("shutdown event");
@@ -1773,7 +1776,10 @@ mod tests {
         })
         .await
         .expect("reopened idle status");
-        reopened.shutdown().await.expect("close reopened session");
+        reopened
+            .shutdown(None)
+            .await
+            .expect("close reopened session");
     }
 
     #[tokio::test]

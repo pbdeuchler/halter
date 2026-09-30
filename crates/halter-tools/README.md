@@ -401,7 +401,7 @@ essentials plus explicit overrides.
 Each job retains the latest 64 KiB of output. `next_cursor` counts all bytes
 produced, including discarded bytes; `truncated` indicates that the requested
 cursor predates retained output. Text uses lossy UTF-8 decoding. A session
-retains at most 64 job records, including completed jobs, until shutdown.
+retains running and completed job records until shutdown.
 
 Session shutdown terminates jobs and awaits their monitors. Unix jobs receive
 TERM, a 500 ms grace period, then KILL for the owned process group and currently
@@ -670,6 +670,11 @@ Typical input:
 ```
 
 Use it to clean up control surfaces once delegated work is done.
+Omit `timeout_ms` to wait for cancellation and cleanup without a deadline. Set
+it to bound the caller's wait, for example `{ "target": "agent-uuid",
+"timeout_ms": 1000 }`. On expiry the operation returns a timeout error and
+requests forced cleanup. Storage writes or already-running blocking work may
+delay final settlement; closing continues after the caller stops waiting.
 
 ---
 

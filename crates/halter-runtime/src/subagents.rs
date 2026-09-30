@@ -27,7 +27,7 @@ use crate::subagent_session::{
     extract_subagent_usage,
 };
 use crate::{
-    HalterSession, HookInvocationContext, RuntimeServices, run_subagent_start, run_subagent_stop,
+    HookInvocationContext, RuntimeServices, SessionExecutor, run_subagent_start, run_subagent_stop,
 };
 
 #[derive(Clone)]
@@ -46,6 +46,14 @@ struct RuntimeSubagentState {
 struct SubagentRegistry {
     entries: HashMap<String, RegisteredSubagent>,
     closing_sessions: HashSet<SessionId>,
+    closing_turns: HashMap<SessionId, ClosingTurn>,
+}
+
+#[derive(Clone)]
+struct ClosingTurn {
+    wrapper: tokio::task::AbortHandle,
+    current_turn: Arc<std::sync::Mutex<Option<TurnId>>>,
+    settled: CancellationToken,
 }
 
 struct RegisteredSubagent {
@@ -59,6 +67,7 @@ struct RegisteredSubagent {
 struct RunningTurn {
     cancel: CancellationToken,
     join_handle: JoinHandle<()>,
+    current_turn: Arc<std::sync::Mutex<Option<TurnId>>>,
 }
 
 struct TurnOutcome {
@@ -108,10 +117,29 @@ impl RuntimeSubagentControl {
             .collect()
     }
 
+    pub(crate) async fn owns_session(&self, session_id: &SessionId) -> bool {
+        let registry = self.inner.registry.lock().await;
+        registry.closing_sessions.contains(session_id)
+            || registry.closing_turns.contains_key(session_id)
+            || registry
+                .entries
+                .values()
+                .any(|entry| &entry.status.session_id == session_id)
+    }
+
     /// Stop and settle every descendant owned by this session before cleaning
     /// up the descendants' persistent tool resources.
+    #[cfg(test)]
     pub(crate) async fn close_session(&self, session_id: &SessionId) -> anyhow::Result<()> {
-        let (sessions, running, records) = {
+        self.close_session_with_deadline(session_id, None).await
+    }
+
+    pub(crate) async fn close_session_with_deadline(
+        &self,
+        session_id: &SessionId,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<()> {
+        let (sessions, mut running, records, previous_closing) = {
             let mut registry = self.inner.registry.lock().await;
             let mut sessions = HashSet::from([session_id.clone()]);
             loop {
@@ -128,6 +156,12 @@ impl RuntimeSubagentControl {
                 }
             }
             registry.closing_sessions.extend(sessions.iter().cloned());
+            let previous_closing = registry
+                .closing_turns
+                .iter()
+                .filter(|(child, _)| *child != session_id && sessions.contains(*child))
+                .map(|(_, task)| task.settled.clone())
+                .collect::<Vec<_>>();
             let mut running = Vec::new();
             let mut records = Vec::new();
             for entry in registry
@@ -138,20 +172,91 @@ impl RuntimeSubagentControl {
                 entry.generation = entry.generation.saturating_add(1);
                 if let Some(task) = entry.running.take() {
                     task.cancel.cancel();
-                    running.push(task.join_handle);
+                    running.push((entry.status.session_id.clone(), task));
                 }
                 entry.status.state = SubagentState::Closed;
                 entry.status.error = Some("closed by session shutdown".to_owned());
                 records.push((entry.parent.clone(), entry.status.clone(), entry.generation));
             }
-            (sessions, running, records)
+            for (child, task) in &running {
+                registry.closing_turns.insert(
+                    child.clone(),
+                    ClosingTurn {
+                        wrapper: task.join_handle.abort_handle(),
+                        current_turn: task.current_turn.clone(),
+                        settled: CancellationToken::new(),
+                    },
+                );
+            }
+            (sessions, running, records, previous_closing)
         };
         self.signal_change();
+        for child in sessions.iter().filter(|child| *child != session_id) {
+            self.inner
+                .services
+                .tool_sessions
+                .request_stop_session(child)
+                .await;
+        }
         let mut failure = None;
-        for result in futures::future::join_all(running).await {
-            if let Err(error) = result {
+        let settled =
+            futures::future::join_all(running.iter_mut().map(|(_, task)| &mut task.join_handle));
+        let results = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, settled).await.ok(),
+            None => Some(settled.await),
+        };
+        if results.is_none() {
+            // Kill all descendant resources first, then abort stream wrappers
+            // to prevent late registration of another executor.
+            for child in sessions.iter().filter(|child| *child != session_id) {
+                self.inner
+                    .services
+                    .tool_sessions
+                    .force_stop_session(child)
+                    .await;
+            }
+            for (_, task) in &running {
+                task.join_handle.abort();
+            }
+            for (_, task) in &mut running {
+                let _ = (&mut task.join_handle).await;
+            }
+        }
+        for result in results.into_iter().flatten() {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
                 failure.get_or_insert_with(|| anyhow::Error::new(error));
             }
+        }
+        for (child, task) in &running {
+            let turn_id = task
+                .current_turn
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(turn_id) = turn_id {
+                let executor = SessionExecutor::new(self.inner.services.clone(), child.clone())?;
+                if let Err(error) = executor.force_interrupt_turn(&turn_id).await {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        let previous_settled =
+            futures::future::join_all(previous_closing.iter().map(CancellationToken::cancelled));
+        if let Some(deadline) = deadline {
+            if tokio::time::timeout_at(deadline, previous_settled)
+                .await
+                .is_err()
+            {
+                self.force_close_session(session_id).await;
+                futures::future::join_all(
+                    previous_closing.iter().map(CancellationToken::cancelled),
+                )
+                .await;
+            }
+        } else {
+            previous_settled.await;
         }
         for (parent, status, generation) in records {
             if let Err(error) = self.record(parent, status, generation).await {
@@ -178,7 +283,7 @@ impl RuntimeSubagentControl {
                     _ => None,
                 }) == Some(true);
                 if !already_ended {
-                    HalterSession::new(self.inner.services.clone(), child.clone())?
+                    SessionExecutor::new(self.inner.services.clone(), child.clone())?
                         .shutdown("parent_session_closed")
                         .await?;
                 }
@@ -192,10 +297,72 @@ impl RuntimeSubagentControl {
         let mut registry = self.inner.registry.lock().await;
         for closed in &sessions {
             registry.closing_sessions.remove(closed);
+            if let Some(task) = registry.closing_turns.remove(closed) {
+                task.settled.cancel();
+            }
         }
         drop(registry);
         self.signal_change();
         failure.map_or(Ok(()), Err)
+    }
+
+    /// Upgrade graceful descendant cleanup to immediate cancellation. The
+    /// existing cleanup task keeps ownership of joins and transcript repair.
+    pub(crate) async fn force_close_session(&self, session_id: &SessionId) {
+        let (sessions, turns) = {
+            let registry = self.inner.registry.lock().await;
+            let mut sessions = HashSet::from([session_id.clone()]);
+            loop {
+                let descendants = registry
+                    .entries
+                    .values()
+                    .filter(|entry| sessions.contains(&entry.parent))
+                    .map(|entry| entry.status.session_id.clone())
+                    .collect::<Vec<_>>();
+                let previous = sessions.len();
+                sessions.extend(descendants);
+                if sessions.len() == previous {
+                    break;
+                }
+            }
+            let mut turns = registry
+                .closing_turns
+                .iter()
+                .filter(|(child, _)| sessions.contains(*child))
+                .map(|(_, control)| control.clone())
+                .collect::<Vec<_>>();
+            turns.extend(
+                registry
+                    .entries
+                    .values()
+                    .filter(|entry| sessions.contains(&entry.parent))
+                    .filter_map(|entry| entry.running.as_ref())
+                    .map(|task| ClosingTurn {
+                        wrapper: task.join_handle.abort_handle(),
+                        current_turn: task.current_turn.clone(),
+                        settled: CancellationToken::new(),
+                    }),
+            );
+            (sessions, turns)
+        };
+        for child in sessions {
+            self.inner
+                .services
+                .tool_sessions
+                .force_stop_session(&child)
+                .await;
+        }
+        for turn in turns {
+            turn.wrapper.abort();
+            if let Some(turn_id) = turn
+                .current_turn
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+            {
+                self.inner.services.turn_registry.abort(turn_id);
+            }
+        }
     }
 
     /// Register the agents `parent`'s log recorded, keeping any entry this
@@ -228,6 +395,74 @@ impl RuntimeSubagentControl {
         self.signal_change();
     }
 
+    async fn settle_closed_turn(
+        &self,
+        session_id: SessionId,
+        mut running: RunningTurn,
+        control: ClosingTurn,
+        deadline: Option<tokio::time::Instant>,
+        record: (SessionId, SubagentStatus, u64),
+    ) -> anyhow::Result<()> {
+        let result = async {
+            self.inner
+                .services
+                .tool_sessions
+                .request_stop_session(&session_id)
+                .await;
+            let joined = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, &mut running.join_handle)
+                    .await
+                    .ok(),
+                None => Some((&mut running.join_handle).await),
+            };
+            if joined.is_none() {
+                self.inner
+                    .services
+                    .tool_sessions
+                    .force_stop_session(&session_id)
+                    .await;
+                running.join_handle.abort();
+                let _ = (&mut running.join_handle).await;
+            }
+            let turn_id = running
+                .current_turn
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(turn_id) = turn_id {
+                SessionExecutor::new(self.inner.services.clone(), session_id.clone())?
+                    .force_interrupt_turn(&turn_id)
+                    .await?;
+            }
+            self.inner
+                .services
+                .tool_sessions
+                .shutdown_session(&session_id)
+                .await?;
+            // Record after execution/resource cancellation has started, so a
+            // blocked writer cannot postpone the cancellation deadline.
+            let _ = self.record(record.0, record.1, record.2).await;
+            if let Some(Err(error)) = joined
+                && !error.is_cancelled()
+            {
+                return Err(anyhow::Error::new(error));
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = &result {
+            warn!(%session_id, %error, "failed to settle closed subagent");
+        }
+        self.inner
+            .registry
+            .lock()
+            .await
+            .closing_turns
+            .remove(&session_id);
+        control.settled.cancel();
+        result
+    }
+
     /// Append an agent's new status to its parent's log.
     async fn record(
         &self,
@@ -236,7 +471,7 @@ impl RuntimeSubagentControl {
         generation: u64,
     ) -> anyhow::Result<()> {
         let record = OutOfTurn::Subagent(SubagentRecord { status, generation });
-        let dispatched = match HalterSession::new(self.inner.services.clone(), parent.clone()) {
+        let dispatched = match SessionExecutor::new(self.inner.services.clone(), parent.clone()) {
             Ok(session) => session.dispatch_out_of_turn(record).await,
             Err(error) => Err(error),
         };
@@ -358,7 +593,9 @@ impl RuntimeSubagentControl {
         let task_message = message.clone();
         let task_cancel = cancel.clone();
         let controller = self.clone();
-        let session = HalterSession::new(services.clone(), task_session_id.clone())?;
+        let current_turn = Arc::new(std::sync::Mutex::new(None));
+        let current_turn_for_task = current_turn.clone();
+        let session = SessionExecutor::new(services.clone(), task_session_id.clone())?;
         let mut registry = self.inner.registry.lock().await;
         let can_start = registry.entries.get(&agent_id.0).is_some_and(|entry| {
             entry.generation == generation && matches!(entry.status.state, SubagentState::Running)
@@ -381,6 +618,7 @@ impl RuntimeSubagentControl {
                     task_message,
                     task_cancel,
                     session,
+                    current_turn_for_task,
                 )
                 .await;
         });
@@ -392,6 +630,7 @@ impl RuntimeSubagentControl {
             RunningTurn {
                 cancel,
                 join_handle,
+                current_turn,
             },
         );
         drop(registry);
@@ -424,15 +663,17 @@ impl RuntimeSubagentControl {
         generation: u64,
         message: String,
         cancel: CancellationToken,
-        session: HalterSession,
+        session: SessionExecutor,
+        current_turn: Arc<std::sync::Mutex<Option<TurnId>>>,
     ) {
         let mut next_input = message;
         let mut resubmissions = 0u32;
         let outcome = loop {
-            let turn_events = match session
-                .submit_turn_with_cancel(Turn::user(next_input.clone()), cancel.clone())
-                .await
-            {
+            let turn = Turn::user(next_input.clone());
+            *current_turn
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(turn.id.clone());
+            let turn_events = match session.submit_turn_with_cancel(turn, cancel.clone()).await {
                 Ok(events) => match events.try_collect::<Vec<_>>().await {
                     Ok(events) => events,
                     Err(error) => {
@@ -571,7 +812,7 @@ impl RuntimeSubagentControl {
         status: &SubagentStatus,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
-        let session = HalterSession::new(
+        let session = SessionExecutor::new(
             self.inner.services.clone(),
             parent.blueprint.session_id.clone(),
         )?;
@@ -615,7 +856,7 @@ impl RuntimeSubagentControl {
         child_session_id: &SessionId,
         cancel: &CancellationToken,
     ) -> anyhow::Result<Option<String>> {
-        let session = HalterSession::new(self.inner.services.clone(), parent_session_id.clone())?;
+        let session = SessionExecutor::new(self.inner.services.clone(), parent_session_id.clone())?;
         let Some((stored, fired_hook_ids)) = session.load_for_out_of_turn_hooks().await? else {
             return Ok(None);
         };
@@ -839,7 +1080,15 @@ impl SubagentControl for RuntimeSubagentControl {
     }
 
     async fn close(&self, request: CloseSubagentRequest) -> anyhow::Result<CloseSubagentResponse> {
-        let (previous_status, parent, status, generation, running) = {
+        let deadline =
+            request
+                .timeout_ms
+                .map(|milliseconds| {
+                    tokio::time::Instant::now().checked_add(Duration::from_millis(milliseconds))
+                .context("failed to close subagent: timeout is outside the supported clock range")
+                })
+                .transpose()?;
+        let (previous_status, record, cleanup, existing) = {
             let mut registry = self.inner.registry.lock().await;
             let entry = registry
                 .entries
@@ -851,30 +1100,73 @@ impl SubagentControl for RuntimeSubagentControl {
                     )
                 })?;
             let previous = entry.status.clone();
-            entry.generation = entry.generation.saturating_add(1);
+            let already_closed = matches!(entry.status.state, SubagentState::Closed);
+            if !already_closed {
+                entry.generation = entry.generation.saturating_add(1);
+            }
             let closed_running_turn = entry.running.is_some();
             let running = entry.running.take();
             if let Some(running) = &running {
                 running.cancel.cancel();
             }
             entry.status.state = SubagentState::Closed;
-            entry.status.error = closed_running_turn
-                .then(|| "closed by close_agent (work was cancelled)".to_owned());
-            (
-                previous,
-                entry.parent.clone(),
-                entry.status.clone(),
-                entry.generation,
-                running,
-            )
+            if !already_closed {
+                entry.status.error = closed_running_turn
+                    .then(|| "closed by close_agent (work was cancelled)".to_owned());
+            }
+            let record = (entry.parent.clone(), entry.status.clone(), entry.generation);
+            let existing = registry.closing_turns.get(&previous.session_id).cloned();
+            let (record, cleanup) = match running {
+                Some(running) => {
+                    let session_id = previous.session_id.clone();
+                    let control = ClosingTurn {
+                        wrapper: running.join_handle.abort_handle(),
+                        current_turn: running.current_turn.clone(),
+                        settled: CancellationToken::new(),
+                    };
+                    registry
+                        .closing_turns
+                        .insert(session_id.clone(), control.clone());
+                    let controller = self.clone();
+                    let cleanup = tokio::spawn(async move {
+                        controller
+                            .settle_closed_turn(session_id, running, control, deadline, record)
+                            .await
+                    });
+                    (None, Some(cleanup))
+                }
+                None => (if already_closed { None } else { Some(record) }, None),
+            };
+            (previous, record, cleanup, existing)
         };
-        if let Some(running) = running {
-            running
-                .join_handle
-                .await
-                .context("failed to settle cancelled subagent")?;
+        self.signal_change();
+        if let Some((parent, status, generation)) = record {
+            let _ = self.record(parent, status, generation).await;
         }
-        let _ = self.record(parent, status, generation).await;
+        if let Some(cleanup) = cleanup {
+            match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, cleanup)
+                    .await
+                    .map_err(|_| anyhow::Error::new(crate::SessionError::TimedOut))?
+                    .context("failed to settle cancelled subagent")??,
+                None => cleanup
+                    .await
+                    .context("failed to settle cancelled subagent")??,
+            }
+        } else if let Some(existing) = existing {
+            match deadline {
+                Some(deadline) => {
+                    if tokio::time::timeout_at(deadline, existing.settled.cancelled())
+                        .await
+                        .is_err()
+                    {
+                        self.force_close_session(&previous_status.session_id).await;
+                        return Err(anyhow::Error::new(crate::SessionError::TimedOut));
+                    }
+                }
+                None => existing.settled.cancelled().await,
+            }
+        }
 
         warn!(
             agent_id = %previous_status.agent_id,
@@ -1123,12 +1415,14 @@ mod tests {
         control
             .close(CloseSubagentRequest {
                 target: first.agent_id,
+                timeout_ms: None,
             })
             .await
             .expect("close first");
         control
             .close(CloseSubagentRequest {
                 target: second.agent_id,
+                timeout_ms: None,
             })
             .await
             .expect("close second");
@@ -1195,6 +1489,7 @@ mod tests {
         control
             .close(CloseSubagentRequest {
                 target: spawned.agent_id,
+                timeout_ms: None,
             })
             .await
             .expect("close");
@@ -1222,6 +1517,7 @@ mod tests {
         let closed = control
             .close(CloseSubagentRequest {
                 target: spawned.agent_id.clone(),
+                timeout_ms: None,
             })
             .await
             .expect("close");
@@ -1243,6 +1539,275 @@ mod tests {
             status.error.as_deref(),
             Some("closed by close_agent (work was cancelled)")
         );
+    }
+
+    #[tokio::test]
+    async fn descendant_deadlines_force_actual_execution_and_can_upgrade_graceful_closure() {
+        for (agent_api, upgrade, sqlite) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut services = test_services(Arc::new(PendingProvider));
+            if sqlite {
+                Arc::get_mut(&mut services).unwrap().sessions = Arc::new(
+                    halter_session::SqliteSessionStore::open(root.path().join("sessions.db"))
+                        .unwrap(),
+                );
+            }
+            let runtime = SessionRuntime::new(services.clone());
+            let parent = runtime
+                .new_session(crate::SessionInit::default())
+                .await
+                .unwrap();
+            let child = runtime
+                .new_session(crate::SessionInit::default())
+                .await
+                .unwrap();
+            let control = RuntimeSubagentControl::new(services.clone());
+            let turn_id = TurnId::new();
+            let agent_id = AgentId::new();
+            let cancel = CancellationToken::new();
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let execution = tokio::spawn({
+                let dropped = dropped.clone();
+                async move {
+                    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for Dropped {
+                        fn drop(&mut self) {
+                            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    let _dropped = Dropped(dropped);
+                    ready.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                }
+            });
+            services
+                .turn_registry
+                .register(turn_id.clone(), cancel.clone(), execution)
+                .unwrap();
+            started.await.unwrap();
+            let mut stored = services
+                .sessions
+                .load_session(child.session_id())
+                .await
+                .unwrap()
+                .unwrap();
+            stored.state.open_turn = Some(turn_id.clone());
+            services
+                .sessions
+                .commit(
+                    child.session_id(),
+                    None,
+                    Some(stored.head_sequence),
+                    Some(stored.state),
+                    vec![halter_protocol::PendingEvent::new(
+                        child.session_id().clone(),
+                        halter_protocol::Delivery::Lossless,
+                        halter_protocol::SessionEventPayload::TurnStarted {
+                            turn_id: turn_id.clone(),
+                            default_model: None,
+                            subagent_model: None,
+                        },
+                    )],
+                )
+                .await
+                .unwrap();
+            control.inner.registry.lock().await.entries.insert(
+                agent_id.0.clone(),
+                RegisteredSubagent {
+                    parent: parent.session_id().clone(),
+                    generation: 1,
+                    status: SubagentStatus {
+                        agent_id: agent_id.clone(),
+                        session_id: child.session_id().clone(),
+                        agent_type: None,
+                        task: "ignore cancellation".to_owned(),
+                        state: SubagentState::Running,
+                        last_message: None,
+                        usage: None,
+                        error: None,
+                    },
+                    running: Some(RunningTurn {
+                        cancel: cancel.clone(),
+                        join_handle: tokio::spawn(std::future::pending()),
+                        current_turn: Arc::new(std::sync::Mutex::new(Some(turn_id.clone()))),
+                    }),
+                },
+            );
+            if agent_api {
+                let initial = tokio::spawn({
+                    let control = control.clone();
+                    let agent_id = agent_id.clone();
+                    async move {
+                        control
+                            .close(CloseSubagentRequest {
+                                target: agent_id,
+                                timeout_ms: if upgrade { None } else { Some(0) },
+                            })
+                            .await
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), cancel.cancelled())
+                    .await
+                    .unwrap();
+                if upgrade {
+                    assert!(
+                        !initial.is_finished(),
+                        "unlimited close retains ownership while waiting"
+                    );
+                    let error = control
+                        .close(CloseSubagentRequest {
+                            target: agent_id.clone(),
+                            timeout_ms: Some(0),
+                        })
+                        .await
+                        .unwrap_err();
+                    assert!(matches!(
+                        error.downcast_ref::<crate::SessionError>(),
+                        Some(crate::SessionError::TimedOut)
+                    ));
+                    tokio::time::timeout(Duration::from_secs(5), initial)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                } else {
+                    let error = initial.await.unwrap().unwrap_err();
+                    assert!(matches!(
+                        error.downcast_ref::<crate::SessionError>(),
+                        Some(crate::SessionError::TimedOut)
+                    ));
+                }
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    control.close(CloseSubagentRequest {
+                        target: agent_id,
+                        timeout_ms: None,
+                    }),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            } else {
+                let closure = tokio::spawn({
+                    let control = control.clone();
+                    let parent_id = parent.session_id().clone();
+                    async move {
+                        control
+                            .close_session_with_deadline(
+                                &parent_id,
+                                if upgrade {
+                                    None
+                                } else {
+                                    Some(tokio::time::Instant::now())
+                                },
+                            )
+                            .await
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), cancel.cancelled())
+                    .await
+                    .unwrap();
+                if upgrade {
+                    assert!(
+                        !closure.is_finished(),
+                        "unlimited descendant closure retains execution"
+                    );
+                    control.force_close_session(parent.session_id()).await;
+                }
+                tokio::time::timeout(Duration::from_secs(5), closure)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(
+                dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "registered executor was aborted, not only its stream wrapper"
+            );
+            let events = child.replay().await.unwrap();
+            assert_eq!(events.iter().filter(|event| matches!(&event.payload, halter_protocol::SessionEventPayload::TurnFailed { turn_id: failed, cancelled: true, .. } if failed == &turn_id)).count(), 1);
+            let stored = services
+                .sessions
+                .load_session(child.session_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.state.open_turn.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_owned_child_cannot_be_resumed_but_parent_can_send_input() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let services = test_services(Arc::new(RecordingProvider::new(requests.clone())));
+        let runtime = SessionRuntime::new(services.clone());
+        let parent = runtime
+            .new_session(crate::SessionInit::default())
+            .await
+            .unwrap();
+        let mut context = parent_context();
+        context.blueprint.session_id = parent.session_id().clone();
+        let control = runtime.subagent_control();
+        let child = control
+            .spawn(
+                &context,
+                spawn_request("first task"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let waited = control
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![child.agent_id.clone()],
+                    timeout_ms: Some(5_000),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(waited.status.unwrap().state, SubagentState::Completed);
+        let result = runtime.resume_session(&child.session_id).await;
+        assert!(
+            matches!(result, Err(crate::SessionError::AlreadyOpen(ref id)) if id == &child.session_id),
+            "parent retains exclusive ownership of completed child sessions"
+        );
+        control
+            .send_input(SendSubagentInputRequest {
+                target: child.agent_id.clone(),
+                message: "second task".to_owned(),
+            })
+            .await
+            .unwrap();
+        let waited = control
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![child.agent_id.clone()],
+                    timeout_ms: Some(5_000),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(waited.status.unwrap().state, SubagentState::Completed);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        control
+            .close(CloseSubagentRequest {
+                target: child.agent_id,
+                timeout_ms: None,
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1321,6 +1886,7 @@ mod tests {
                     running: Some(RunningTurn {
                         cancel,
                         join_handle,
+                        current_turn: Arc::new(std::sync::Mutex::new(None)),
                     }),
                 },
             );
@@ -1683,6 +2249,7 @@ mod tests {
         control
             .close(CloseSubagentRequest {
                 target: agent.clone(),
+                timeout_ms: None,
             })
             .await
             .expect("close");
@@ -1832,7 +2399,7 @@ mod tests {
         // Keep a parent handle alive for the whole run, as a real parent
         // session would while its subagents are managed.
         let _parent_handle =
-            HalterSession::new(services.clone(), parent.blueprint.session_id.clone())
+            SessionExecutor::new(services.clone(), parent.blueprint.session_id.clone())
                 .expect("parent handle");
 
         let spawned = control
@@ -1911,7 +2478,7 @@ mod tests {
         let parent = parent_context();
         store_parent_session(&services, &parent).await;
         let _parent_handle =
-            HalterSession::new(services.clone(), parent.blueprint.session_id.clone())
+            SessionExecutor::new(services.clone(), parent.blueprint.session_id.clone())
                 .expect("parent handle");
 
         let spawned = control
@@ -1997,6 +2564,7 @@ mod tests {
                 RunningTurn {
                     cancel: cancel.clone(),
                     join_handle,
+                    current_turn: Arc::new(std::sync::Mutex::new(None)),
                 },
             );
             let entry_running = registry
@@ -2036,6 +2604,7 @@ mod tests {
             RunningTurn {
                 cancel: CancellationToken::new(),
                 join_handle,
+                current_turn: Arc::new(std::sync::Mutex::new(None)),
             },
         );
         let orphan = orphan.expect("turn for missing entry must be handed back");

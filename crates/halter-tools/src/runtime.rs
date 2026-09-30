@@ -70,7 +70,9 @@ pub trait SubagentControl: Send + Sync {
         request: WaitSubagentRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<WaitSubagentResponse>;
-    /// Close a subagent and return its previous status.
+    /// Close a subagent, wait for cancellation and resource cleanup, and return
+    /// its previous status. [`CloseSubagentRequest::timeout_ms`] bounds waiting;
+    /// owned cleanup continues if that deadline expires.
     async fn close(&self, request: CloseSubagentRequest) -> anyhow::Result<CloseSubagentResponse>;
 }
 

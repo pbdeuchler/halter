@@ -19,7 +19,7 @@ use crate::{
     EventBus, RuntimeServices, SessionError, SessionEventStream, SessionInit, SessionRuntime,
 };
 
-fn services(provider: Arc<dyn Provider>) -> Arc<RuntimeServices> {
+pub(crate) fn services(provider: Arc<dyn Provider>) -> Arc<RuntimeServices> {
     let mut models = ModelRegistry::new();
     let model = ResolvedModel {
         role: ModelRole::default(),
@@ -81,7 +81,7 @@ async fn session_stream_spans_submissions_and_reopens_idle_with_stale_handles_cl
             "same id is acknowledged without executing twice"
         );
     }
-    session.shutdown().await.unwrap();
+    session.shutdown(None).await.unwrap();
     observed.extend(events.try_collect::<Vec<_>>().await.unwrap());
     let log = session.replay().await.unwrap();
     assert_eq!(
@@ -108,7 +108,7 @@ async fn session_stream_spans_submissions_and_reopens_idle_with_stale_handles_cl
         runtime.resume_session(session.id()).await,
         Err(SessionError::AlreadyOpen(_))
     ));
-    reopened.shutdown().await.unwrap();
+    reopened.shutdown(None).await.unwrap();
 }
 
 struct BlockingFirst {
@@ -180,15 +180,20 @@ async fn interrupt_awaits_finalization_preserves_pending_input_and_next_submit_c
         })
         .await
         .unwrap();
-    session.submit(Message::user("start")).await.unwrap();
+    let primary = session
+        .submit(Message::user("start"))
+        .await
+        .unwrap()
+        .message_id;
     provider.started.notified().await;
     // Observe the first request has consumed its text before interrupting it.
     // Input admission is serialized after the executor's opening commits.
     let queued = session
         .submit(Message::user("queued correction"))
         .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), session.interrupt())
+        .unwrap()
+        .message_id;
+    tokio::time::timeout(Duration::from_secs(5), session.interrupt(None))
         .await
         .expect("uncooperative stream is cancellable")
         .unwrap();
@@ -219,7 +224,11 @@ async fn interrupt_awaits_finalization_preserves_pending_input_and_next_submit_c
     );
     // Drain the interrupted execution, then continue on the same stream.
     until_status(&mut events, SessionStatus::Running).await;
-    until_status(&mut events, SessionStatus::Idle).await;
+    let interrupted = until_status(&mut events, SessionStatus::Idle).await;
+    assert!(interrupted.iter().any(|event| matches!(&event.payload,
+        SessionEventPayload::InputSettled { message_id, outcome: halter_protocol::InputOutcome::Interrupted } if message_id == &primary)));
+    assert!(interrupted.iter().any(|event| matches!(&event.payload,
+        SessionEventPayload::InputDeferred { message_id, reason: halter_protocol::InputDeferredReason::Interrupted } if message_id == &queued)));
     session.submit(Message::user("continue")).await.unwrap();
     until_status(&mut events, SessionStatus::Running).await;
     until_status(&mut events, SessionStatus::Idle).await;
@@ -236,7 +245,7 @@ async fn interrupt_awaits_finalization_preserves_pending_input_and_next_submit_c
         .collect::<Vec<_>>();
     assert!(texts.contains(&"queued correction".to_owned()));
     assert!(texts.contains(&"continue".to_owned()));
-    session.shutdown().await.unwrap();
+    session.shutdown(None).await.unwrap();
 }
 
 #[tokio::test]
@@ -259,12 +268,12 @@ async fn inbox_capacity_is_bounded_while_provider_creation_is_blocked() {
         session.submit(Message::user("overflow")).await,
         Err(SessionError::InboxFull)
     ));
-    tokio::time::timeout(Duration::from_secs(5), session.interrupt())
+    tokio::time::timeout(Duration::from_secs(5), session.interrupt(None))
         .await
         .expect("provider creation cancels")
         .unwrap();
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-    session.shutdown().await.unwrap();
+    session.shutdown(None).await.unwrap();
 }
 
 #[tokio::test]
@@ -280,7 +289,7 @@ async fn lagged_stream_replays_every_committed_event_once_and_runtime_closes_idl
             .await
             .unwrap();
     }
-    session.interrupt().await.unwrap();
+    session.interrupt(None).await.unwrap();
     let report = runtime.shutdown(Duration::from_secs(5)).await;
     assert!(!report.timed_out);
     let received = tokio::time::timeout(Duration::from_secs(5), events.try_collect::<Vec<_>>())
@@ -429,7 +438,7 @@ async fn failed_admission_is_not_acknowledged_or_recorded_and_can_be_retried() {
     session.submit(message).await.unwrap();
     until_status(&mut events, SessionStatus::Running).await;
     until_status(&mut events, SessionStatus::Idle).await;
-    session.shutdown().await.unwrap();
+    session.shutdown(None).await.unwrap();
 }
 
 #[tokio::test]
@@ -462,7 +471,8 @@ async fn explicit_compaction_finishes_idle_and_subsequent_submission_has_its_own
     let id = session
         .submit(Message::user("after compaction"))
         .await
-        .unwrap();
+        .unwrap()
+        .message_id;
     loop {
         let event = events.next().await.unwrap().unwrap();
         if matches!(event.payload, SessionEventPayload::InputAccepted { message } if message.id == id)
@@ -473,7 +483,7 @@ async fn explicit_compaction_finishes_idle_and_subsequent_submission_has_its_own
     until_status(&mut events, SessionStatus::Running).await;
     let delivered = until_status(&mut events, SessionStatus::Idle).await;
     assert!(delivered.iter().any(|event| matches!(&event.payload, SessionEventPayload::MessageItem { message: Message::User(message) } if message.id == id)));
-    session.shutdown().await.unwrap();
+    session.shutdown(None).await.unwrap();
 }
 
 #[tokio::test]
@@ -509,7 +519,7 @@ async fn cancelled_open_releases_reservation_and_runtime_shutdown_refuses_delaye
                 .create_session(init)
                 .await
                 .expect("cancelled opener releases its reservation");
-            session.shutdown().await.unwrap();
+            session.shutdown(None).await.unwrap();
         } else {
             let report = runtime.shutdown(Duration::from_secs(5)).await;
             assert!(!report.timed_out);
@@ -526,9 +536,9 @@ async fn concurrent_shutdown_calls_are_idempotent() {
         .create_session(SessionInit::default())
         .await
         .unwrap();
-    let results = futures::future::join_all((0..32).map(|_| session.shutdown())).await;
+    let results = futures::future::join_all((0..32).map(|_| session.shutdown(None))).await;
     assert!(results.into_iter().all(|result| result.is_ok()));
-    session.shutdown().await.unwrap();
+    session.shutdown(None).await.unwrap();
 }
 
 #[tokio::test]
@@ -558,7 +568,7 @@ async fn driver_storage_failure_closes_stream_cleans_up_and_keeps_input_resumabl
         "driver failure must reach stream consumers"
     );
     assert!(matches!(
-        session.shutdown().await,
+        session.shutdown(None).await,
         Err(SessionError::Operation(_))
     ));
     assert!(
@@ -575,7 +585,7 @@ async fn driver_storage_failure_closes_stream_cleans_up_and_keeps_input_resumabl
     until_status(&mut events, SessionStatus::Running).await;
     let delivered = until_status(&mut events, SessionStatus::Idle).await;
     assert!(delivered.iter().any(|event| matches!(&event.payload, SessionEventPayload::MessageItem { message: Message::User(message) } if message.plain_text() == "durable input")));
-    reopened.shutdown().await.unwrap();
+    reopened.shutdown(None).await.unwrap();
 }
 
 #[tokio::test]
@@ -610,7 +620,7 @@ async fn terminal_execution_commit_failure_closes_the_stream_and_cleans_up_the_d
             tokio::time::timeout(Duration::from_secs(5), provider.started.notified())
                 .await
                 .expect("foreground provider starts");
-            let error = tokio::time::timeout(Duration::from_secs(5), session.interrupt())
+            let error = tokio::time::timeout(Duration::from_secs(5), session.interrupt(None))
                 .await
                 .expect("failed finalization settles interrupt")
                 .expect_err("interrupt must report its failed finalization");
@@ -631,7 +641,7 @@ async fn terminal_execution_commit_failure_closes_the_stream_and_cleans_up_the_d
                 .contains("terminal execution commit unavailable")
         );
         assert!(matches!(
-            session.shutdown().await,
+            session.shutdown(None).await,
             Err(SessionError::Operation(_))
         ));
         assert!(matches!(
@@ -694,7 +704,7 @@ async fn compaction_idle_commit_failure_reaches_interrupt_compact_and_stream_aft
         .expect("compaction starts before interruption");
     store.fail_idle.store(true, Ordering::SeqCst);
 
-    let interrupted = tokio::time::timeout(Duration::from_secs(5), session.interrupt())
+    let interrupted = tokio::time::timeout(Duration::from_secs(5), session.interrupt(None))
         .await
         .expect("interrupt settles the failed compaction");
     let compacted = compact.await.unwrap();
@@ -713,7 +723,7 @@ async fn compaction_idle_commit_failure_reaches_interrupt_compact_and_stream_aft
             .contains("idle status commit unavailable")
     );
     assert!(matches!(
-        session.shutdown().await,
+        session.shutdown(None).await,
         Err(SessionError::Operation(_))
     ));
     assert!(
@@ -725,4 +735,151 @@ async fn compaction_idle_commit_failure_reaches_interrupt_compact_and_stream_aft
             .any(|event| matches!(event.payload, SessionEventPayload::SessionShutdownComplete)),
         "interrupt returns only after failed-driver cleanup has committed"
     );
+}
+
+struct ReleasedCompaction {
+    started: Arc<Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl crate::CompactionStrategy for ReleasedCompaction {
+    async fn compact(
+        &self,
+        _context: crate::CompactionContext<'_>,
+    ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+        self.started.notify_one();
+        self.release.acquire().await.unwrap().forget();
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn input_submitted_during_compaction_settles_after_its_own_execution() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut services = (*services(Arc::new(FakeProvider::default()))).clone();
+    services.compaction = Arc::new(ReleasedCompaction {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let runtime = SessionRuntime::new(Arc::new(services));
+    let (session, mut events) = runtime
+        .create_session(SessionInit::default())
+        .await
+        .unwrap();
+    until_status(&mut events, SessionStatus::Idle).await;
+    let compact_session = session.clone();
+    let compact = tokio::spawn(async move { compact_session.compact("manual", None).await });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    until_status(&mut events, SessionStatus::Running).await;
+    let id = session
+        .submit(Message::user("submitted during compaction"))
+        .await
+        .unwrap()
+        .message_id;
+    release.add_permits(1);
+    compact.await.unwrap().unwrap();
+    let compaction = until_status(&mut events, SessionStatus::Idle).await;
+    assert!(!compaction.iter().any(|event| matches!(&event.payload,
+        SessionEventPayload::InputSettled { message_id, .. } if message_id == &id)));
+    let execution = until_status(&mut events, SessionStatus::Idle).await;
+    assert_eq!(execution.iter().filter(|event| matches!(&event.payload,
+        SessionEventPayload::InputSettled { message_id, outcome: halter_protocol::InputOutcome::Completed } if message_id == &id)).count(), 1);
+    assert!(execution.iter().any(|event| matches!(&event.payload,
+        SessionEventPayload::MessageItem { message: Message::User(message) } if message.id == id)));
+    session.shutdown(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn retry_of_deferred_input_has_a_fresh_acceptance_boundary_and_one_settlement() {
+    let provider = Arc::new(BlockingFirst::new(false));
+    let runtime = SessionRuntime::new(services(provider.clone()));
+    let (session, mut events) = runtime
+        .create_session(SessionInit::default())
+        .await
+        .unwrap();
+    session.submit(Message::user("start")).await.unwrap();
+    provider.started.notified().await;
+    let input = Message::user("pending input");
+    let original = session.submit(input.clone()).await.unwrap();
+    let id = original.message_id;
+    session.interrupt(None).await.unwrap();
+    let before = session.replay().await.unwrap();
+    assert!(before.iter().any(|event| matches!(&event.payload,
+        SessionEventPayload::InputDeferred { message_id, .. } if message_id == &id)));
+    let retry = session.submit(input).await.unwrap();
+    assert!(original.sequence < retry.sequence);
+    // The stream still contains the first attempt's acceptance and deferral.
+    // The receipt excludes them without requiring the caller to drain first.
+    let after = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut after = Vec::new();
+        loop {
+            let event = events.next().await.unwrap().unwrap();
+            if event.sequence() < retry.sequence { continue; }
+            let settled = matches!(&event.payload, SessionEventPayload::InputSettled { message_id, .. } if message_id == &id);
+            after.push(event);
+            if settled { break after; }
+        }
+    }).await.unwrap();
+    let accepted = after
+        .iter()
+        .position(|event| {
+            matches!(&event.payload,
+        SessionEventPayload::InputAccepted { message } if message.id == id)
+        })
+        .unwrap();
+    let settled = after.iter().position(|event| matches!(&event.payload,
+        SessionEventPayload::InputSettled { message_id, outcome: halter_protocol::InputOutcome::Completed } if message_id == &id)).unwrap();
+    assert!(accepted < settled);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|event| matches!(&event.payload,
+        SessionEventPayload::InputSettled { message_id, .. } if message_id == &id))
+            .count(),
+        1
+    );
+    session.shutdown(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_pending_retry_does_not_wake_a_deferred_input() {
+    let provider = Arc::new(BlockingFirst::new(false));
+    let store = Arc::new(AdmissionFailure {
+        store: Default::default(),
+        fail: AtomicBool::new(false),
+        fail_running: AtomicBool::new(false),
+        fail_idle: AtomicBool::new(false),
+        fail_terminal: AtomicBool::new(false),
+        opening: None,
+    });
+    let mut services = (*services(provider.clone())).clone();
+    services.sessions = store.clone();
+    services.compaction = Arc::new(ReleasedCompaction {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(tokio::sync::Semaphore::new(1)),
+    });
+    let runtime = SessionRuntime::new(Arc::new(services));
+    let (session, _events) = runtime
+        .create_session(SessionInit::default())
+        .await
+        .unwrap();
+    session.submit(Message::user("start")).await.unwrap();
+    provider.started.notified().await;
+    let pending = Message::user("deferred");
+    session.submit(pending.clone()).await.unwrap();
+    session.interrupt(None).await.unwrap();
+    store.fail.store(true, Ordering::SeqCst);
+    assert!(session.submit(pending).await.is_err());
+    // A successful idle operation gives the actor a chance to process the
+    // failed retry. It must not start the queued provider request instead.
+    tokio::time::timeout(Duration::from_secs(5), session.compact("barrier", None))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    session.shutdown(None).await.unwrap();
 }

@@ -1,9 +1,31 @@
 //! Process management
 
 use futures::FutureExt;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::{error, sys};
+
+/// Tracks live, owned children independently of their execution futures.
+/// Hosts can force-stop them without acquiring the shell's execution lock.
+#[derive(Clone, Default)]
+pub struct ProcessTracker {
+    children: Arc<Mutex<HashMap<sys::process::ProcessId, Option<sys::process::ProcessId>>>>,
+}
+
+impl ProcessTracker {
+    /// Immediately stop all currently owned children and process groups.
+    pub fn force_stop(&self) {
+        let children = self
+            .children
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (&pid, &pgid) in children.iter() {
+            force_stop_process(Some(pid), pgid);
+        }
+    }
+}
 
 /// A waitable future that will yield the results of a child process's execution.
 pub(crate) type WaitableChildProcess = std::pin::Pin<
@@ -18,6 +40,8 @@ pub struct ChildProcess {
     pid: Option<sys::process::ProcessId>,
     /// If available, the process group ID of the child.
     pgid: Option<sys::process::ProcessId>,
+    owned: bool,
+    tracker: Option<ProcessTracker>,
 }
 
 impl ChildProcess {
@@ -31,6 +55,46 @@ impl ChildProcess {
             exec_future: Box::pin(child.wait_with_output()),
             pid,
             pgid,
+            owned: true,
+            tracker: None,
+        }
+    }
+
+    pub(crate) fn track(&mut self, tracker: Option<ProcessTracker>) {
+        if let (Some(pid), Some(tracker)) = (self.pid, tracker) {
+            tracker
+                .children
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(pid, self.pgid);
+            let tracked = tracker.clone();
+            let mut execution =
+                std::mem::replace(&mut self.exec_future, Box::pin(std::future::pending()));
+            self.exec_future = Box::pin(futures::future::poll_fn(move |cx| {
+                // Serialize reaping with signalling, retiring the PID before
+                // releasing the lock when the OS wait completes.
+                let mut children = tracked
+                    .children
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let result = execution.as_mut().poll(cx);
+                if result.is_ready() {
+                    children.remove(&pid);
+                }
+                result
+            }));
+            self.tracker = Some(tracker);
+        }
+    }
+
+    fn retire(&mut self) {
+        self.owned = false;
+        if let (Some(pid), Some(tracker)) = (self.pid, self.tracker.take()) {
+            tracker
+                .children
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&pid);
         }
     }
 
@@ -73,6 +137,7 @@ impl ChildProcess {
         loop {
             tokio::select! {
                 output = &mut self.exec_future => {
+                    self.retire();
                     break Ok(ProcessWaitResult::Completed(output?))
                 },
                 _ = &mut cancelled => {
@@ -114,18 +179,20 @@ impl ChildProcess {
             use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
             let signal = |signal| match kill(Pid::from_raw(target), signal) {
-                Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+                Ok(()) => Ok(true),
+                Err(nix::errno::Errno::ESRCH) => Ok(false),
                 // Darwin can report EPERM after TERM has removed the group.
                 // Confirm the group is empty or contains only zombies with
                 // libproc; never suppress errors for executing processes.
                 Err(nix::errno::Errno::EPERM) if target < 0 && process_group_is_gone(-target) => {
-                    Ok(())
+                    Ok(false)
                 }
                 Err(error) => Err(error),
             };
-            signal(Signal::SIGTERM)?;
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            signal(Signal::SIGKILL)?;
+            if signal(Signal::SIGTERM)? {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                signal(Signal::SIGKILL)?;
+            }
         }
         #[cfg(windows)]
         if let Some(pid) = self.pid {
@@ -145,15 +212,66 @@ impl ChildProcess {
             }
         }
         (&mut self.exec_future).await?;
+        self.retire();
         Ok(())
     }
 
     pub(crate) fn poll(&mut self) -> Option<Result<std::process::Output, error::Error>> {
         let checkable_future = &mut self.exec_future;
-        checkable_future
+        let result = checkable_future
             .now_or_never()
-            .map(|result| result.map_err(Into::into))
+            .map(|result| result.map_err(Into::into));
+        if result.is_some() {
+            self.retire();
+        }
+        result
     }
+}
+
+impl Drop for ChildProcess {
+    fn drop(&mut self) {
+        if self.owned {
+            // Dropping an aborted execution future bypasses async TERM/reap
+            // handling. Kill the owned group before dropping its child future.
+            force_stop_process(self.pid, self.pgid);
+            self.retire();
+        }
+    }
+}
+
+fn force_stop_process(pid: Option<sys::process::ProcessId>, pgid: Option<sys::process::ProcessId>) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        // SAFETY: getpgrp has no arguments or ownership requirements.
+        let harness_group = unsafe { libc::getpgrp() };
+        if let Some(target) = pgid
+            .filter(|group| *group > 0 && *group != harness_group)
+            .map(|group| -group)
+            .or_else(|| pid.filter(|pid| *pid > 0))
+        {
+            let _ = kill(Pid::from_raw(target), Signal::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = pid {
+        let executable = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows"))
+            .join("System32")
+            .join("taskkill.exe");
+        // Start native tree termination without blocking the executor/drop.
+        let _ = std::process::Command::new(executable)
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
 }
 
 #[cfg(target_os = "macos")]

@@ -72,6 +72,88 @@ fn assert_reaped(pid: i32) {
 }
 
 #[tokio::test]
+async fn completed_job_records_do_not_limit_later_spawns() {
+    let root = tempfile::tempdir().unwrap();
+    let context = context(root.path());
+    for _ in 0..65 {
+        let job = execute(
+            &context,
+            json!({"action": "spawn", "command": "printf done"}),
+        )
+        .await;
+        context
+            .tool_sessions
+            .background_session(&context.session_id)
+            .get(job["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        execute(&context, json!({"action": "list"})).await["jobs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        65
+    );
+    context
+        .tool_sessions
+        .shutdown_session(&context.session_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn aborting_foreground_shell_future_stops_its_worker_and_owned_descendants() {
+    let root = tempfile::tempdir().unwrap();
+    let context = context(root.path());
+    let worker = tokio::spawn({
+        let context = context.clone();
+        async move {
+            crate::ShellTool.execute(context, json!({"command": "sh -c 'trap \"\" TERM; sleep 30 & printf \"%s %s\" \"$$\" \"$!\" > owned-pids; wait'"})).await
+        }
+    });
+    let pids = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(pids) = tokio::fs::read_to_string(root.path().join("owned-pids")).await {
+                let parsed = pids
+                    .split_whitespace()
+                    .map(str::parse::<i32>)
+                    .collect::<Result<Vec<_>, _>>();
+                if let Ok(pids) = parsed
+                    && pids.len() == 2
+                {
+                    break pids;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("foreground children publish their pids");
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            // SAFETY: probes only children created by this test.
+            if pids.iter().all(|pid| unsafe { libc::kill(*pid, 0) } == -1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("aborted foreground worker kills and reaps its process group");
+    context
+        .tool_sessions
+        .shutdown_session(&context.session_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn session_shutdown_reaps_shell_jobs_and_preserves_task_list() {
     let root = tempfile::tempdir().unwrap();
     let context = context(root.path());

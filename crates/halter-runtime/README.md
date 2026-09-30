@@ -39,7 +39,7 @@ this crate explains the core machinery.
 Key exports include:
 
 - `SessionRuntime`
-- `SessionHandle`, `SessionEventStream`, `SessionError`
+- `SessionHandle`, `SessionEventStream`, `SessionError`, `Submission`
 - `SessionInit`
 - `RuntimeServices`
 - `ResourceHandle`
@@ -64,7 +64,7 @@ A typical flow looks like this:
 2. open a session with `create_session(...)`
 3. receive a `SessionHandle` and continuous `SessionEventStream`
 4. submit user messages with `submit(...)`
-5. consume events until `SessionStatusChanged` reports idle after running
+5. use the submission receipt to match `InputSettled`, `InputRejected`, or `InputDeferred`
 6. interrupt, compact, replay, close, or reopen the conversation
 
 `SessionRuntime` is the factory and coordinator.
@@ -150,7 +150,7 @@ async fn start(runtime: &SessionRuntime) -> anyhow::Result<()> {
         ..SessionInit::default()
     }).await?;
 
-    session.shutdown().await?;
+    session.shutdown(None).await?;
     Ok(())
 }
 ```
@@ -162,21 +162,22 @@ The top-level SDK exposes this as `Halter::new_session`.
 ## `SessionHandle`
 
 The handle is cloneable; one event receiver accompanies each newly opened driver.
-Dropping either does not stop the driver. Use `shutdown()` to close it explicitly.
+Dropping either does not stop the driver. Use `shutdown(None)` to close it explicitly.
 Old handles stay closed when the stored conversation is reopened.
 
 Important methods:
 
 - `id()` / `session_id()`
 - `submit(Message::user(...))`
-- `interrupt()`
-- `shutdown()`
+- `interrupt(timeout)`
+- `shutdown(timeout)`
 - `replay()` / `export_trace()`
 - `compact(trigger, custom_instructions)`
 
 ### `submit(...)`
 
-Returns the accepted message ID after input commits to the session store. Idle
+Returns `Submission { message_id, sequence }` after input commits to the session
+store. `sequence` identifies the acknowledged `InputAccepted` event. Idle
 sessions start execution. During inference or a foreground tool, accepted input
 queues until a safe boundary after outstanding tool results. `MessageItem`
 confirms delivery into history. The pending inbox lives outside the compaction
@@ -186,20 +187,36 @@ Only user messages are accepted. Assistant responses and tool results remain
 runtime-owned. Admission is bounded; submission can return `InboxFull` or
 `Closed`. Recoverability after process exit depends on the configured store.
 
-When waiting for a particular submission on a retained stream, match its returned
-message ID in `InputAccepted` before interpreting execution status. Earlier
-compaction or execution events can still be buffered in that receiver.
+For completion, ignore events before the receipt's `sequence`, then match
+`submission.message_id` in `InputSettled`. Its outcome is
+`Completed`, `Failed { error, retryable }`, or `Interrupted`. Inputs delivered
+during one execution share that outcome; they do not receive independent replies.
+`InputRejected` reports a hook decision. `InputDeferred` reports input still
+queued after interruption, failure, shutdown, or idle resume. Deferral preserves
+the input for later execution.
 
-### `interrupt()`
+The sequence boundary keeps buffered outcomes from an earlier attempt from
+finishing a retry on a retained stream. Submitting the same queued ID
+records a fresh acceptance boundary with its original contents, without adding
+a duplicate inbox entry. A settled or rejected ID is an idempotent lookup:
+submission returns its ID and recorded acceptance sequence without a new event
+or execution. Use `replay()` to read its recorded outcome. `Running` and `Idle`
+describe driver activity, including compaction; they do not identify completion
+of a particular input.
 
-Cancels foreground execution and waits for tool cleanup and final commits.
+### `interrupt(timeout)`
+
+`interrupt(None)` cancels foreground execution and waits for tool cleanup and
+final commits. `Some(duration)` bounds the caller's wait for cooperative
+cancellation. If it expires, the method returns `SessionError::TimedOut` and
+requests forced recovery; call `interrupt(None)` to await settlement. In-flight
+storage writes or blocking code can delay final settlement.
 Earlier pending input remains recorded without automatically restarting execution.
 A later submission starts work again. Cancellation cannot undo completed effects,
 and custom tools must honor their token and settle their owned resources.
 
-The low-level `HalterSession` executor and its `submit_turn` methods remain for
-runtime integrations. The SDK's `HalterSession` prelude alias names the new
-`SessionHandle`; clients do not need to construct turns.
+The SDK's `HalterSession` prelude alias names `SessionHandle`; clients submit
+messages and control the session without constructing turns.
 
 ### `replay()`
 
@@ -242,11 +259,15 @@ error like:
 
 > `failed to compact session: provider '{}' does not support compaction`
 
-### `shutdown()`
+### `shutdown(timeout)`
 
 Closes the live driver, cancels foreground work, and awaits cleanup of owned
 subagents and tool resources. The event stream ends. Stored history remains
 available to `resume_session`, which creates a fresh driver starting idle.
+`None` waits for cleanup. `Some(duration)` bounds the wait; on timeout the method
+returns `SessionError::TimedOut` and requests forced process cleanup. The session
+stays fenced against reopening until cleanup and final commits settle. Call
+`shutdown(None)` to await that cleanup.
 
 ---
 
@@ -543,6 +564,9 @@ Subagent control is also coordinated with the tool layer, where tools like
 `wait_agent` while work is running, or `close_agent` to cancel it. A timed-out
 `wait_agent` response includes `target_statuses` so callers can see the current
 state of every requested child.
+`close_agent` accepts optional `timeout_ms` to bound waiting for cancellation and
+cleanup. Omitting it waits without a deadline. Expiry returns a timeout error
+and requests forced cleanup; final settlement can continue afterward.
 
 The parent's log records each child. Every spawn, turn start, turn finish and
 close appends a `SubagentUpdated` event, which is folded into
@@ -660,7 +684,7 @@ parent's concrete model instead of recursively entering the wrapper again.
 
 ```rust
 use futures::StreamExt;
-use halter_protocol::{Message, SessionEventPayload, SessionStatus};
+use halter_protocol::{Message, SessionEventPayload};
 use halter_runtime::{SessionInit, SessionRuntime};
 
 pub async fn run_once(runtime: &SessionRuntime, prompt: &str) -> anyhow::Result<()> {
@@ -668,17 +692,20 @@ pub async fn run_once(runtime: &SessionRuntime, prompt: &str) -> anyhow::Result<
         working_dir: std::env::current_dir()?,
         ..SessionInit::default()
     }).await?;
-    session.submit(Message::user(prompt)).await?;
-    let mut running = false;
+    let submission = session.submit(Message::user(prompt)).await?;
     while let Some(event) = events.next().await {
-        match event?.payload {
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
-            SessionEventPayload::TurnFailed { error, .. } => anyhow::bail!(error),
+        let event = event?;
+        if event.session_id != *session.id() || event.sequence() < submission.sequence {
+            continue;
+        }
+        match event.payload {
+            SessionEventPayload::InputSettled { message_id: id, .. }
+            | SessionEventPayload::InputRejected { message_id: id, .. }
+            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
             _ => {}
         }
     }
-    session.shutdown().await?;
+    session.shutdown(None).await?;
     Ok(())
 }
 ```

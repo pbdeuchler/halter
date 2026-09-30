@@ -5,20 +5,23 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use halter_protocol::SessionId;
 use parking_lot::Mutex;
+#[cfg(feature = "browser-tools")]
 use tokio::sync::Mutex as TokioMutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::builtin::background::BackgroundRegistry;
 #[cfg(feature = "browser-tools")]
 use crate::builtin::browser::session::BrowserSession;
 #[cfg(feature = "pty")]
 use crate::builtin::pty::PtySessionHandle;
-use crate::builtin::shell::session::ShellSessionCore;
+use crate::builtin::shell::session::ShellSession;
 use crate::builtin::task::TaskList;
 
 #[derive(Default)]
 /// Per-session storage for stateful tools.
 pub struct ToolSessionStore {
-    shell_sessions: DashMap<String, Arc<TokioMutex<Option<ShellSessionCore>>>>,
+    shell_sessions: DashMap<String, Arc<ShellSession>>,
+    process_lifetimes: DashMap<String, CancellationToken>,
     task_sessions: DashMap<String, Arc<Mutex<TaskList>>>,
     background_sessions: DashMap<String, Arc<BackgroundRegistry>>,
     #[cfg(feature = "pty")]
@@ -28,10 +31,91 @@ pub struct ToolSessionStore {
 }
 
 impl ToolSessionStore {
+    pub(crate) fn process_lifetime(&self, session_id: &SessionId) -> CancellationToken {
+        self.process_lifetimes
+            .entry(session_id.0.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Close process admission and signal resources without waiting for reaping.
+    pub async fn request_stop_session(&self, session_id: &SessionId) {
+        self.stop_session_resources(session_id, false).await;
+    }
+
+    /// Force-stop owned processes while retaining their cleanup slots.
+    pub async fn force_stop_session(&self, session_id: &SessionId) {
+        self.stop_session_resources(session_id, true).await;
+    }
+
+    async fn stop_session_resources(&self, session_id: &SessionId, force: bool) {
+        if force {
+            // A cleanup deadline can fire after some resources have already
+            // settled. Never recreate closed slots that would poison reopen.
+            if let Some(lifetime) = self.process_lifetimes.get(&session_id.0) {
+                lifetime.cancel();
+            }
+            let jobs = self
+                .background_sessions
+                .get(&session_id.0)
+                .map(|entry| entry.clone());
+            if let Some(jobs) = jobs {
+                jobs.request_stop(true).await;
+            }
+        } else {
+            self.process_lifetime(session_id).cancel();
+            self.background_session(session_id)
+                .request_stop(false)
+                .await;
+        }
+        if let Some(shell) = self.shell_sessions.get(&session_id.0) {
+            shell.request_stop(force);
+        }
+        #[cfg(feature = "pty")]
+        if let Some(pty) = self.pty_sessions.get(&session_id.0) {
+            crate::builtin::pty::request_stop_session(&pty);
+        }
+    }
+
+    pub async fn request_stop_all(&self) {
+        for id in self.process_session_ids() {
+            self.request_stop_session(&id).await;
+        }
+    }
+
+    pub async fn force_stop_all(&self) {
+        for id in self.process_session_ids() {
+            self.force_stop_session(&id).await;
+        }
+    }
+
+    fn process_session_ids(&self) -> Vec<SessionId> {
+        let mut ids = std::collections::HashSet::new();
+        ids.extend(
+            self.process_lifetimes
+                .iter()
+                .map(|entry| entry.key().clone()),
+        );
+        ids.extend(
+            self.background_sessions
+                .iter()
+                .map(|entry| entry.key().clone()),
+        );
+        ids.extend(self.shell_sessions.iter().map(|entry| entry.key().clone()));
+        #[cfg(feature = "pty")]
+        ids.extend(self.pty_sessions.iter().map(|entry| entry.key().clone()));
+        #[cfg(feature = "browser-tools")]
+        ids.extend(
+            self.browser_sessions
+                .iter()
+                .map(|entry| entry.key().clone()),
+        );
+        ids.into_iter().map(SessionId::from).collect()
+    }
     pub(crate) fn background_session(&self, session_id: &SessionId) -> Arc<BackgroundRegistry> {
         self.background_sessions
             .entry(session_id.0.clone())
-            .or_default()
+            .or_insert_with(|| Arc::new(BackgroundRegistry::new(self.process_lifetime(session_id))))
             .clone()
     }
 
@@ -39,25 +123,43 @@ impl ToolSessionStore {
     /// settled. Runtime admission must remain closed during this operation.
     /// Task lists are retained; process resources receive fresh slots on reopen.
     pub async fn shutdown_session(&self, session_id: &SessionId) -> anyhow::Result<()> {
+        self.request_stop_session(session_id).await;
         let mut errors = Vec::new();
-        if let Some((_, jobs)) = self.background_sessions.remove(&session_id.0)
+        let jobs = self
+            .background_sessions
+            .get(&session_id.0)
+            .map(|entry| entry.clone());
+        if let Some(jobs) = jobs
             && let Err(error) = jobs.shutdown().await
         {
             errors.push(error.to_string());
         }
-        if let Some((_, shell)) = self.shell_sessions.remove(&session_id.0)
+        let shell = self
+            .shell_sessions
+            .get(&session_id.0)
+            .map(|entry| entry.clone());
+        if let Some(shell) = shell
             && let Err(error) = crate::builtin::shell::session::shutdown_shell_session(&shell).await
         {
             errors.push(error.to_string());
         }
         #[cfg(feature = "pty")]
-        if let Some((_, pty)) = self.pty_sessions.remove(&session_id.0)
+        let pty = self
+            .pty_sessions
+            .get(&session_id.0)
+            .map(|entry| entry.clone());
+        #[cfg(feature = "pty")]
+        if let Some(pty) = pty
             && let Err(error) = crate::builtin::pty::stop_session(&pty).await
         {
             errors.push(error.to_string());
         }
         #[cfg(feature = "browser-tools")]
-        if let Some((_, browser)) = self.browser_sessions.remove(&session_id.0) {
+        if let Some(browser) = self
+            .browser_sessions
+            .get(&session_id.0)
+            .map(|entry| entry.clone())
+        {
             let browser = browser.lock().await.take();
             if let Some(browser) = browser
                 && let Err(error) = browser.close().await
@@ -65,6 +167,13 @@ impl ToolSessionStore {
                 errors.push(error.to_string());
             }
         }
+        self.background_sessions.remove(&session_id.0);
+        self.shell_sessions.remove(&session_id.0);
+        #[cfg(feature = "pty")]
+        self.pty_sessions.remove(&session_id.0);
+        #[cfg(feature = "browser-tools")]
+        self.browser_sessions.remove(&session_id.0);
+        self.process_lifetimes.remove(&session_id.0);
         anyhow::ensure!(
             errors.is_empty(),
             "failed to shut down session tool resources: {}",
@@ -75,13 +184,10 @@ impl ToolSessionStore {
 
     /// Return the persistent shell session slot for a halter session.
     #[must_use]
-    pub fn shell_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Arc<TokioMutex<Option<ShellSessionCore>>> {
+    pub fn shell_session(&self, session_id: &SessionId) -> Arc<ShellSession> {
         self.shell_sessions
             .entry(session_id.0.clone())
-            .or_insert_with(|| Arc::new(TokioMutex::new(None)))
+            .or_insert_with(|| Arc::new(ShellSession::new(self.process_lifetime(session_id))))
             .clone()
     }
 

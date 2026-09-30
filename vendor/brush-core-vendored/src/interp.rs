@@ -41,9 +41,19 @@ pub struct ExecutionParameters {
     /// Optionally provides a cancellation token; when triggered, execution
     /// is interrupted as promptly as practical.
     cancel_token: Option<CancellationToken>,
+    process_tracker: Option<crate::processes::ProcessTracker>,
 }
 
 impl ExecutionParameters {
+    /// Attach ownership tracking shared by every child of this execution.
+    pub fn set_process_tracker(&mut self, tracker: crate::processes::ProcessTracker) {
+        self.process_tracker = Some(tracker);
+    }
+
+    pub(crate) fn process_tracker(&self) -> Option<crate::processes::ProcessTracker> {
+        self.process_tracker.clone()
+    }
+
     /// Returns the standard input file; usable with `write!` et al.
     ///
     /// # Arguments

@@ -42,4 +42,5 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+halter-session = { path = "../halter-session", version = "0.8.0", features = ["sqlite"] }
 tempfile.workspace = true

@@ -30,8 +30,32 @@ pub(super) struct BackgroundJob {
     started_at_ms: u128,
     output: Arc<Mutex<OutputBuffer>>,
     stop: CancellationToken,
+    owned_process: Arc<Mutex<Option<OwnedProcessIds>>>,
     status: watch::Receiver<JobStatus>,
     task: AsyncMutex<Option<JoinHandle<()>>>,
+}
+
+struct OwnedProcessIds {
+    pid: Option<u32>,
+    group: u32,
+}
+
+struct OwnedProcessGuard(Arc<Mutex<Option<OwnedProcessIds>>>);
+
+impl Drop for OwnedProcessGuard {
+    fn drop(&mut self) {
+        if let Some(owned) = self.0.lock().take() {
+            signal_owned(&owned, 9);
+        }
+    }
+}
+
+fn signal_owned(owned: &OwnedProcessIds, signal: i32) {
+    #[cfg(unix)]
+    kill_process_group(owned.group as i32, signal);
+    if let Some(pid) = owned.pid {
+        kill_tree(pid as i32, signal);
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -148,13 +172,23 @@ impl BackgroundJob {
         let stderr = child.stderr.take().expect("spawn configured piped stderr");
         let stop = CancellationToken::new();
         let (status_tx, status) = watch::channel(JobStatus::Running);
+        let owned_process = Arc::new(Mutex::new(Some(OwnedProcessIds {
+            pid: Some(pid),
+            group: pid,
+        })));
+        let ownership = OwnedProcessGuard(owned_process.clone());
         let task = tokio::spawn({
             let output = output.clone();
             let stop = stop.clone();
+            let owned_process = owned_process.clone();
             async move {
+                let _ownership = ownership;
                 let stdout = tokio::spawn(capture(stdout, output.clone()));
                 let stderr = tokio::spawn(capture(stderr, output));
-                let outcome = monitor(&mut child, pid, &stop).await;
+                let outcome = monitor(&mut child, pid, &stop, &owned_process).await;
+                // Disable signalling before output drains; a completed PID
+                // must never be targeted after the OS reuses it.
+                owned_process.lock().take();
                 let stdout_result = drain_reader(stdout).await;
                 let stderr_result = drain_reader(stderr).await;
                 let status = match outcome
@@ -179,6 +213,7 @@ impl BackgroundJob {
                 .as_millis(),
             output,
             stop,
+            owned_process,
             status,
             task: AsyncMutex::new(Some(task)),
         }))
@@ -209,6 +244,13 @@ impl BackgroundJob {
 
     pub(super) fn request_stop(&self) {
         self.stop.cancel();
+    }
+
+    pub(super) fn force_stop(&self) {
+        self.stop.cancel();
+        if let Some(owned) = self.owned_process.lock().as_ref() {
+            signal_owned(owned, 9);
+        }
     }
 
     pub(super) async fn wait(&self) -> anyhow::Result<()> {
@@ -286,16 +328,17 @@ async fn monitor(
     child: &mut Child,
     pid: u32,
     stop: &CancellationToken,
+    owned: &Mutex<Option<OwnedProcessIds>>,
 ) -> anyhow::Result<JobStatus> {
     let outcome = tokio::select! {
-        result = child.wait() => result,
+        result = wait_owned_child(child, owned) => result,
         _ = stop.cancelled() => {
             signal_job(pid, 15);
             // Give every member of the owned process group a TERM grace
             // period, even if the group leader exits sooner.
             tokio::time::sleep(TERM_GRACE).await;
             signal_job(pid, 9);
-            child.wait().await
+            wait_owned_child(child, owned).await
         }
     };
     // A command using '&' can leave descendants behind after its shell exits.
@@ -319,6 +362,27 @@ async fn monitor(
         exit_code: status.code(),
         signal,
     })
+}
+
+async fn wait_owned_child(
+    child: &mut Child,
+    owned: &Mutex<Option<OwnedProcessIds>>,
+) -> std::io::Result<std::process::ExitStatus> {
+    let wait = child.wait();
+    tokio::pin!(wait);
+    std::future::poll_fn(|cx| {
+        // Reaping and external force-stop use the same lock. A reaped PID
+        // is retired before another caller could signal its replacement.
+        let mut control = owned.lock();
+        let result = std::future::Future::poll(wait.as_mut(), cx);
+        if result.is_ready()
+            && let Some(owned) = control.as_mut()
+        {
+            owned.pid = None;
+        }
+        result
+    })
+    .await
 }
 
 fn signal_job(pid: u32, signal: i32) {

@@ -16,19 +16,21 @@ async fn main() -> anyhow::Result<()> {
     let harness = Halter::from_config_file("halter.toml").await?;
     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 
-    session.submit(Message::user("Summarize this repository")).await?;
-
-    let mut running = false;
+    let submission = session.submit(Message::user("Summarize this repository")).await?;
     while let Some(event) = events.next().await {
         let event = event?;
+        if event.session_id != *session.id() || event.sequence() < submission.sequence {
+            continue;
+        }
         println!("{:?}", event.payload);
         match event.payload {
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
-            SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
+            SessionEventPayload::InputSettled { message_id: id, .. }
+            | SessionEventPayload::InputRejected { message_id: id, .. }
+            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
             _ => {}
         }
     }
-    session.shutdown().await?;
+    session.shutdown(None).await?;
 
     Ok(())
 }
@@ -51,11 +53,21 @@ The `halter` crate keeps optional capabilities out of the default build. No feat
 | `full`           | Convenience rollup for the optional built-in tool families.                                                                              | Same extra dependencies as `advanced-tools`, `ast-tools`, `browser-tools`, `image-tools`, `pty`, and `profiling`. | Does not include `sqlite`; enable `sqlite` separately when persistent session storage is needed.                                                                                  |
 | `sqlite`         | Enables SQLite-backed session persistence and the matching config schema.                                                                | `rusqlite`                                                                                                        | Allows `sessions.backend = "sqlite"` and exposes `halter::session::SqliteSessionStore`. The default backend remains memory unless config selects SQLite.                          |
 
-`submit` returns after input is committed to the configured session store. While
+`submit` returns `Submission { message_id, sequence }` after input is committed
+to the configured session store. While
 execution is active, further submissions queue for the next safe boundary.
-`interrupt()` waits for cancellation and cleanup without closing the handle.
-`shutdown()` closes the live driver and stream; `harness.resume_session(id)`
+Ignore events before `submission.sequence`, then match `submission.message_id`
+in `InputSettled` for its execution outcome. `InputRejected`
+reports hook rejection; `InputDeferred` means the input is still queued.
+`interrupt(None)` waits for cancellation and cleanup without closing the handle.
+`shutdown(None)` closes the live driver and stream; `harness.resume_session(id)`
 reopens the stored conversation idle with fresh handles.
+Use `Some(duration)` to bound the caller's wait for cleanup. Expiry returns
+`SessionError::TimedOut` and requests forced recovery; call again with `None`
+to await settlement. Storage writes or blocking code can delay final settlement.
+Queued same-ID retries emit a fresh `InputAccepted` whose
+sequence is returned in the receipt, without duplicating input. Already settled
+or rejected IDs start no work; their outcomes remain available through `replay()`.
 
 ## More documentation
 

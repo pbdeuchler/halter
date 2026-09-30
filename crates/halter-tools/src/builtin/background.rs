@@ -22,13 +22,11 @@ use job::BackgroundJob;
 /// Retained stdout and stderr bytes per job. Output cursors count original
 /// bytes, including bytes already discarded from this bounded buffer.
 const OUTPUT_CAPACITY: usize = 64 * 1024;
-// Completed records remain queryable until the session closes. Bound those
-// too, so repeated spawning cannot grow the session without limit.
-const MAX_JOBS: usize = 64;
 
 #[derive(Default)]
 pub(crate) struct BackgroundRegistry {
     state: Mutex<RegistryState>,
+    lifetime: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Default)]
@@ -38,6 +36,12 @@ struct RegistryState {
 }
 
 impl BackgroundRegistry {
+    pub(crate) fn new(lifetime: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            lifetime,
+            ..Self::default()
+        }
+    }
     async fn spawn(
         &self,
         context: &ToolContext,
@@ -48,12 +52,8 @@ impl BackgroundRegistry {
         let mut state = self.state.lock().await;
         ensure_not_cancelled(&context.cancel)?;
         anyhow::ensure!(
-            !state.closed,
+            !state.closed && !self.lifetime.is_cancelled(),
             "failed to spawn background job: session is closed"
-        );
-        anyhow::ensure!(
-            state.jobs.len() < MAX_JOBS,
-            "failed to spawn background job: session job limit ({MAX_JOBS}) reached"
         );
         let id = format!("bg-{}", SessionId::new().0);
         // Spawn and registration have no await between them. Once registered,
@@ -105,6 +105,18 @@ impl BackgroundRegistry {
             errors.join("; ")
         );
         Ok(())
+    }
+
+    pub(crate) async fn request_stop(&self, force: bool) {
+        let mut state = self.state.lock().await;
+        state.closed = true;
+        for job in state.jobs.values() {
+            if force {
+                job.force_stop();
+            } else {
+                job.request_stop();
+            }
+        }
     }
 }
 

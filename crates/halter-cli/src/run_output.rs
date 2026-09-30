@@ -2,11 +2,12 @@
 
 use clap::Args;
 use halter_protocol::{
-    AssistantMessage, AssistantPart, Message, SessionEvent, SessionEventPayload, SessionStatus,
+    AssistantMessage, AssistantPart, InputDeferredReason, InputOutcome, Message, MessageId,
+    SessionEvent, SessionEventPayload,
 };
 
 #[cfg(test)]
-use halter_protocol::{MessageId, ReplayMeta, StopReason, Usage};
+use halter_protocol::{ReplayMeta, SessionStatus, StopReason, Usage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutputMode {
@@ -41,17 +42,31 @@ impl RunOutputArgs {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct JsonResultTracker {
     final_result: Option<AssistantMessage>,
-    running: bool,
+    message_id: MessageId,
 }
 
 impl JsonResultTracker {
+    pub fn new(message_id: MessageId) -> Self {
+        Self {
+            final_result: None,
+            message_id,
+        }
+    }
+
     pub fn observe(
         &mut self,
         payload: &SessionEventPayload,
     ) -> Result<Option<&AssistantMessage>, String> {
+        if input_completion(payload, &self.message_id)? {
+            return self
+                .final_result
+                .as_ref()
+                .map(Some)
+                .ok_or_else(|| "failed to capture final assistant result".to_owned());
+        }
         match payload {
             SessionEventPayload::MessageItem {
                 message: Message::Assistant(message),
@@ -59,22 +74,44 @@ impl JsonResultTracker {
                 self.final_result = Some(message.clone());
                 Ok(None)
             }
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Running,
-            } => {
-                self.running = true;
-                Ok(None)
-            }
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Idle,
-            } if self.running => self
-                .final_result
-                .as_ref()
-                .map(Some)
-                .ok_or_else(|| "failed to capture final assistant result".to_owned()),
-            SessionEventPayload::TurnFailed { error, .. } => Err(error.clone()),
             _ => Ok(None),
         }
+    }
+}
+
+/// Match a submitted input rather than unrelated execution or activity events.
+pub fn input_completion(
+    payload: &SessionEventPayload,
+    message_id: &MessageId,
+) -> Result<bool, String> {
+    match payload {
+        SessionEventPayload::InputSettled {
+            message_id: id,
+            outcome,
+        } if id == message_id => match outcome {
+            InputOutcome::Completed => Ok(true),
+            InputOutcome::Failed { error, .. } => Err(error.clone()),
+            InputOutcome::Interrupted => Err("input was interrupted".to_owned()),
+        },
+        SessionEventPayload::InputRejected {
+            message_id: id,
+            reason,
+        } if id == message_id => Err(format!("input was rejected: {reason}")),
+        SessionEventPayload::InputDeferred {
+            message_id: id,
+            reason,
+        } if id == message_id => {
+            let reason = match reason {
+                InputDeferredReason::Interrupted => "execution was interrupted".to_owned(),
+                InputDeferredReason::ExecutionFailed { error, .. } => {
+                    format!("execution failed: {error}")
+                }
+                InputDeferredReason::Shutdown => "the session was shut down".to_owned(),
+                InputDeferredReason::Resumed => "the session was resumed idle".to_owned(),
+            };
+            Err(format!("input remains queued because {reason}"))
+        }
+        _ => Ok(false),
     }
 }
 
@@ -157,12 +194,8 @@ mod tests {
 
     #[test]
     fn json_result_tracker_returns_latest_assistant_message_on_completion() {
-        let mut tracker = JsonResultTracker::default();
-        tracker
-            .observe(&SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Running,
-            })
-            .unwrap();
+        let id = MessageId::from("input-1");
+        let mut tracker = JsonResultTracker::new(id.clone());
         let tool_request = assistant_message("call tool", Some(StopReason::ToolUse));
         let final_result = assistant_message("done", Some(StopReason::EndTurn));
 
@@ -200,8 +233,9 @@ mod tests {
         );
 
         let result = tracker
-            .observe(&SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Idle,
+            .observe(&SessionEventPayload::InputSettled {
+                message_id: id,
+                outcome: InputOutcome::Completed,
             })
             .expect("turn completed")
             .expect("assistant result");
@@ -210,14 +244,16 @@ mod tests {
     }
 
     #[test]
-    fn json_result_tracker_errors_on_turn_failure() {
-        let mut tracker = JsonResultTracker::default();
+    fn json_result_tracker_errors_on_its_input_failure() {
+        let id = MessageId::from("input-1");
+        let mut tracker = JsonResultTracker::new(id.clone());
         let error = tracker
-            .observe(&SessionEventPayload::TurnFailed {
-                turn_id: halter_protocol::TurnId::from("turn-1"),
-                error: "provider exploded".to_owned(),
-                cancelled: false,
-                retryable: false,
+            .observe(&SessionEventPayload::InputSettled {
+                message_id: id,
+                outcome: InputOutcome::Failed {
+                    error: "provider exploded".to_owned(),
+                    retryable: false,
+                },
             })
             .expect_err("turn failure should surface");
         assert_eq!(error, "provider exploded");
@@ -225,31 +261,120 @@ mod tests {
 
     #[test]
     fn json_result_tracker_requires_a_final_assistant_message() {
-        let mut tracker = JsonResultTracker::default();
-        tracker
-            .observe(&SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Running,
-            })
-            .unwrap();
+        let id = MessageId::from("input-1");
+        let mut tracker = JsonResultTracker::new(id.clone());
         let error = tracker
-            .observe(&SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Idle,
+            .observe(&SessionEventPayload::InputSettled {
+                message_id: id,
+                outcome: InputOutcome::Completed,
             })
             .expect_err("turn completion without assistant result should fail");
         assert_eq!(error, "failed to capture final assistant result");
     }
 
     #[test]
-    fn json_result_tracker_ignores_initial_idle_status() {
-        let mut tracker = JsonResultTracker::default();
-        assert!(
-            tracker
-                .observe(&SessionEventPayload::SessionStatusChanged {
-                    status: SessionStatus::Idle
-                })
-                .unwrap()
-                .is_none()
-        );
+    fn json_result_tracker_ignores_activity_and_other_input_outcomes() {
+        let mut tracker = JsonResultTracker::new(MessageId::from("input-1"));
+        for payload in [
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Running,
+            },
+            SessionEventPayload::SessionStatusChanged {
+                status: SessionStatus::Idle,
+            },
+            SessionEventPayload::TurnFailed {
+                turn_id: halter_protocol::TurnId::from("earlier-turn"),
+                error: "unrelated failure".to_owned(),
+                cancelled: false,
+                retryable: false,
+            },
+            SessionEventPayload::InputSettled {
+                message_id: MessageId::from("another-input"),
+                outcome: InputOutcome::Completed,
+            },
+            SessionEventPayload::InputDeferred {
+                message_id: MessageId::from("another-input"),
+                reason: InputDeferredReason::Interrupted,
+            },
+        ] {
+            assert!(tracker.observe(&payload).unwrap().is_none(), "{payload:?}");
+        }
+    }
+
+    #[test]
+    fn input_completion_distinguishes_settlement_rejection_and_pending_input() {
+        let id = MessageId::from("input-1");
+        let cases = [
+            (
+                SessionEventPayload::InputSettled {
+                    message_id: id.clone(),
+                    outcome: InputOutcome::Completed,
+                },
+                Ok(true),
+            ),
+            (
+                SessionEventPayload::InputSettled {
+                    message_id: id.clone(),
+                    outcome: InputOutcome::Failed {
+                        error: "provider unavailable".to_owned(),
+                        retryable: true,
+                    },
+                },
+                Err("provider unavailable"),
+            ),
+            (
+                SessionEventPayload::InputSettled {
+                    message_id: id.clone(),
+                    outcome: InputOutcome::Interrupted,
+                },
+                Err("input was interrupted"),
+            ),
+            (
+                SessionEventPayload::InputRejected {
+                    message_id: id.clone(),
+                    reason: "blocked by hook".to_owned(),
+                },
+                Err("input was rejected: blocked by hook"),
+            ),
+            (
+                SessionEventPayload::InputDeferred {
+                    message_id: id.clone(),
+                    reason: InputDeferredReason::Interrupted,
+                },
+                Err("input remains queued because execution was interrupted"),
+            ),
+            (
+                SessionEventPayload::InputDeferred {
+                    message_id: id.clone(),
+                    reason: InputDeferredReason::ExecutionFailed {
+                        error: "hook failed".to_owned(),
+                        retryable: false,
+                    },
+                },
+                Err("input remains queued because execution failed: hook failed"),
+            ),
+            (
+                SessionEventPayload::InputDeferred {
+                    message_id: id.clone(),
+                    reason: InputDeferredReason::Shutdown,
+                },
+                Err("input remains queued because the session was shut down"),
+            ),
+            (
+                SessionEventPayload::InputDeferred {
+                    message_id: id.clone(),
+                    reason: InputDeferredReason::Resumed,
+                },
+                Err("input remains queued because the session was resumed idle"),
+            ),
+        ];
+        for (payload, expected) in cases {
+            assert_eq!(
+                input_completion(&payload, &id),
+                expected.map_err(str::to_owned),
+                "{payload:?}"
+            );
+        }
     }
 
     #[test]

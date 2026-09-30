@@ -39,14 +39,13 @@ use crate::turn_registry::TurnRegistry;
 use crate::{
     CompactionBoundary, CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager,
     ContextSettings, EventBus, ExecutedHookDispatch, HookInvocationContext, PromptAssembler,
-    run_notification, run_post_compact, run_post_tool_use, run_post_tool_use_failure,
-    run_pre_compact, run_pre_tool_use, run_session_end, run_session_start, run_stop,
-    run_user_prompt_submit,
+    run_post_compact, run_post_tool_use, run_post_tool_use_failure, run_pre_compact,
+    run_pre_tool_use, run_session_end, run_session_start, run_stop, run_user_prompt_submit,
 };
 #[cfg(test)]
-use crate::{DefaultContextManager, ModelSummary};
+use crate::{DefaultContextManager, ModelSummary, run_notification};
 
-/// Stream of committed session events returned by turn submission.
+/// Stream of session events emitted by the runtime.
 pub type SessionEventStream = BoxStream<'static, anyhow::Result<SessionEvent>>;
 
 const PROVIDER_STREAM_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
@@ -248,12 +247,12 @@ impl SessionInit {
 }
 
 /// Drop-time hook eviction guard, scoped to a *session*, not a handle:
-/// every live [`SessionHandle`] for a session id shares the same guard
+/// every live [`SessionExecutor`] for a session id shares the same guard
 /// (clones share it via `Arc`, and separately-constructed handles find it
 /// through the [`SessionHookEntry`] weak reference), so the session's hook
 /// store entry is evicted only when the last handle for that session —
 /// however it was constructed — is dropped. Pre-Phase-3 code put `Drop` on
-/// `HalterSession` itself, which meant any short-lived clone would evict
+/// `SessionExecutor` itself, which meant any short-lived clone would evict
 /// the hooks for the still-live original handle; per-handle guards had the
 /// same bug for the temporary parent handles built during subagent hook
 /// dispatch.
@@ -279,7 +278,7 @@ impl Drop for EvictionGuard {
 /// when every handle for the session — clones and independently
 /// constructed handles alike — has been dropped.
 #[derive(Clone)]
-pub struct SessionHandle {
+pub(crate) struct SessionExecutor {
     services: Arc<RuntimeServices>,
     session_id: SessionId,
     session_hooks: Arc<Hooks>,
@@ -287,12 +286,8 @@ pub struct SessionHandle {
     /// see `EvictionGuard`.
     #[allow(dead_code)]
     eviction: Arc<EvictionGuard>,
-    managed: Option<Arc<crate::session_driver::SessionInbox>>,
+    inbox: Option<Arc<crate::session_driver::SessionInbox>>,
 }
-
-/// Backwards-compatible alias for the public session type. Prefer
-/// `SessionHandle` in new code.
-pub type HalterSession = SessionHandle;
 
 #[derive(Debug, Default)]
 struct ToolEventBuffer {
@@ -399,7 +394,7 @@ impl LiveTurnStream {
         };
 
         if should_send_lagged {
-            let _ = self.tx.send(Ok(forwarding_lagged_event()));
+            let _ = self.tx.send(Ok(crate::event_bus::lagged_event(1)));
             return;
         }
 
@@ -409,15 +404,6 @@ impl LiveTurnStream {
     fn emit_error(&self, error: anyhow::Error) {
         let _ = self.tx.send(Err(error));
     }
-}
-
-fn forwarding_lagged_event() -> SessionEvent {
-    PendingEvent::new(
-        SessionId::from(crate::event_bus::BUS_SESSION_ID),
-        Delivery::BestEffort,
-        SessionEventPayload::Lagged { dropped_events: 1 },
-    )
-    .into_committed(0)
 }
 
 #[derive(Default)]
@@ -569,7 +555,13 @@ impl SessionRuntime {
         let result = async {
             let executor = self.new_session(init).await?;
             self.drivers
-                .open(executor, self.services.clone(), self.subagents.clone(), 0)
+                .open(
+                    executor,
+                    self.services.clone(),
+                    self.subagents.clone(),
+                    0,
+                    None,
+                )
                 .await
         }
         .await;
@@ -589,6 +581,11 @@ impl SessionRuntime {
         }
         let _opening = self.drivers.reserve(id)?;
         let result = async {
+            // Bounded child executors belong to their parent even between
+            // executions; opening a driver would introduce a second owner.
+            if self.subagents.owns_session(id).await {
+                return Err(crate::SessionError::AlreadyOpen(id.clone()));
+            }
             let head = self
                 .services
                 .sessions
@@ -596,8 +593,8 @@ impl SessionRuntime {
                 .await?
                 .ok_or_else(|| crate::SessionError::NotFound(id.clone()))?
                 .head_sequence;
-            let executor = self
-                .resume(id)
+            let (executor, history) = self
+                .resume_with_history(id)
                 .await?
                 .ok_or_else(|| crate::SessionError::NotFound(id.clone()))?;
             self.drivers
@@ -606,6 +603,7 @@ impl SessionRuntime {
                     self.services.clone(),
                     self.subagents.clone(),
                     head,
+                    Some(history),
                 )
                 .await
         }
@@ -617,7 +615,7 @@ impl SessionRuntime {
     }
 
     /// Create and persist a new session.
-    pub async fn new_session(&self, init: SessionInit) -> anyhow::Result<HalterSession> {
+    pub(crate) async fn new_session(&self, init: SessionInit) -> anyhow::Result<SessionExecutor> {
         debug!(
             working_dir = %init.working_dir.display(),
             parent_session_id = ?init.parent_session_id,
@@ -637,22 +635,36 @@ impl SessionRuntime {
     }
 
     /// Resume an existing session and fire resume-time hooks.
-    pub async fn resume(&self, session_id: &SessionId) -> anyhow::Result<Option<HalterSession>> {
-        let session = HalterSession::new(self.services.clone(), session_id.clone())?;
-        let found = session
+    #[cfg(test)]
+    pub(crate) async fn resume(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<Option<SessionExecutor>> {
+        Ok(self
+            .resume_with_history(session_id)
+            .await?
+            .map(|(executor, _)| executor))
+    }
+
+    async fn resume_with_history(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<Option<(SessionExecutor, Vec<SessionEvent>)>> {
+        let session = SessionExecutor::new(self.services.clone(), session_id.clone())?;
+        let history = session
             .leased(async {
                 // Agents this process runs are not interrupted, whatever the
                 // log says.
                 let live = self.subagents.agent_ids().await;
-                let Some(subagents) = session.mark_resumed(&live).await? else {
-                    return Ok(false);
+                let Some((subagents, history)) = session.mark_resumed(&live).await? else {
+                    return Ok(None);
                 };
                 self.subagents.restore(session_id, subagents).await;
-                Ok(true)
+                Ok(Some(history))
             })
             .await?;
-        debug!(session_id = %session_id, found, "resuming session");
-        Ok(found.then_some(session))
+        debug!(session_id = %session_id, found = history.is_some(), "resuming session");
+        Ok(history.map(|history| (session, history)))
     }
 
     /// List persisted session blueprints.
@@ -674,36 +686,43 @@ impl SessionRuntime {
             .replace(snapshot, hooks, hook_warnings);
     }
 
-    /// Mark the runtime as shutting down, cancel every in-flight turn,
-    /// and wait for the spawned task loops to settle (or be aborted)
-    /// within `drain`. After this returns, subsequent `submit_turn`
-    /// calls fail with a "runtime is shutting down" error.
+    /// Stop accepting sessions, cancel execution and close session resources.
+    /// `None` waits for graceful cleanup without a deadline. A duration bounds
+    /// the wait and requests forced cleanup when it expires.
     ///
     /// Idempotent: calling shutdown after the registry is already in
     /// the shutting-down state still drains any newly raced-in turns.
-    pub async fn shutdown(&self, drain: std::time::Duration) -> crate::ShutdownReport {
-        let deadline = tokio::time::Instant::now() + drain;
-        let mut report = self.services.turn_registry.shutdown(drain).await;
-        if tokio::time::timeout_at(deadline, self.drivers.close_all())
-            .await
-            .is_err()
-        {
-            report.timed_out = true;
+    pub async fn shutdown(
+        &self,
+        timeout: impl Into<Option<std::time::Duration>>,
+    ) -> crate::ShutdownReport {
+        let timeout = timeout.into();
+        let deadline =
+            timeout.and_then(|duration| tokio::time::Instant::now().checked_add(duration));
+        self.services.turn_registry.begin_shutdown();
+        self.services.tool_sessions.request_stop_all().await;
+        let (mut report, driver_timeout) = tokio::join!(
+            self.services.turn_registry.shutdown_at(deadline),
+            self.drivers.close_all(deadline),
+        );
+        report.timed_out |= driver_timeout;
+        if report.timed_out {
+            self.services.tool_sessions.force_stop_all().await;
         }
         info!(
             drained = report.turns_drained,
             aborted = report.turns_aborted,
             timed_out = report.timed_out,
-            drain_ms = %drain.as_millis(),
+            timeout_ms = ?timeout.map(|duration| duration.as_millis()),
             "runtime shutdown"
         );
         report
     }
 }
 
-impl SessionHandle {
-    pub(crate) fn with_driver(mut self, inbox: Arc<crate::session_driver::SessionInbox>) -> Self {
-        self.managed = Some(inbox);
+impl SessionExecutor {
+    pub(crate) fn with_inbox(mut self, inbox: Arc<crate::session_driver::SessionInbox>) -> Self {
+        self.inbox = Some(inbox);
         self
     }
     pub(crate) fn new(
@@ -716,13 +735,13 @@ impl SessionHandle {
             session_id,
             session_hooks,
             eviction,
-            managed: None,
+            inbox: None,
         })
     }
 
     /// Session id for this handle.
     #[must_use]
-    pub fn session_id(&self) -> &SessionId {
+    pub(crate) fn session_id(&self) -> &SessionId {
         &self.session_id
     }
 
@@ -738,7 +757,8 @@ impl SessionHandle {
     ///
     /// The turn is cancelled only by runtime shutdown; dropping the stream
     /// does not stop it. Use [`Self::submit_turn_with_cancel`] to cancel it.
-    pub async fn submit_turn(&self, turn: Turn) -> anyhow::Result<SessionEventStream> {
+    #[cfg(test)]
+    pub(crate) async fn submit_turn(&self, turn: Turn) -> anyhow::Result<SessionEventStream> {
         self.submit_turn_with_cancel(turn, self.services.turn_registry.child_token())
             .await
     }
@@ -749,7 +769,7 @@ impl SessionHandle {
     /// requests, tools, hooks, subagent waits and compaction; the turn then
     /// commits `TurnFailed { cancelled: true }`. Runtime shutdown cancels the
     /// turn regardless of the caller's token.
-    pub async fn submit_turn_with_cancel(
+    pub(crate) async fn submit_turn_with_cancel(
         &self,
         turn: Turn,
         turn_cancel: CancellationToken,
@@ -805,8 +825,6 @@ impl SessionHandle {
             });
         let session = self.clone();
 
-        let registry = session.services.turn_registry.clone();
-        let turn_id_for_dereg = turn.id.clone();
         let turn_id_for_register = turn.id.clone();
         let task_cancel = turn_cancel.clone();
         let task_cancel_status = turn_cancel.clone();
@@ -817,21 +835,8 @@ impl SessionHandle {
             if registered_rx.await.is_err() {
                 return;
             }
-            // Always deregister, even if the turn body panics, so we don't
-            // leak entries that block shutdown drain.
-            struct DeregisterOnDrop {
-                registry: Arc<TurnRegistry>,
-                turn_id: TurnId,
-            }
-            impl Drop for DeregisterOnDrop {
-                fn drop(&mut self) {
-                    self.registry.deregister(&self.turn_id);
-                }
-            }
-            let _guard = DeregisterOnDrop {
-                registry: registry.clone(),
-                turn_id: turn_id_for_dereg,
-            };
+            // The registry's supervisor deregisters only after this actual
+            // executor has settled, including dropping its session lease.
             let _parent_stream_registration = parent_stream_registration;
 
             let blueprint = stored.blueprint.clone();
@@ -933,7 +938,7 @@ impl SessionHandle {
                     retryable,
                 })];
                 if let Err(commit_error) = session
-                    .commit_turn_failure(failure_events, live.as_ref())
+                    .commit_turn_failure(failure_events, Some(live.as_ref()))
                     .await
                 {
                     error!(
@@ -981,20 +986,60 @@ impl SessionHandle {
     }
 
     /// Replay committed events for this session.
-    pub async fn replay(&self) -> anyhow::Result<Vec<SessionEvent>> {
+    #[cfg(test)]
+    pub(crate) async fn replay(&self) -> anyhow::Result<Vec<SessionEvent>> {
         self.services.sessions.replay(&self.session_id).await
     }
 
-    /// Serialize this session's trace (including subagent sessions) from the
-    /// committed event log. See [`crate::export_session_trace`].
-    pub async fn export_trace(&self) -> anyhow::Result<String> {
-        crate::trace_export::export_session_trace(self.services.sessions.as_ref(), &self.session_id)
-            .await
+    /// Shut down this session and run session-end hooks.
+    pub(crate) async fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
+        self.leased(self.run_shutdown(reason)).await
     }
 
-    /// Shut down this session and run session-end hooks.
-    pub async fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
-        self.leased(self.run_shutdown(reason)).await
+    /// Force an uncooperative executor down, then close its checkpoint under
+    /// the session lease. Waiting for the actual task prevents late tool or
+    /// provider commits from racing transcript repair.
+    pub(crate) async fn force_interrupt_turn(&self, turn_id: &TurnId) -> anyhow::Result<()> {
+        self.services.turn_registry.abort_and_wait(turn_id).await;
+        if let Some(inbox) = &self.inbox {
+            inbox.synchronize().await?;
+        }
+        self.services.sessions.synchronize(&self.session_id).await?;
+        self.leased(async {
+            loop {
+                let Some(stored) = self
+                    .services
+                    .sessions
+                    .load_session(&self.session_id)
+                    .await?
+                else {
+                    anyhow::bail!(
+                        "failed to interrupt execution: unknown session '{}'",
+                        self.session_id
+                    );
+                };
+                if stored.state.open_turn.as_ref() != Some(turn_id) {
+                    return Ok(());
+                }
+                let failure = self.make_event(SessionEventPayload::TurnFailed {
+                    turn_id: turn_id.clone(),
+                    error: "execution interrupted after cancellation deadline".to_owned(),
+                    cancelled: true,
+                    retryable: false,
+                });
+                match self.commit_turn_failure(vec![failure], None).await {
+                    Err(error)
+                        if error
+                            .downcast_ref::<halter_session::SessionCommitConflict>()
+                            .is_some() =>
+                    {
+                        continue;
+                    }
+                    outcome => return outcome,
+                }
+            }
+        })
+        .await
     }
 
     async fn run_shutdown(&self, reason: &str) -> anyhow::Result<()> {
@@ -1055,7 +1100,12 @@ impl SessionHandle {
     }
 
     /// Emit a notification event through notification hooks.
-    pub async fn notify(&self, notification_type: &str, message: &str) -> anyhow::Result<()> {
+    #[cfg(test)]
+    pub(crate) async fn notify(
+        &self,
+        notification_type: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
         let (stored, fired_hook_ids) =
             self.load_for_out_of_turn_hooks().await?.with_context(|| {
                 format!(
@@ -1082,7 +1132,8 @@ impl SessionHandle {
 
     /// Compact the session immediately using the configured provider.
     /// Runtime shutdown cancels it.
-    pub async fn compact(
+    #[cfg(test)]
+    pub(crate) async fn compact(
         &self,
         trigger: &str,
         custom_instructions: Option<&str>,
@@ -1098,7 +1149,7 @@ impl SessionHandle {
     /// [`Self::compact`] that also stops when `cancel` fires, whether it is
     /// still waiting for the session lease or already running hooks and
     /// provider compaction.
-    pub async fn compact_with_cancel(
+    pub(crate) async fn compact_with_cancel(
         &self,
         trigger: &str,
         custom_instructions: Option<&str>,
@@ -1330,14 +1381,12 @@ impl SessionHandle {
             .clone()
             .or_else(|| prompt_dispatch.merged.block_reason.clone())
         {
-            if self.managed.is_some() {
-                let payload = SessionEventPayload::InputRejected {
-                    message_id: turn.user_message.id.clone(),
-                    reason: reason.clone(),
-                };
-                halter_protocol::fold::apply_event(&mut state, &payload);
-                self.push_event(&mut events, payload);
-            }
+            let payload = SessionEventPayload::InputRejected {
+                message_id: turn.user_message.id.clone(),
+                reason: reason.clone(),
+            };
+            halter_protocol::fold::apply_event(&mut state, &payload);
+            self.push_event(&mut events, payload);
             let blocked = Message::System(SystemMessage {
                 id: MessageId::new(),
                 created_at: Utc::now(),
@@ -1375,10 +1424,11 @@ impl SessionHandle {
         );
         let mut ledger_at_boundary = state.token_ledger.effective_tokens();
 
-        // Managed input stays in the durable inbox until the current window
-        // has been compacted. CleanWindow must not wipe a freshly delivered
-        // message before ordinary inference has seen it.
-        let mut primary_pending = self.managed.is_some();
+        // CleanWindow prepares the window before delivering fresh input so
+        // rollover cannot erase it. Prefix compaction includes fresh input in
+        // its token budget. Both internal and driven executions use this path.
+        let mut primary_pending =
+            self.services.compaction.window_policy() == crate::WindowPolicy::CleanWindow;
         if !primary_pending {
             let user_message = Message::User(turn.user_message.clone());
             state.append(user_message.clone());
@@ -1462,7 +1512,7 @@ impl SessionHandle {
                 )
                 .await?;
             }
-            self.deliver_managed_input(
+            self.deliver_pending_input(
                 &mut state,
                 &mut events,
                 &mut fired_hook_ids,
@@ -1768,7 +1818,7 @@ impl SessionHandle {
                 // Stop hooks and final compaction can take time. Input
                 // accepted during those awaits extends this execution.
                 let delivered = self
-                    .deliver_managed_input(
+                    .deliver_pending_input(
                         &mut state,
                         &mut events,
                         &mut fired_hook_ids,
@@ -1854,7 +1904,7 @@ impl SessionHandle {
     /// Deliver durably accepted input only at boundaries where every tool
     /// call has its result and the context window has already been prepared.
     /// Hook-blocked input leaves the inbox through an explicit rejection.
-    async fn deliver_managed_input(
+    async fn deliver_pending_input(
         &self,
         state: &mut SessionState,
         events: &mut Vec<PendingEvent>,
@@ -1862,7 +1912,7 @@ impl SessionHandle {
         hook_ctx: HookInvocationContext<'_>,
         cancel: &CancellationToken,
     ) -> anyhow::Result<bool> {
-        let Some(driver) = &self.managed else {
+        let Some(driver) = &self.inbox else {
             return Ok(false);
         };
         if cancel.is_cancelled() {
@@ -2774,14 +2824,13 @@ impl SessionHandle {
         Ok(())
     }
 
-    /// Persist the resume latch and append `SessionResumed`. Returns `false`
-    /// when the session does not exist.
-    /// Returns the resumed session's subagents, or `None` for an unknown
-    /// session.
+    /// Persist the resume latch and append `SessionResumed`. Return restored
+    /// subagents and the history already read for recovery, or `None` when the
+    /// session does not exist.
     async fn mark_resumed(
         &self,
         live_subagents: &HashSet<AgentId>,
-    ) -> anyhow::Result<Option<Vec<SubagentRecord>>> {
+    ) -> anyhow::Result<Option<(Vec<SubagentRecord>, Vec<SessionEvent>)>> {
         let Some(mut stored) = self
             .services
             .sessions
@@ -2801,7 +2850,7 @@ impl SessionHandle {
         stored.state.pending_session_start_source = Some(HookSessionStartSource::Resume);
         // The task list lives in the tool store; the log holds every result
         // that changed it.
-        let log = self.services.sessions.replay(&self.session_id).await?;
+        let mut log = self.services.sessions.replay(&self.session_id).await?;
         let task_results = log.iter().filter_map(|event| match &event.payload {
             SessionEventPayload::ToolExecutionCompleted {
                 outcome:
@@ -2851,22 +2900,24 @@ impl SessionHandle {
             .chain([SessionEventPayload::SessionResumed])
             .map(|payload| self.make_event(payload))
             .collect();
-        self.commit_and_publish(
-            &stored.blueprint,
-            None,
-            Some(stored.head_sequence),
-            Some(stored.state.clone()),
-            events,
-            None,
-        )
-        .await?;
-        Ok(Some(stored.state.subagents.into_values().collect()))
+        let committed = self
+            .commit_and_publish(
+                &stored.blueprint,
+                None,
+                Some(stored.head_sequence),
+                Some(stored.state.clone()),
+                events,
+                None,
+            )
+            .await?;
+        log.extend(committed);
+        Ok(Some((stored.state.subagents.into_values().collect(), log)))
     }
 
     async fn commit_turn_failure(
         &self,
         failure_events: Vec<PendingEvent>,
-        live: &LiveTurnStream,
+        live: Option<&LiveTurnStream>,
     ) -> anyhow::Result<()> {
         let mut stored = self
             .services
@@ -2894,7 +2945,7 @@ impl SessionHandle {
             Some(stored.head_sequence),
             Some(stored.state),
             events,
-            Some(live),
+            live,
         )
         .await?;
         Ok(())
@@ -3695,7 +3746,7 @@ pub(crate) async fn create_session_seeded(
     init: SessionInit,
     mut initial_state: SessionState,
     snapshot: Arc<ResourceSnapshot>,
-) -> anyhow::Result<HalterSession> {
+) -> anyhow::Result<SessionExecutor> {
     if services.compaction.window_policy() == crate::WindowPolicy::CleanWindow {
         for tool in services.compaction.tools() {
             services.tools.register(tool);
@@ -3786,7 +3837,7 @@ pub(crate) async fn create_session_seeded(
         services.event_bus.publish(event);
     }
 
-    HalterSession::new(services, session_id)
+    SessionExecutor::new(services, session_id)
 }
 
 /// Look up the session's shared hooks and eviction guard, creating both when
@@ -4239,14 +4290,19 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                let primary_id = session.submit(Message::user("initial task")).await.unwrap();
+                let primary_id = session
+                    .submit(Message::user("initial task"))
+                    .await
+                    .unwrap()
+                    .message_id;
                 tokio::time::timeout(Duration::from_secs(5), provider.started.notified())
                     .await
                     .unwrap();
                 let correction_id = session
                     .submit(Message::user("keep the public API"))
                     .await
-                    .unwrap();
+                    .unwrap()
+                    .message_id;
                 let accepted = session.replay().await.unwrap();
                 assert!(accepted.iter().any(|event| matches!(
                     &event.payload,
@@ -4258,6 +4314,32 @@ mod tests {
                 )));
                 provider.release.notify_one();
                 let completed = idle(&mut events).await;
+                let terminal = completed
+                    .iter()
+                    .find(|event| {
+                        matches!(event.payload, SessionEventPayload::TurnCompleted { .. })
+                    })
+                    .unwrap()
+                    .sequence();
+                let log = session.replay().await.unwrap();
+                for input_id in [&primary_id, &correction_id] {
+                    let settled = log.iter().filter(|event| matches!(
+                        &event.payload,
+                        SessionEventPayload::InputSettled { message_id, outcome: halter_protocol::InputOutcome::Completed }
+                            if message_id == input_id
+                    )).collect::<Vec<_>>();
+                    assert_eq!(settled.len(), 1, "each delivered input settles once");
+                    assert!(
+                        settled[0].sequence() > terminal,
+                        "settlement follows terminal execution"
+                    );
+                    assert!(
+                        completed
+                            .iter()
+                            .any(|event| event.sequence() == settled[0].sequence()),
+                        "settlement is in the terminal event batch"
+                    );
+                }
                 assert!(
                     !completed.iter().any(|event| matches!(
                         event.payload,
@@ -4283,7 +4365,7 @@ mod tests {
                     assert!(result_at < corrected_at, "tool result precedes steering");
                 }
                 drop(requests);
-                session.shutdown().await.unwrap();
+                session.shutdown(None).await.unwrap();
             }
         }
 
@@ -4314,13 +4396,21 @@ mod tests {
                     .await
                     .unwrap();
                 let rejected_id = if primary {
-                    session.submit(Message::user("blocked")).await.unwrap()
+                    session
+                        .submit(Message::user("blocked"))
+                        .await
+                        .unwrap()
+                        .message_id
                 } else {
                     session.submit(Message::user("initial")).await.unwrap();
                     tokio::time::timeout(Duration::from_secs(5), provider.started.notified())
                         .await
                         .unwrap();
-                    let id = session.submit(Message::user("blocked")).await.unwrap();
+                    let id = session
+                        .submit(Message::user("blocked"))
+                        .await
+                        .unwrap()
+                        .message_id;
                     provider.release.notify_one();
                     id
                 };
@@ -4346,7 +4436,7 @@ mod tests {
                     provider.requests.lock().unwrap().len(),
                     usize::from(!primary)
                 );
-                session.shutdown().await.unwrap();
+                session.shutdown(None).await.unwrap();
             }
         }
 
@@ -4398,7 +4488,11 @@ mod tests {
                 .await
                 .unwrap();
             let (session, mut events) = runtime.resume_session(legacy.session_id()).await.unwrap();
-            let fresh_id = session.submit(Message::user("fresh input")).await.unwrap();
+            let fresh_id = session
+                .submit(Message::user("fresh input"))
+                .await
+                .unwrap()
+                .message_id;
             let completed = idle(&mut events).await;
             assert!(completed.iter().any(|event| matches!(
                 &event.payload,
@@ -4422,7 +4516,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(stored.state.pending_inputs.is_empty());
-            session.shutdown().await.unwrap();
+            session.shutdown(None).await.unwrap();
         }
 
         #[tokio::test]
@@ -4444,8 +4538,9 @@ mod tests {
             let pending_id = session
                 .submit(Message::user("use the smaller test suite"))
                 .await
-                .unwrap();
-            session.interrupt().await.unwrap();
+                .unwrap()
+                .message_id;
+            session.interrupt(None).await.unwrap();
             let cancelled = idle(&mut events).await;
             assert!(cancelled.iter().any(|event| matches!(
                 event.payload,
@@ -4489,12 +4584,212 @@ mod tests {
             assert!(result_at < input_at);
             assert_eq!(calls.load(Ordering::SeqCst), 3);
             drop(requests);
-            session.shutdown().await.unwrap();
+            session.shutdown(None).await.unwrap();
         }
 
         struct PartialProvider {
             stalled: Arc<Notify>,
             requests: Mutex<Vec<ProviderRequest>>,
+        }
+
+        struct IgnoringTool {
+            started: tokio::sync::mpsc::UnboundedSender<CancellationToken>,
+            release: Arc<Notify>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Tool for IgnoringTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "managed_wait".into(),
+                    description: "Ignore cancellation until released".to_owned(),
+                    input_schema: json!({"type":"object","properties":{}}),
+                    concurrency: ToolConcurrency::Exclusive,
+                    capabilities: ToolCapabilities {
+                        cancellable: true,
+                        long_running: true,
+                        ..ToolCapabilities::default()
+                    },
+                    provider_aliases: Default::default(),
+                }
+            }
+
+            async fn execute(
+                &self,
+                context: ToolContext,
+                _input: serde_json::Value,
+            ) -> anyhow::Result<ToolResult> {
+                struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for Dropped {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _dropped = Dropped(self.dropped.clone());
+                self.started.send(context.cancel).unwrap();
+                self.release.notified().await;
+                Ok(ToolResult::Empty)
+            }
+        }
+
+        #[tokio::test]
+        async fn timed_cancellation_aborts_actual_uncooperative_tool_and_repairs_execution() {
+            for close in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let (provider, services, _) = setup(root.path(), true);
+                let (started, mut tokens) = tokio::sync::mpsc::unbounded_channel();
+                let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                services.tools.register(Arc::new(IgnoringTool {
+                    started,
+                    release: Arc::new(Notify::new()),
+                    dropped: dropped.clone(),
+                }));
+                let runtime = SessionRuntime::new(services.clone());
+                let (session, mut events) = runtime
+                    .create_session(SessionInit {
+                        working_dir: root.path().to_owned(),
+                        ..SessionInit::default()
+                    })
+                    .await
+                    .unwrap();
+                session.submit(Message::user("initial task")).await.unwrap();
+                let token = tokio::time::timeout(Duration::from_secs(5), tokens.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let result = if close {
+                    session.shutdown(Some(Duration::from_millis(25))).await
+                } else {
+                    session.interrupt(Some(Duration::from_millis(25))).await
+                };
+                assert!(matches!(result, Err(crate::SessionError::TimedOut)));
+                tokio::time::timeout(Duration::from_secs(5), token.cancelled())
+                    .await
+                    .unwrap();
+                if close {
+                    tokio::time::timeout(Duration::from_secs(5), session.shutdown(None))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                } else {
+                    tokio::time::timeout(Duration::from_secs(5), session.interrupt(None))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    idle(&mut events).await;
+                }
+                assert!(
+                    dropped.load(Ordering::SeqCst),
+                    "actual tool future was dropped"
+                );
+                let mut stored = services
+                    .sessions
+                    .load_session(session.id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                hydrate_stored_session(services.sessions.as_ref(), &mut stored)
+                    .await
+                    .unwrap();
+                assert!(stored.state.open_turn.is_none());
+                assert!(stored.state.pending_tool_calls.is_empty());
+                let replay = session.replay().await.unwrap();
+                assert_eq!(
+                    replay
+                        .iter()
+                        .filter(|event| matches!(
+                            event.payload,
+                            SessionEventPayload::TurnFailed {
+                                cancelled: true,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    1
+                );
+                if close {
+                    assert_eq!(
+                        stored.state.session_status,
+                        halter_protocol::SessionStatus::Closed
+                    );
+                } else {
+                    session
+                        .submit(Message::user("continue after interruption"))
+                        .await
+                        .unwrap();
+                    idle(&mut events).await;
+                    let requests = provider.requests.lock().unwrap().clone();
+                    assert_eq!(requests.len(), 2);
+                    let call_ids = requests[1]
+                        .messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            Message::Assistant(message) => Some(&message.parts),
+                            _ => None,
+                        })
+                        .flatten()
+                        .filter_map(|part| match part {
+                            AssistantPart::ToolCall(call) => Some(call.id.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(
+                        !call_ids.is_empty(),
+                        "interrupted tool invocation stays in provider history"
+                    );
+                    for id in call_ids {
+                        assert!(requests[1].messages.iter().any(|message| matches!(message, Message::Tool(result) if result.call_id == id && result.error.is_some())), "next provider request answers interrupted tool calls");
+                    }
+                    session.shutdown(None).await.unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn unlimited_shutdown_waits_for_uncooperative_tool_to_finish() {
+            let root = tempfile::tempdir().unwrap();
+            let (_, services, _) = setup(root.path(), true);
+            let (started, mut tokens) = tokio::sync::mpsc::unbounded_channel();
+            let release = Arc::new(Notify::new());
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            services.tools.register(Arc::new(IgnoringTool {
+                started,
+                release: release.clone(),
+                dropped: dropped.clone(),
+            }));
+            let runtime = SessionRuntime::new(services.clone());
+            let (session, _) = runtime
+                .create_session(SessionInit {
+                    working_dir: root.path().to_owned(),
+                    ..SessionInit::default()
+                })
+                .await
+                .unwrap();
+            session.submit(Message::user("initial task")).await.unwrap();
+            let token = tokio::time::timeout(Duration::from_secs(5), tokens.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let shutdown = tokio::spawn({
+                let session = session.clone();
+                async move { session.shutdown(None).await }
+            });
+            tokio::time::timeout(Duration::from_secs(5), token.cancelled())
+                .await
+                .unwrap();
+            assert!(
+                !shutdown.is_finished(),
+                "unlimited graceful shutdown waits for the tool"
+            );
+            assert!(!dropped.load(Ordering::SeqCst));
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
         }
 
         #[async_trait]
@@ -4597,7 +4892,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), provider.stalled.notified())
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), session.interrupt())
+            tokio::time::timeout(Duration::from_secs(5), session.interrupt(None))
                 .await
                 .unwrap()
                 .unwrap();
@@ -4645,7 +4940,7 @@ mod tests {
                 Message::Assistant(message) if message.stop_reason == Some(StopReason::Interrupted)
             )));
             drop(requests);
-            session.shutdown().await.unwrap();
+            session.shutdown(None).await.unwrap();
         }
 
         struct CleanWipe;
@@ -4708,11 +5003,14 @@ mod tests {
                 .await
                 .unwrap();
             let message = Message::user("retain this task");
-            let id = session.submit(message.clone()).await.unwrap();
+            let id = session.submit(message.clone()).await.unwrap().message_id;
 
             for expected_attempts in [1, 2] {
                 if expected_attempts == 2 {
-                    assert_eq!(session.submit(message.clone()).await.unwrap(), id);
+                    assert_eq!(
+                        session.submit(message.clone()).await.unwrap().message_id,
+                        id
+                    );
                 }
                 let completed = idle(&mut events).await;
                 assert_eq!(
@@ -4750,7 +5048,7 @@ mod tests {
                 assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
                 assert!(provider.requests.lock().unwrap().is_empty());
             }
-            session.shutdown().await.unwrap();
+            session.shutdown(None).await.unwrap();
             assert_eq!(attempts.load(Ordering::SeqCst), 2);
         }
 
@@ -4783,10 +5081,13 @@ mod tests {
                 .await
                 .unwrap();
             let message = Message::user("retain this task");
-            let id = session.submit(message.clone()).await.unwrap();
+            let id = session.submit(message.clone()).await.unwrap().message_id;
             for expected_attempts in [1, 2] {
                 if expected_attempts == 2 {
-                    assert_eq!(session.submit(message.clone()).await.unwrap(), id);
+                    assert_eq!(
+                        session.submit(message.clone()).await.unwrap().message_id,
+                        id
+                    );
                 }
                 let completed = idle(&mut events).await;
                 let failures = completed
@@ -4814,7 +5115,7 @@ mod tests {
                 assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
                 assert!(provider.requests.lock().unwrap().is_empty());
             }
-            session.shutdown().await.unwrap();
+            session.shutdown(None).await.unwrap();
             assert_eq!(attempts.load(Ordering::SeqCst), 2);
         }
 
@@ -4843,7 +5144,7 @@ mod tests {
                     .unwrap();
                 session.submit(Message::user(prompt)).await.unwrap();
                 let mut observed = idle(&mut events).await;
-                session.shutdown().await.unwrap();
+                session.shutdown(None).await.unwrap();
                 observed.extend(events.try_collect::<Vec<_>>().await.unwrap());
 
                 let forwarded = forwarded_events(&observed, session.id());
@@ -4944,7 +5245,7 @@ mod tests {
             })
             .await
             .expect("parent finishes while event consumption is delayed");
-            session.shutdown().await.unwrap();
+            session.shutdown(None).await.unwrap();
             let observed = events.try_collect::<Vec<_>>().await.unwrap();
             assert_eq!(forwarded_events(&observed, session.id()).len(), 128);
             assert!(observed.iter().any(|event| matches!(
@@ -5005,14 +5306,16 @@ mod tests {
             let primary_id = session
                 .submit(Message::user("primary ".repeat(1_000)))
                 .await
-                .unwrap();
+                .unwrap()
+                .message_id;
             tokio::time::timeout(Duration::from_secs(5), provider.started.notified())
                 .await
                 .unwrap();
             let correction_id = session
                 .submit(Message::user("correction ".repeat(1_000)))
                 .await
-                .unwrap();
+                .unwrap()
+                .message_id;
             provider.release.notify_one();
             let completed = idle(&mut events).await;
             assert!(
@@ -5039,7 +5342,7 @@ mod tests {
             );
             assert_eq!(calls.load(Ordering::SeqCst), 2);
             drop(requests);
-            session.shutdown().await.unwrap();
+            session.shutdown(None).await.unwrap();
         }
     }
 
@@ -5083,11 +5386,11 @@ mod tests {
         );
     }
 
-    /// Regression: dropping a short-lived `HalterSession` constructed for an
+    /// Regression: dropping a short-lived `SessionExecutor` constructed for an
     /// already-live session must not close that session's trace writer.
     /// Previously, `EvictionGuard::drop` invoked `recorder.close_session(...)`,
     /// which removed the writer entry. Subagent hook dispatch builds
-    /// temporary parent handles via `HalterSession::new`; when those
+    /// temporary parent handles via `SessionExecutor::new`; when those
     /// temporaries dropped, the parent's trace was silently torn down and
     /// every subsequent event for that root session id was dropped on the
     /// floor.
@@ -5124,15 +5427,15 @@ mod tests {
             .open_session(&session_id, None, &blueprint)
             .expect("open session");
 
-        // Construct two independent `HalterSession` handles for the same
+        // Construct two independent `SessionExecutor` handles for the same
         // session id — the same shape produced by subagent hook dispatch
         // (parent gets a primary handle, the start-hook code path then
         // builds a temporary handle for the same parent session id).
         let primary =
-            HalterSession::new(services.clone(), session_id.clone()).expect("primary handle");
+            SessionExecutor::new(services.clone(), session_id.clone()).expect("primary handle");
         {
-            let _temporary =
-                HalterSession::new(services.clone(), session_id.clone()).expect("temporary handle");
+            let _temporary = SessionExecutor::new(services.clone(), session_id.clone())
+                .expect("temporary handle");
         } // drop the temporary here
 
         // Recording must still land in the trace file: the primary handle
@@ -5919,7 +6222,7 @@ mod tests {
         use halter_tools::{DefaultToolPolicy, PolicySettings};
 
         use super::{
-            CompactionStrategy, ContextSettings, HalterSession, ModelRegistry, RuntimeServices,
+            CompactionStrategy, ContextSettings, ModelRegistry, RuntimeServices, SessionExecutor,
             SessionInit, SessionRuntime,
         };
 
@@ -6026,7 +6329,7 @@ mod tests {
         pub(super) async fn new_session(
             runtime: &SessionRuntime,
             working_dir: &Path,
-        ) -> HalterSession {
+        ) -> SessionExecutor {
             runtime
                 .new_session(SessionInit {
                     working_dir: working_dir.to_path_buf(),
@@ -6277,7 +6580,7 @@ mod tests {
         let session = new_session(&runtime, temp.path()).await;
         let session_id = session.session_id().clone();
 
-        // Setup: the SessionHandle's hooks are registered in the runtime store.
+        // Setup: the SessionExecutor's hooks are registered in the runtime store.
         {
             let store = services
                 .session_hook_store
@@ -6289,7 +6592,7 @@ mod tests {
             );
         }
 
-        // Before Phase 3, `HalterSession: Clone + Drop` evicted the hook entry
+        // Before Phase 3, `SessionExecutor: Clone + Drop` evicted the hook entry
         // every time any clone was dropped (even an internal clone moved into
         // the spawned turn loop). The pinned PR re-introduces the footgun if
         // this assertion ever flips back to "absent".
@@ -6333,11 +6636,11 @@ mod tests {
         let session_id = halter_protocol::SessionId::from("shared-hooks");
 
         let primary =
-            HalterSession::new(services.clone(), session_id.clone()).expect("primary handle");
+            SessionExecutor::new(services.clone(), session_id.clone()).expect("primary handle");
 
         {
-            let temporary =
-                HalterSession::new(services.clone(), session_id.clone()).expect("temporary handle");
+            let temporary = SessionExecutor::new(services.clone(), session_id.clone())
+                .expect("temporary handle");
             // Independent handles share one hooks instance (the state carrier).
             assert!(Arc::ptr_eq(
                 temporary.session_hooks(),
@@ -8688,6 +8991,30 @@ mod tests {
             services
         }
 
+        async fn seed_previous_window(session: &SessionExecutor, text: String) {
+            let stored = session
+                .services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .unwrap()
+                .unwrap();
+            session
+                .services
+                .sessions
+                .commit(
+                    session.session_id(),
+                    None,
+                    Some(stored.head_sequence),
+                    None,
+                    vec![session.make_event(SessionEventPayload::MessageItem {
+                        message: Message::user(text),
+                    })],
+                )
+                .await
+                .unwrap();
+        }
+
         #[tokio::test]
         async fn forced_rollover_preserves_notes_tasks_and_searchable_history() {
             for mode in ["cooperates", "notes_only", "neither", "provider_error"] {
@@ -8716,16 +9043,18 @@ mod tests {
                 let services = clean_services(provider.clone(), temp.path());
                 let runtime = SessionRuntime::new(services.clone());
                 let session = new_session(&runtime, temp.path()).await;
+                seed_previous_window(
+                    &session,
+                    format!("important request {}", "x".repeat(24_000)),
+                )
+                .await;
                 services
                     .tool_sessions
                     .task_session(session.session_id())
                     .lock()
                     .create("finish the report".to_owned(), None);
                 let events = session
-                    .submit_turn(Turn::user(format!(
-                        "important request {}",
-                        "x".repeat(24_000)
-                    )))
+                    .submit_turn(Turn::user("continue the report"))
                     .await
                     .unwrap()
                     .try_collect::<Vec<_>>()
@@ -8755,10 +9084,12 @@ mod tests {
                 let bootstrap = requests
                     .iter()
                     .find(|request| {
-                        latest_user_text(&request.messages) == crate::CLEAN_WINDOW_BOOTSTRAP
+                        request.messages.iter().any(|message| matches!(message,
+                            Message::User(user) if user.plain_text() == crate::CLEAN_WINDOW_BOOTSTRAP))
                     })
                     .unwrap();
-                assert_eq!(bootstrap.messages.len(), 1);
+                assert_eq!(bootstrap.messages.len(), 2);
+                assert_eq!(latest_user_text(&bootstrap.messages), "continue the report");
                 assert!(bootstrap.previous_response_id.is_none());
                 assert!(bootstrap.compacted_prefix.is_empty());
                 assert_eq!(
@@ -8984,8 +9315,9 @@ mod tests {
             Arc::get_mut(&mut services).unwrap().registered_hooks = Arc::new(hooks);
             let runtime = SessionRuntime::new(services);
             let session = new_session(&runtime, temp.path()).await;
+            seed_previous_window(&session, "x".repeat(24_000)).await;
             let events = session
-                .submit_turn(Turn::user("x".repeat(24_000)))
+                .submit_turn(Turn::user("continue"))
                 .await
                 .unwrap()
                 .try_collect::<Vec<_>>()
@@ -9114,8 +9446,9 @@ mod tests {
             );
             let runtime = SessionRuntime::new(services);
             let session = new_session(&runtime, temp.path()).await;
+            seed_previous_window(&session, "x".repeat(24_000)).await;
             let events = session
-                .submit_turn(Turn::user("x".repeat(24_000)))
+                .submit_turn(Turn::user("continue"))
                 .await
                 .unwrap()
                 .try_collect::<Vec<_>>()
@@ -9130,10 +9463,9 @@ mod tests {
             );
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
-            assert_eq!(
-                latest_user_text(&requests[0].messages),
-                crate::CLEAN_WINDOW_BOOTSTRAP
-            );
+            assert_eq!(latest_user_text(&requests[0].messages), "continue");
+            assert!(requests[0].messages.iter().any(|message| matches!(message,
+                Message::User(user) if user.plain_text() == crate::CLEAN_WINDOW_BOOTSTRAP)));
         }
     }
 
@@ -9907,7 +10239,7 @@ mod tests {
                 .await
                 .session_id()
                 .clone();
-            let run = |session: HalterSession| async move {
+            let run = |session: SessionExecutor| async move {
                 session
                     .submit_turn(Turn::user("hello"))
                     .await

@@ -16,19 +16,22 @@
 //!     let harness = Halter::from_config_file("halter.toml").await?;
 //!     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 //!
-//!     session.submit(Message::user("Summarize this repository")).await?;
+//!     let submission = session.submit(Message::user("Summarize this repository")).await?;
 //!
-//!     let mut running = false;
 //!     while let Some(event) = events.next().await {
 //!         let event = event?;
+//!         if event.session_id != *session.id() || event.sequence() < submission.sequence {
+//!             continue;
+//!         }
 //!         println!("{:?}", event.payload);
 //!         match event.payload {
-//!             SessionEventPayload::SessionStatusChanged { status: SessionStatus::Running } => running = true,
-//!             SessionEventPayload::SessionStatusChanged { status: SessionStatus::Idle } if running => break,
+//!             SessionEventPayload::InputSettled { message_id: id, .. }
+//!             | SessionEventPayload::InputRejected { message_id: id, .. }
+//!             | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
 //!             _ => {}
 //!         }
 //!     }
-//!     session.shutdown().await?;
+//!     session.shutdown(None).await?;
 //!
 //!     Ok(())
 //! }
@@ -50,7 +53,7 @@ pub use halter_config::{
     LoadedOutputStyle, LoadedPlugin, LoadedResourceFile, LoadedSkill, PluginDefaults, PluginLoader,
     SkillLoader,
 };
-pub use halter_runtime::{SessionError, SessionEventStream, SessionHandle};
+pub use halter_runtime::{SessionError, SessionEventStream, SessionHandle, Submission};
 pub use resources::{CompiledResources, ResourceCompiler};
 
 pub mod session {
@@ -103,13 +106,13 @@ pub mod prompts {
 pub mod prelude {
     pub use halter_config::{HarnessConfig, PromptsConfig, SystemPromptPreset};
     pub use halter_protocol::{
-        Message, MessageId, ResourceSnapshot, SessionEvent, SessionEventPayload, SessionId,
-        SessionStatus,
+        InputDeferredReason, InputOutcome, Message, MessageId, ResourceSnapshot, SessionEvent,
+        SessionEventPayload, SessionId, SessionStatus,
     };
     pub use halter_runtime::SessionHandle as HalterSession;
     pub use halter_runtime::{
         SessionError, SessionEventStream, SessionHandle, SessionInit, SessionRuntime,
-        SubagentEventForwarding,
+        SubagentEventForwarding, Submission,
     };
 
     pub use crate::compaction;

@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::warn;
 
 use crate::ExecutedHookDispatch;
-use crate::session::SessionHandle;
+use crate::session::SessionExecutor;
 
 #[derive(Default)]
 /// Per-session write leases plus the writes queued behind them.
@@ -134,11 +134,11 @@ impl SessionLeases {
 /// lease without releasing (panic, abort, early return) releases it in the
 /// background so the session never stays locked.
 pub(crate) struct SessionLease {
-    session: Option<SessionHandle>,
+    session: Option<SessionExecutor>,
 }
 
 impl SessionLease {
-    pub(crate) fn new(session: SessionHandle) -> Self {
+    pub(crate) fn new(session: SessionExecutor) -> Self {
         Self {
             session: Some(session),
         }
