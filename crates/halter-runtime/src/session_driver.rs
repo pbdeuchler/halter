@@ -529,7 +529,10 @@ impl Driver {
                             }
                             if let Err(error) = &result {
                                 if !error.downcast_ref::<halter_protocol::ProviderError>().is_some_and(halter_protocol::ProviderError::is_cancelled) {
-                                    self.wake_requested = false;
+                                    // Ordinary execution failures are durable
+                                    // TurnFailed events. A stream error means
+                                    // finalization failed; close this incarnation.
+                                    return Err(anyhow::anyhow!("{error:#}"));
                                 }
                                 tracing::warn!(session_id = %self.control.id, %error, "session execution failed");
                             }
@@ -662,7 +665,7 @@ impl Driver {
         let forwarded = self.control.forwarded.clone();
         let task = tokio::spawn(async move {
             let mut events = executor.submit_turn_with_cancel(turn, task_cancel).await?;
-            let mut outcome = TaskOutcome::Complete;
+            let mut outcome = None;
             // Semantic failures are recorded as events. Drain to completion so
             // cleanup finishes, but do not automatically retry undelivered input.
             while let Some(event) = events.try_next().await? {
@@ -670,12 +673,15 @@ impl Driver {
                     || matches!(event.payload, SessionEventPayload::Lagged { .. })
                 {
                     let _ = forwarded.send(event);
-                } else if matches!(event.payload, SessionEventPayload::TurnFailed { turn_id: failed, .. } if failed == turn_id)
+                } else if matches!(&event.payload, SessionEventPayload::TurnFailed { turn_id: failed, .. } if failed == &turn_id)
                 {
-                    outcome = TaskOutcome::TurnFailed;
+                    outcome = Some(TaskOutcome::TurnFailed);
+                } else if matches!(&event.payload, SessionEventPayload::TurnCompleted { turn_id: completed, .. } if completed == &turn_id)
+                {
+                    outcome = Some(TaskOutcome::Complete);
                 }
             }
-            Ok(outcome)
+            outcome.ok_or_else(|| anyhow::anyhow!("execution ended without a terminal event"))
         });
         self.active = Some(Active {
             cancel,

@@ -316,6 +316,7 @@ struct AdmissionFailure {
     fail: AtomicBool,
     fail_running: AtomicBool,
     fail_idle: AtomicBool,
+    fail_terminal: AtomicBool,
     opening: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
 }
 
@@ -342,6 +343,17 @@ impl halter_session::SessionStore for AdmissionFailure {
         state: Option<SessionState>,
         events: Vec<halter_protocol::PendingEvent>,
     ) -> anyhow::Result<Vec<SessionEvent>> {
+        if self.fail_terminal.load(Ordering::SeqCst)
+            && events.iter().any(|event| {
+                matches!(
+                    event.payload,
+                    SessionEventPayload::TurnCompleted { .. }
+                        | SessionEventPayload::TurnFailed { .. }
+                )
+            })
+        {
+            anyhow::bail!("terminal execution commit unavailable");
+        }
         if events.iter().any(|event| {
             matches!(
                 event.payload,
@@ -390,6 +402,7 @@ async fn failed_admission_is_not_acknowledged_or_recorded_and_can_be_retried() {
         fail: AtomicBool::new(true),
         fail_running: AtomicBool::new(false),
         fail_idle: AtomicBool::new(false),
+        fail_terminal: AtomicBool::new(false),
         opening: None,
     });
     let mut services = (*services(Arc::new(FakeProvider::default()))).clone();
@@ -473,6 +486,7 @@ async fn cancelled_open_releases_reservation_and_runtime_shutdown_refuses_delaye
             fail: AtomicBool::new(false),
             fail_running: AtomicBool::new(false),
             fail_idle: AtomicBool::new(false),
+            fail_terminal: AtomicBool::new(false),
             opening: Some((started.clone(), release.clone())),
         });
         let mut services = (*services(Arc::new(FakeProvider::default()))).clone();
@@ -524,6 +538,7 @@ async fn driver_storage_failure_closes_stream_cleans_up_and_keeps_input_resumabl
         fail: AtomicBool::new(false),
         fail_running: AtomicBool::new(true),
         fail_idle: AtomicBool::new(false),
+        fail_terminal: AtomicBool::new(false),
         opening: None,
     });
     let mut services = (*services(Arc::new(FakeProvider::default()))).clone();
@@ -563,6 +578,78 @@ async fn driver_storage_failure_closes_stream_cleans_up_and_keeps_input_resumabl
     reopened.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn terminal_execution_commit_failure_closes_the_stream_and_cleans_up_the_driver() {
+    for interrupted in [false, true] {
+        let provider = Arc::new(BlockingFirst::new(true));
+        let execution_provider: Arc<dyn Provider> = if interrupted {
+            provider.clone()
+        } else {
+            Arc::new(FakeProvider::default())
+        };
+        let store = Arc::new(AdmissionFailure {
+            store: Default::default(),
+            fail: AtomicBool::new(false),
+            fail_running: AtomicBool::new(false),
+            fail_idle: AtomicBool::new(false),
+            fail_terminal: AtomicBool::new(true),
+            opening: None,
+        });
+        let mut services = (*services(execution_provider)).clone();
+        services.sessions = store;
+        let runtime = SessionRuntime::new(Arc::new(services));
+        let (session, events) = runtime
+            .create_session(SessionInit::default())
+            .await
+            .unwrap();
+        session
+            .submit(Message::user("persist this result"))
+            .await
+            .unwrap();
+        if interrupted {
+            tokio::time::timeout(Duration::from_secs(5), provider.started.notified())
+                .await
+                .expect("foreground provider starts");
+            let error = tokio::time::timeout(Duration::from_secs(5), session.interrupt())
+                .await
+                .expect("failed finalization settles interrupt")
+                .expect_err("interrupt must report its failed finalization");
+            assert!(matches!(error, SessionError::Operation(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("terminal execution commit unavailable")
+            );
+        }
+        let error = tokio::time::timeout(Duration::from_secs(5), events.try_collect::<Vec<_>>())
+            .await
+            .expect("failed finalization closes the session stream")
+            .expect_err("continuous stream must expose storage failure");
+        assert!(
+            error
+                .to_string()
+                .contains("terminal execution commit unavailable")
+        );
+        assert!(matches!(
+            session.shutdown().await,
+            Err(SessionError::Operation(_))
+        ));
+        assert!(matches!(
+            session.submit(Message::user("closed")).await,
+            Err(SessionError::Closed)
+        ));
+        let log = session.replay().await.unwrap();
+        assert!(
+            log.iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::SessionShutdownComplete))
+        );
+        assert!(!log.iter().any(|event| matches!(
+            event.payload,
+            SessionEventPayload::TurnCompleted { .. } | SessionEventPayload::TurnFailed { .. }
+        )));
+    }
+}
+
 struct BlockingCompaction {
     started: Arc<Notify>,
 }
@@ -587,6 +674,7 @@ async fn compaction_idle_commit_failure_reaches_interrupt_compact_and_stream_aft
         fail: AtomicBool::new(false),
         fail_running: AtomicBool::new(false),
         fail_idle: AtomicBool::new(false),
+        fail_terminal: AtomicBool::new(false),
         opening: None,
     });
     let mut services = (*services(Arc::new(FakeProvider::default()))).clone();

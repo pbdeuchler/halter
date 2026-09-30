@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use chrono::Utc;
+use futures::FutureExt;
 use futures::stream::{BoxStream, StreamExt};
 use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
@@ -764,9 +765,11 @@ impl SessionHandle {
         // mid-flight. Checked before the lease, whose wait shutdown
         // cancels; `register` catches a shutdown that starts after this.
         if self.services.turn_registry.is_shutting_down() {
-            anyhow::bail!(
-                "failed to submit turn '{}': runtime is shutting down",
-                turn.id
+            return Err(
+                anyhow::Error::new(ProviderError::cancelled()).context(format!(
+                    "failed to submit turn '{}': runtime is shutting down",
+                    turn.id
+                )),
             );
         }
         // Taken before the load so no out-of-turn write lands between the
@@ -870,10 +873,25 @@ impl SessionHandle {
                 }
             };
 
-            let outcome = match session
-                .run_turn(stored, turn.clone(), start_head, task_cancel, live.as_ref())
-                .await
-            {
+            // A plugin panic must use the same failure finalization as an
+            // ordinary error. Cancel its execution scope so any tool work
+            // holding child tokens also stops, without marking it as a user
+            // interruption.
+            let execution_cancel = task_cancel.child_token();
+            let execution = std::panic::AssertUnwindSafe(session.run_turn(
+                stored,
+                turn.clone(),
+                start_head,
+                execution_cancel.clone(),
+                live.as_ref(),
+            ))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                execution_cancel.cancel();
+                Err(anyhow::anyhow!("session execution panicked"))
+            });
+            let outcome = match execution {
                 Ok(turn_commit) => {
                     let mut state = turn_commit.state;
                     state.open_turn = None;
@@ -948,6 +966,13 @@ impl SessionHandle {
             // The registry already cancelled the token and aborted the
             // task before returning the error. Surface the same shutdown
             // error to the caller as the upfront check would have.
+            if matches!(
+                register_error,
+                crate::turn_registry::TurnRegistryError::ShuttingDown(_)
+            ) {
+                return Err(anyhow::Error::new(ProviderError::cancelled())
+                    .context(format!("failed to register turn: {register_error}")));
+            }
             anyhow::bail!("failed to register turn: {register_error}");
         }
         let _ = registered_tx.send(());
@@ -4721,6 +4746,70 @@ mod tests {
                     stored.state.session_status,
                     halter_protocol::SessionStatus::Idle
                 );
+                assert!(stored.state.open_turn.is_none());
+                assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+                assert!(provider.requests.lock().unwrap().is_empty());
+            }
+            session.shutdown().await.unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn panicking_input_hook_finalizes_failure_and_waits_for_explicit_retry() {
+            async fn panic_hook(attempts: Arc<AtomicUsize>) -> HookResponse {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                panic!("input hook panic");
+            }
+
+            let root = tempfile::tempdir().unwrap();
+            let (provider, mut services, _) = setup(root.path(), false);
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let hook_attempts = attempts.clone();
+            let mut hooks = RegisteredHooks::default();
+            hooks.register(
+                PluginId::from("panic-input"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(HookEventName::UserPromptSubmit, move |_input| {
+                    panic_hook(hook_attempts.clone())
+                }),
+            );
+            Arc::get_mut(&mut services).unwrap().registered_hooks = Arc::new(hooks);
+            let runtime = SessionRuntime::new(services.clone());
+            let (session, mut events) = runtime
+                .create_session(SessionInit {
+                    working_dir: root.path().to_path_buf(),
+                    ..SessionInit::default()
+                })
+                .await
+                .unwrap();
+            let message = Message::user("retain this task");
+            let id = session.submit(message.clone()).await.unwrap();
+            for expected_attempts in [1, 2] {
+                if expected_attempts == 2 {
+                    assert_eq!(session.submit(message.clone()).await.unwrap(), id);
+                }
+                let completed = idle(&mut events).await;
+                let failures = completed
+                    .iter()
+                    .filter(|event| matches!(event.payload, SessionEventPayload::TurnFailed { .. }))
+                    .collect::<Vec<_>>();
+                assert_eq!(failures.len(), 1);
+                assert!(matches!(
+                    &failures[0].payload,
+                    SessionEventPayload::TurnFailed { error, cancelled: false, .. }
+                        if error == "session execution panicked"
+                ));
+                let mut stored = services
+                    .sessions
+                    .load_session(session.id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                hydrate_stored_session(services.sessions.as_ref(), &mut stored)
+                    .await
+                    .unwrap();
+                assert_eq!(stored.state.pending_inputs.len(), 1);
+                assert_eq!(stored.state.pending_inputs[0].id, id);
                 assert!(stored.state.open_turn.is_none());
                 assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
                 assert!(provider.requests.lock().unwrap().is_empty());
@@ -10850,6 +10939,11 @@ mod tests {
         assert!(
             err.to_string().contains("runtime is shutting down"),
             "unexpected error: {err}"
+        );
+        assert!(
+            err.downcast_ref::<ProviderError>()
+                .is_some_and(ProviderError::is_cancelled),
+            "shutdown rejection is identifiable as cancellation"
         );
     }
 
