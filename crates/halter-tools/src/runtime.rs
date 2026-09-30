@@ -51,17 +51,25 @@ pub struct SubagentParentContext {
 #[async_trait]
 /// Control plane used by the built-in subagent tools.
 pub trait SubagentControl: Send + Sync {
-    /// Spawn a subagent from a parent session context.
+    /// Spawn a subagent from a parent session context. `cancel` is the
+    /// calling tool's token: it bounds the spawn itself (start hooks), not the
+    /// subagent, which outlives the parent turn.
     async fn spawn(
         &self,
         parent: &SubagentParentContext,
         request: SpawnSubagentRequest,
+        cancel: CancellationToken,
     ) -> anyhow::Result<SubagentStatus>;
     /// Send additional input to a subagent after its current turn is terminal.
     async fn send_input(&self, request: SendSubagentInputRequest)
     -> anyhow::Result<SubagentStatus>;
-    /// Wait for subagent progress or completion.
-    async fn wait(&self, request: WaitSubagentRequest) -> anyhow::Result<WaitSubagentResponse>;
+    /// Wait for subagent progress or completion, returning early with an
+    /// error when `cancel` fires.
+    async fn wait(
+        &self,
+        request: WaitSubagentRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<WaitSubagentResponse>;
     /// Close a subagent and return its previous status.
     async fn close(&self, request: CloseSubagentRequest) -> anyhow::Result<CloseSubagentResponse>;
 }
@@ -76,6 +84,7 @@ impl SubagentControl for NoopSubagentControl {
         &self,
         _parent: &SubagentParentContext,
         _request: SpawnSubagentRequest,
+        _cancel: CancellationToken,
     ) -> anyhow::Result<SubagentStatus> {
         anyhow::bail!("failed to execute subagent tool: subagent control is unavailable")
     }
@@ -87,7 +96,11 @@ impl SubagentControl for NoopSubagentControl {
         anyhow::bail!("failed to execute subagent tool: subagent control is unavailable")
     }
 
-    async fn wait(&self, _request: WaitSubagentRequest) -> anyhow::Result<WaitSubagentResponse> {
+    async fn wait(
+        &self,
+        _request: WaitSubagentRequest,
+        _cancel: CancellationToken,
+    ) -> anyhow::Result<WaitSubagentResponse> {
         anyhow::bail!("failed to execute subagent tool: subagent control is unavailable")
     }
 

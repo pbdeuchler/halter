@@ -285,13 +285,16 @@ impl ResponsesTransport {
             .await
             .map_err(transport_error_to_anyhow)?;
         select! {
-            _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),
+            biased;
+            _ = cancel.cancelled() => return Err(ProviderError::cancelled().into()),
             result = response.json::<Value>() => result,
         }
-        .map_err(|error| anyhow::anyhow!(
-            "failed to decode {} compaction response: {error}",
-            provider_label
-        ))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to decode {} compaction response: {error}",
+                provider_label
+            )
+        })
     }
 
     pub(crate) async fn responses_json(
@@ -312,7 +315,8 @@ impl ResponsesTransport {
             .await
             .map_err(transport_error_to_anyhow)?;
         select! {
-            _ = cancel.cancelled() => anyhow::bail!("failed to execute provider request: request cancelled"),
+            biased;
+            _ = cancel.cancelled() => return Err(ProviderError::cancelled().into()),
             result = response.json::<Value>() => result,
         }
         .map_err(|error| anyhow::anyhow!("failed to decode {} response: {error}", provider_label))
@@ -329,13 +333,18 @@ impl ResponsesTransport {
         let mut permit = self
             .rate_limit_permit(&request_meta, cancel.child_token())
             .await
-            .map_err(|error| TransportError::Fatal {
-                source: OpenAIError::ApiError(ApiError {
-                    message: format!("failed to acquire rate-limit permit: {error}"),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                }),
+            .map_err(|error| {
+                if cancel.is_cancelled() {
+                    return TransportError::Cancelled;
+                }
+                TransportError::Fatal {
+                    source: OpenAIError::ApiError(ApiError {
+                        message: format!("failed to acquire rate-limit permit: {error}"),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }),
+                }
             })?;
         let body_bytes = serde_json::to_vec(&request).map_err(|error| TransportError::Fatal {
             source: OpenAIError::ApiError(ApiError {
@@ -1044,6 +1053,49 @@ mod tests {
         assert!(
             cooldown.is_some(),
             "send_json_request error branch must thread TPM into apply_retry_after",
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_rate_limit_wait_is_a_cancellation_not_a_fatal_error() {
+        // No server: the request must end while waiting on the cooldown.
+        let transport = ResponsesTransport::try_new("test-key", "http://127.0.0.1:9", &[])
+            .expect("responses transport");
+        transport.openai_rate_limiter.apply_retry_after(
+            "gpt-5",
+            Some(500_000),
+            Duration::from_secs(60),
+        );
+        let request_meta = ResponsesTransportRequest {
+            provider_label: "openai",
+            model: "gpt-5".to_owned(),
+            reservation: OpenAiReservation {
+                requests: 1,
+                tokens: 1,
+            },
+            rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
+            tokens_per_minute: Some(500_000),
+        };
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.responses_json(json!({"model": "gpt-5", "input": []}), request_meta, cancel),
+        )
+        .await
+        .expect("cancel must end the rate-limit wait")
+        .expect_err("cancelled request must fail");
+
+        assert!(
+            error
+                .downcast_ref::<ProviderError>()
+                .is_some_and(ProviderError::is_cancelled),
+            "{error:#}"
         );
     }
 

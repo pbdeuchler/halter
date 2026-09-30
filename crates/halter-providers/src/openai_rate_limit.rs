@@ -109,7 +109,7 @@ impl OpenAiRateLimiter {
                     tokio::pin!(sleep);
                     select! {
                         _ = cancel.cancelled() => {
-                            anyhow::bail!("failed to execute provider request: request cancelled");
+                            return Err(halter_protocol::ProviderError::cancelled().into());
                         }
                         _ = &mut notified => {}
                         _ = &mut sleep => {}

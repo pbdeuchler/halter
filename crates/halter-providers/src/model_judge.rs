@@ -135,6 +135,11 @@ impl Provider for ModelJudgeProvider {
         cancel: CancellationToken,
     ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
         let candidates = self.run_panels(&request, &cancel).await;
+        // Panel and synthesis failures fall back to the default model; a
+        // cancellation must not, or it would surface as a panel error.
+        if cancel.is_cancelled() {
+            return Err(ProviderError::cancelled().into());
+        }
 
         if candidates.is_empty() {
             warn!(
@@ -147,6 +152,7 @@ impl Provider for ModelJudgeProvider {
         match run_panel_synthesis(&self.synthesis, &request, &candidates, &cancel).await {
             // The provider seam has no place to report the synthesis usage.
             Ok((synthesis, _usage)) => self.run_default(&request, Some(synthesis), cancel).await,
+            Err(_) if cancel.is_cancelled() => Err(ProviderError::cancelled().into()),
             Err(error) => {
                 warn!(
                     target: MODEL_JUDGE_TRACE_TARGET,
@@ -217,8 +223,8 @@ impl ModelJudgeProvider {
             let provider = panelist.provider.clone();
             let cancel = cancel.child_token();
             async move {
-                let collected = match provider.stream(inner, cancel).await {
-                    Ok(events) => collect_message(events).await,
+                let collected = match provider.stream(inner, cancel.clone()).await {
+                    Ok(events) => collect_message(events, &cancel).await,
                     Err(error) => Err(ProviderError::new(error.to_string(), false)),
                 };
                 (index, collected)
@@ -320,11 +326,12 @@ pub async fn run_panel_synthesis(
             messages.clone(),
             vec![rank_tool.clone()],
         );
+        let round_cancel = cancel.child_token();
         let events = synthesis
             .provider
-            .stream(inner, cancel.child_token())
+            .stream(inner, round_cancel.clone())
             .await?;
-        let collected = collect_message(events)
+        let collected = collect_message(events, &round_cancel)
             .await
             .map_err(|error| anyhow::anyhow!("model-judge synthesis stream failed: {error}"))?;
         usage.saturating_accumulate(&collected.usage);
@@ -406,12 +413,17 @@ struct PartialToolCall {
 
 async fn collect_message(
     mut events: BoxStream<'static, Result<StreamEvent, ProviderError>>,
+    cancel: &CancellationToken,
 ) -> Result<CollectedMessage, ProviderError> {
     let mut text = String::new();
     let mut partials: Vec<PartialToolCall> = Vec::new();
     let mut usage = Usage::default();
 
-    while let Some(item) = events.next().await {
+    while let Some(item) = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(ProviderError::cancelled()),
+        item = events.next() => item,
+    } {
         match item? {
             StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
             StreamEvent::ToolCallStart {
@@ -911,7 +923,10 @@ mod tests {
     async fn collect_text(
         stream: BoxStream<'static, Result<StreamEvent, ProviderError>>,
     ) -> String {
-        collect_message(stream).await.expect("collect").text
+        collect_message(stream, &CancellationToken::new())
+            .await
+            .expect("collect")
+            .text
     }
 
     /// True if any user message in the request contains `needle`. Used to assert
@@ -1074,6 +1089,43 @@ mod tests {
             })
             .expect("guidance user message");
         assert!(guidance.contains("A is the best available answer"));
+    }
+
+    #[tokio::test]
+    async fn model_judge_cancelled_turn_does_not_fall_back_to_default() {
+        let (panel, _) = member("panel-a", Some("answer A"), None);
+        let (synthesis, synthesis_reqs) = member("synthesis", Some("unused"), None);
+        let (default, default_reqs) = member("default", Some("fallback answer"), None);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let model_judge = ModelJudgeProvider::new(default, synthesis, vec![panel]);
+        let error = match model_judge.stream(sample_request(), cancel).await {
+            Ok(_) => panic!("a cancelled turn must not stream"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .downcast_ref::<ProviderError>()
+                .is_some_and(ProviderError::is_cancelled),
+            "{error:#}"
+        );
+        assert_eq!(synthesis_reqs.lock().unwrap().len(), 0);
+        assert_eq!(default_reqs.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_message_stops_at_cancellation() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = match collect_message(futures::stream::pending().boxed(), &cancel).await {
+            Ok(_) => panic!("a cancelled collect must not complete"),
+            Err(error) => error,
+        };
+
+        assert!(error.is_cancelled());
     }
 
     #[tokio::test]

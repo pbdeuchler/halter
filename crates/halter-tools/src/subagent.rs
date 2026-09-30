@@ -175,7 +175,10 @@ impl Tool for SpawnAgentTool {
         let request: SpawnSubagentRequest = serde_json::from_value(input)
             .context("failed to execute spawn_agent tool: invalid input")?;
         let request = self.normalize_request(request)?;
-        let status = self.control.spawn(parent, request).await?;
+        let status = self
+            .control
+            .spawn(parent, request, context.cancel.clone())
+            .await?;
         emit_completed(&context, "spawn_agent");
         Ok(ToolResult::Json {
             value: serde_json::to_value(status)
@@ -282,7 +285,7 @@ impl Tool for WaitAgentTool {
         emit_started(&context, "wait_agent");
         let request: WaitSubagentRequest = serde_json::from_value(input)
             .context("failed to execute wait_agent tool: invalid input")?;
-        let response = self.control.wait(request).await?;
+        let response = self.control.wait(request, context.cancel.clone()).await?;
         emit_completed(&context, "wait_agent");
         Ok(ToolResult::Json {
             value: serde_json::to_value(response)
@@ -359,7 +362,8 @@ fn subagent_capabilities(long_running: bool) -> ToolCapabilities {
     ToolCapabilities {
         mutating: false,
         requires_approval: false,
-        cancellable: false,
+        // The long-running calls (spawn, wait) observe the tool's token.
+        cancellable: long_running,
         long_running,
     }
 }
@@ -406,6 +410,7 @@ mod tests {
             &self,
             _parent: &SubagentParentContext,
             request: SpawnSubagentRequest,
+            _cancel: CancellationToken,
         ) -> anyhow::Result<SubagentStatus> {
             self.requests.lock().expect("requests").push(request);
             Ok(SubagentStatus {
@@ -432,6 +437,7 @@ mod tests {
         async fn wait(
             &self,
             _request: WaitSubagentRequest,
+            _cancel: CancellationToken,
         ) -> anyhow::Result<WaitSubagentResponse> {
             unreachable!(
                 "RecordingSubagentControl::wait was called, but this test does not exercise wait_agent"

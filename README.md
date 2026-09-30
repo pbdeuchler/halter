@@ -1029,6 +1029,25 @@ It owns:
 
 The public session handle is `SessionHandle`; `HalterSession` remains a backwards-compatible alias.
 
+#### Cancellation
+
+`submit_turn` and `compact` are cancelled only by runtime shutdown. Dropping
+the turn's event stream does **not** cancel the turn. To cancel one yourself,
+pass a `CancellationToken`:
+
+```rust
+let cancel = tokio_util::sync::CancellationToken::new();
+let turn = session.submit_turn_with_cancel(request, cancel.clone()).await?;
+// later: cancel.cancel(); the turn fails as cancelled.
+```
+
+`compact_with_cancel(trigger, instructions, cancel)` does the same for
+compaction. The token reaches every external call a turn makes: provider
+requests, rate-limit waits, model-judge panels, hooks, subagent spawn/wait,
+and browser actions. SDK hooks get it as `HookInput::cancel`, and custom
+`SubagentControl` implementations get it on `spawn` and `wait`. Subagents
+themselves outlive their parent turn and stop at runtime shutdown.
+
 > [!NOTE]
 > halter implements its own compaction strategy. This can be less token efficient than managed compaction from inference providers or frontier harnesses. The goal is a higher-quality context window, which can reduce overall token use throughout the turn and gives halter a consistent baseline across providers and models.
 

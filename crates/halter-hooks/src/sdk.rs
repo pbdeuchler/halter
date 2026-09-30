@@ -11,6 +11,7 @@ use futures::future::BoxFuture;
 use halter_protocol::{HookHandlerType, PluginId};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::HookEventName;
 use crate::merge::{HookDecision, HookOutput, HookSpecificOutput, PermissionDecision};
@@ -38,6 +39,10 @@ pub struct HookInput {
     pub event_name: HookEventName,
     pub matcher_value: Option<String>,
     pub payload: Value,
+    /// Fires when the dispatching turn is cancelled. The runtime drops the
+    /// callback future at that point; work the callback spawned should
+    /// observe this token to stop too.
+    pub cancel: CancellationToken,
 }
 
 impl HookInput {
@@ -499,6 +504,7 @@ mod tests {
             event_name: HookEventName::Stop,
             matcher_value: None,
             payload: json!({}),
+            cancel: CancellationToken::new(),
         })
         .await
         .expect("callback response");

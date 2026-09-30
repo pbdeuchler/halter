@@ -7,6 +7,8 @@
 // actual session create/close calls happen later when the agent navigates,
 // and use the in-memory copy of the credentials.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -15,6 +17,8 @@ use tracing::{info, warn};
 use super::provider::{BrowserProvider, RemoteSession};
 
 const DEFAULT_BASE_URL: &str = "https://api.browserbase.com";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct BrowserbaseConfig {
@@ -87,8 +91,12 @@ pub struct BrowserbaseProvider {
 
 impl BrowserbaseProvider {
     pub fn new(config: BrowserbaseConfig) -> anyhow::Result<Self> {
+        // Bounded so the uncancellable release calls (explicit close and the
+        // Drop fallback) cannot hang.
         let client = Client::builder()
             .user_agent(concat!("halter-tools/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|err| anyhow::anyhow!("failed to build browserbase http client: {err}"))?;
         Ok(Self { config, client })

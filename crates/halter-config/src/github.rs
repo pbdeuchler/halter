@@ -141,9 +141,17 @@ impl Default for GithubFetcher {
 
 impl GithubFetcher {
     /// Create a fetcher using `GITHUB_TOKEN` or `GH_TOKEN` when either exists.
+    ///
+    /// The default client bounds connecting and each read, not the whole
+    /// download, so a stalled GitHub cannot hang loading; cancel a load by
+    /// dropping its future.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             token: std::env::var("GITHUB_TOKEN")
                 .ok()
                 .or_else(|| std::env::var("GH_TOKEN").ok()),

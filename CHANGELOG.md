@@ -8,6 +8,29 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Added
+
+- `SessionHandle::submit_turn_with_cancel` (now public) and `SessionHandle::compact_with_cancel`: run a turn or a compaction under a caller-owned `CancellationToken`, including while waiting for the session's write lease.
+- `HookInput::cancel`: SDK hooks receive the token for the turn they run in. **Breaking:** `HookInput` literals must set it.
+- `TurnRegistry::child_token`: a token that fires on runtime shutdown, for work not yet registered as a turn.
+
+### Changed
+
+- **Breaking:** `SubagentControl::spawn` and `SubagentControl::wait` take a `CancellationToken`. `wait_agent` without a timeout now returns when its turn is cancelled.
+- `submit_turn`, `compact` and `notify` stop at runtime shutdown. Dropping a turn's event stream still does not cancel it.
+- The Browserbase client, the GitHub plugin fetcher and the CLI's OpenAI OAuth client have connect and request timeouts. Browser actions stop when the turn is cancelled.
+
+### Fixed
+
+- A cancelled rate-limit wait, response-body read, or stream setup now surfaces as a cancellation instead of a fatal or retryable error.
+- The cancellation marker on a provider stream is no longer dropped when the event channel is full.
+- A cancelled model-judge turn no longer falls back to the default model, and its panels stop when the turn is cancelled or dropped.
+- A command hook that times out now kills its child process.
+- Agent hooks cancel their sub-turn when they time out or are dropped.
+- A turn cancelled between model rounds stops instead of starting another round.
+
+Known gaps that remain are tracked in [#211](https://github.com/pbdeuchler/halter/issues/211).
+
 ## [0.7.0] - 2026-09-29
 
 The session log now carries the session. A resumed session, in a new process,

@@ -45,6 +45,9 @@ pub struct ShutdownReport {
 #[derive(Default)]
 pub struct TurnRegistry {
     inner: Mutex<TurnRegistryInner>,
+    /// Parent of every runtime-issued token, cancelled by `shutdown`, so work
+    /// that is not (yet) a registered turn still observes runtime shutdown.
+    root: CancellationToken,
 }
 
 #[derive(Default)]
@@ -92,6 +95,12 @@ impl TurnRegistry {
         Ok(())
     }
 
+    /// A token cancelled when runtime shutdown starts.
+    #[must_use]
+    pub fn child_token(&self) -> CancellationToken {
+        self.root.child_token()
+    }
+
     /// Remove a turn from the registry. Idempotent: deregistering an
     /// unknown id is a no-op (covers the race where shutdown drains
     /// the entry just before the task body's deregister runs).
@@ -119,6 +128,7 @@ impl TurnRegistry {
         let handles = {
             let mut inner = self.lock();
             inner.shutting_down = true;
+            self.root.cancel();
             let mut taken = Vec::with_capacity(inner.in_flight.len());
             for (_, registered) in inner.in_flight.drain() {
                 registered.cancel.cancel();
@@ -197,6 +207,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn child_tokens_fire_only_on_shutdown() {
+        let registry = TurnRegistry::new();
+        let before = registry.child_token();
+        assert!(!before.is_cancelled(), "live runtime must not cancel");
+
+        let _ = registry.shutdown(Duration::from_millis(0)).await;
+
+        assert!(before.is_cancelled(), "shutdown must cancel issued tokens");
+        assert!(
+            registry.child_token().is_cancelled(),
+            "tokens issued after shutdown start cancelled"
+        );
+    }
 
     #[tokio::test]
     async fn register_and_deregister_round_trip() {

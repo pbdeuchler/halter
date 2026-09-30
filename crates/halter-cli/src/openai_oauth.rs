@@ -209,8 +209,12 @@ fn generate_url_token() -> String {
 }
 
 fn oauth_http_client() -> anyhow::Result<Client> {
+    // Token exchanges are small requests; bound them so a stalled auth
+    // server cannot hang login.
     Client::builder()
         .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .context("failed to build OAuth HTTP client")
 }

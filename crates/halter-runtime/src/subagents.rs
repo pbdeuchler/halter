@@ -212,7 +212,9 @@ impl RuntimeSubagentControl {
             .load_session(session_id)
             .await?
             .and_then(|stored| stored.blueprint.parent_session_id);
-        let cancel = CancellationToken::new();
+        // Subagents outlive the parent turn; close_agent and runtime shutdown
+        // cancel them.
+        let cancel = self.inner.services.turn_registry.child_token();
         let (parent, generation, status) = {
             let mut registry = self.inner.registry.lock().await;
             let entry = registry.entries.get_mut(&agent_id.0).with_context(|| {
@@ -374,6 +376,7 @@ impl RuntimeSubagentControl {
                     &agent_id,
                     agent_type.as_ref(),
                     &session_id,
+                    &cancel,
                 )
                 .await
             {
@@ -451,6 +454,7 @@ impl RuntimeSubagentControl {
         &self,
         parent: &SubagentParentContext,
         status: &SubagentStatus,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
         let session = HalterSession::new(
             self.inner.services.clone(),
@@ -460,9 +464,7 @@ impl RuntimeSubagentControl {
             return Ok(());
         };
         let turn_id = TurnId::new();
-        // Parent hook dispatch runs outside any turn scope; the token never
-        // fires.
-        let hook_cancel = CancellationToken::new();
+        // Runs inside the parent's spawn tool call, under its token.
         let dispatch = run_subagent_start(
             &session,
             &fired_hook_ids,
@@ -470,7 +472,7 @@ impl RuntimeSubagentControl {
                 turn_id: &turn_id,
                 model: &stored.blueprint.default_model,
                 working_dir: &stored.blueprint.working_dir,
-                cancel: &hook_cancel,
+                cancel,
             },
             &status.agent_id,
             status
@@ -496,6 +498,7 @@ impl RuntimeSubagentControl {
         agent_id: &AgentId,
         agent_type: Option<&AgentName>,
         child_session_id: &SessionId,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<Option<String>> {
         let session = HalterSession::new(self.inner.services.clone(), parent_session_id.clone())?;
         let Some((stored, fired_hook_ids)) = session.load_for_out_of_turn_hooks().await? else {
@@ -507,9 +510,7 @@ impl RuntimeSubagentControl {
             .services
             .sessions
             .transcript_path(child_session_id);
-        // Parent hook dispatch runs outside any turn scope; the token never
-        // fires.
-        let hook_cancel = CancellationToken::new();
+        // Runs under the subagent's token, so close_agent stops it.
         let dispatch = run_subagent_stop(
             &session,
             &fired_hook_ids,
@@ -517,7 +518,7 @@ impl RuntimeSubagentControl {
                 turn_id: &turn_id,
                 model: &stored.blueprint.default_model,
                 working_dir: &stored.blueprint.working_dir,
-                cancel: &hook_cancel,
+                cancel,
             },
             agent_id,
             agent_type.map_or("default", |agent_type| agent_type.0.as_str()),
@@ -547,6 +548,7 @@ impl SubagentControl for RuntimeSubagentControl {
         &self,
         parent: &SubagentParentContext,
         request: SpawnSubagentRequest,
+        cancel: CancellationToken,
     ) -> anyhow::Result<SubagentStatus> {
         if request.message.trim().is_empty() {
             anyhow::bail!("failed to execute spawn_agent tool: message cannot be empty");
@@ -583,9 +585,18 @@ impl SubagentControl for RuntimeSubagentControl {
             return Err(error);
         }
 
-        if let Err(error) = self.run_subagent_start_hooks(parent, &status).await {
+        if let Err(error) = self
+            .run_subagent_start_hooks(parent, &status, &cancel)
+            .await
+        {
             self.remove_reserved_subagent(&agent_id).await;
             return Err(error);
+        }
+        // A parent cancelled mid-spawn could never wait on or close the
+        // child, so it is not started.
+        if cancel.is_cancelled() {
+            self.remove_reserved_subagent(&agent_id).await;
+            anyhow::bail!("failed to execute spawn_agent tool: cancelled");
         }
 
         self.start_turn(
@@ -635,7 +646,11 @@ impl SubagentControl for RuntimeSubagentControl {
             .await
     }
 
-    async fn wait(&self, request: WaitSubagentRequest) -> anyhow::Result<WaitSubagentResponse> {
+    async fn wait(
+        &self,
+        request: WaitSubagentRequest,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<WaitSubagentResponse> {
         if request.targets.is_empty() {
             anyhow::bail!("failed to execute wait_agent tool: targets cannot be empty");
         }
@@ -650,6 +665,9 @@ impl SubagentControl for RuntimeSubagentControl {
 
         let wait_for_status = async {
             loop {
+                if cancel.is_cancelled() {
+                    anyhow::bail!("failed to execute wait_agent tool: cancelled");
+                }
                 if let Some(status) = self.terminal_status_for_targets(&request.targets).await? {
                     return anyhow::Result::<SubagentStatus>::Ok(status);
                 }
@@ -658,7 +676,11 @@ impl SubagentControl for RuntimeSubagentControl {
                 if self.inner.version.load(Ordering::SeqCst) != version {
                     continue;
                 }
-                notified.await;
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {}
+                    () = notified => {}
+                }
             }
         };
 
@@ -826,16 +848,20 @@ mod tests {
                     fork_context: true,
                     model: None,
                 },
+                CancellationToken::new(),
             )
             .await
             .expect("spawn");
 
         assert_eq!(status.state, SubagentState::Running);
         let waited = control
-            .wait(WaitSubagentRequest {
-                targets: vec![status.agent_id.clone()],
-                timeout_ms: Some(5_000),
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![status.agent_id.clone()],
+                    timeout_ms: Some(5_000),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("wait");
 
@@ -875,14 +901,18 @@ mod tests {
                     fork_context: false,
                     model: None,
                 },
+                CancellationToken::new(),
             )
             .await
             .expect("spawn");
         control
-            .wait(WaitSubagentRequest {
-                targets: vec![spawned.agent_id.clone()],
-                timeout_ms: Some(5_000),
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![spawned.agent_id.clone()],
+                    timeout_ms: Some(5_000),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("wait");
 
@@ -896,10 +926,13 @@ mod tests {
         assert_eq!(restarted.session_id, spawned.session_id);
 
         let waited = control
-            .wait(WaitSubagentRequest {
-                targets: vec![spawned.agent_id.clone()],
-                timeout_ms: Some(5_000),
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![spawned.agent_id.clone()],
+                    timeout_ms: Some(5_000),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("wait");
         assert_eq!(
@@ -924,6 +957,7 @@ mod tests {
                     fork_context: false,
                     model: None,
                 },
+                CancellationToken::new(),
             )
             .await
             .expect("spawn first");
@@ -936,15 +970,19 @@ mod tests {
                     fork_context: false,
                     model: None,
                 },
+                CancellationToken::new(),
             )
             .await
             .expect("spawn second");
 
         let waited = control
-            .wait(WaitSubagentRequest {
-                targets: vec![first.agent_id.clone(), second.agent_id.clone()],
-                timeout_ms: Some(5),
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![first.agent_id.clone(), second.agent_id.clone()],
+                    timeout_ms: Some(5),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("wait timeout");
 
@@ -980,10 +1018,13 @@ mod tests {
         let control = RuntimeSubagentControl::new(services);
 
         let error = control
-            .wait(WaitSubagentRequest {
-                targets: vec![AgentId::from("missing-agent")],
-                timeout_ms: Some(5),
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![AgentId::from("missing-agent")],
+                    timeout_ms: Some(5),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect_err("unknown target should error");
 
@@ -1007,6 +1048,7 @@ mod tests {
                     fork_context: false,
                     model: None,
                 },
+                CancellationToken::new(),
             )
             .await
             .expect("spawn");
@@ -1050,6 +1092,7 @@ mod tests {
                     fork_context: false,
                     model: None,
                 },
+                CancellationToken::new(),
             )
             .await
             .expect("spawn");
@@ -1063,10 +1106,13 @@ mod tests {
         assert_eq!(closed.previous_status.state, SubagentState::Running);
 
         let waited = control
-            .wait(WaitSubagentRequest {
-                targets: vec![spawned.agent_id],
-                timeout_ms: None,
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![spawned.agent_id],
+                    timeout_ms: None,
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("wait");
         let status = waited.status.expect("closed status");
@@ -1075,6 +1121,66 @@ mod tests {
             status.error.as_deref(),
             Some("closed by close_agent (work was cancelled)")
         );
+    }
+
+    #[tokio::test]
+    async fn wait_without_timeout_returns_when_cancelled() {
+        let services = test_services(Arc::new(PendingProvider));
+        let control = RuntimeSubagentControl::new(services);
+        let spawned = control
+            .spawn(
+                &parent_context(),
+                spawn_request("running task"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("spawn");
+        let cancel = CancellationToken::new();
+        let waiting = control.wait(
+            WaitSubagentRequest {
+                targets: vec![spawned.agent_id.clone()],
+                timeout_ms: None,
+            },
+            cancel.clone(),
+        );
+        cancel.cancel();
+
+        let error = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("cancelled wait must not block")
+            .expect_err("cancelled wait must fail");
+
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        let still_running = control
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![spawned.agent_id],
+                    timeout_ms: Some(10),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("wait");
+        assert!(
+            still_running.timed_out,
+            "cancelling the wait must not cancel the subagent"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_cancelled_token_starts_no_subagent() {
+        let services = test_services(Arc::new(PendingProvider));
+        let control = RuntimeSubagentControl::new(services);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = control
+            .spawn(&parent_context(), spawn_request("never runs"), cancel)
+            .await
+            .expect_err("cancelled spawn must fail");
+
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(control.inner.registry.lock().await.entries.is_empty());
     }
 
     fn spawn_request(message: &str) -> SpawnSubagentRequest {
@@ -1099,10 +1205,13 @@ mod tests {
         timeout_ms: u64,
     ) -> SubagentStatus {
         let waited = control
-            .wait(WaitSubagentRequest {
-                targets: vec![agent.clone()],
-                timeout_ms: Some(timeout_ms),
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![agent.clone()],
+                    timeout_ms: Some(timeout_ms),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("the agent is registered");
         waited
@@ -1172,7 +1281,7 @@ mod tests {
             let first = SessionRuntime::new(services.clone());
             let agent = first
                 .subagent_control()
-                .spawn(&parent, spawn_request("task"))
+                .spawn(&parent, spawn_request("task"), CancellationToken::new())
                 .await
                 .expect("spawn")
                 .agent_id;
@@ -1216,7 +1325,7 @@ mod tests {
         store_parent_session(&services, &parent).await;
         let spawned = SessionRuntime::new(services.clone())
             .subagent_control()
-            .spawn(&parent, spawn_request("task"))
+            .spawn(&parent, spawn_request("task"), CancellationToken::new())
             .await
             .expect("spawn");
         let agent = spawned.agent_id;
@@ -1265,10 +1374,13 @@ mod tests {
             .await
             .expect("send_input");
         let waited = control
-            .wait(WaitSubagentRequest {
-                targets: vec![agent.clone()],
-                timeout_ms: Some(5_000),
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![agent.clone()],
+                    timeout_ms: Some(5_000),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("wait")
             .status
@@ -1322,6 +1434,7 @@ mod tests {
                     fork_context: true,
                     model: None,
                 },
+                CancellationToken::new(),
             )
             .await
             .expect_err("depth should fail");
@@ -1450,14 +1563,18 @@ mod tests {
                     fork_context: false,
                     model: None,
                 },
+                CancellationToken::new(),
             )
             .await
             .expect("spawn");
         let waited = control
-            .wait(WaitSubagentRequest {
-                targets: vec![spawned.agent_id],
-                timeout_ms: Some(30_000),
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![spawned.agent_id],
+                    timeout_ms: Some(30_000),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("wait");
 
@@ -1525,14 +1642,18 @@ mod tests {
                     fork_context: false,
                     model: None,
                 },
+                CancellationToken::new(),
             )
             .await
             .expect("spawn");
         let waited = control
-            .wait(WaitSubagentRequest {
-                targets: vec![spawned.agent_id],
-                timeout_ms: Some(30_000),
-            })
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![spawned.agent_id],
+                    timeout_ms: Some(30_000),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("wait");
 

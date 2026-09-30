@@ -651,27 +651,27 @@ async fn run_command(
         .stdin
         .take()
         .context("failed to run hook command: missing stdin")?;
-    stdin
-        .write_all(&body)
-        .await
-        .context("failed to write hook stdin")?;
-    stdin
-        .shutdown()
-        .await
-        .context("failed to close hook stdin")?;
-
-    let mut wait = tokio::spawn(async move { child.wait_with_output().await });
+    // The future owns the child, so leaving it by cancel, timeout or the
+    // caller dropping us drops the child and `kill_on_drop` reaps it. The
+    // stdin write is inside so a child that never reads is bounded too.
+    let run = async move {
+        stdin
+            .write_all(&body)
+            .await
+            .context("failed to write hook stdin")?;
+        stdin
+            .shutdown()
+            .await
+            .context("failed to close hook stdin")?;
+        drop(stdin);
+        child
+            .wait_with_output()
+            .await
+            .context("failed to wait for hook command")
+    };
     let output = tokio::select! {
-        _ = cancel.cancelled() => {
-            wait.abort();
-            return Ok(HandlerExecution::Cancelled);
-        }
-        output = timeout(handler.timeout, &mut wait) => {
-            output
-                .context("hook timed out")?
-                .context("failed to join hook command task")?
-                .context("failed to wait for hook command")?
-        }
+        _ = cancel.cancelled() => return Ok(HandlerExecution::Cancelled),
+        output = timeout(handler.timeout, run) => output.context("hook timed out")??,
     };
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -706,6 +706,7 @@ async fn run_sdk_hook(
         event_name: request.event_name,
         matcher_value: request.matcher_value.clone(),
         payload,
+        cancel: cancel.clone(),
     };
 
     let response = tokio::select! {
@@ -738,7 +739,10 @@ async fn run_http(
     // Single unified network gate. `PolicySettings::allowed_loopback` and
     // `allowed_hosts` govern both loopback and remote access — the runtime no
     // longer maintains a parallel IP allowlist (C3).
-    check_hook_network(sess.services().policy.as_ref(), &config.url).await?;
+    tokio::select! {
+        _ = cancel.cancelled() => return Ok(HandlerExecution::Cancelled),
+        result = check_hook_network(sess.services().policy.as_ref(), &config.url) => result?,
+    }
 
     let url = Url::parse(&config.url).context("failed to parse hook url")?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -921,6 +925,8 @@ async fn run_agent(
     let payload_json = serde_json::to_string_pretty(&request.payload)?;
     let agent_cancel = cancel.child_token();
     let turn_cancel = agent_cancel.clone();
+    // Any exit (cancel, timeout, this future dropped) stops the hook agent.
+    let _agent_guard = agent_cancel.drop_guard();
     // Hook agents run on the ambient tokio runtime via `tokio::spawn`. The
     // earlier `spawn_blocking + Handle::block_on` pattern only worked when the
     // outer caller was itself blocking; any future async caller would
@@ -936,7 +942,6 @@ async fn run_agent(
     ));
     let events = tokio::select! {
         _ = cancel.cancelled() => {
-            agent_cancel.cancel();
             agent_task.abort();
             return Ok(HandlerExecution::Cancelled);
         }
@@ -945,7 +950,7 @@ async fn run_agent(
                 .context("failed to join hook agent task")?
                 .context("failed to execute hook agent")?,
             Err(_) => {
-                agent_cancel.cancel();
+                agent_task.abort();
                 anyhow::bail!("hook agent timed out");
             }
         },
@@ -2016,6 +2021,25 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(4),
             "cancellation must not wait for the command"
         );
+    }
+
+    /// A timed-out command hook is killed rather than left running detached.
+    #[tokio::test]
+    async fn run_command_timeout_kills_the_child() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("still-running");
+        let (handler, config, request) =
+            command_fixture(&format!("sleep 1; touch '{}'", marker.display()));
+        let mut handler = (*handler).clone();
+        handler.timeout = std::time::Duration::from_millis(100);
+
+        let error = run_command(&handler, &config, &request, CancellationToken::new())
+            .await
+            .expect_err("timeout must error");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        assert!(!marker.exists(), "timed-out hook command kept running");
     }
 
     /// M17/M18: `handler_run_result` covers every execution outcome,

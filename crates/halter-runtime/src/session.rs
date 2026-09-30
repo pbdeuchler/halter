@@ -651,12 +651,21 @@ impl SessionHandle {
     }
 
     /// Submit a turn and return a stream of committed events for that turn.
+    ///
+    /// The turn is cancelled only by runtime shutdown; dropping the stream
+    /// does not stop it. Use [`Self::submit_turn_with_cancel`] to cancel it.
     pub async fn submit_turn(&self, turn: Turn) -> anyhow::Result<SessionEventStream> {
-        self.submit_turn_with_cancel(turn, CancellationToken::new())
+        self.submit_turn_with_cancel(turn, self.services.turn_registry.child_token())
             .await
     }
 
-    pub(crate) async fn submit_turn_with_cancel(
+    /// Submit a turn that stops when `turn_cancel` fires.
+    ///
+    /// Cancellation reaches the wait for the session lease, provider
+    /// requests, tools, hooks, subagent waits and compaction; the turn then
+    /// commits `TurnFailed { cancelled: true }`. Runtime shutdown cancels the
+    /// turn regardless of the caller's token.
+    pub async fn submit_turn_with_cancel(
         &self,
         turn: Turn,
         turn_cancel: CancellationToken,
@@ -667,10 +676,20 @@ impl SessionHandle {
             user_part_count = turn.user_message.parts.len(),
             "submitting turn"
         );
+        // Reject new turns once the runtime is shutting down so callers
+        // get a structured error instead of a turn that gets aborted
+        // mid-flight. Checked before the lease, whose wait shutdown
+        // cancels; `register` catches a shutdown that starts after this.
+        if self.services.turn_registry.is_shutting_down() {
+            anyhow::bail!(
+                "failed to submit turn '{}': runtime is shutting down",
+                turn.id
+            );
+        }
         // Taken before the load so no out-of-turn write lands between the
         // head this turn reads and the `TurnStarted` it commits. A turn
         // submitted while another is in flight waits for it.
-        let lease = self.acquire_lease().await;
+        let lease = self.acquire_lease_or_cancel(&turn_cancel).await?;
         let mut stored = self
             .services
             .sessions
@@ -683,15 +702,6 @@ impl SessionHandle {
                 )
             })?;
         hydrate_stored_session(self.services.sessions.as_ref(), &mut stored).await?;
-        // Reject new turns once the runtime is shutting down so callers
-        // get a structured error instead of a turn that gets aborted
-        // mid-flight.
-        if self.services.turn_registry.is_shutting_down() {
-            anyhow::bail!(
-                "failed to submit turn '{}': runtime is shutting down",
-                turn.id
-            );
-        }
 
         let (tx, rx) = mpsc::unbounded_channel();
         let live = Arc::new(LiveTurnStream::new(
@@ -714,7 +724,13 @@ impl SessionHandle {
         let turn_id_for_register = turn.id.clone();
         let task_cancel = turn_cancel.clone();
         let task_cancel_status = turn_cancel.clone();
+        // The body waits for registration so its deregister cannot run first
+        // and leave a finished turn in the registry.
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
+            if registered_rx.await.is_err() {
+                return;
+            }
             // Always deregister, even if the turn body panics, so we don't
             // leak entries that block shutdown drain.
             struct DeregisterOnDrop {
@@ -851,6 +867,7 @@ impl SessionHandle {
             // error to the caller as the upfront check would have.
             anyhow::bail!("failed to register turn: {register_error}");
         }
+        let _ = registered_tx.send(());
 
         Ok(UnboundedReceiverStream::new(rx).boxed())
     }
@@ -889,8 +906,9 @@ impl SessionHandle {
         let mut state = stored.state;
         let mut events = Vec::new();
         let turn_id = TurnId::new();
-        // Session-level entry point with no turn token: hooks run with a
-        // token that never fires.
+        // SessionEnd hooks run after runtime shutdown has cancelled every
+        // runtime token, so they get one that never fires; their configured
+        // timeouts bound them.
         let hook_cancel = CancellationToken::new();
         let hook_ctx = HookInvocationContext {
             turn_id: &turn_id,
@@ -938,9 +956,9 @@ impl SessionHandle {
                 )
             })?;
         let turn_id = TurnId::new();
-        // Session-level entry point with no turn token: hooks run with a
-        // token that never fires.
-        let hook_cancel = CancellationToken::new();
+        // Session-level entry point with no turn token: hooks stop at
+        // runtime shutdown.
+        let hook_cancel = self.services.turn_registry.child_token();
         let hook_ctx = HookInvocationContext {
             turn_id: &turn_id,
             model: &stored.blueprint.default_model,
@@ -955,19 +973,40 @@ impl SessionHandle {
     }
 
     /// Compact the session immediately using the configured provider.
+    /// Runtime shutdown cancels it.
     pub async fn compact(
         &self,
         trigger: &str,
         custom_instructions: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.leased(self.run_compact(trigger, custom_instructions))
-            .await
+        self.compact_with_cancel(
+            trigger,
+            custom_instructions,
+            self.services.turn_registry.child_token(),
+        )
+        .await
+    }
+
+    /// [`Self::compact`] that also stops when `cancel` fires, whether it is
+    /// still waiting for the session lease or already running hooks and
+    /// provider compaction.
+    pub async fn compact_with_cancel(
+        &self,
+        trigger: &str,
+        custom_instructions: Option<&str>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let lease = self.acquire_lease_or_cancel(&cancel).await?;
+        let outcome = self.run_compact(trigger, custom_instructions, cancel).await;
+        lease.release().await?;
+        outcome
     }
 
     async fn run_compact(
         &self,
         trigger: &str,
         custom_instructions: Option<&str>,
+        hook_cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let mut stored = self
             .services
@@ -987,9 +1026,6 @@ impl SessionHandle {
         let mut state = stored.state;
         let mut events = Vec::new();
         let turn_id = TurnId::new();
-        // Session-level entry point with no turn token: hooks run with a
-        // token that never fires.
-        let hook_cancel = CancellationToken::new();
         let hook_ctx = HookInvocationContext {
             turn_id: &turn_id,
             model: &stored.blueprint.default_model,
@@ -1272,6 +1308,11 @@ impl SessionHandle {
             )
             .await?;
             boundary_result?;
+            // Hooks report a cancelled dispatch as a summary, not an error,
+            // so the loop checks the token itself before the next step.
+            if turn_cancel.is_cancelled() {
+                return Err(ProviderError::cancelled().into());
+            }
             ensure_provider_iteration_allowed(stored.blueprint.max_turns, provider_iterations)?;
             provider_iterations = provider_iterations.saturating_add(1);
             self.services
@@ -2322,6 +2363,18 @@ impl SessionHandle {
     pub(crate) async fn acquire_lease(&self) -> SessionLease {
         self.services.session_leases.acquire(&self.session_id).await;
         SessionLease::new(self.clone())
+    }
+
+    /// Wait for the session lease unless `cancel` fires first.
+    async fn acquire_lease_or_cancel(
+        &self,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<SessionLease> {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(ProviderError::cancelled().into()),
+            lease = self.acquire_lease() => Ok(lease),
+        }
     }
 
     pub(crate) async fn release_lease(&self) -> anyhow::Result<()> {
@@ -9576,6 +9629,125 @@ mod tests {
         assert!(
             err.to_string().contains("runtime is shutting down"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_turn_with_cancel_completes_when_not_cancelled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let runtime = SessionRuntime::new(services);
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn_with_cancel(Turn::user("hello"), CancellationToken::new())
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("turn events");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_turn_with_cancel_fails_turn_as_cancelled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Arc::new(Notify::new());
+        let services = configured_services(
+            Arc::new(CancellableBlockingProvider {
+                started: started.clone(),
+            }),
+            temp.path(),
+        );
+        let runtime = SessionRuntime::new(services);
+        let session = new_session(&runtime, temp.path()).await;
+        let cancel = CancellationToken::new();
+
+        let stream = session
+            .submit_turn_with_cancel(Turn::user("blocking turn"), cancel.clone())
+            .await
+            .expect("submit turn");
+        started.notified().await;
+        cancel.cancel();
+
+        let events = tokio::time::timeout(Duration::from_secs(5), stream.try_collect::<Vec<_>>())
+            .await
+            .expect("cancelled turn must end")
+            .expect("turn events");
+        assert!(
+            events.iter().any(|event| matches!(
+                event.payload,
+                SessionEventPayload::TurnFailed {
+                    cancelled: true,
+                    ..
+                }
+            )),
+            "caller cancellation must fail the turn as cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_turn_with_cancel_stops_waiting_for_the_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Arc::new(Notify::new());
+        let services = configured_services(
+            Arc::new(CancellableBlockingProvider {
+                started: started.clone(),
+            }),
+            temp.path(),
+        );
+        let runtime = SessionRuntime::new(services);
+        let session = new_session(&runtime, temp.path()).await;
+        let _running = session
+            .submit_turn(Turn::user("holds the lease"))
+            .await
+            .expect("first turn");
+        started.notified().await;
+
+        let cancel = CancellationToken::new();
+        let waiting = session.submit_turn_with_cancel(Turn::user("queued"), cancel.clone());
+        cancel.cancel();
+        let error = match tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("cancelled submit must not wait for the lease")
+        {
+            Ok(_) => panic!("cancelled submit must fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .downcast_ref::<ProviderError>()
+                .is_some_and(ProviderError::is_cancelled),
+            "unexpected error: {error}"
+        );
+        let _ = runtime.shutdown(Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn compact_with_cancel_rejects_a_cancelled_token() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let runtime = SessionRuntime::new(services);
+        let session = new_session(&runtime, temp.path()).await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = session
+            .compact_with_cancel("manual", None, cancel)
+            .await
+            .expect_err("cancelled compaction must fail");
+
+        assert!(
+            error
+                .downcast_ref::<ProviderError>()
+                .is_some_and(ProviderError::is_cancelled),
+            "unexpected error: {error}"
         );
     }
 

@@ -66,20 +66,32 @@ impl Tool for BrowserTool {
         let action = required_string(&input, "action")?.to_owned();
         debug!(session_id = %context.session_id, action = %action, "browser action dispatch");
 
-        let value = match action.as_str() {
-            "navigate" => action_navigate(&context, &input).await?,
-            "snapshot" => action_snapshot(&context).await?,
-            "click" => action_click(&context, &input).await?,
-            "type" => action_type(&context, &input).await?,
-            "scroll" => action_scroll(&context, &input).await?,
-            "back" => action_back(&context).await?,
-            "press" => action_press(&context, &input).await?,
-            "screenshot" => action_screenshot(&context, &input).await?,
-            "eval" => action_eval(&context, &input).await?,
-            "console" => action_console(&context).await?,
-            "close" => action_close(&context).await?,
-            other => anyhow::bail!("failed to execute browser tool: unknown action '{other}'"),
+        let dispatch = async {
+            match action.as_str() {
+                "navigate" => action_navigate(&context, &input).await,
+                "snapshot" => action_snapshot(&context).await,
+                "click" => action_click(&context, &input).await,
+                "type" => action_type(&context, &input).await,
+                "scroll" => action_scroll(&context, &input).await,
+                "back" => action_back(&context).await,
+                "press" => action_press(&context, &input).await,
+                "screenshot" => action_screenshot(&context, &input).await,
+                "eval" => action_eval(&context, &input).await,
+                "console" => action_console(&context).await,
+                "close" => action_close(&context).await,
+                other => anyhow::bail!("failed to execute browser tool: unknown action '{other}'"),
+            }
         };
+        // Every action is a remote round trip (session lock, Browserbase API,
+        // CDP), so the whole dispatch races the token. Dropping it mid-call
+        // releases the session lock; an in-flight remote call's reply is
+        // discarded, and a session dropped mid-open is reaped by the cloud
+        // side's own timeout.
+        let value = context
+            .cancel
+            .run_until_cancelled(dispatch)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("failed to execute tool: cancelled"))??;
         Ok(ToolResult::Json { value })
     }
 }

@@ -147,12 +147,21 @@ where
             loop {
                 let attempt_id = gate.next_attempt_id();
                 let attempt_cancel = cancel.child_token();
-                let mut attempt_stream = match tokio::time::timeout(
-                    policy.timeouts.request,
-                    inner.stream(request.clone(), attempt_cancel.clone()),
-                )
-                .await
-                {
+                // Every exit from this attempt (retry, terminal error, return)
+                // releases the attempt's upstream reader.
+                let _attempt_guard = attempt_cancel.clone().drop_guard();
+                let setup = select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        send_cancelled(&mut tx).await;
+                        return;
+                    }
+                    setup = tokio::time::timeout(
+                        policy.timeouts.request,
+                        inner.stream(request.clone(), attempt_cancel.clone()),
+                    ) => setup,
+                };
+                let mut attempt_stream = match setup {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(error)) => {
                         // Recover the typed classification when the provider
@@ -208,8 +217,10 @@ where
 
                 loop {
                     let item = select! {
+                        biased;
                         _ = cancel.cancelled() => {
-                            let _ = tx.try_send(Err(ProviderError::cancelled()));
+                            drop(attempt_stream);
+                            send_cancelled(&mut tx).await;
                             return;
                         }
                         item = tokio::time::timeout(policy.timeouts.stream_idle, attempt_stream.next()) => item,
@@ -439,22 +450,31 @@ fn compact_provider_error(error: anyhow::Error) -> ProviderError {
     }
 }
 
-/// Send an item to the consumer, racing the cancellation token so a stalled
-/// consumer cannot wedge the worker past cancellation. Returns `false` when
-/// the worker should stop (consumer dropped or stream cancelled); a
-/// best-effort cancellation marker is queued in the cancel case.
+/// Send an item to the consumer, racing the cancellation token so a pending
+/// item is abandoned once the stream is cancelled. Returns `false` when the
+/// worker should stop (consumer dropped or stream cancelled); the cancel case
+/// ends the stream with the cancellation marker.
 async fn forward(
     tx: &mut mpsc::Sender<Result<StreamEvent, ProviderError>>,
     cancel: &CancellationToken,
     item: Result<StreamEvent, ProviderError>,
 ) -> bool {
     select! {
+        biased;
         _ = cancel.cancelled() => {
-            let _ = tx.try_send(Err(ProviderError::cancelled()));
+            send_cancelled(tx).await;
             false
         }
         result = tx.send(item) => result.is_ok(),
     }
+}
+
+/// Terminate the stream with the cancellation marker. This waits for channel
+/// capacity rather than `try_send`ing, so a full buffer cannot swallow the
+/// marker and leave the consumer with a silent end-of-stream; it returns as
+/// soon as the consumer drops the receiver.
+async fn send_cancelled(tx: &mut mpsc::Sender<Result<StreamEvent, ProviderError>>) {
+    let _ = tx.send(Err(ProviderError::cancelled())).await;
 }
 
 struct RetryContext<'a> {
@@ -483,8 +503,9 @@ async fn retry_or_emit(context: RetryContext<'_>, error: ProviderError) -> bool 
                 "retrying provider request"
             );
             select! {
+                biased;
                 _ = context.cancel.cancelled() => {
-                    let _ = context.tx.try_send(Err(ProviderError::cancelled()));
+                    send_cancelled(context.tx).await;
                     false
                 }
                 _ = tokio::time::sleep(delay) => true,
@@ -980,6 +1001,91 @@ mod tests {
                 .is_cancelled()
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_setup_emits_cancelled_error() {
+        // The inner provider ignores its token while opening the stream; the
+        // request timeout is far away, so only the cancel race can end it.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let policy = ResiliencePolicy {
+            timeouts: ProviderTimeouts {
+                request: Duration::from_secs(30),
+                ..test_policy(1).timeouts
+            },
+            ..test_policy(1)
+        };
+        let resilient = ResilientProvider::new(
+            "test",
+            HangingStartupProvider {
+                attempts: attempts.clone(),
+            },
+            policy,
+        );
+        let cancel = CancellationToken::new();
+        let mut stream = resilient
+            .stream(sample_request(), cancel.clone())
+            .await
+            .expect("stream");
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("cancel must end stream setup")
+            .expect("cancelled item");
+
+        assert!(item.expect_err("cancellation").is_cancelled());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Debug)]
+    struct FloodThenPendingProvider;
+
+    #[async_trait]
+    impl Provider for FloodThenPendingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            let deltas = (0..EVENT_CHANNEL_CAPACITY * 3).map(|index| {
+                Ok(StreamEvent::TextDelta {
+                    id: BlockId::from("text"),
+                    delta: index.to_string(),
+                })
+            });
+            Ok(stream::iter(deltas).chain(stream::pending()).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_marker_survives_a_full_channel() {
+        let resilient = ResilientProvider::new("test", FloodThenPendingProvider, test_policy(1));
+        let cancel = CancellationToken::new();
+        let stream = resilient
+            .stream(sample_request(), cancel.clone())
+            .await
+            .expect("stream");
+
+        // The worker fills the channel and observes the cancel while it is
+        // still full: only then could a `try_send` drop the marker.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let items = tokio::time::timeout(Duration::from_secs(1), stream.collect::<Vec<_>>())
+            .await
+            .expect("cancelled stream must end");
+
+        let last = items.last().expect("items").as_ref();
+        assert!(
+            last.expect_err("the stream must end with the cancellation marker")
+                .is_cancelled()
+        );
     }
 
     /// L6: a `ProviderWarning` before any content must not commit the

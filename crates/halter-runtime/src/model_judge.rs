@@ -121,6 +121,9 @@ pub(crate) fn run_full_turn_deliberation(
         let workspaces =
             provision_workspaces(&blueprint, plan.isolation, &turn_id.0, plan.panel.len()).await;
 
+        // Dropping this deliberation (the parent turn was aborted) stops the
+        // detached panel tasks too.
+        let _panels_guard = cancel.clone().drop_guard();
         // Each panel turn runs as its own task so the parent turn's future stays
         // `Send` and the panels genuinely run in parallel.
         let mut handles = Vec::with_capacity(plan.panel.len());
@@ -147,6 +150,11 @@ pub(crate) fn run_full_turn_deliberation(
 
         for workspace in &workspaces {
             workspace.cleanup(&blueprint).await;
+        }
+        // A cancelled turn skips synthesis; its next provider call reports
+        // the cancellation.
+        if cancel.is_cancelled() {
+            return None;
         }
         if candidates.is_empty() {
             warn!(
