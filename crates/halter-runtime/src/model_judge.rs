@@ -227,35 +227,26 @@ async fn run_panel_turn(
             return None;
         }
     };
-    session
-        .services()
-        .tool_sessions
-        .open_session(session.session_id());
-
-    let events = match session
-        .submit_turn_with_cancel(Turn::user(user_text.as_str().to_owned()), cancel.clone())
-        .await
-    {
-        Ok(stream) => match stream.try_collect::<Vec<_>>().await {
-            Ok(events) => events,
-            Err(error) => {
-                warn!(
-                    target: MODEL_JUDGE_TRACE_TARGET,
-                    event = "panel_error",
-                    candidate_id = %panelist.label,
-                    %error,
-                    "full-turn model-judge panel turn failed"
-                );
-                return None;
-            }
-        },
+    let turn = Turn::user(user_text.as_str().to_owned());
+    let temporary = crate::temporary_session::TemporarySession::new(&session, &turn.id);
+    let outcome = tokio::select! {
+        _ = cancel.cancelled() => Ok(None),
+        result = async {
+            let stream = session.submit_turn_with_cancel(turn, cancel.clone()).await?;
+            stream.try_collect::<Vec<_>>().await
+        } => result.map(Some),
+    };
+    let cleanup = temporary.finish().await;
+    let events = match outcome {
+        Ok(Some(events)) if cleanup.is_ok() => events,
+        Ok(_) => return None,
         Err(error) => {
             warn!(
                 target: MODEL_JUDGE_TRACE_TARGET,
                 event = "panel_error",
                 candidate_id = %panelist.label,
                 %error,
-                "full-turn model-judge panel turn could not start"
+                "full-turn model-judge panel turn failed"
             );
             return None;
         }
@@ -485,7 +476,7 @@ mod tests {
 
     use super::{PanelWorkspace, provision_workspaces, read_only_tool_names};
 
-    fn test_blueprint(working_dir: PathBuf) -> SessionBlueprint {
+    pub(super) fn test_blueprint(working_dir: PathBuf) -> SessionBlueprint {
         SessionBlueprint {
             session_id: SessionId::from("test"),
             parent_session_id: None,
@@ -555,3 +546,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "model_judge_lifecycle_tests.rs"]
+mod lifecycle_tests;

@@ -8,11 +8,160 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+Sessions now accept user messages through a durable inbox and return one
+continuous event stream. Input submitted during execution steers the model at
+the next safe boundary; background work belongs to the session. This changes
+the public SDK/runtime APIs and event protocol on the pre-1.0 line.
+
+### Added
+
+- `Message::user(...)` and `SessionHandle::submit(message)`. Submission returns
+  `Submission { message_id, sequence }` after input commits, acknowledging
+  admission rather than a reply or completion of background work.
+- `Halter::resume_session(id)` and `SessionRuntime::resume_session(id)` reopen
+  stored history and pending input with a fresh, idle handle and stream. Old
+  handles stay closed; reopening does not restart pending input automatically.
+  An already-open session returns `SessionError::AlreadyOpen`.
+- `SessionState::pending_inputs` and the lossless `InputAccepted`,
+  `InputDelivered`, `InputRejected`, and `InputDeferred` events. The inbox stays
+  outside the replaceable transcript window, so compaction cannot discard it.
+  `SessionHandle::discard(&message_id)` removes queued input while idle and
+  records `InputRejected` without adding it to history.
+- `SessionStatus`, `status()`, and `subscribe_status()` expose current foreground
+  activity. Status watches may coalesce changes; neither status nor delivery
+  events promise a final response or completion of background jobs.
+- The `background` tool (`BackgroundTool`) manages session-owned commands with
+  `spawn`, `list`, `output`, `kill`, and `prune` actions. Jobs survive foreground
+  completion and interruption, use independent shells, and retain the latest
+  64 KiB of combined stdout/stderr with byte cursors and truncation indicators.
+  There is no job-count cap; finished records remain until pruning or shutdown.
+  Spawn applies the shell command and working-directory read policies.
+  Spawn is currently Unix-only. The tool is registered when `tools.enabled` is
+  empty; explicit tool lists must include `"background"`.
+- `SessionStore::synchronize(session_id)`, a recovery barrier for writes whose
+  callers were cancelled. The default is a no-op; stores whose writes can outlive
+  dropped futures must override it. SQLite waits for its admitted writes.
+- `bin/release` cuts a release from clean, synchronized `main`: it updates crate
+  versions and the changelog, checks the workspace, then commits, tags, pushes,
+  and creates the GitHub release. Confirmation is required unless `--yes` is
+  supplied. Tag publication triggers the crates.io workflow.
+
 ### Changed
 
-- **Breaking:** `Halter::new_session` now returns a session handle and continuous event stream. Submit user messages with `session.submit(message)`; callers no longer construct a `Turn`. Submission acknowledges committed input, including while a provider or tool is running.
-- `session.interrupt()` waits for execution to stop and its final state to commit. `session.shutdown()` closes that driver and its resources. `Halter::resume_session(id)` reopens the stored conversation with a fresh handle and stream, starting idle.
-- The CLI and software-factory consume session status changes to detect when submitted work becomes idle.
+- **Breaking:** `Halter::new_session` returns
+  `Result<(SessionHandle, SessionEventStream), SessionError>`. Runtime callers use
+  `SessionRuntime::create_session` instead of `new_session` and `resume_session`
+  instead of `resume`; missing sessions return `SessionError::NotFound` rather
+  than `Ok(None)`. The cloneable handle submits user messages while an explicit
+  driver state machine owns execution, admission, compaction, and cleanup.
+  Operation errors retain their concrete
+  types through `SessionError::operation_error()`.
+- `SessionHandle::interrupt(timeout)` stops foreground work and commits its final
+  state without closing the session; `shutdown(timeout)` closes the driver and
+  its owned resources. Both take `Option<Duration>`: `None` waits indefinitely;
+  expiry returns `SessionError::TimedOut` and requests forced cleanup. Cleanup
+  continues with reopening fenced until settlement. `Halter::shutdown`,
+  `SessionRuntime::shutdown`, and `TurnRegistry::shutdown` also accept `None`,
+  while existing `Duration` arguments remain valid.
+- Dropping the last handle automatically releases an idle session once runnable
+  input, foreground work, background jobs, and subagents have finished. Parked
+  input stays durable and does not prevent release; event streams and status
+  receivers do not retain ownership. `SessionEnd` receives `session_released`
+  for release and `session_closed` for explicit shutdown. Cleanup closes completed
+  children too; reopening the parent does not reactivate them. A persistent PTY
+  or background job can retain a handleless session until runtime shutdown.
+- `InputDeferredReason::ExecutionFailed` parks the input whose attempt failed
+  before delivery. Retry requires resubmitting the same ID, even when
+  `retryable` is true; unrelated submissions skip it. `ExecutionStopped` marks
+  untouched followers, which remain eligible alongside later submitted input.
+  Interrupted input also stays queued until a later submission or explicit retry.
+- Foreground status is no longer stored in session checkpoints or emitted as
+  durable Running/Idle transitions. A clean stream ends with one transient
+  `SessionStatusChanged { status: Closed }` event at sequence zero, then EOF.
+  Legacy stored status events remain readable but do not affect durable state.
+- The CLI and software-factory anchor their foreground result on matching
+  `InputDelivered`, then wait for `TurnCompleted` or `TurnFailed`. Matching input
+  rejection or deferral fails promptly. This handles steering and buffered
+  earlier-stage events without waiting for Running/Idle transitions or background
+  completion. Software-factory now uses submission receipts and `shutdown(None)`.
+- **Breaking:** `CloseSubagentRequest` gains `timeout_ms: Option<u64>`, also
+  exposed by `close_agent`. Omission waits for cleanup indefinitely; a timeout
+  bounds the caller's wait and requests forced cleanup. Closed children reject
+  `send_input`; their stored conversations can be reopened independently.
+- **Breaking for direct tool consumers:** process tools require admission through
+  `ToolSessionStore::open_session(id)`; the runtime manages this automatically.
+  `shell_session` now returns `Arc<ShellSession>`. `BrowserSession::close` now
+  returns `anyhow::Result<()>` and reports provider release failures.
+- `SESSION_LOG_FORMAT` increases from 1 to 2 for the durable inbox protocol.
+  This build reads older logs; 0.8.0 refuses writes to sessions created or
+  committed by this build. Process ownership and background output remain local
+  to the process; resume does not relaunch jobs and now includes managed
+  background commands in the process-state-reset notice.
+
+### Removed
+
+- **Breaking:** the public runtime `HalterSession` executor and its turn-oriented
+  `submit_turn`, `submit_turn_with_cancel`, `compact_with_cancel`, and `notify`
+  methods. The SDK prelude's `HalterSession` alias now names the new
+  `SessionHandle`, and `Turn` is no longer in that prelude. `halter_protocol::Turn`
+  and turn IDs remain available for protocol events and internal execution.
+- **Breaking:** the runtime's public `run_*` lifecycle-hook dispatch helpers.
+  Lifecycle dispatch now belongs to the internal executor.
+
+### Fixed
+
+- Cancellation preserves received assistant text, excludes reasoning and tool
+  calls from an aborted provider response, resets response chaining, and supplies
+  error results for committed unanswered tool calls. Results distinguish calls that
+  may have started from calls that never ran, keeping the next request valid.
+- Execution panics follow failure finalization. Errors before execution starts
+  defer the attempted input instead of closing the whole driver or repeatedly
+  blocking every later message behind the same failing input. Unrecoverable
+  finalization failures surface on the session stream instead of appearing to
+  succeed.
+- SQLite retries rolled-back `BUSY`/`LOCKED` transactions within its existing
+  contention budget. Cancellation recovery waits for outstanding native writes
+  before repairing history, avoiding late commits after forced cancellation.
+- Session streams recover committed events from storage after bus lag, skip
+  unrelated-session wakeups, and stop at their incarnation's final head so an
+  old stream cannot consume events from a reopened session.
+- Repeated shutdown and late resource lookups cannot recreate cancelled tool
+  slots. Closed sessions leave no process-admission tombstones. Descendant
+  cleanup releases reopen fences even on failure, and failed unpublished
+  subagent reservations do not add spurious closure records to the parent's log.
+- Temporary model-judge panelists and hook agents settle their executor and
+  close isolated tool sessions on success, failure, timeout, or cancellation.
+  Dropping the caller also starts cleanup, preventing unowned shell, PTY, and
+  background processes from surviving these invocations.
+- Brush shell cancellation terminates and reaps owned processes instead of
+  abandoning their waits; forced cancellation also signals separate workers.
+  Session shutdown cleans up owned shell jobs, managed background processes, and
+  PTYs. PTY kill waits for process, worker, and reader cleanup; cancellable readers
+  prevent an inherited slave descriptor from hanging shutdown.
+- PTY working directories default to the session directory, resolve relative
+  paths against it, and pass read-policy authorization before spawning.
+- Browser cleanup attempts cloud release independently of page closure, so a
+  dead page or missing page-close response cannot prevent successful release.
+
+### Upgrading from 0.8
+
+- Destructure `(session, events)` on creation or resume, submit `Message::user`,
+  and keep the event stream across idle periods. Use `interrupt(None)` or
+  `shutdown(None)` for an unlimited wait, or pass `Some(duration)` to bound it.
+- Exhaustive event matches need the new input variants and
+  `SessionStatusChanged`. `SessionState` literals need `pending_inputs` (or
+  `..Default::default()`); `CloseSubagentRequest` literals need `timeout_ms`.
+- Submitting a delivered or rejected ID returns its existing acceptance receipt
+  without a new event or execution. Read `replay()` for the recorded outcome;
+  waiting for a fresh delivery event would hang. A queued-ID retry records a new
+  acceptance sequence without duplicating the inbox entry or replacing its contents.
+- SQLite log upgrades are one-way for writes: do not expect a 0.8.0 build to
+  resume execution in a session this build has written. Older readers may skip
+  unknown events and cannot reconstruct the new inbox faithfully.
+- Earlier unreleased revisions exposed `InputSettled` and persisted status.
+  `InputDelivered` replaces `InputSettled` and acknowledges delivery only.
+  The format remains 2 within this unreleased branch; there is no migration or
+  compatibility guarantee for logs written by intermediate format-2 revisions.
 
 ## [0.8.0] - 2026-09-29
 

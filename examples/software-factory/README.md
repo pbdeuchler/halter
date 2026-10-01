@@ -240,11 +240,13 @@ current issue corpus, while still keeping selection bounded to the issues the
 workflow loaded. The default-decision harness also registers `rank_responses`,
 and each synthesis turn must call it before returning the final decision.
 
-Each agent session keeps one `SessionEventStream`. The runner submits user
-messages and waits for `SessionStatusChanged` to report idle after running;
-it first matches the submission's `InputAccepted` message ID so buffered
-compaction or earlier-stage events cannot finish the new stage. Internal execution events still provide
-usage and failure diagnostics. The runner logs tool
+Each agent session keeps one handle and one `SessionEventStream`. The runner
+submits a user message and waits for its `InputDelivered` event, then the next
+`TurnCompleted` or `TurnFailed` event. Delivery anchors the stage even when input
+joins an execution already running; earlier-stage events cannot finish it.
+Rejected or deferred input fails the stage immediately. A stage finishes when
+its foreground execution ends; background jobs remain owned by the session.
+`shutdown(None)` waits for session cleanup without a timeout. The runner logs tool
 starts, tool results, warnings, hook runs, compaction, usage, failures, and lagged
 events instead of treating assistant text as the only output channel.
 

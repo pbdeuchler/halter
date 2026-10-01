@@ -31,6 +31,7 @@ mod session_driver_tests;
 mod session_lease;
 mod subagent_session;
 mod subagents;
+mod temporary_session;
 mod trace_export;
 mod trace_format;
 mod trace_recorder;

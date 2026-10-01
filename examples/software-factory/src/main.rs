@@ -26,7 +26,7 @@ use halter_config::{
 use halter_protocol::{
     AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
     ReasoningEffort, SessionEventPayload, ToolCapabilities, ToolConcurrency, ToolName, ToolResult,
-    ToolSpec, Usage, Volatility,
+    ToolSpec, Volatility,
 };
 use halter_tools::{Tool, ToolContext};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -709,7 +709,7 @@ async fn main() -> anyhow::Result<()> {
     write_checkpoint(&checkpoint_path, &checkpoint).await?;
 
     info!("shutting down harnesses");
-    let _ = default_session.shutdown().await;
+    let _ = default_session.shutdown(None).await;
     shutdown_all([&default_harness, &implementer, &reviewer, &pr_writer]).await;
     shutdown_all(panel_harnesses.iter().map(|panel| &panel.harness)).await;
     info!("software factory run complete");
@@ -2272,7 +2272,7 @@ async fn run_agent_with_prompt_kind(
     )
     .await;
     info!(stage = label, "shutting down agent session");
-    session.shutdown().await?;
+    session.shutdown(None).await?;
     run
 }
 
@@ -2359,13 +2359,13 @@ async fn run_session_stage(
     required_tool: Option<&str>,
 ) -> anyhow::Result<AgentRun> {
     let mut events = session.events.lock().await;
-    let message_id = session
+    let submission = session
         .submit(message)
         .await
         .with_context(|| format!("failed to submit agent stage {label}"))?;
     collect_session_stage(
         &mut events,
-        &message_id,
+        &submission,
         label,
         text_requirement,
         required_tool,
@@ -2375,35 +2375,72 @@ async fn run_session_stage(
 
 async fn collect_session_stage(
     events: &mut SessionEventStream,
-    message_id: &MessageId,
+    submission: &Submission,
     label: &str,
     text_requirement: AgentTextRequirement,
     required_tool: Option<&str>,
 ) -> anyhow::Result<AgentRun> {
-    let mut accepted = false;
-    let mut running = false;
-    let mut completed = false;
+    let mut delivered = false;
     let mut latest_text = None;
     let mut delta_text = String::new();
-    let mut usage = Usage::default();
     let mut required_tool_completed_count = 0usize;
 
-    while let Some(event) = events.next().await {
+    let usage = loop {
+        let Some(event) = events.next().await else {
+            bail!("session closed before agent stage {label} completed");
+        };
         let event =
             event.with_context(|| format!("failed to read event for agent stage {label}"))?;
-        if !accepted {
-            accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if &message.id == message_id);
+        if event.sequence() < submission.sequence {
+            continue;
+        }
+        match &event.payload {
+            SessionEventPayload::InputDelivered { message_id }
+                if message_id == &submission.message_id =>
+            {
+                delivered = true;
+                info!(stage = label, %message_id, "agent stage input delivered");
+            }
+            SessionEventPayload::InputRejected { message_id, reason }
+                if message_id == &submission.message_id =>
+            {
+                bail!("agent stage {label} input was rejected: {reason}");
+            }
+            SessionEventPayload::InputDeferred { message_id, reason }
+                if message_id == &submission.message_id =>
+            {
+                let (reason, retryable, cancelled) = match reason {
+                    InputDeferredReason::ExecutionFailed { error, retryable } => {
+                        (format!("execution failed: {error}"), *retryable, false)
+                    }
+                    InputDeferredReason::ExecutionStopped => {
+                        ("earlier execution failed".to_owned(), false, false)
+                    }
+                    InputDeferredReason::Interrupted => {
+                        ("execution was interrupted".to_owned(), false, true)
+                    }
+                    InputDeferredReason::Shutdown => {
+                        ("the session was shut down".to_owned(), false, true)
+                    }
+                    InputDeferredReason::Resumed => {
+                        ("the session was resumed idle".to_owned(), false, false)
+                    }
+                };
+                return Err(anyhow::Error::new(AgentStageFailure {
+                    label: label.to_owned(),
+                    error: format!("input remains queued because {reason}"),
+                    retryable,
+                    cancelled,
+                }));
+            }
+            _ => {}
+        }
+        if !delivered {
             continue;
         }
         match event.payload {
-            SessionEventPayload::SessionStarted => {
-                info!(stage = label, "agent session started");
-            }
             SessionEventPayload::Warning { message } => {
                 warn!(stage = label, warning = %message, "agent warning");
-            }
-            SessionEventPayload::TurnStarted { turn_id, .. } => {
-                info!(stage = label, turn_id = %turn_id, "agent turn started");
             }
             SessionEventPayload::DeltaItem { delta } => {
                 debug!(stage = label, bytes = delta.text.len(), "assistant delta");
@@ -2510,11 +2547,7 @@ async fn collect_session_stage(
                     "context compacted"
                 );
             }
-            SessionEventPayload::TurnCompleted {
-                turn_id,
-                usage: turn_usage,
-            } => {
-                usage = turn_usage;
+            SessionEventPayload::TurnCompleted { turn_id, usage } => {
                 info!(
                     stage = label,
                     turn_id = %turn_id,
@@ -2524,15 +2557,9 @@ async fn collect_session_stage(
                     cache_read_input_tokens = usage.cache_read_input_tokens,
                     "agent turn completed"
                 );
-            }
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Running,
-            } => running = true,
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Idle,
-            } if running => {
-                completed = true;
-                break;
+                // Executions in this session are serialized. After delivery,
+                // the next terminal event belongs to this stage's execution.
+                break usage;
             }
             SessionEventPayload::TurnFailed {
                 turn_id,
@@ -2564,11 +2591,7 @@ async fn collect_session_stage(
             }
             _ => {}
         }
-    }
-
-    if !completed {
-        bail!("session closed before agent stage {label} completed");
-    }
+    };
     if let Some(tool) = required_tool {
         match required_tool_completed_count {
             1 => {}
@@ -4771,7 +4794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_collection_ignores_prior_compaction_and_failure_events() {
+    async fn stage_collection_waits_for_delivery_and_its_execution_result() {
         let Message::User(input) = Message::user("new stage") else {
             unreachable!()
         };
@@ -4779,62 +4802,331 @@ mod tests {
         let Message::User(earlier_input) = Message::user("earlier stage") else {
             unreachable!()
         };
-        let payloads = vec![
-            SessionEventPayload::InputAccepted {
-                message: earlier_input,
-            },
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Running,
-            },
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Idle,
-            },
-            SessionEventPayload::TurnFailed {
-                turn_id: halter_protocol::TurnId::from("previous-stage"),
-                error: "previous failure".to_owned(),
-                cancelled: false,
-                retryable: true,
-            },
-            SessionEventPayload::InputAccepted { message: input },
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Running,
-            },
-            SessionEventPayload::MessageItem {
-                message: Message::Assistant(halter_protocol::AssistantMessage {
-                    id: MessageId::new(),
-                    created_at: Utc::now(),
-                    parts: vec![AssistantPart::Text {
-                        text: "new stage result".to_owned(),
-                    }],
-                    stop_reason: Some(halter_protocol::StopReason::EndTurn),
-                    usage: None,
-                    replay_meta: Default::default(),
+        let assistant = |text: &str| SessionEventPayload::MessageItem {
+            message: Message::Assistant(halter_protocol::AssistantMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: vec![AssistantPart::Text {
+                    text: text.to_owned(),
+                }],
+                stop_reason: Some(halter_protocol::StopReason::EndTurn),
+                usage: None,
+                replay_meta: Default::default(),
+            }),
+        };
+        let started = |id: &str| SessionEventPayload::TurnStarted {
+            turn_id: halter_protocol::TurnId::from(id),
+            default_model: None,
+            subagent_model: None,
+        };
+        let completed = |id: &str| SessionEventPayload::TurnCompleted {
+            turn_id: halter_protocol::TurnId::from(id),
+            usage: halter_protocol::Usage::default(),
+        };
+        let tool_completed = || SessionEventPayload::ToolExecutionCompleted {
+            outcome: halter_protocol::ToolExecutionOutcome {
+                call: halter_protocol::ToolCall {
+                    id: halter_protocol::ToolCallId::new(),
+                    name: ToolName::from(RANK_RESPONSES_TOOL),
+                    arguments: json!({}),
+                },
+                result: Ok(ToolResult::Text {
+                    text: "ranked".to_owned(),
                 }),
             },
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Idle,
-            },
+        };
+        let delivered = SessionEventPayload::InputDelivered {
+            message_id: input_id.clone(),
+        };
+        let cases = [
+            (
+                "idle submission",
+                1,
+                vec![
+                    SessionEventPayload::SessionStarted,
+                    SessionEventPayload::InputAccepted {
+                        message: input.clone(),
+                    },
+                    started("stage"),
+                    delivered.clone(),
+                    assistant("tool request"),
+                    tool_completed(),
+                    assistant("new stage result"),
+                    completed("stage"),
+                ],
+            ),
+            (
+                "earlier execution finishes after acceptance",
+                1,
+                vec![
+                    SessionEventPayload::InputAccepted {
+                        message: earlier_input.clone(),
+                    },
+                    started("earlier"),
+                    SessionEventPayload::InputAccepted {
+                        message: input.clone(),
+                    },
+                    tool_completed(),
+                    assistant("earlier result"),
+                    completed("earlier"),
+                    started("stage"),
+                    delivered.clone(),
+                    tool_completed(),
+                    assistant("new stage result"),
+                    completed("stage"),
+                ],
+            ),
+            (
+                "steering without an observed execution start",
+                1,
+                vec![
+                    SessionEventPayload::InputAccepted {
+                        message: input.clone(),
+                    },
+                    assistant("before steering"),
+                    delivered.clone(),
+                    tool_completed(),
+                    assistant("new stage result"),
+                    completed("existing-execution"),
+                ],
+            ),
+            (
+                "prior compaction and failure",
+                1,
+                vec![
+                    SessionEventPayload::SessionStatusChanged {
+                        status: SessionStatus::Running,
+                    },
+                    SessionEventPayload::InputAccepted {
+                        message: input.clone(),
+                    },
+                    SessionEventPayload::SessionStatusChanged {
+                        status: SessionStatus::Idle,
+                    },
+                    SessionEventPayload::TurnFailed {
+                        turn_id: halter_protocol::TurnId::from("earlier"),
+                        error: "earlier failure".to_owned(),
+                        cancelled: false,
+                        retryable: true,
+                    },
+                    SessionEventPayload::InputRejected {
+                        message_id: earlier_input.id.clone(),
+                        reason: "earlier input rejected".to_owned(),
+                    },
+                    started("stage"),
+                    SessionEventPayload::InputDelivered {
+                        message_id: earlier_input.id.clone(),
+                    },
+                    delivered.clone(),
+                    tool_completed(),
+                    assistant("new stage result"),
+                    completed("stage"),
+                ],
+            ),
+            (
+                "ignore events before retry acceptance sequence",
+                2,
+                vec![
+                    SessionEventPayload::InputDeferred {
+                        message_id: input_id.clone(),
+                        reason: InputDeferredReason::Interrupted,
+                    },
+                    SessionEventPayload::InputAccepted { message: input },
+                    delivered,
+                    tool_completed(),
+                    assistant("new stage result"),
+                    completed("stage"),
+                ],
+            ),
         ];
-        let mut events: SessionEventStream =
-            futures::stream::iter(payloads.into_iter().enumerate().map(|(index, payload)| {
-                Ok(SessionEvent::new_committed(
-                    SessionId::from("factory-session"),
-                    index as u64 + 1,
-                    halter_protocol::Delivery::Lossless,
-                    payload,
-                ))
-            }))
-            .boxed();
-        let result = collect_session_stage(
-            &mut events,
-            &input_id,
-            "new stage",
-            AgentTextRequirement::Required,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.text, "new stage result");
+
+        for (name, sequence, payloads) in cases {
+            let mut events = stage_test_events(payloads)
+                .chain(futures::stream::pending())
+                .boxed();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                collect_session_stage(
+                    &mut events,
+                    &Submission {
+                        message_id: input_id.clone(),
+                        sequence,
+                    },
+                    "new stage",
+                    AgentTextRequirement::Required,
+                    Some(RANK_RESPONSES_TOOL),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name}: waited for idle or stream closure"))
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(result.text, "new stage result", "{name}");
+        }
+    }
+
+    fn stage_test_events(payloads: Vec<SessionEventPayload>) -> SessionEventStream {
+        futures::stream::iter(payloads.into_iter().enumerate().map(|(index, payload)| {
+            Ok(SessionEvent::new_committed(
+                SessionId::from("factory-session"),
+                index as u64 + 1,
+                halter_protocol::Delivery::Lossless,
+                payload,
+            ))
+        }))
+        .boxed()
+    }
+
+    #[tokio::test]
+    async fn stage_collection_reports_input_and_execution_failures() {
+        let input_id = MessageId::new();
+        let delivered = SessionEventPayload::InputDelivered {
+            message_id: input_id.clone(),
+        };
+        let cases = [
+            (
+                "rejected",
+                vec![SessionEventPayload::InputRejected {
+                    message_id: input_id.clone(),
+                    reason: "hook rejected input".to_owned(),
+                }],
+                "input was rejected: hook rejected input",
+                None,
+            ),
+            (
+                "failed before delivery",
+                vec![SessionEventPayload::InputDeferred {
+                    message_id: input_id.clone(),
+                    reason: InputDeferredReason::ExecutionFailed {
+                        error: "start failed".to_owned(),
+                        retryable: true,
+                    },
+                }],
+                "execution failed: start failed",
+                Some((true, false)),
+            ),
+            (
+                "failed after delivery",
+                vec![
+                    delivered.clone(),
+                    SessionEventPayload::TurnFailed {
+                        turn_id: halter_protocol::TurnId::from("stage"),
+                        error: "provider failed".to_owned(),
+                        cancelled: false,
+                        retryable: true,
+                    },
+                ],
+                "provider failed",
+                Some((true, false)),
+            ),
+            (
+                "earlier failure defers target",
+                vec![
+                    SessionEventPayload::TurnFailed {
+                        turn_id: halter_protocol::TurnId::from("earlier"),
+                        error: "earlier failed".to_owned(),
+                        cancelled: false,
+                        retryable: true,
+                    },
+                    SessionEventPayload::InputDeferred {
+                        message_id: input_id.clone(),
+                        reason: InputDeferredReason::ExecutionStopped,
+                    },
+                ],
+                "input remains queued because earlier execution failed",
+                Some((false, false)),
+            ),
+            (
+                "interrupted",
+                vec![SessionEventPayload::InputDeferred {
+                    message_id: input_id.clone(),
+                    reason: InputDeferredReason::Interrupted,
+                }],
+                "execution was interrupted",
+                Some((false, true)),
+            ),
+            (
+                "shutdown",
+                vec![SessionEventPayload::InputDeferred {
+                    message_id: input_id.clone(),
+                    reason: InputDeferredReason::Shutdown,
+                }],
+                "the session was shut down",
+                Some((false, true)),
+            ),
+            (
+                "resumed",
+                vec![SessionEventPayload::InputDeferred {
+                    message_id: input_id.clone(),
+                    reason: InputDeferredReason::Resumed,
+                }],
+                "the session was resumed idle",
+                Some((false, false)),
+            ),
+            (
+                "missing required tool",
+                vec![
+                    delivered.clone(),
+                    SessionEventPayload::TurnCompleted {
+                        turn_id: halter_protocol::TurnId::from("stage"),
+                        usage: Default::default(),
+                    },
+                ],
+                "did not complete required tool",
+                None,
+            ),
+        ];
+        for (name, payloads, expected_error, expected_flags) in cases {
+            let mut events = stage_test_events(payloads)
+                .chain(futures::stream::pending())
+                .boxed();
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                collect_session_stage(
+                    &mut events,
+                    &Submission {
+                        message_id: input_id.clone(),
+                        sequence: 1,
+                    },
+                    "new stage",
+                    AgentTextRequirement::Optional,
+                    Some(RANK_RESPONSES_TOOL),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name}: waited after failure"))
+            .expect_err(name);
+            assert!(
+                error.to_string().contains(expected_error),
+                "{name}: {error}"
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<AgentStageFailure>()
+                    .map(|failure| (failure.retryable, failure.cancelled)),
+                expected_flags,
+                "{name}"
+            );
+        }
+        for payloads in [vec![], vec![delivered]] {
+            let mut events = stage_test_events(payloads);
+            let error = collect_session_stage(
+                &mut events,
+                &Submission {
+                    message_id: input_id.clone(),
+                    sequence: 1,
+                },
+                "new stage",
+                AgentTextRequirement::Optional,
+                None,
+            )
+            .await
+            .expect_err("closed stream");
+            assert!(
+                error
+                    .to_string()
+                    .contains("session closed before agent stage")
+            );
+        }
     }
 
     #[test]

@@ -923,43 +923,26 @@ async fn run_agent(
     };
     let initial_state = SessionState::default();
     let agent_session = create_session_seeded(services, init, initial_state, resources).await?;
-    agent_session
-        .services()
-        .tool_sessions
-        .open_session(agent_session.session_id());
-    let payload_json = serde_json::to_string_pretty(&request.payload)?;
+    let turn = Turn::user(serde_json::to_string_pretty(&request.payload)?);
+    let temporary = crate::temporary_session::TemporarySession::new(&agent_session, &turn.id);
     let agent_cancel = cancel.child_token();
     let turn_cancel = agent_cancel.clone();
     // Any exit (cancel, timeout, this future dropped) stops the hook agent.
     let _agent_guard = agent_cancel.drop_guard();
-    // Hook agents run on the ambient tokio runtime via `tokio::spawn`. The
-    // earlier `spawn_blocking + Handle::block_on` pattern only worked when the
-    // outer caller was itself blocking; any future async caller would
-    // deadlock. AC2.8 requires the dispatch path to stay fully async.
-    //
-    // `run_hook_agent_turn` returns a typed `BoxFuture` so `tokio::spawn`'s
-    // auto-`Send` check is satisfied by the concrete pointer type and does
-    // not have to recurse through `run_agent`'s own opaque return.
-    let mut agent_task = tokio::spawn(run_hook_agent_turn(
-        agent_session,
-        payload_json,
-        turn_cancel,
-    ));
-    let events = tokio::select! {
-        _ = cancel.cancelled() => {
-            agent_task.abort();
-            return Ok(HandlerExecution::Cancelled);
-        }
-        result = timeout(timeout_limit, &mut agent_task) => match result {
-            Ok(events) => events
-                .context("failed to join hook agent task")?
-                .context("failed to execute hook agent")?,
-            Err(_) => {
-                agent_task.abort();
-                anyhow::bail!("hook agent timed out");
-            }
+    // Poll submission here so abandoning this future cannot leave a wrapper
+    // task registering execution after the temporary owner starts cleanup.
+    let outcome = tokio::select! {
+        _ = cancel.cancelled() => Ok(None),
+        result = timeout(timeout_limit, run_hook_agent_turn(agent_session, turn, turn_cancel)) => match result {
+            Ok(events) => events.context("failed to execute hook agent").map(Some),
+            Err(_) => Err(anyhow::anyhow!("hook agent timed out")),
         },
     };
+    let cleanup = temporary.finish().await;
+    let Some(events) = outcome? else {
+        return Ok(HandlerExecution::Cancelled);
+    };
+    cleanup?;
     let output = crate::subagent_session::extract_subagent_output(&events)
         .context("hook agent did not produce a final assistant message")?;
     Ok(HandlerExecution::completed(parse_json_hook_output(
@@ -967,19 +950,17 @@ async fn run_agent(
     )?))
 }
 
-// Returns a `BoxFuture` rather than `async fn` so the spawn caller has a
-// concrete `Pin<Box<dyn Future + Send>>` to hand to `tokio::spawn`. Returning
-// `impl Future` would force `tokio::spawn`'s `Send` check to recurse through
-// `submit_turn_with_cancel` -> hook dispatch -> `run_agent`, producing an
-// inference cycle on `run_agent`'s own opaque return type.
+// Returns a `BoxFuture` rather than `async fn` so Send inference does not
+// recurse through `submit_turn_with_cancel` -> hook dispatch -> `run_agent`,
+// producing an inference cycle on `run_agent`'s own opaque return type.
 fn run_hook_agent_turn(
     agent_session: SessionExecutor,
-    payload_json: String,
+    turn: Turn,
     turn_cancel: CancellationToken,
 ) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<halter_protocol::SessionEvent>>> {
     Box::pin(async move {
         let stream = agent_session
-            .submit_turn_with_cancel(Turn::user(payload_json), turn_cancel)
+            .submit_turn_with_cancel(turn, turn_cancel)
             .await?;
         stream.try_collect::<Vec<_>>().await
     })
@@ -1417,6 +1398,10 @@ fn hash_text(text: &str) -> String {
     hasher.update(text.as_bytes());
     format!("{:x}", hasher.finalize())
 }
+
+#[cfg(all(test, unix))]
+#[path = "hook_agent_cleanup_tests.rs"]
+mod agent_cleanup_tests;
 
 #[cfg(test)]
 mod tests {
