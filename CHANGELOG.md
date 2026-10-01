@@ -8,10 +8,20 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-01
+
 Sessions now accept user messages through a durable inbox and return one
 continuous event stream. Input submitted during execution steers the model at
 the next safe boundary; background work belongs to the session. This changes
-the public SDK/runtime APIs and event protocol on the pre-1.0 line.
+the public SDK/runtime signatures, public enum variants, and event protocol,
+requiring a minor release on the pre-1.0 line.
+
+Published crates: `halter-protocol`, `halter-hooks`, `halter-config`,
+`halter-providers`, `halter-session`, `halter-tools`, `halter-runtime`, and
+`halter` at `0.9.0`; `halter-brush-core` at `0.6.0` and
+`halter-brush-builtins` at `0.3.0`. `halter-cli` also moves to `0.9.0` but remains
+`publish = false`. The brush crates move to new minor versions because cancelled
+waits now terminate owned processes and builtins use the new core crate.
 
 ### Added
 
