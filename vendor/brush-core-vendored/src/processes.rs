@@ -2,6 +2,7 @@
 
 use futures::FutureExt;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -12,9 +13,41 @@ use crate::{error, sys};
 #[derive(Clone, Default)]
 pub struct ProcessTracker {
     children: Arc<Mutex<HashMap<sys::process::ProcessId, Option<sys::process::ProcessId>>>>,
+    tasks: Arc<AtomicUsize>,
+    activity: Option<tokio::sync::watch::Sender<()>>,
 }
 
 impl ProcessTracker {
+    /// Attach a coalescing notification channel for owned work changes.
+    pub fn with_activity(activity: tokio::sync::watch::Sender<()>) -> Self {
+        Self {
+            activity: Some(activity),
+            ..Self::default()
+        }
+    }
+
+    /// Whether native children or asynchronous shell jobs remain active.
+    pub fn has_running(&self) -> bool {
+        self.tasks.load(Ordering::Acquire) != 0
+            || !self
+                .children
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+    }
+
+    fn notify(&self) {
+        if let Some(activity) = &self.activity {
+            activity.send_replace(());
+        }
+    }
+
+    pub(crate) fn start_task(&self) -> TrackedTask {
+        self.tasks.fetch_add(1, Ordering::AcqRel);
+        self.notify();
+        TrackedTask(self.clone())
+    }
+
     /// Immediately stop all currently owned children and process groups.
     pub fn force_stop(&self) {
         let children = self
@@ -24,6 +57,15 @@ impl ProcessTracker {
         for (&pid, &pgid) in children.iter() {
             force_stop_process(Some(pid), pgid);
         }
+    }
+}
+
+pub(crate) struct TrackedTask(ProcessTracker);
+
+impl Drop for TrackedTask {
+    fn drop(&mut self) {
+        self.0.tasks.fetch_sub(1, Ordering::AcqRel);
+        self.0.notify();
     }
 }
 
@@ -67,6 +109,7 @@ impl ChildProcess {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .insert(pid, self.pgid);
+            tracker.notify();
             let tracked = tracker.clone();
             let mut execution =
                 std::mem::replace(&mut self.exec_future, Box::pin(std::future::pending()));
@@ -78,8 +121,10 @@ impl ChildProcess {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 let result = execution.as_mut().poll(cx);
-                if result.is_ready() {
-                    children.remove(&pid);
+                let removed = result.is_ready() && children.remove(&pid).is_some();
+                drop(children);
+                if removed {
+                    tracked.notify();
                 }
                 result
             }));
@@ -90,11 +135,14 @@ impl ChildProcess {
     fn retire(&mut self) {
         self.owned = false;
         if let (Some(pid), Some(tracker)) = (self.pid, self.tracker.take()) {
-            tracker
+            let removed = tracker
                 .children
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&pid);
+            if removed.is_some() {
+                tracker.notify();
+            }
         }
     }
 
@@ -189,9 +237,28 @@ impl ChildProcess {
                 }
                 Err(error) => Err(error),
             };
-            if signal(Signal::SIGTERM)? {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                signal(Signal::SIGKILL)?;
+            if signal(Some(Signal::SIGTERM))? {
+                let grace = tokio::time::sleep(std::time::Duration::from_millis(500));
+                tokio::pin!(grace);
+                let mut output = None;
+                loop {
+                    // Reap promptly, but preserve the group's grace while
+                    // surviving descendants still exist. A leader exiting
+                    // is not evidence that its process group has finished.
+                    if output.is_some() && (target > 0 || !signal(None)?) {
+                        break;
+                    }
+                    tokio::select! {
+                        result = &mut self.exec_future, if output.is_none() => output = Some(result),
+                        () = &mut grace => { signal(Some(Signal::SIGKILL))?; break; },
+                        () = tokio::time::sleep(std::time::Duration::from_millis(25)), if output.is_some() => {},
+                    }
+                }
+                if let Some(output) = output {
+                    self.retire();
+                    output?;
+                    return Ok(());
+                }
             }
         }
         #[cfg(windows)]

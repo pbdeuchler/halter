@@ -383,7 +383,7 @@ If your workflow needs `python`, `just`, `make`, `npm`, `docker`, or `sort`, add
 ## `background`
 
 Use `background` for managed commands that should survive agent interruption,
-such as a development server. It has four actions:
+such as a development server. It has five actions:
 
 | Action | Input | Result |
 | --- | --- | --- |
@@ -391,6 +391,7 @@ such as a development server. It has four actions:
 | `list` | — | Running and completed job records |
 | `output` | `id`, optional byte `cursor` | Combined stdout/stderr, cursors and truncation flag |
 | `kill` | `id` | Final status after termination and child reaping |
+| `prune` | — | Removes finished job records and output; preserves running jobs |
 
 Jobs use independent shells. `cwd` defaults to the session working directory;
 relative paths resolve against it. Persistent shell variables and functions
@@ -401,7 +402,7 @@ essentials plus explicit overrides.
 Each job retains the latest 64 KiB of output. `next_cursor` counts all bytes
 produced, including discarded bytes; `truncated` indicates that the requested
 cursor predates retained output. Text uses lossy UTF-8 decoding. A session
-retains running and completed job records until shutdown.
+retains running and completed job records until shutdown or explicit pruning.
 
 Session shutdown terminates jobs and awaits their monitors. Unix jobs receive
 TERM, a 500 ms grace period, then KILL for the owned process group and currently
@@ -740,6 +741,12 @@ This is what makes tools runtime-aware rather than mere pure functions.
 ## Tool session store integration
 
 `ToolSessionStore` exists so tool execution can coordinate with session-related state when needed.
+
+The session runtime opens process admission automatically. If you execute tools
+directly, call `tool_sessions.open_session(&session_id)` before using shell,
+background, PTY, or browser tools. Shutdown removes admission; later lookups
+reject process work without retaining a closed-session marker. Reopening admits
+a fresh process lifetime.
 
 This matters most for:
 

@@ -108,11 +108,14 @@ mod tests {
     use super::*;
 
     fn tool_context(root: &std::path::Path, allowed_shell_commands: Vec<String>) -> ToolContext {
+        let session_id = halter_protocol::SessionId::new();
+        let tool_sessions = Arc::new(ToolSessionStore::default());
+        tool_sessions.open_session(&session_id);
         ToolContext {
-            session_id: halter_protocol::SessionId::new(),
+            session_id,
             working_dir: root.to_path_buf(),
             path_locks: Arc::new(PathLockMap::default()),
-            tool_sessions: Arc::new(ToolSessionStore::default()),
+            tool_sessions,
             snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),

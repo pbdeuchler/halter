@@ -13,11 +13,14 @@ use crate::{
 };
 
 fn context(root: &Path) -> ToolContext {
+    let session_id = SessionId::new();
+    let tool_sessions = Arc::new(ToolSessionStore::default());
+    tool_sessions.open_session(&session_id);
     ToolContext {
-        session_id: SessionId::new(),
+        session_id,
         working_dir: root.to_owned(),
         path_locks: Arc::new(PathLockMap::default()),
-        tool_sessions: Arc::new(ToolSessionStore::default()),
+        tool_sessions,
         snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
         cancel: CancellationToken::new(),
         emit: Arc::new(NoopToolEventSink),
@@ -72,6 +75,124 @@ fn assert_reaped(pid: i32) {
 }
 
 #[tokio::test]
+async fn stale_background_spawn_is_denied_without_slots_and_reopen_is_fresh() {
+    let root = tempfile::tempdir().unwrap();
+    let context = context(root.path());
+    let store = &context.tool_sessions;
+    store.shutdown_session(&context.session_id).await.unwrap();
+    let error = BackgroundTool
+        .execute(
+            context.clone(),
+            json!({"action": "spawn", "command": "printf late"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("session is closed"));
+    assert!(!store.has_process_state(&context.session_id));
+    assert!(store.process_lifetime(&context.session_id).is_cancelled());
+    store.open_session(&context.session_id);
+    let job = execute(
+        &context,
+        json!({"action": "spawn", "command": "printf fresh"}),
+    )
+    .await;
+    let output = wait_for(&context, job["id"].as_str().unwrap(), |output| {
+        output["status"]["state"] == "exited"
+    })
+    .await;
+    assert_eq!(output["output"], "fresh");
+    store.shutdown_session(&context.session_id).await.unwrap();
+    assert!(!store.has_process_state(&context.session_id));
+}
+
+#[tokio::test]
+async fn activity_notifies_after_last_managed_job_and_output_finish() {
+    let root = tempfile::tempdir().unwrap();
+    let context = context(root.path());
+    let store = &context.tool_sessions;
+    let mut activity = store.subscribe_activity();
+    let first = execute(&context, json!({"action": "spawn", "command": "sleep 30"})).await;
+    let last = execute(&context, json!({"action": "spawn", "command": "sleep 30"})).await;
+    assert!(store.has_running_jobs(&context.session_id));
+    assert!(!store.has_running_jobs(&SessionId::new()));
+    execute(&context, json!({"action": "kill", "id": first["id"]})).await;
+    assert!(
+        store.has_running_jobs(&context.session_id),
+        "the other job remains owned"
+    );
+    activity.borrow_and_update();
+    // Exit outside the tool API, so completion must wake an otherwise idle
+    // observer directly from the monitor rather than from another tool call.
+    super::super::process::kill_process_group(last["pid"].as_i64().unwrap() as i32, 15);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while store.has_running_jobs(&context.session_id) {
+            activity.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("final process completion publishes activity");
+    assert!(
+        store.has_process_state(&context.session_id),
+        "completed records remain retained"
+    );
+    let jobs = execute(&context, json!({"action": "list"})).await;
+    assert!(
+        jobs["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|job| job["status"]["state"] == "exited")
+    );
+    activity.borrow_and_update();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), activity.changed())
+            .await
+            .is_err(),
+        "no polling watcher keeps publishing after completion"
+    );
+    store.shutdown_session(&context.session_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn running_jobs_include_descendant_cleanup_after_leader_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let context = context(root.path());
+    let mut activity = context.tool_sessions.subscribe_activity();
+    // Publish output before creating the inherited writer. This fixture tests
+    // retaining buffered output while cleaning up a descendant, separately
+    // from the shell's background-command startup ordering.
+    let job = execute(
+        &context,
+        json!({"action": "spawn", "command": "printf done; sleep 30 & exit"}),
+    )
+    .await;
+    assert!(context.tool_sessions.has_running_jobs(&context.session_id));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while context.tool_sessions.has_running_jobs(&context.session_id) {
+            activity.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("process group and output drain finish without another tool call");
+    let output = execute(&context, json!({"action": "output", "id": job["id"]})).await;
+    assert_eq!(output["status"]["state"], "exited");
+    assert_eq!(
+        output["status"]["exit_code"], 0,
+        "leader did not exit successfully: {output}"
+    );
+    assert!(
+        output["status"]["signal"].is_null(),
+        "leader received an unexpected signal: {output}"
+    );
+    assert_eq!(output["output"], "done", "complete output record: {output}");
+    context
+        .tool_sessions
+        .shutdown_session(&context.session_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn completed_job_records_do_not_limit_later_spawns() {
     let root = tempfile::tempdir().unwrap();
     let context = context(root.path());
@@ -98,6 +219,46 @@ async fn completed_job_records_do_not_limit_later_spawns() {
             .len(),
         65
     );
+    context
+        .tool_sessions
+        .shutdown_session(&context.session_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn prune_releases_finished_records_and_output_while_preserving_running_jobs() {
+    let root = tempfile::tempdir().unwrap();
+    let context = context(root.path());
+    let finished = execute(
+        &context,
+        json!({"action": "spawn", "command": "printf retained-output"}),
+    )
+    .await;
+    let finished_id = finished["id"].as_str().unwrap();
+    wait_for(&context, finished_id, |output| {
+        output["status"]["state"] == "exited"
+    })
+    .await;
+    let running = execute(&context, json!({"action": "spawn", "command": "sleep 30"})).await;
+    let running_id = running["id"].as_str().unwrap();
+    let pruned = execute(&context, json!({"action": "prune"})).await;
+    assert_eq!(pruned["pruned"], json!([finished_id]));
+    assert_eq!(pruned["remaining"], 1);
+    let jobs = execute(&context, json!({"action": "list"})).await;
+    assert_eq!(jobs["jobs"][0]["id"], running_id);
+    assert!(
+        BackgroundTool
+            .execute(
+                context.clone(),
+                json!({"action": "output", "id": finished_id})
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown job")
+    );
+    execute(&context, json!({"action": "kill", "id": running_id})).await;
     context
         .tool_sessions
         .shutdown_session(&context.session_id)

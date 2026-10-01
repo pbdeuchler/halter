@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use halter_protocol::{
     CompactionEventEffects, Delivery, Message, ModelId, PendingEvent, ResourceSnapshot,
-    SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, SessionStatus,
+    SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState,
     SubagentEventForwarding, Usage, UserMessage, fold,
 };
 use halter_session::{InMemorySessionStore, SessionCommitConflict, SessionStore, StoredSession};
@@ -400,9 +400,6 @@ async fn durable_inbox_replays_from_a_stale_checkpoint_and_survives_context_rewr
                     event(SessionEventPayload::InputAccepted {
                         message: pending.clone(),
                     }),
-                    event(SessionEventPayload::SessionStatusChanged {
-                        status: SessionStatus::Running,
-                    }),
                 ],
             )
             .await
@@ -414,7 +411,7 @@ async fn durable_inbox_replays_from_a_stale_checkpoint_and_survives_context_rewr
             .expect(backend)
             .expect(backend);
         assert_eq!(checkpoint.state_sequence, 0, "{backend}");
-        assert_eq!(checkpoint.head_sequence, 4, "{backend}");
+        assert_eq!(checkpoint.head_sequence, 3, "{backend}");
         let tail = store
             .replay_after(session_id, checkpoint.state_sequence)
             .await
@@ -425,7 +422,6 @@ async fn durable_inbox_replays_from_a_stale_checkpoint_and_survives_context_rewr
             [delivered.clone(), rejected.clone(), pending.clone()],
             "{backend}"
         );
-        assert_eq!(state.session_status, SessionStatus::Running, "{backend}");
         assert!(state.messages.is_empty(), "{backend}");
         assert_eq!(
             state.token_ledger,
@@ -434,33 +430,37 @@ async fn durable_inbox_replays_from_a_stale_checkpoint_and_survives_context_rewr
         );
 
         let mut head = checkpoint.head_sequence;
-        for payload in [
-            SessionEventPayload::ContextWindowRolledOver {
+        for payloads in [
+            vec![SessionEventPayload::ContextWindowRolledOver {
                 summary: "new window".to_owned(),
                 effects: Box::new(CompactionEventEffects {
                     messages: vec![],
                     compacted_prefix: vec![],
                     usage: Usage::default(),
                 }),
-            },
-            SessionEventPayload::MessageItem {
-                message: Message::User(delivered.clone()),
-            },
-            SessionEventPayload::InputRejected {
+            }],
+            vec![
+                SessionEventPayload::MessageItem {
+                    message: Message::User(delivered.clone()),
+                },
+                SessionEventPayload::InputDelivered {
+                    message_id: delivered.id.clone(),
+                },
+            ],
+            vec![SessionEventPayload::InputRejected {
                 message_id: rejected.id.clone(),
                 reason: "invalid input".to_owned(),
-            },
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Closed,
-            },
+            }],
         ] {
-            fold::apply_event(&mut state, &payload);
+            for payload in &payloads {
+                fold::apply_event(&mut state, payload);
+            }
             head = commit_events(
                 store.as_ref(),
                 session_id,
                 head,
                 &state,
-                vec![event(payload)],
+                payloads.into_iter().map(event).collect(),
             )
             .await;
         }
@@ -471,11 +471,6 @@ async fn durable_inbox_replays_from_a_stale_checkpoint_and_survives_context_rewr
             .expect(backend)
             .expect(backend);
         assert_eq!(checkpoint.state.pending_inputs, [pending], "{backend}");
-        assert_eq!(
-            checkpoint.state.session_status,
-            SessionStatus::Closed,
-            "{backend}"
-        );
         assert_eq!(
             checkpoint.state.messages,
             [Message::User(delivered)],

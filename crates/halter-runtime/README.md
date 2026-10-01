@@ -64,7 +64,7 @@ A typical flow looks like this:
 2. open a session with `create_session(...)`
 3. receive a `SessionHandle` and continuous `SessionEventStream`
 4. submit user messages with `submit(...)`
-5. use the submission receipt to match `InputSettled`, `InputRejected`, or `InputDeferred`
+5. consume session events and watch foreground activity through the session handle
 6. interrupt, compact, replay, close, or reopen the conversation
 
 `SessionRuntime` is the factory and coordinator.
@@ -162,13 +162,30 @@ The top-level SDK exposes this as `Halter::new_session`.
 ## `SessionHandle`
 
 The handle is cloneable; one event receiver accompanies each newly opened driver.
-Dropping either does not stop the driver. Use `shutdown(None)` to close it explicitly.
-Old handles stay closed when the stored conversation is reopened.
+Keep a handle to submit more input across idle periods. Dropping the last handle
+releases the driver after foreground work, queued runnable input, background jobs,
+and subagents finish. It does not cancel active execution. Event streams and status
+receivers do not retain the session. Dropping a stream does not stop execution.
+
+Release runs resource cleanup and the `SessionEnd` hook with reason
+`session_released`. Deferred input and history remain stored for `resume_session`,
+which opens a fresh idle driver. Use `shutdown(None)` to cancel work and close the
+session explicitly. Old handles stay closed when the stored conversation is reopened.
+
+Release closes child agents, including completed ones, just as explicit shutdown
+does. Reopening the parent does not reactivate those agents. Spawn replacements,
+or reopen a child's stored conversation separately by its session ID.
+
+A persistent PTY or background job can keep a session open indefinitely after
+its last handle is dropped. Keep a handle if you need to stop that work
+explicitly; otherwise only runtime shutdown can close it.
 
 Important methods:
 
 - `id()` / `session_id()`
 - `submit(Message::user(...))`
+- `discard(&message_id)`
+- `status()` / `subscribe_status()`
 - `interrupt(timeout)`
 - `shutdown(timeout)`
 - `replay()` / `export_trace()`
@@ -179,30 +196,55 @@ Important methods:
 Returns `Submission { message_id, sequence }` after input commits to the session
 store. `sequence` identifies the acknowledged `InputAccepted` event. Idle
 sessions start execution. During inference or a foreground tool, accepted input
-queues until a safe boundary after outstanding tool results. `MessageItem`
-confirms delivery into history. The pending inbox lives outside the compaction
+queues until a safe boundary after outstanding tool results. `InputDelivered`
+records delivery alongside the user `MessageItem`. The pending inbox lives outside the compaction
 window, so rollover cannot discard accepted input.
 
 Only user messages are accepted. Assistant responses and tool results remain
 runtime-owned. Admission is bounded; submission can return `InboxFull` or
 `Closed`. Recoverability after process exit depends on the configured store.
 
-For completion, ignore events before the receipt's `sequence`, then match
-`submission.message_id` in `InputSettled`. Its outcome is
-`Completed`, `Failed { error, retryable }`, or `Interrupted`. Inputs delivered
-during one execution share that outcome; they do not receive independent replies.
-`InputRejected` reports a hook decision. `InputDeferred` reports input still
+`InputRejected` records removal without delivery. `InputDeferred` reports input still
 queued after interruption, failure, shutdown, or idle resume. Deferral preserves
-the input for later execution.
+the input for later execution. These events describe admission and delivery;
+they do not promise a final reply or completion of background work.
 
-The sequence boundary keeps buffered outcomes from an earlier attempt from
-finishing a retry on a retained stream. Submitting the same queued ID
+`ExecutionFailed` defers the input whose attempt failed before delivery. New
+messages skip that entry; resubmit its ID to retry it or discard it while idle.
+`ExecutionStopped` marks untouched inputs after that failure. They remain eligible
+for delivery when a later submission starts foreground work.
+
+The `retryable` flag describes the failure, not a scheduling policy. Even when
+it is `true`, an `ExecutionFailed` input needs an explicit resubmission of its ID.
+
+The receipt's sequence identifies the acceptance in replay. Submitting the same queued ID
 records a fresh acceptance boundary with its original contents, without adding
-a duplicate inbox entry. A settled or rejected ID is an idempotent lookup:
+a duplicate inbox entry. A delivered or rejected ID is an idempotent lookup:
 submission returns its ID and recorded acceptance sequence without a new event
-or execution. Use `replay()` to read its recorded outcome. `Running` and `Idle`
-describe driver activity, including compaction; they do not identify completion
-of a particular input.
+or execution. Use `replay()` to read its recorded events.
+
+### `status()` and `subscribe_status()`
+
+`status()` reads the current `Idle`, `Running`, or `Closed` state of this handle.
+`subscribe_status()` returns a watch receiver initialized with that value. Changes
+may coalesce; the receiver exposes current activity, not a durable transition log.
+Activity includes inference, foreground tools, and compaction. Background processes
+can remain active while the session is idle. Status belongs to the live incarnation
+and is not persisted or restored from the session log.
+
+A clean event stream closure emits one transient
+`SessionStatusChanged { status: Closed }` after all committed events, then ends.
+This notification has sequence zero and is absent from replay. Status receivers
+also report `Closed`; neither kind of receiver keeps the driver alive.
+
+### `discard(&message_id)`
+
+Remove queued input while idle, recording `InputRejected` without adding it to
+history. The method returns `true` when it removes an entry and `false` when the
+ID is no longer pending. It returns `Busy` during execution, compaction, or
+cancellation cleanup; use `interrupt(None)` first when necessary. All retained
+input counts toward inbox capacity, including deferred entries, so discarding
+an unwanted entry also releases capacity.
 
 ### `interrupt(timeout)`
 
@@ -680,38 +722,35 @@ parent's concrete model instead of recursively entering the wrapper again.
 
 ---
 
-## Example: building a simple runner abstraction
+## Example: keeping a session open
 
 ```rust
 use futures::StreamExt;
-use halter_protocol::{Message, SessionEventPayload};
+use halter_protocol::Message;
 use halter_runtime::{SessionInit, SessionRuntime};
 
-pub async fn run_once(runtime: &SessionRuntime, prompt: &str) -> anyhow::Result<()> {
+pub async fn interact(runtime: &SessionRuntime, prompt: &str) -> anyhow::Result<()> {
     let (session, mut events) = runtime.create_session(SessionInit {
         working_dir: std::env::current_dir()?,
         ..SessionInit::default()
     }).await?;
-    let submission = session.submit(Message::user(prompt)).await?;
-    while let Some(event) = events.next().await {
-        let event = event?;
-        if event.session_id != *session.id() || event.sequence() < submission.sequence {
-            continue;
+    let listener = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            println!("{:?}", event?.payload);
         }
-        match event.payload {
-            SessionEventPayload::InputSettled { message_id: id, .. }
-            | SessionEventPayload::InputRejected { message_id: id, .. }
-            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
-            _ => {}
-        }
-    }
+        Ok::<(), anyhow::Error>(())
+    });
+    session.submit(Message::user(prompt)).await?;
+    tokio::signal::ctrl_c().await?;
     session.shutdown(None).await?;
+    listener.await??;
     Ok(())
 }
 ```
 
 
-This is not the full richness of the runtime, but it shows the core shape.
+The event listener stays attached across foreground executions and idle periods.
+The client chooses when to shut down the session.
 
 ---
 

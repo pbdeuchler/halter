@@ -4,6 +4,7 @@ mod job;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use halter_protocol::{
@@ -27,6 +28,8 @@ const OUTPUT_CAPACITY: usize = 64 * 1024;
 pub(crate) struct BackgroundRegistry {
     state: Mutex<RegistryState>,
     lifetime: tokio_util::sync::CancellationToken,
+    running: Arc<AtomicUsize>,
+    activity: tokio::sync::watch::Sender<()>,
 }
 
 #[derive(Default)]
@@ -36,11 +39,18 @@ struct RegistryState {
 }
 
 impl BackgroundRegistry {
-    pub(crate) fn new(lifetime: tokio_util::sync::CancellationToken) -> Self {
+    pub(crate) fn new(
+        lifetime: tokio_util::sync::CancellationToken,
+        activity: tokio::sync::watch::Sender<()>,
+    ) -> Self {
         Self {
             lifetime,
+            activity,
             ..Self::default()
         }
+    }
+    pub(crate) fn has_running(&self) -> bool {
+        self.running.load(Ordering::Acquire) != 0
     }
     async fn spawn(
         &self,
@@ -59,7 +69,15 @@ impl BackgroundRegistry {
         // Spawn and registration have no await between them. Once registered,
         // the session owns the process; the originating turn token no longer
         // controls it. Holding the registry lock also serializes shutdown.
-        let job = BackgroundJob::spawn(id.clone(), command.to_owned(), cwd, env, OUTPUT_CAPACITY)?;
+        let job = BackgroundJob::spawn(
+            id.clone(),
+            command.to_owned(),
+            cwd,
+            env,
+            OUTPUT_CAPACITY,
+            self.running.clone(),
+            self.activity.clone(),
+        )?;
         let value = job.summary();
         state.jobs.insert(id, job);
         Ok(value)
@@ -80,6 +98,21 @@ impl BackgroundRegistry {
         let mut jobs: Vec<_> = state.jobs.values().collect();
         jobs.sort_by(|left, right| left.id.cmp(&right.id));
         json!({"jobs": jobs.into_iter().map(|job| job.summary()).collect::<Vec<_>>()})
+    }
+
+    async fn prune(&self) -> Value {
+        let mut state = self.state.lock().await;
+        let mut pruned = Vec::new();
+        state.jobs.retain(|id, job| {
+            if job.is_finished() {
+                pruned.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        pruned.sort();
+        json!({"pruned": pruned, "remaining": state.jobs.len()})
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
@@ -129,11 +162,11 @@ impl Tool for BackgroundTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("background"),
-            description: "Spawn, list, read output from, or stop managed background commands. Jobs survive interruption of agent execution and are terminated when the session closes. Commands use an independent shell with explicit cwd/env; persistent shell state is not inherited. Output is bounded and cursors count bytes of combined stdout/stderr.".to_owned(),
+            description: "Spawn, list, read output from, stop, or prune finished managed background commands. Prune removes finished job records and retained output; running jobs are preserved. Jobs survive interruption of agent execution and are terminated when the session closes. Commands use an independent shell with explicit cwd/env; persistent shell state is not inherited. Output is bounded and cursors count bytes of combined stdout/stderr.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["spawn", "list", "output", "kill"]},
+                    "action": {"type": "string", "enum": ["spawn", "list", "output", "kill", "prune"]},
                     "command": {"type": "string", "minLength": 1},
                     "cwd": {"type": "string"},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
@@ -186,6 +219,7 @@ impl Tool for BackgroundTool {
                 registry.spawn(&context, command, cwd, env).await?
             }
             "list" => registry.list().await,
+            "prune" => registry.prune().await,
             "output" => {
                 let job = registry.get(required_string(&input, "id")?).await?;
                 job.output(optional_u64(&input, "cursor")?.unwrap_or(0))?

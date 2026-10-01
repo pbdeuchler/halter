@@ -73,7 +73,6 @@ pub fn build_subagent_state(
         messages: parent.state.messages.clone(),
         // Input accepted by the parent belongs to its own conversation.
         pending_inputs: Vec::new(),
-        session_status: Default::default(),
         compacted_prefix: parent.state.compacted_prefix.clone(),
         appended_prompt_segments: parent.state.appended_prompt_segments.clone(),
         pending_tool_calls: Default::default(),

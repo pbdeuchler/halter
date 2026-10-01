@@ -2,12 +2,12 @@
 
 use clap::Args;
 use halter_protocol::{
-    AssistantMessage, AssistantPart, InputDeferredReason, InputOutcome, Message, MessageId,
-    SessionEvent, SessionEventPayload,
+    AssistantMessage, AssistantPart, InputDeferredReason, Message, MessageId, SessionEvent,
+    SessionEventPayload,
 };
 
 #[cfg(test)]
-use halter_protocol::{ReplayMeta, SessionStatus, StopReason, Usage};
+use halter_protocol::{ReplayMeta, StopReason, TurnId, Usage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutputMode {
@@ -43,75 +43,71 @@ impl RunOutputArgs {
 }
 
 #[derive(Debug)]
-pub struct JsonResultTracker {
+/// The CLI drives one foreground execution at a time and renders its events
+/// before returning to the prompt. Background lifetime belongs to the session.
+pub struct ForegroundRun {
     final_result: Option<AssistantMessage>,
     message_id: MessageId,
+    delivered: bool,
 }
 
-impl JsonResultTracker {
+impl ForegroundRun {
     pub fn new(message_id: MessageId) -> Self {
         Self {
             final_result: None,
             message_id,
+            delivered: false,
         }
     }
 
-    pub fn observe(
-        &mut self,
-        payload: &SessionEventPayload,
-    ) -> Result<Option<&AssistantMessage>, String> {
-        if input_completion(payload, &self.message_id)? {
-            return self
-                .final_result
-                .as_ref()
-                .map(Some)
-                .ok_or_else(|| "failed to capture final assistant result".to_owned());
-        }
+    pub fn observe(&mut self, payload: &SessionEventPayload) -> Result<bool, String> {
         match payload {
+            SessionEventPayload::InputDelivered { message_id }
+                if message_id == &self.message_id =>
+            {
+                self.delivered = true;
+            }
+            // Parent-session execution is serialized. Once this input enters
+            // history, the next terminal event belongs to its execution.
+            SessionEventPayload::TurnCompleted { .. } if self.delivered => {
+                return Ok(true);
+            }
+            SessionEventPayload::TurnFailed { error, .. } if self.delivered => {
+                return Err(error.clone());
+            }
             SessionEventPayload::MessageItem {
                 message: Message::Assistant(message),
-            } => {
+            } if self.delivered => {
                 self.final_result = Some(message.clone());
-                Ok(None)
             }
-            _ => Ok(None),
+            SessionEventPayload::InputRejected { message_id, reason }
+                if message_id == &self.message_id =>
+            {
+                return Err(format!("input was rejected: {reason}"));
+            }
+            SessionEventPayload::InputDeferred { message_id, reason }
+                if message_id == &self.message_id =>
+            {
+                let reason = match reason {
+                    InputDeferredReason::Interrupted => "execution was interrupted".to_owned(),
+                    InputDeferredReason::ExecutionFailed { error, .. } => {
+                        format!("execution failed: {error}")
+                    }
+                    InputDeferredReason::ExecutionStopped => "earlier execution failed".to_owned(),
+                    InputDeferredReason::Shutdown => "the session was shut down".to_owned(),
+                    InputDeferredReason::Resumed => "the session was resumed idle".to_owned(),
+                };
+                return Err(format!("input remains queued because {reason}"));
+            }
+            _ => {}
         }
+        Ok(false)
     }
-}
 
-/// Match a submitted input rather than unrelated execution or activity events.
-pub fn input_completion(
-    payload: &SessionEventPayload,
-    message_id: &MessageId,
-) -> Result<bool, String> {
-    match payload {
-        SessionEventPayload::InputSettled {
-            message_id: id,
-            outcome,
-        } if id == message_id => match outcome {
-            InputOutcome::Completed => Ok(true),
-            InputOutcome::Failed { error, .. } => Err(error.clone()),
-            InputOutcome::Interrupted => Err("input was interrupted".to_owned()),
-        },
-        SessionEventPayload::InputRejected {
-            message_id: id,
-            reason,
-        } if id == message_id => Err(format!("input was rejected: {reason}")),
-        SessionEventPayload::InputDeferred {
-            message_id: id,
-            reason,
-        } if id == message_id => {
-            let reason = match reason {
-                InputDeferredReason::Interrupted => "execution was interrupted".to_owned(),
-                InputDeferredReason::ExecutionFailed { error, .. } => {
-                    format!("execution failed: {error}")
-                }
-                InputDeferredReason::Shutdown => "the session was shut down".to_owned(),
-                InputDeferredReason::Resumed => "the session was resumed idle".to_owned(),
-            };
-            Err(format!("input remains queued because {reason}"))
-        }
-        _ => Ok(false),
+    pub fn final_result(&self) -> Result<&AssistantMessage, String> {
+        self.final_result
+            .as_ref()
+            .ok_or_else(|| "failed to capture final assistant result".to_owned())
     }
 }
 
@@ -193,155 +189,223 @@ mod tests {
     }
 
     #[test]
-    fn json_result_tracker_returns_latest_assistant_message_on_completion() {
-        let id = MessageId::from("input-1");
-        let mut tracker = JsonResultTracker::new(id.clone());
-        let tool_request = assistant_message("call tool", Some(StopReason::ToolUse));
+    fn foreground_run_keeps_latest_assistant_until_its_execution_stops() {
+        let input = MessageId::from("input-1");
+        let turn = TurnId::from("foreground-turn");
+        let mut foreground = ForegroundRun::new(input.clone());
         let final_result = assistant_message("done", Some(StopReason::EndTurn));
-
-        assert!(
-            tracker
-                .observe(&SessionEventPayload::MessageItem {
-                    message: Message::Assistant(tool_request),
-                })
-                .expect("observe tool request")
-                .is_none()
-        );
-        assert!(
-            tracker
-                .observe(&SessionEventPayload::MessageItem {
-                    message: Message::Tool(halter_protocol::ToolResultMessage {
-                        id: MessageId::from("tool-message"),
-                        call_id: halter_protocol::ToolCallId::from("call-1"),
-                        content: halter_protocol::ToolResult::Text {
-                            text: "ok".to_owned(),
-                        },
-                        error: None,
-                        created_at: Utc::now(),
-                    }),
-                })
-                .expect("observe tool result")
-                .is_none()
-        );
-        assert!(
-            tracker
-                .observe(&SessionEventPayload::MessageItem {
-                    message: Message::Assistant(final_result.clone()),
-                })
-                .expect("observe final result")
-                .is_none()
-        );
-
-        let result = tracker
-            .observe(&SessionEventPayload::InputSettled {
-                message_id: id,
-                outcome: InputOutcome::Completed,
-            })
-            .expect("turn completed")
-            .expect("assistant result");
-
-        assert_eq!(result, &final_result);
-    }
-
-    #[test]
-    fn json_result_tracker_errors_on_its_input_failure() {
-        let id = MessageId::from("input-1");
-        let mut tracker = JsonResultTracker::new(id.clone());
-        let error = tracker
-            .observe(&SessionEventPayload::InputSettled {
-                message_id: id,
-                outcome: InputOutcome::Failed {
-                    error: "provider exploded".to_owned(),
-                    retryable: false,
-                },
-            })
-            .expect_err("turn failure should surface");
-        assert_eq!(error, "provider exploded");
-    }
-
-    #[test]
-    fn json_result_tracker_requires_a_final_assistant_message() {
-        let id = MessageId::from("input-1");
-        let mut tracker = JsonResultTracker::new(id.clone());
-        let error = tracker
-            .observe(&SessionEventPayload::InputSettled {
-                message_id: id,
-                outcome: InputOutcome::Completed,
-            })
-            .expect_err("turn completion without assistant result should fail");
-        assert_eq!(error, "failed to capture final assistant result");
-    }
-
-    #[test]
-    fn json_result_tracker_ignores_activity_and_other_input_outcomes() {
-        let mut tracker = JsonResultTracker::new(MessageId::from("input-1"));
         for payload in [
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Running,
+            SessionEventPayload::TurnStarted {
+                turn_id: turn.clone(),
+                default_model: None,
+                subagent_model: None,
             },
-            SessionEventPayload::SessionStatusChanged {
-                status: SessionStatus::Idle,
+            SessionEventPayload::InputDelivered { message_id: input },
+            SessionEventPayload::MessageItem {
+                message: Message::Assistant(assistant_message(
+                    "call tool",
+                    Some(StopReason::ToolUse),
+                )),
+            },
+            SessionEventPayload::MessageItem {
+                message: Message::Assistant(final_result.clone()),
+            },
+        ] {
+            assert!(!foreground.observe(&payload).unwrap(), "{payload:?}");
+        }
+        assert!(
+            foreground
+                .observe(&SessionEventPayload::TurnCompleted {
+                    turn_id: turn,
+                    usage: Usage::default(),
+                })
+                .unwrap()
+        );
+        assert_eq!(foreground.final_result().unwrap(), &final_result);
+    }
+
+    #[test]
+    fn foreground_run_waits_past_rejection_of_earlier_queued_input() {
+        let target = MessageId::from("fresh-input");
+        let mut foreground = ForegroundRun::new(target.clone());
+        let prior_turn = TurnId::from("prior-turn");
+        for payload in [
+            SessionEventPayload::TurnStarted {
+                turn_id: prior_turn.clone(),
+                default_model: None,
+                subagent_model: None,
+            },
+            SessionEventPayload::MessageItem {
+                message: Message::Assistant(assistant_message(
+                    "earlier hook output",
+                    Some(StopReason::EndTurn),
+                )),
+            },
+            SessionEventPayload::InputRejected {
+                message_id: MessageId::from("earlier-deferred-input"),
+                reason: "blocked by hook".to_owned(),
+            },
+            SessionEventPayload::TurnCompleted {
+                turn_id: prior_turn,
+                usage: Usage::default(),
+            },
+        ] {
+            assert!(!foreground.observe(&payload).unwrap(), "{payload:?}");
+        }
+        assert!(foreground.final_result().is_err());
+
+        let target_turn = TurnId::from("target-turn");
+        let expected = assistant_message("target result", Some(StopReason::EndTurn));
+        for payload in [
+            SessionEventPayload::TurnStarted {
+                turn_id: target_turn.clone(),
+                default_model: None,
+                subagent_model: None,
+            },
+            SessionEventPayload::InputDelivered { message_id: target },
+            SessionEventPayload::MessageItem {
+                message: Message::Assistant(expected.clone()),
+            },
+        ] {
+            assert!(!foreground.observe(&payload).unwrap(), "{payload:?}");
+        }
+        assert!(
+            foreground
+                .observe(&SessionEventPayload::TurnCompleted {
+                    turn_id: target_turn,
+                    usage: Usage::default(),
+                })
+                .unwrap()
+        );
+        assert_eq!(foreground.final_result().unwrap(), &expected);
+    }
+
+    #[test]
+    fn foreground_run_observes_steering_delivery_without_an_execution_start() {
+        let target = MessageId::from("steering-input");
+        let expected = assistant_message("steered result", Some(StopReason::EndTurn));
+        let mut foreground = ForegroundRun::new(target.clone());
+        // The caller skips TurnStarted when it precedes the steering input's
+        // acceptance sequence in the retained session stream.
+        for payload in [
+            SessionEventPayload::MessageItem {
+                message: Message::Assistant(assistant_message(
+                    "before steering",
+                    Some(StopReason::EndTurn),
+                )),
+            },
+            SessionEventPayload::InputDelivered { message_id: target },
+            SessionEventPayload::MessageItem {
+                message: Message::Assistant(expected.clone()),
+            },
+        ] {
+            assert!(!foreground.observe(&payload).unwrap(), "{payload:?}");
+        }
+        assert!(
+            foreground
+                .observe(&SessionEventPayload::TurnCompleted {
+                    turn_id: TurnId::from("already-running-turn"),
+                    usage: Usage::default(),
+                })
+                .unwrap()
+        );
+        assert_eq!(foreground.final_result().unwrap(), &expected);
+    }
+
+    #[test]
+    fn foreground_run_reports_its_deferral_after_an_earlier_execution_fails() {
+        let target = MessageId::from("unattempted-input");
+        let prior_turn = TurnId::from("prior-turn");
+        let mut foreground = ForegroundRun::new(target.clone());
+        for payload in [
+            SessionEventPayload::TurnStarted {
+                turn_id: prior_turn.clone(),
+                default_model: None,
+                subagent_model: None,
             },
             SessionEventPayload::TurnFailed {
-                turn_id: halter_protocol::TurnId::from("earlier-turn"),
+                turn_id: prior_turn,
+                error: "earlier input hook failed".to_owned(),
+                cancelled: false,
+                retryable: true,
+            },
+        ] {
+            assert!(!foreground.observe(&payload).unwrap(), "{payload:?}");
+        }
+        assert_eq!(
+            foreground.observe(&SessionEventPayload::InputDeferred {
+                message_id: target,
+                reason: InputDeferredReason::ExecutionStopped,
+            }),
+            Err("input remains queued because earlier execution failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn foreground_run_ignores_unrelated_execution_and_input_events() {
+        let mut foreground = ForegroundRun::new(MessageId::from("input-1"));
+        let turn = TurnId::from("foreground-turn");
+        foreground
+            .observe(&SessionEventPayload::TurnStarted {
+                turn_id: turn,
+                default_model: None,
+                subagent_model: None,
+            })
+            .unwrap();
+        for payload in [
+            SessionEventPayload::TurnFailed {
+                turn_id: TurnId::from("earlier-turn"),
                 error: "unrelated failure".to_owned(),
                 cancelled: false,
                 retryable: false,
             },
-            SessionEventPayload::InputSettled {
+            SessionEventPayload::TurnCompleted {
+                turn_id: TurnId::from("earlier-turn"),
+                usage: Usage::default(),
+            },
+            SessionEventPayload::InputDelivered {
                 message_id: MessageId::from("another-input"),
-                outcome: InputOutcome::Completed,
+            },
+            SessionEventPayload::InputRejected {
+                message_id: MessageId::from("another-input"),
+                reason: "blocked".to_owned(),
             },
             SessionEventPayload::InputDeferred {
                 message_id: MessageId::from("another-input"),
                 reason: InputDeferredReason::Interrupted,
             },
         ] {
-            assert!(tracker.observe(&payload).unwrap().is_none(), "{payload:?}");
+            assert!(!foreground.observe(&payload).unwrap(), "{payload:?}");
         }
     }
 
     #[test]
-    fn input_completion_distinguishes_settlement_rejection_and_pending_input() {
+    fn foreground_run_reports_execution_and_input_failures() {
         let id = MessageId::from("input-1");
+        let turn = TurnId::from("foreground-turn");
         let cases = [
             (
-                SessionEventPayload::InputSettled {
-                    message_id: id.clone(),
-                    outcome: InputOutcome::Completed,
+                SessionEventPayload::TurnFailed {
+                    turn_id: turn.clone(),
+                    error: "provider unavailable".to_owned(),
+                    cancelled: false,
+                    retryable: true,
                 },
-                Ok(true),
-            ),
-            (
-                SessionEventPayload::InputSettled {
-                    message_id: id.clone(),
-                    outcome: InputOutcome::Failed {
-                        error: "provider unavailable".to_owned(),
-                        retryable: true,
-                    },
-                },
-                Err("provider unavailable"),
-            ),
-            (
-                SessionEventPayload::InputSettled {
-                    message_id: id.clone(),
-                    outcome: InputOutcome::Interrupted,
-                },
-                Err("input was interrupted"),
+                "provider unavailable",
             ),
             (
                 SessionEventPayload::InputRejected {
                     message_id: id.clone(),
                     reason: "blocked by hook".to_owned(),
                 },
-                Err("input was rejected: blocked by hook"),
+                "input was rejected: blocked by hook",
             ),
             (
                 SessionEventPayload::InputDeferred {
                     message_id: id.clone(),
                     reason: InputDeferredReason::Interrupted,
                 },
-                Err("input remains queued because execution was interrupted"),
+                "input remains queued because execution was interrupted",
             ),
             (
                 SessionEventPayload::InputDeferred {
@@ -351,30 +415,54 @@ mod tests {
                         retryable: false,
                     },
                 },
-                Err("input remains queued because execution failed: hook failed"),
+                "input remains queued because execution failed: hook failed",
+            ),
+            (
+                SessionEventPayload::InputDeferred {
+                    message_id: id.clone(),
+                    reason: InputDeferredReason::ExecutionStopped,
+                },
+                "input remains queued because earlier execution failed",
             ),
             (
                 SessionEventPayload::InputDeferred {
                     message_id: id.clone(),
                     reason: InputDeferredReason::Shutdown,
                 },
-                Err("input remains queued because the session was shut down"),
+                "input remains queued because the session was shut down",
             ),
             (
                 SessionEventPayload::InputDeferred {
                     message_id: id.clone(),
                     reason: InputDeferredReason::Resumed,
                 },
-                Err("input remains queued because the session was resumed idle"),
+                "input remains queued because the session was resumed idle",
             ),
         ];
         for (payload, expected) in cases {
+            let mut foreground = ForegroundRun::new(id.clone());
+            if matches!(payload, SessionEventPayload::TurnFailed { .. }) {
+                foreground
+                    .observe(&SessionEventPayload::InputDelivered {
+                        message_id: id.clone(),
+                    })
+                    .unwrap();
+            }
             assert_eq!(
-                input_completion(&payload, &id),
-                expected.map_err(str::to_owned),
+                foreground.observe(&payload),
+                Err(expected.to_owned()),
                 "{payload:?}"
             );
         }
+    }
+
+    #[test]
+    fn foreground_json_output_requires_an_assistant_message() {
+        let foreground = ForegroundRun::new(MessageId::from("input-1"));
+        assert_eq!(
+            foreground.final_result().unwrap_err(),
+            "failed to capture final assistant result"
+        );
     }
 
     #[test]

@@ -18,8 +18,8 @@ use halter::prelude::*;
 use halter_config::{export_json_schema, generate_starter_config, load_path};
 use halter_protocol::{AssistantMessage, SessionEvent, SessionEventPayload};
 use run_output::{
-    JsonResultTracker, RunOutputArgs, RunOutputMode, input_completion,
-    strip_signatures_from_assistant_message, strip_signatures_from_session_event,
+    ForegroundRun, RunOutputArgs, RunOutputMode, strip_signatures_from_assistant_message,
+    strip_signatures_from_session_event,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info};
@@ -240,51 +240,27 @@ async fn run_once_body(
     output: &mut dyn Write,
 ) -> anyhow::Result<()> {
     let submission = session.submit(Message::user(task)).await?;
-
-    match output_mode {
-        RunOutputMode::StreamingJson => {
-            let mut accepted = false;
-            while let Some(event) = events.next().await {
-                let event = event?;
-                write_json_event(output, &event)?;
-                if event.session_id != *session.id() || event.sequence() < submission.sequence {
-                    continue;
-                }
-                if !accepted {
-                    accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if message.id == submission.message_id);
-                    continue;
-                }
-                if input_completion(&event.payload, &submission.message_id)
-                    .map_err(anyhow::Error::msg)?
-                {
-                    return Ok(());
-                }
-            }
-            anyhow::bail!("session closed before execution completed")
+    let mut foreground = ForegroundRun::new(submission.message_id.clone());
+    while let Some(event) = events.next().await {
+        let event = event?;
+        if output_mode == RunOutputMode::StreamingJson {
+            write_json_event(output, &event)?;
         }
-        RunOutputMode::JsonResult => {
-            let mut tracker = JsonResultTracker::new(submission.message_id.clone());
-            let mut accepted = false;
-            while let Some(event) = events.next().await {
-                let event = event?;
-                if event.session_id != *session.id() || event.sequence() < submission.sequence {
-                    continue;
-                }
-                if !accepted {
-                    accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if message.id == submission.message_id);
-                    continue;
-                }
-                if let Some(result) = tracker
-                    .observe(&event.payload)
-                    .map_err(anyhow::Error::msg)?
-                {
-                    write_json_result(output, result)?;
-                    return Ok(());
-                }
+        if event.session_id != *session.id() || event.sequence() < submission.sequence {
+            continue;
+        }
+        if foreground
+            .observe(&event.payload)
+            .map_err(anyhow::Error::msg)?
+        {
+            if output_mode == RunOutputMode::JsonResult {
+                let result = foreground.final_result().map_err(anyhow::Error::msg)?;
+                write_json_result(output, result)?;
             }
-            anyhow::bail!("failed to receive final assistant result")
+            return Ok(());
         }
     }
+    anyhow::bail!("session closed before foreground execution stopped")
 }
 
 async fn chat(path: &Path, output: &mut dyn Write) -> anyhow::Result<()> {
@@ -338,18 +314,15 @@ async fn chat_body(
         }
 
         let submission = session.submit(Message::user(line)).await?;
-        let mut accepted = false;
+        let mut foreground = ForegroundRun::new(submission.message_id.clone());
         let mut completed = false;
         while let Some(event) = events.next().await {
             let event = event?;
             if event.session_id != *session.id() || event.sequence() < submission.sequence {
                 continue;
             }
-            if !accepted {
-                accepted = matches!(&event.payload, SessionEventPayload::InputAccepted { message } if message.id == submission.message_id);
-                continue;
-            }
-            if input_completion(&event.payload, &submission.message_id)
+            if foreground
+                .observe(&event.payload)
                 .map_err(anyhow::Error::msg)?
             {
                 completed = true;

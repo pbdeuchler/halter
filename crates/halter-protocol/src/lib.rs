@@ -986,9 +986,10 @@ pub const SESSION_LOG_FORMAT: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-/// Persisted lifecycle state of a session driver.
+/// Current foreground activity of a live session driver. Not persisted.
 pub enum SessionStatus {
-    /// The driver is open and no execution is active. Input may remain queued.
+    /// The driver is open and no foreground execution is active. Input may
+    /// remain queued and background processes may still be running.
     #[default]
     Idle,
     /// The driver is executing accepted input or compacting the conversation.
@@ -997,23 +998,24 @@ pub enum SessionStatus {
     Closed,
 }
 
-/// The execution outcome of input delivered into the conversation.
-/// Multiple inputs delivered during one execution share its outcome.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum InputOutcome {
-    Completed,
-    Failed { error: String, retryable: bool },
-    Interrupted,
-}
-
 /// Why accepted input is still queued rather than executing.
 /// Deferral preserves the input and permits a later explicit retry.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputDeferredReason {
     Interrupted,
-    ExecutionFailed { error: String, retryable: bool },
+    /// This input's attempt failed before delivery. Resubmit the same ID to
+    /// retry it; unrelated new input does not retry the failing entry, even
+    /// when `retryable` is true. That flag classifies the failure and never
+    /// schedules an automatic retry.
+    ExecutionFailed {
+        error: String,
+        retryable: bool,
+    },
+    /// Earlier execution failed before this input was attempted. A later
+    /// submission starts execution and makes these inputs eligible for delivery
+    /// alongside the newly submitted message.
+    ExecutionStopped,
     Shutdown,
     Resumed,
 }
@@ -1039,19 +1041,19 @@ pub enum SessionEventPayload {
         message_id: MessageId,
         reason: String,
     },
-    /// Delivered input reached an execution outcome. This is the completion
-    /// signal for consumers; driver activity changes are not input outcomes.
-    InputSettled {
+    /// Accepted input entered the conversation history. Committed alongside
+    /// its user `MessageItem`; subsequent work may continue indefinitely.
+    InputDelivered {
         message_id: MessageId,
-        outcome: InputOutcome,
     },
-    /// Input remains in the inbox. This notification is not a terminal
-    /// outcome; a later submission can restart execution of the same ID.
+    /// Input remains in the inbox for later execution.
     InputDeferred {
         message_id: MessageId,
         reason: InputDeferredReason,
     },
-    /// The session driver changed lifecycle state.
+    /// Legacy durable events remain readable. Live activity uses status
+    /// watches; a stream-local `Closed` event ends a clean session stream.
+    /// That notification has sequence zero and is not written to the log.
     SessionStatusChanged {
         status: SessionStatus,
     },
@@ -1690,9 +1692,6 @@ pub struct SessionState {
     /// compaction cannot discard it.
     #[serde(default)]
     pub pending_inputs: Vec<UserMessage>,
-    /// Lifecycle state of the most recently opened session driver.
-    #[serde(default)]
-    pub session_status: SessionStatus,
     #[serde(default)]
     pub compacted_prefix: Vec<Value>,
     pub appended_prompt_segments: Vec<PromptSegment>,
@@ -2155,12 +2154,11 @@ mod tests {
                 "message_id",
             ),
             (
-                "input_settled",
-                SessionEventPayload::InputSettled {
+                "input_delivered",
+                SessionEventPayload::InputDelivered {
                     message_id: message.id.clone(),
-                    outcome: InputOutcome::Completed,
                 },
-                "outcome",
+                "message_id",
             ),
             (
                 "input_deferred",
@@ -2169,13 +2167,6 @@ mod tests {
                     reason: InputDeferredReason::Interrupted,
                 },
                 "reason",
-            ),
-            (
-                "session_status_changed",
-                SessionEventPayload::SessionStatusChanged {
-                    status: SessionStatus::Running,
-                },
-                "status",
             ),
         ];
         let schema = serde_json::to_value(schemars::schema_for!(SessionEventPayload))
@@ -2207,14 +2198,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_checkpoints_default_to_an_empty_idle_inbox() {
+    fn legacy_checkpoints_default_to_an_empty_inbox() {
         let mut checkpoint = serde_json::to_value(SessionState::default()).unwrap();
         let fields = checkpoint.as_object_mut().unwrap();
         fields.remove("pending_inputs");
-        fields.remove("session_status");
         let restored: SessionState = serde_json::from_value(checkpoint).unwrap();
         assert!(restored.pending_inputs.is_empty());
-        assert_eq!(restored.session_status, SessionStatus::Idle);
     }
 
     proptest! {
@@ -2227,11 +2216,10 @@ mod tests {
             for payload in [
                 SessionEventPayload::InputAccepted { message: message.clone() },
                 SessionEventPayload::InputRejected { message_id: message.id.clone(), reason: reason.clone() },
-                SessionEventPayload::InputSettled { message_id: message.id.clone(), outcome: InputOutcome::Completed },
-                SessionEventPayload::InputSettled { message_id: message.id.clone(), outcome: InputOutcome::Failed { error: reason.clone(), retryable: true } },
-                SessionEventPayload::InputSettled { message_id: message.id.clone(), outcome: InputOutcome::Interrupted },
+                SessionEventPayload::InputDelivered { message_id: message.id.clone() },
                 SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::Interrupted },
                 SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::ExecutionFailed { error: reason, retryable: false } },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::ExecutionStopped },
                 SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::Shutdown },
                 SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::Resumed },
             ] {
@@ -2241,7 +2229,6 @@ mod tests {
             }
             let state = SessionState {
                 pending_inputs: vec![message],
-                session_status: SessionStatus::Running,
                 ..SessionState::default()
             };
             let restored: SessionState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();

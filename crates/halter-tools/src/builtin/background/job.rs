@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -15,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::CanonicalPath;
-use crate::builtin::process::{kill_process_group, kill_tree};
+use crate::builtin::process::{kill_process_group, list_descendants, signal_process};
 
 const TERM_GRACE: Duration = Duration::from_millis(500);
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -30,6 +31,7 @@ pub(super) struct BackgroundJob {
     started_at_ms: u128,
     output: Arc<Mutex<OutputBuffer>>,
     stop: CancellationToken,
+    force: CancellationToken,
     owned_process: Arc<Mutex<Option<OwnedProcessIds>>>,
     status: watch::Receiver<JobStatus>,
     task: AsyncMutex<Option<JoinHandle<()>>>,
@@ -41,6 +43,28 @@ struct OwnedProcessIds {
 }
 
 struct OwnedProcessGuard(Arc<Mutex<Option<OwnedProcessIds>>>);
+
+// One lease covers process settlement and both output drains. Its Drop also
+// publishes completion if the monitor panics, without a separate watcher task.
+struct RunningJob {
+    count: Arc<AtomicUsize>,
+    activity: watch::Sender<()>,
+}
+
+impl RunningJob {
+    fn new(count: Arc<AtomicUsize>, activity: watch::Sender<()>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        activity.send_replace(());
+        Self { count, activity }
+    }
+}
+
+impl Drop for RunningJob {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+        self.activity.send_replace(());
+    }
+}
 
 impl Drop for OwnedProcessGuard {
     fn drop(&mut self) {
@@ -54,7 +78,7 @@ fn signal_owned(owned: &OwnedProcessIds, signal: i32) {
     #[cfg(unix)]
     kill_process_group(owned.group as i32, signal);
     if let Some(pid) = owned.pid {
-        kill_tree(pid as i32, signal);
+        signal_process(pid as i32, signal);
     }
 }
 
@@ -98,6 +122,8 @@ impl BackgroundJob {
         cwd: CanonicalPath,
         env: Option<HashMap<String, String>>,
         capacity: usize,
+        running: Arc<AtomicUsize>,
+        activity: watch::Sender<()>,
     ) -> anyhow::Result<Arc<Self>> {
         let cwd_path = cwd.path().to_owned();
         let mut process = shell_command(&command)?;
@@ -171,21 +197,28 @@ impl BackgroundJob {
         let stdout = child.stdout.take().expect("spawn configured piped stdout");
         let stderr = child.stderr.take().expect("spawn configured piped stderr");
         let stop = CancellationToken::new();
+        let force = CancellationToken::new();
         let (status_tx, status) = watch::channel(JobStatus::Running);
         let owned_process = Arc::new(Mutex::new(Some(OwnedProcessIds {
             pid: Some(pid),
             group: pid,
         })));
         let ownership = OwnedProcessGuard(owned_process.clone());
+        let running = RunningJob::new(running, activity);
         let task = tokio::spawn({
             let output = output.clone();
             let stop = stop.clone();
+            let force = force.clone();
             let owned_process = owned_process.clone();
             async move {
+                let _running = running;
+                // A local child drops before the activity lease on unwind,
+                // after the group guard has signalled owned descendants.
+                let mut child = child;
                 let _ownership = ownership;
                 let stdout = tokio::spawn(capture(stdout, output.clone()));
                 let stderr = tokio::spawn(capture(stderr, output));
-                let outcome = monitor(&mut child, pid, &stop, &owned_process).await;
+                let outcome = monitor(&mut child, pid, &stop, &force, &owned_process).await;
                 // Disable signalling before output drains; a completed PID
                 // must never be targeted after the OS reuses it.
                 owned_process.lock().take();
@@ -213,6 +246,7 @@ impl BackgroundJob {
                 .as_millis(),
             output,
             stop,
+            force,
             owned_process,
             status,
             task: AsyncMutex::new(Some(task)),
@@ -221,6 +255,10 @@ impl BackgroundJob {
 
     pub(super) fn summary(&self) -> Value {
         json!({"id": self.id, "command": self.command, "cwd": self.cwd, "pid": self.pid, "started_at_ms": self.started_at_ms, "status": self.status.borrow().clone()})
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        !matches!(*self.status.borrow(), JobStatus::Running)
     }
 
     pub(super) fn output(&self, cursor: u64) -> anyhow::Result<Value> {
@@ -247,25 +285,42 @@ impl BackgroundJob {
     }
 
     pub(super) fn force_stop(&self) {
+        self.force.cancel();
         self.stop.cancel();
-        if let Some(owned) = self.owned_process.lock().as_ref() {
+        // A native cleanup scan may own the PID lock. Never make the actor
+        // wait for that scan; the monitor observes the force token afterward.
+        if let Some(control) = self.owned_process.try_lock()
+            && let Some(owned) = control.as_ref()
+        {
             signal_owned(owned, 9);
         }
     }
 
     pub(super) async fn wait(&self) -> anyhow::Result<()> {
         let mut status = self.status.clone();
+        let mut monitor_closed = false;
         while matches!(*status.borrow_and_update(), JobStatus::Running) {
-            status.changed().await.map_err(|_| {
-                anyhow::anyhow!("background process monitor stopped without recording completion")
-            })?;
+            if status.changed().await.is_err() {
+                monitor_closed = true;
+                break;
+            }
         }
         // Only one caller joins, while the mutex makes other waiters await
         // that join too. Thus every successful caller observes task completion.
-        if let Some(task) = self.task.lock().await.take() {
-            task.await
+        let mut task = self.task.lock().await;
+        let joined = match task.as_mut() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        task.take();
+        if let Some(joined) = joined {
+            joined
                 .map_err(|error| anyhow::anyhow!("background process monitor failed: {error}"))?;
         }
+        anyhow::ensure!(
+            !monitor_closed,
+            "background process monitor stopped without recording completion"
+        );
         if let JobStatus::Failed { error } = &*status.borrow() {
             anyhow::bail!("background process failed: {error}");
         }
@@ -328,16 +383,20 @@ async fn monitor(
     child: &mut Child,
     pid: u32,
     stop: &CancellationToken,
-    owned: &Mutex<Option<OwnedProcessIds>>,
+    force: &CancellationToken,
+    owned: &Arc<Mutex<Option<OwnedProcessIds>>>,
 ) -> anyhow::Result<JobStatus> {
     let outcome = tokio::select! {
         result = wait_owned_child(child, owned) => result,
         _ = stop.cancelled() => {
-            signal_job(pid, 15);
+            signal_job(owned.clone(), if force.is_cancelled() { 9 } else { 15 }).await?;
             // Give every member of the owned process group a TERM grace
             // period, even if the group leader exits sooner.
-            tokio::time::sleep(TERM_GRACE).await;
-            signal_job(pid, 9);
+            tokio::select! {
+                _ = tokio::time::sleep(TERM_GRACE), if !force.is_cancelled() => {},
+                _ = force.cancelled() => {},
+            }
+            signal_job(owned.clone(), 9).await?;
             wait_owned_child(child, owned).await
         }
     };
@@ -345,11 +404,14 @@ async fn monitor(
     // Those are still this job's resources, never implicitly detached jobs.
     #[cfg(unix)]
     if kill_process_group(pid as i32, 15) {
-        tokio::time::sleep(TERM_GRACE).await;
+        tokio::select! {
+            _ = tokio::time::sleep(TERM_GRACE) => {},
+            _ = force.cancelled() => {},
+        }
         kill_process_group(pid as i32, 9);
     }
     #[cfg(not(unix))]
-    kill_tree(pid as i32, 9);
+    signal_process(pid as i32, 9);
     let status = outcome?;
     #[cfg(unix)]
     let signal = {
@@ -385,12 +447,76 @@ async fn wait_owned_child(
     .await
 }
 
-fn signal_job(pid: u32, signal: i32) {
-    #[cfg(unix)]
-    kill_process_group(pid as i32, signal);
-    // Also catch currently discoverable descendants that changed process
-    // groups. Daemons escaping ancestry/session ownership remain unsupported.
-    kill_tree(pid as i32, signal);
+async fn signal_job(owned: Arc<Mutex<Option<OwnedProcessIds>>>, signal: i32) -> anyhow::Result<()> {
+    // The monitor owns and joins this native operation before reaping. Stop
+    // requests only set tokens, avoiding /proc scans on the actor thread.
+    tokio::task::spawn_blocking(move || {
+        let root = owned.lock().as_ref().and_then(|control| control.pid);
+        let descendants = root
+            .map(|pid| list_descendants(pid as i32))
+            .unwrap_or_default();
+        // Scanning holds no shared lock. Verify the root is still owned before
+        // signalling the snapshot; reaping and signalling share this short lock.
+        let control = owned.lock();
+        if let Some(control) = control.as_ref() {
+            if control.pid == root && root.is_some() {
+                for pid in descendants.into_iter().rev() {
+                    signal_process(pid, signal);
+                }
+            }
+            signal_owned(control, signal);
+        }
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("background process termination failed: {error}"))
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_status_still_joins_monitor_and_retains_cancelled_waiter() {
+        let (send_status, status) = watch::channel(JobStatus::Running);
+        drop(send_status);
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn({
+            let settled = settled.clone();
+            async move {
+                finishing.await.unwrap();
+                settled.store(true, Ordering::Release);
+            }
+        });
+        let job = BackgroundJob {
+            id: "failed-monitor".to_owned(),
+            command: "test".to_owned(),
+            cwd: std::path::PathBuf::new(),
+            pid: 0,
+            started_at_ms: 0,
+            output: Arc::new(Mutex::new(OutputBuffer {
+                bytes: VecDeque::new(),
+                end: 0,
+                capacity: 1,
+            })),
+            stop: CancellationToken::new(),
+            force: CancellationToken::new(),
+            owned_process: Arc::new(Mutex::new(None)),
+            status,
+            task: AsyncMutex::new(Some(task)),
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), job.wait())
+                .await
+                .is_err(),
+            "status closure must not abandon a settling monitor"
+        );
+        assert!(!settled.load(Ordering::Acquire));
+        finish.send(()).unwrap();
+        let error = job.wait().await.unwrap_err();
+        assert!(error.to_string().contains("without recording completion"));
+        assert!(settled.load(Ordering::Acquire));
+    }
 }
 
 #[cfg(all(test, not(unix)))]

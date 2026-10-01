@@ -22,6 +22,7 @@ use super::process::{kill_process_group, kill_tree, process_group_id};
 const TERM_SIGNAL: i32 = 15;
 const KILL_SIGNAL: i32 = 9;
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 // Minimum env vars passed through to spawned PTYs. Keeps the surface small
 // while preserving locale and shell ergonomics. Anything more should come
@@ -77,11 +78,32 @@ fn checked_u16(input: &Value, key: &str, default: u16) -> anyhow::Result<u16> {
 }
 
 /// Handle for an active PTY session stored per halter session.
+#[derive(Clone)]
 pub struct PtySessionHandle {
     control_tx: mpsc::Sender<ControlMessage>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>>,
     generation: Arc<()>,
     termination: PtyTermination,
+    running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PtySessionHandle {
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+struct PtyActivity {
+    running: Arc<std::sync::atomic::AtomicBool>,
+    activity: tokio::sync::watch::Sender<()>,
+}
+
+impl Drop for PtyActivity {
+    fn drop(&mut self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.activity.send_replace(());
+    }
 }
 
 // A separate killer lets shutdown unblock a worker stuck writing PTY input.
@@ -95,8 +117,7 @@ struct PtyTerminationState {
 }
 
 struct PtyChildKiller {
-    killer: Box<dyn ChildKiller + Send + Sync>,
-    child_pid: Option<i32>,
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     process_group: Option<i32>,
 }
 
@@ -195,6 +216,7 @@ impl Tool for PtyTool {
                     config,
                     context.emit.clone(),
                     context.tool_sessions.process_lifetime(&context.session_id),
+                    context.tool_sessions.activity_sender(),
                 )
                 .await?;
                 Ok(ToolResult::Json {
@@ -232,6 +254,7 @@ async fn start_session(
     config: PtyConfig,
     emit: Arc<dyn crate::ToolEventSink>,
     lifetime: tokio_util::sync::CancellationToken,
+    activity: tokio::sync::watch::Sender<()>,
 ) -> anyhow::Result<()> {
     let (control_tx, control_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -239,6 +262,11 @@ async fn start_session(
     let termination_for_task = termination.clone();
     let session_for_task = Arc::clone(&session);
     let generation = Arc::new(());
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let worker_activity = PtyActivity {
+        running: running.clone(),
+        activity: activity.clone(),
+    };
     let generation_for_task = generation.clone();
     {
         let mut guard = session.lock();
@@ -251,6 +279,7 @@ async fn start_session(
             "failed to execute pty tool: PTY session already active"
         );
         let task = tokio::task::spawn_blocking(move || {
+            let _activity = worker_activity;
             let result = match prepare_pty(&config, termination_for_task, &lifetime) {
                 Ok(state) => {
                     let _ = ready_tx.send(Ok(()));
@@ -272,10 +301,12 @@ async fn start_session(
         });
         *guard = Some(PtySessionHandle {
             control_tx,
-            task,
+            task: Arc::new(tokio::sync::Mutex::new(Some(task))),
             generation,
             termination,
+            running,
         });
+        activity.send_replace(());
     }
     ready_rx
         .await
@@ -287,15 +318,21 @@ async fn start_session(
 pub(crate) async fn stop_session(
     session: &Arc<Mutex<Option<PtySessionHandle>>>,
 ) -> anyhow::Result<()> {
-    let handle = session.lock().take();
+    let handle = session.lock().clone();
     if let Some(handle) = handle {
         let _ = handle.control_tx.send(ControlMessage::Kill);
-        let killed = tokio::task::spawn_blocking(move || terminate_pty(&handle.termination)).await;
-        // Join even if the independent killer panicked; the worker owns the
-        // child wait and reader thread, and both must finish before returning.
-        let joined = handle.task.await;
-        killed.map_err(|error| anyhow::anyhow!("failed to terminate PTY child: {error}"))?;
-        joined.map_err(|error| anyhow::anyhow!("failed to stop PTY worker: {error}"))??;
+        terminate_pty(&handle.termination);
+        // Keep signalling controls discoverable while any caller joins. The
+        // worker owns the child and cancellable reader through settlement.
+        let mut task = handle.task.lock().await;
+        let joined = match task.as_mut() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        task.take();
+        if let Some(joined) = joined {
+            joined.map_err(|error| anyhow::anyhow!("failed to stop PTY worker: {error}"))??;
+        }
     }
     Ok(())
 }
@@ -324,11 +361,56 @@ fn send_control(
 }
 
 struct PtyRunState {
-    child: Box<dyn Child + Send + Sync>,
-    termination: PtyTermination,
-    reader: Box<dyn Read + Send>,
+    child: OwnedPtyChild,
+    reader: PtyReader,
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+// Native cleanup stays owned even if the event sink panics during output
+// delivery. Retain the group after reaping its leader: descendants can still
+// keep the terminal open and must not outlive the session resource.
+struct OwnedPtyChild {
+    child: Box<dyn Child + Send + Sync>,
+    termination: PtyTermination,
+    pid: Option<i32>,
+    reaped: bool,
+    settled: bool,
+}
+
+impl OwnedPtyChild {
+    fn try_wait(&mut self) -> std::io::Result<bool> {
+        let mut control = self.termination.lock();
+        if self.child.try_wait()?.is_some() {
+            if let Some(target) = control.killer.as_mut() {
+                target.killer.take();
+            }
+            self.reaped = true;
+        }
+        Ok(self.reaped)
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        if self.settled {
+            return Ok(());
+        }
+        terminate_pty(&self.termination);
+        // Scan on the owned blocking worker, before reaping releases the PID.
+        if !self.reaped
+            && let Some(pid) = self.pid
+        {
+            kill_tree(pid, KILL_SIGNAL);
+        }
+        self.child.wait()?;
+        self.settled = true;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedPtyChild {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
 }
 
 fn prepare_pty(
@@ -362,15 +444,14 @@ fn prepare_pty(
 
     // Allocate fallible IO handles before spawning so an allocation failure
     // cannot leave an unowned child process behind.
-    let reader = pair.master.try_clone_reader()?;
+    let reader = prepare_reader(pair.master.as_ref())?;
     let writer = pair.master.take_writer()?;
     let child = pair.slave.spawn_command(command)?;
     let child_pid = child.process_id().map(|pid| pid as i32);
     let process_group = child_pid.and_then(process_group_id);
     let mut control = termination.lock();
     control.killer = Some(PtyChildKiller {
-        killer: child.clone_killer(),
-        child_pid,
+        killer: Some(child.clone_killer()),
         process_group,
     });
     let stopped = control.stopped || lifetime.is_cancelled();
@@ -380,8 +461,13 @@ fn prepare_pty(
     }
 
     Ok(PtyRunState {
-        child,
-        termination,
+        child: OwnedPtyChild {
+            child,
+            termination,
+            pid: child_pid,
+            reaped: false,
+            settled: false,
+        },
         reader,
         writer,
         master: pair.master,
@@ -396,11 +482,11 @@ fn run_pty_loop(
 ) -> anyhow::Result<()> {
     let PtyRunState {
         mut child,
-        termination,
         reader,
         mut writer,
         master,
     } = state;
+    let termination = child.termination.clone();
     let start = Instant::now();
     let (reader_tx, reader_rx) = mpsc::channel();
     let reader_thread = spawn_reader_thread(reader, reader_tx);
@@ -443,14 +529,8 @@ fn run_pty_loop(
                 break;
             }
 
-            if reader_closed {
-                let mut killer = termination.lock();
-                if child.try_wait()?.is_some() {
-                    // Retire the killer while reaping under the same lock,
-                    // so concurrent shutdown cannot signal an already reaped PID.
-                    killer.killer.take();
-                    break;
-                }
+            if child.try_wait()? {
+                break;
             }
         }
         Ok(())
@@ -462,8 +542,8 @@ fn run_pty_loop(
 
     drop(writer);
     drop(master);
-    let waited = child.wait();
-    let joined = reader_thread.join();
+    let waited = child.finish();
+    let joined = reader_thread.finish();
     drain_reader_output(&reader_rx, &emit, &mut reader_closed);
     outcome?;
     waited?;
@@ -471,13 +551,36 @@ fn run_pty_loop(
     Ok(())
 }
 
-fn spawn_reader_thread(
-    mut reader: Box<dyn Read + Send>,
-    tx: mpsc::Sender<ReaderEvent>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+fn spawn_reader_thread(mut reader: PtyReader, tx: mpsc::Sender<ReaderEvent>) -> ReaderThread {
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_cancel = cancelled.clone();
+    let task = std::thread::spawn(move || {
         let mut buffer = [0u8; 8192];
         loop {
+            if reader_cancel.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let mut poll = libc::pollfd {
+                    fd: reader.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll borrows one valid descriptor owned by this thread.
+                let ready =
+                    unsafe { libc::poll(&mut poll, 1, CONTROL_POLL_INTERVAL.as_millis() as i32) };
+                if ready == 0 {
+                    continue;
+                }
+                if ready < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+            }
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
@@ -491,7 +594,85 @@ fn spawn_reader_thread(
             }
         }
         let _ = tx.send(ReaderEvent::Closed);
-    })
+    });
+    ReaderThread {
+        task: Some(task),
+        cancelled,
+    }
+}
+
+#[cfg(unix)]
+type PtyReader = std::fs::File;
+#[cfg(not(unix))]
+type PtyReader = Box<dyn Read + Send>;
+
+#[cfg(unix)]
+fn prepare_reader(master: &dyn portable_pty::MasterPty) -> anyhow::Result<PtyReader> {
+    use std::os::fd::FromRawFd;
+    let fd = master
+        .as_raw_fd()
+        .ok_or_else(|| anyhow::anyhow!("PTY reader has no native descriptor"))?;
+    // SAFETY: duplicate the borrowed descriptor; the resulting File owns only
+    // the new descriptor and outlives the master during bounded output drain.
+    let reader = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    anyhow::ensure!(
+        reader >= 0,
+        "failed to clone PTY reader: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(unsafe { std::fs::File::from_raw_fd(reader) })
+}
+
+#[cfg(not(unix))]
+fn prepare_reader(master: &dyn portable_pty::MasterPty) -> anyhow::Result<PtyReader> {
+    master.try_clone_reader()
+}
+
+struct ReaderThread {
+    task: Option<std::thread::JoinHandle<()>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReaderThread {
+    fn finish(mut self) -> std::thread::Result<()> {
+        let drain_until = Instant::now() + READER_DRAIN_TIMEOUT;
+        while self.task.as_ref().is_some_and(|task| !task.is_finished())
+            && Instant::now() < drain_until
+        {
+            std::thread::sleep(CONTROL_POLL_INTERVAL);
+        }
+        self.cancel_and_join()
+    }
+
+    fn cancel_and_join(&mut self) -> std::thread::Result<()> {
+        let Some(task) = self.task.take() else {
+            return Ok(());
+        };
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+            }
+            while !task.is_finished() {
+                // SAFETY: the thread handle stays valid until the join below.
+                unsafe {
+                    CancelSynchronousIo(task.as_raw_handle());
+                }
+                std::thread::sleep(CONTROL_POLL_INTERVAL);
+            }
+        }
+        task.join()
+    }
+}
+
+impl Drop for ReaderThread {
+    fn drop(&mut self) {
+        let _ = self.cancel_and_join();
+    }
 }
 
 fn drain_reader_output(
@@ -514,43 +695,27 @@ fn terminate_pty(termination: &PtyTermination) {
     let mut state = termination.lock();
     state.stopped = true;
     if let Some(mut target) = state.killer.take() {
-        terminate_pty_child(&mut target.killer, target.child_pid, target.process_group);
+        terminate_pty_child(&mut target);
     }
 }
 
 #[cfg(unix)]
-fn terminate_pty_child(
-    child: &mut Box<dyn ChildKiller + Send + Sync>,
-    child_pid: Option<i32>,
-    process_group: Option<i32>,
-) {
-    if let Some(process_group) = process_group {
+fn terminate_pty_child(target: &mut PtyChildKiller) {
+    if let Some(process_group) = target.process_group {
         let _ = kill_process_group(process_group, TERM_SIGNAL);
     }
-    if let Some(child_pid) = child_pid {
-        let _ = kill_tree(child_pid, TERM_SIGNAL);
+    if let Some(child) = target.killer.as_mut() {
+        let _ = child.kill();
     }
-    let _ = child.kill();
-    if let Some(process_group) = process_group {
+    if let Some(process_group) = target.process_group {
         let _ = kill_process_group(process_group, KILL_SIGNAL);
-    }
-    if let Some(child_pid) = child_pid {
-        let _ = kill_tree(child_pid, KILL_SIGNAL);
     }
 }
 
 #[cfg(not(unix))]
-fn terminate_pty_child(
-    child: &mut Box<dyn ChildKiller + Send + Sync>,
-    child_pid: Option<i32>,
-    _process_group: Option<i32>,
-) {
-    if let Some(child_pid) = child_pid {
-        let _ = kill_tree(child_pid, TERM_SIGNAL);
-    }
-    let _ = child.kill();
-    if let Some(child_pid) = child_pid {
-        let _ = kill_tree(child_pid, KILL_SIGNAL);
+fn terminate_pty_child(target: &mut PtyChildKiller) {
+    if let Some(child) = target.killer.as_mut() {
+        let _ = child.kill();
     }
 }
 
@@ -573,12 +738,165 @@ mod security_tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_worker_publishes_activity_after_native_cleanup() {
+        let store = crate::ToolSessionStore::default();
+        let id = halter_protocol::SessionId::new();
+        store.open_session(&id);
+        let mut activity = store.subscribe_activity();
+        let slot = store.pty_session(&id);
+        start_session(
+            slot.clone(),
+            PtyConfig {
+                command: "sleep 30".to_owned(),
+                cwd: None,
+                env: None,
+                cols: 120,
+                rows: 40,
+                timeout: None,
+            },
+            Arc::new(NoopToolEventSink),
+            store.process_lifetime(&id),
+            store.activity_sender(),
+        )
+        .await
+        .unwrap();
+        assert!(store.has_running_jobs(&id));
+        activity.borrow_and_update();
+        request_stop_session(&slot);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.has_running_jobs(&id) {
+                activity.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("PTY cleanup publishes completion without a join caller");
+        assert!(slot.lock().is_none());
+        store.shutdown_session(&id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panicking_output_sink_still_reaps_child_and_reader() {
+        struct PanickingSink;
+        impl crate::ToolEventSink for PanickingSink {
+            fn emit(&self, _: ToolRuntimeEvent) {
+                panic!("output delivery failed");
+            }
+        }
+
+        let lifetime = CancellationToken::new();
+        let config = PtyConfig {
+            command: "printf ready; sleep 30".to_owned(),
+            cwd: None,
+            env: None,
+            cols: 120,
+            rows: 40,
+            timeout: None,
+        };
+        let state = prepare_pty(&config, Arc::default(), &lifetime).unwrap();
+        let pid = state.child.pid.unwrap();
+        let (_control, receiver) = mpsc::channel();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_pty_loop(state, None, receiver, Arc::new(PanickingSink))
+        }));
+        assert!(result.is_err());
+        // SAFETY: signal zero probes only the child reaped by the guard.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leader_exit_stops_descendants_that_keep_terminal_open() {
+        let root = tempfile::tempdir().unwrap();
+        let config = PtyConfig {
+            command: "sleep 30 & printf '%s' \"$!\" > descendant; exit".to_owned(),
+            cwd: Some(root.path().to_string_lossy().into_owned()),
+            env: None,
+            cols: 120,
+            rows: 40,
+            timeout: None,
+        };
+        let state = prepare_pty(&config, Arc::default(), &CancellationToken::new()).unwrap();
+        let (_control, receiver) = mpsc::channel();
+        run_pty_loop(state, None, receiver, Arc::new(NoopToolEventSink)).unwrap();
+        let descendant: i32 = std::fs::read_to_string(root.path().join("descendant"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // Orphaned descendants are reaped by the OS rather than this worker.
+        while unsafe { libc::kill(descendant, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(CONTROL_POLL_INTERVAL);
+        }
+        let alive = unsafe { libc::kill(descendant, 0) } == 0;
+        if alive {
+            super::super::process::signal_process(descendant, KILL_SIGNAL);
+        }
+        assert!(!alive, "PTY descendant survived leader completion");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_shutdown_joins_even_when_slave_keeps_output_open() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let reader = prepare_reader(pair.master.as_ref()).unwrap();
+        let (output, _received) = mpsc::channel();
+        let reader = spawn_reader_thread(reader, output);
+        let began = Instant::now();
+        reader.finish().unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "reader cancellation cannot depend on slave EOF"
+        );
+        drop(pair);
+    }
+
+    #[tokio::test]
+    async fn aborted_stop_waiter_does_not_detach_native_worker() {
+        let (release, wait) = mpsc::channel();
+        let (control_tx, _control_rx) = mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            wait.recv().unwrap();
+            anyhow::Ok(())
+        });
+        let session = Arc::new(Mutex::new(Some(PtySessionHandle {
+            control_tx,
+            task: Arc::new(tokio::sync::Mutex::new(Some(task))),
+            generation: Arc::new(()),
+            termination: Arc::new(Mutex::new(PtyTerminationState::default())),
+            running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })));
+        // Each deadline drops a different waiter while the native worker is
+        // deliberately blocked. The next waiter must still join that worker.
+        for _ in 0..2 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), stop_session(&session))
+                    .await
+                    .is_err()
+            );
+        }
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), stop_session(&session))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     fn tool_context_with(policy: Arc<dyn ToolPolicy>) -> ToolContext {
+        let session_id = halter_protocol::SessionId::new();
+        let tool_sessions = Arc::new(ToolSessionStore::default());
+        tool_sessions.open_session(&session_id);
         ToolContext {
-            session_id: halter_protocol::SessionId::new(),
+            session_id,
             working_dir: std::env::temp_dir(),
             path_locks: Arc::new(PathLockMap::default()),
-            tool_sessions: Arc::new(ToolSessionStore::default()),
+            tool_sessions,
             snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
             cancel: CancellationToken::new(),
             emit: Arc::new(NoopToolEventSink),

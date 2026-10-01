@@ -227,6 +227,10 @@ async fn run_panel_turn(
             return None;
         }
     };
+    session
+        .services()
+        .tool_sessions
+        .open_session(session.session_id());
 
     let events = match session
         .submit_turn_with_cancel(Turn::user(user_text.as_str().to_owned()), cancel.clone())

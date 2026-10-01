@@ -923,6 +923,10 @@ async fn run_agent(
     };
     let initial_state = SessionState::default();
     let agent_session = create_session_seeded(services, init, initial_state, resources).await?;
+    agent_session
+        .services()
+        .tool_sessions
+        .open_session(agent_session.session_id());
     let payload_json = serde_json::to_string_pretty(&request.payload)?;
     let agent_cancel = cancel.child_token();
     let turn_cancel = agent_cancel.clone();

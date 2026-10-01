@@ -238,7 +238,7 @@ Internally this command does the following:
 2. builds a `Halter`
 3. creates `SessionInit::default()`
 4. reads `--prompt-file` when provided
-5. durably submits one `Message::user(task)` and reads its ID-correlated outcome
+5. durably submits one `Message::user(task)` and observes foreground execution
 6. prints either the final assistant message or the full event stream
 
 ### Output modes
@@ -318,11 +318,11 @@ RUST_LOG=info halter run \
 
 ### Failure behavior
 
-The command succeeds when its submitted ID receives `InputSettled` with a
-`Completed` outcome. It exits with an error on failure, interruption, or rejection.
+The command prints the last assistant response when its foreground execution
+stops. It exits with an error on execution failure, interruption, or input rejection.
 `InputDeferred` also exits with an error explaining that input remains queued;
-it does not mean the input was discarded. Activity changes and outcomes for
-other inputs do not finish the command.
+it does not mean the input was discarded. This command does not wait for background
+processes or promise that all work in the session has finished.
 The submission receipt identifies the accepted log sequence, so buffered events
 from before that acceptance cannot finish the command either.
 

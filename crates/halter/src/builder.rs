@@ -1236,9 +1236,7 @@ mod tests {
         ModelConfig, OpenAiOAuthConfig, ProviderConfig, RequestRetryConfig, ResilienceConfig,
         ResilienceTimeoutsConfig,
     };
-    use halter_protocol::{
-        Message, PluginManifest, ReasoningEffort, SessionEventPayload, SessionStatus, SkillId,
-    };
+    use halter_protocol::{Message, PluginManifest, ReasoningEffort, SessionStatus, SkillId};
     use tempfile::tempdir;
 
     use super::*;
@@ -1696,7 +1694,7 @@ mod tests {
             .expect("create session");
 
         assert_eq!(store.create_calls(), 1);
-        assert_eq!(store.commit_calls(), 2);
+        assert_eq!(store.commit_calls(), 1);
     }
 
     #[tokio::test]
@@ -1718,26 +1716,15 @@ mod tests {
         let session_id = session.id().clone();
         let stale_handle = session.clone();
 
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let event = events.next().await.expect("open stream").expect("event");
-                if matches!(
-                    event.payload,
-                    SessionEventPayload::SessionStatusChanged {
-                        status: SessionStatus::Idle
-                    }
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("initial idle status");
+        assert_eq!(session.status(), SessionStatus::Idle);
+        let status = session.subscribe_status();
         assert!(
             harness.resume_session(&session_id).await.is_err(),
             "an open conversation has one driver"
         );
         session.shutdown(None).await.expect("close session");
+        assert_eq!(session.status(), SessionStatus::Closed);
+        assert_eq!(*status.borrow(), SessionStatus::Closed);
         tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events.next().await {
                 event.expect("shutdown event");
@@ -1746,7 +1733,7 @@ mod tests {
         .await
         .expect("closed stream");
 
-        let (reopened, mut reopened_events) = harness
+        let (reopened, _reopened_events) = harness
             .resume_session(&session_id)
             .await
             .expect("reopen stored session");
@@ -1757,25 +1744,8 @@ mod tests {
                 .await
                 .is_err()
         );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let event = reopened_events
-                    .next()
-                    .await
-                    .expect("reopened stream")
-                    .expect("event");
-                if matches!(
-                    event.payload,
-                    SessionEventPayload::SessionStatusChanged {
-                        status: SessionStatus::Idle
-                    }
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("reopened idle status");
+        assert_eq!(reopened.status(), SessionStatus::Idle);
+        assert_eq!(stale_handle.status(), SessionStatus::Closed);
         reopened
             .shutdown(None)
             .await

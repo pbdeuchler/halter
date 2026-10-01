@@ -155,6 +155,13 @@ async fn action_navigate(context: &ToolContext, input: &Value) -> anyhow::Result
 
     let session_handle = context.tool_sessions.browser_session(&context.session_id);
     let mut guard = session_handle.lock().await;
+    anyhow::ensure!(
+        !context
+            .tool_sessions
+            .process_lifetime(&context.session_id)
+            .is_cancelled(),
+        "failed to open browser: session is closed"
+    );
     let session = ensure_session(&mut guard).await?;
     session
         .page()

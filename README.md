@@ -47,21 +47,17 @@ async fn main() -> anyhow::Result<()> {
     let harness = Halter::from_config_file("halter.toml").await?;
     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 
-    let submission = session.submit(Message::user("Summarize the session persistence design")).await?;
-    while let Some(event) = events.next().await {
-        let event = event?;
-        if event.session_id != *session.id() || event.sequence() < submission.sequence {
-            continue;
+    let listener = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            println!("{:?}", event?.payload);
         }
-        println!("{:?}", event.payload);
-        match event.payload {
-            SessionEventPayload::InputSettled { message_id: id, .. }
-            | SessionEventPayload::InputRejected { message_id: id, .. }
-            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
-            _ => {}
-        }
-    }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    session.submit(Message::user("Summarize the session persistence design")).await?;
+    tokio::signal::ctrl_c().await?;
     session.shutdown(None).await?;
+    listener.await??;
 
     Ok(())
 }
@@ -74,7 +70,7 @@ This code does all of the following:
 - builds providers, tools, hooks, policy, and session storage
 - creates a runtime
 - creates a session
-- durably accepts input and streams its outcome or deferral
+- durably accepts input and streams session events until shutdown
 
 ### Detailed events
 
@@ -93,28 +89,27 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-    let submission = session.submit(Message::user("List the major crates in this repo")).await?;
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        if event.session_id != *session.id() || event.sequence() < submission.sequence {
-            continue;
-        }
-        match event.payload {
-            SessionEventPayload::DeltaItem { delta } => print!("{}", delta.text),
-            SessionEventPayload::TurnCompleted { usage, .. } => {
-                println!("\nusage: in={} out={}", usage.input_tokens, usage.output_tokens);
+    let listener = tokio::spawn(async move {
+        while let Some(event) = stream.next().await {
+            match event?.payload {
+                SessionEventPayload::DeltaItem { delta } => print!("{}", delta.text),
+                SessionEventPayload::ToolOutput { chunk, .. } => print!("{chunk}"),
+                SessionEventPayload::InputDelivered { message_id } => {
+                    println!("input {message_id} entered history");
+                }
+                SessionEventPayload::InputRejected { message_id, reason } => {
+                    eprintln!("input {message_id} rejected: {reason}");
+                }
+                _ => {}
             }
-            SessionEventPayload::InputSettled { message_id: id, .. }
-            | SessionEventPayload::InputRejected { message_id: id, .. }
-            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
-            SessionEventPayload::TurnFailed { error, .. } => {
-                eprintln!("turn failed: {error}");
-            }
-            _ => {}
         }
-    }
+        Ok::<(), anyhow::Error>(())
+    });
 
+    session.submit(Message::user("List the major crates in this repo")).await?;
+    tokio::signal::ctrl_c().await?;
     session.shutdown(None).await?;
+    listener.await??;
 
     Ok(())
 }
@@ -865,20 +860,17 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
-    let submission = session.submit(Message::user("Describe the active runtime and available skills")).await?;
-    while let Some(event) = events.next().await {
-        let event = event?;
-        if event.session_id != *session.id() || event.sequence() < submission.sequence {
-            continue;
+    let listener = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            println!("{:?}", event?.payload);
         }
-        match event.payload {
-            SessionEventPayload::InputSettled { message_id: id, .. }
-            | SessionEventPayload::InputRejected { message_id: id, .. }
-            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
-            _ => {}
-        }
-    }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    session.submit(Message::user("Describe the active runtime and available skills")).await?;
+    tokio::signal::ctrl_c().await?;
     session.shutdown(None).await?;
+    listener.await??;
 
     Ok(())
 }
@@ -1092,24 +1084,64 @@ resources. The stored conversation can be reopened; old handles stay closed.
 Reopening restores history and pending input without rerunning tools or launching
 old processes. Dropping an event stream does not stop execution.
 
-The stream stays open through idle periods and interruptions. Consume
-`SessionStatusChanged` events to track `Running`, `Idle`, and `Closed`; a newly
-opened stream includes its initial idle status. Provider deltas and tool output
-retain their existing buffering behavior.
+Keep a session handle to submit more input across idle periods. Dropping its last
+clone releases the driver after foreground work, runnable queued input, background
+jobs, and subagents finish. Active work continues normally. Event streams and status
+receivers do not retain the driver. Release runs cleanup and the `SessionEnd` hook
+with reason `session_released`; history and deferred input remain available for resume.
+
+Release also closes child agents, including completed ones. After reopening the
+parent, spawn new child agents; the previous children's conversations remain
+stored and can be reopened separately by session ID.
+
+A persistent PTY, shell job such as `sleep infinity &`, or managed background
+process can keep a session open indefinitely after its last handle is dropped.
+Retain a handle when you need to stop that work explicitly. Otherwise, runtime
+shutdown is the remaining way to close it.
+
+The stream stays open through idle periods and interruptions. Read
+`session.status()` for current foreground activity or use
+`session.subscribe_status()` to watch `Running`, `Idle`, and `Closed`. This status
+belongs to the live handle and is not persisted in the log. A watch receiver starts
+with the current value and may coalesce changes. An idle session may still own
+background processes. Provider deltas and tool output retain their existing
+buffering behavior.
+
+When a live stream closes cleanly, it emits one transient
+`SessionStatusChanged { status: Closed }` after its final committed event, then ends.
+This notification has sequence zero and does not appear in replay.
+
+```rust
+let mut activity = session.subscribe_status();
+loop {
+    let current = *activity.borrow_and_update();
+    println!("session activity: {current:?}");
+    if current == SessionStatus::Closed || activity.changed().await.is_err() {
+        break;
+    }
+}
+```
 
 `submit` returns `Submission { message_id, sequence }` after acceptance commits.
-For completion, ignore events before `submission.sequence`, then match
-`submission.message_id` in `InputSettled`; its outcome is `Completed`, `Failed`,
-or `Interrupted`. `InputRejected` reports a hook
-decision, while `InputDeferred` means that input remains queued. Several steering
-messages can share one execution outcome and assistant response. Activity changes
-such as `Running` and `Idle` also cover compaction and do not prove input completed.
+`InputDelivered` records when accepted input enters conversation history.
+`InputRejected` records removal without delivery; `InputDeferred` records input
+that remains queued. These events describe what happened to the input, without
+promising a final reply or completion of background work. Several steering messages
+can influence the same foreground execution.
+
+An input deferred with `ExecutionFailed` requires an explicit same-ID retry;
+unrelated new messages skip it. `ExecutionStopped` marks untouched followers,
+which remain eligible when a later submission starts foreground work.
 
 When retrying a queued message with the same ID, the receipt identifies its fresh
 `InputAccepted` sequence. Ignore earlier events on a retained stream. Retry
 preserves the original contents and does not duplicate the inbox entry.
 Submitting an already
-settled or rejected ID starts no new work; read its outcome with `replay()`.
+delivered or rejected ID starts no new work; read its records with `replay()`.
+To remove queued input, call `session.discard(&message_id)` while idle. It records
+`InputRejected` and returns whether an entry was removed. Use `interrupt(None)`
+first if foreground work is active. Retained deferred entries count toward inbox
+capacity; discarding unwanted input releases its slot.
 Pass `Some(duration)` to `interrupt` or `shutdown` to set a cooperative cleanup
 deadline; `None` waits without a deadline. Expiry returns `SessionError::TimedOut`
 and requests forced recovery. Call the control method again with `None` to

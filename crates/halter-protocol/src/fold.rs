@@ -35,8 +35,6 @@
 //! - `pending_inputs` — queued by [`SessionEventPayload::InputAccepted`],
 //!   removed by matching user `MessageItem` delivery or `InputRejected`.
 //!   Context rewrites leave this inbox intact.
-//! - `session_status` — replaced by
-//!   [`SessionEventPayload::SessionStatusChanged`].
 //!
 //! Runtime bookkeeping fields (`pending_tool_calls`, `fired_hook_ids`,
 //! `appended_prompt_segments`, `lineage`, hook latches, and
@@ -73,9 +71,6 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
             state
                 .pending_inputs
                 .retain(|message| &message.id != message_id);
-        }
-        SessionEventPayload::SessionStatusChanged { status } => {
-            state.session_status = *status;
         }
         SessionEventPayload::MessageItem { message }
         | SessionEventPayload::MessageRecorded { message } => {
@@ -125,8 +120,9 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         SessionEventPayload::ContextCompacted { effects: None, .. }
         | SessionEventPayload::SessionStarted
         | SessionEventPayload::SessionResumed
-        | SessionEventPayload::InputSettled { .. }
+        | SessionEventPayload::InputDelivered { .. }
         | SessionEventPayload::InputDeferred { .. }
+        | SessionEventPayload::SessionStatusChanged { .. }
         | SessionEventPayload::Warning { .. }
         | SessionEventPayload::TurnStarted { .. }
         | SessionEventPayload::DeltaItem { .. }
@@ -176,7 +172,6 @@ pub fn fold_events(mut state: SessionState, events: &[SessionEvent]) -> SessionS
 pub fn covered_state_matches(a: &SessionState, b: &SessionState) -> bool {
     a.messages == b.messages
         && a.pending_inputs == b.pending_inputs
-        && a.session_status == b.session_status
         && a.compacted_prefix == b.compacted_prefix
         && a.usage_so_far == b.usage_so_far
         && a.token_ledger == b.token_ledger
@@ -316,10 +311,9 @@ mod tests {
                 vec![],
             ),
             (
-                "settlement is an outcome rather than inbox delivery",
-                SessionEventPayload::InputSettled {
+                "delivery notification leaves the transcript transition to MessageItem",
+                SessionEventPayload::InputDelivered {
                     message_id: first.id.clone(),
-                    outcome: crate::InputOutcome::Completed,
                 },
                 vec![first.clone(), second.clone()],
                 vec![],
@@ -353,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn context_rewrites_preserve_pending_input_and_session_status() {
+    fn context_rewrites_preserve_pending_input() {
         let pending = UserMessage::text("keep the public API");
         let window = vec![Message::user("rewritten context")];
         let effects = CompactionEventEffects {
@@ -382,7 +376,6 @@ mod tests {
         for payload in cases {
             let mut state = SessionState {
                 pending_inputs: vec![pending.clone()],
-                session_status: SessionStatus::Running,
                 ..SessionState::default()
             };
             state.append(Message::user("old context"));
@@ -393,12 +386,11 @@ mod tests {
                 std::slice::from_ref(&pending),
                 "{payload:?}"
             );
-            assert_eq!(state.session_status, SessionStatus::Running, "{payload:?}");
         }
     }
 
     #[test]
-    fn session_lifecycle_status_replays_without_discarding_the_inbox() {
+    fn legacy_session_status_events_leave_durable_state_untouched() {
         let pending = UserMessage::text("continue later");
         let mut state = SessionState {
             pending_inputs: vec![pending.clone()],
@@ -413,8 +405,8 @@ mod tests {
                 &mut state,
                 &SessionEventPayload::SessionStatusChanged { status },
             );
-            assert_eq!(state.session_status, status);
             assert_eq!(state.pending_inputs, std::slice::from_ref(&pending));
+            assert_eq!(state.messages, Vec::<Message>::new());
         }
     }
 
@@ -834,12 +826,6 @@ mod tests {
             ..base.clone()
         };
         assert!(!covered_state_matches(&base, &inbox_differs));
-
-        let status_differs = SessionState {
-            session_status: SessionStatus::Closed,
-            ..base.clone()
-        };
-        assert!(!covered_state_matches(&base, &status_differs));
     }
 
     fn fold_payload_strategy() -> impl Strategy<Value = SessionEventPayload> {

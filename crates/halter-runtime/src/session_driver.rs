@@ -1,21 +1,22 @@
 //! A session owns admission, its durable inbox, and its live execution.
 // pattern: Imperative Shell
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use halter_protocol::{
-    InputDeferredReason, InputOutcome, Message, MessageId, PendingEvent, ResourceSnapshot,
-    SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, SessionStatus,
-    Turn, TurnId, UserMessage,
+    InputDeferredReason, Message, MessageId, PendingEvent, ResourceSnapshot, SessionBlueprint,
+    SessionEvent, SessionEventPayload, SessionId, SessionState, SessionStatus, Turn, TurnId,
+    UserMessage,
 };
 use halter_session::{SessionStore, StoredSession};
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -50,9 +51,22 @@ pub enum SessionError {
 
 type Reply<T> = oneshot::Sender<Result<T, SessionError>>;
 
-/// Durable admission receipt. Ignore events below `sequence` when waiting for
-/// this attempt's outcome. Repeating an already-settled ID returns its previous
-/// receipt; its outcome remains available through replay.
+impl SessionError {
+    /// The original operation failure, including its concrete error type.
+    pub fn operation_error(&self) -> Option<&anyhow::Error> {
+        let Self::Operation(error) = self else {
+            return None;
+        };
+        let mut original = error;
+        while let Some(shared) = original.downcast_ref::<SharedOperationError>() {
+            original = shared.0.as_ref();
+        }
+        Some(original)
+    }
+}
+
+/// Durable admission receipt. This acknowledges queuing, not completion of
+/// the request or background work. Repeating a delivered ID returns its receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Submission {
     pub message_id: MessageId,
@@ -60,10 +74,24 @@ pub struct Submission {
 }
 
 /// A cloneable connection to one live incarnation of a stored session.
-/// Dropping a handle or event stream does not stop execution.
+/// Once every handle is dropped, the session closes after foreground work,
+/// background jobs and subagents settle. Event streams do not keep it open.
 #[derive(Clone)]
 pub struct SessionHandle {
     control: Arc<DriverControl>,
+    _token: Arc<HandleToken>,
+}
+
+// Only public handles hold this token. Internal control references and event
+// streams cannot revive handle ownership after the final handle is dropped.
+struct HandleToken {
+    stop_tx: mpsc::UnboundedSender<Command>,
+}
+
+impl Drop for HandleToken {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(Command::Released);
+    }
 }
 
 struct DriverControl {
@@ -71,9 +99,13 @@ struct DriverControl {
     tx: mpsc::Sender<Command>,
     stop_tx: mpsc::UnboundedSender<Command>,
     closed: CancellationToken,
+    // Published before releasing the incarnation reservation. Old streams
+    // must never replay events appended by a subsequently opened driver.
+    final_head: AtomicU64,
     services: Arc<RuntimeServices>,
     forwarded: broadcast::Sender<SessionEvent>,
-    failure: std::sync::Mutex<Option<String>>,
+    status: watch::Sender<SessionStatus>,
+    failure: std::sync::Mutex<Option<SharedOperationError>>,
 }
 
 impl SessionHandle {
@@ -85,6 +117,26 @@ impl SessionHandle {
     #[must_use]
     pub fn session_id(&self) -> &SessionId {
         self.id()
+    }
+
+    /// Current foreground activity. Background processes may run while idle.
+    #[must_use]
+    pub fn status(&self) -> SessionStatus {
+        *self.control.status.borrow()
+    }
+
+    /// Observe current activity. Intermediate changes may be coalesced; this
+    /// is not an acknowledgement of delivery or completion of submitted input.
+    #[must_use]
+    pub fn subscribe_status(&self) -> watch::Receiver<SessionStatus> {
+        self.control.status.subscribe()
+    }
+
+    /// Remove an input that is still queued. Requires an idle session to avoid
+    /// racing delivery. Returns false if it has already left the inbox.
+    pub async fn discard(&self, message_id: &MessageId) -> Result<bool, SessionError> {
+        self.request(|reply| Command::Discard(message_id.clone(), reply))
+            .await
     }
 
     /// Record input before acknowledging it. Active execution sees it at its
@@ -101,14 +153,10 @@ impl SessionHandle {
     /// `None` waits without a deadline. A timeout requests forced recovery;
     /// call with `None` to await its settlement.
     pub async fn interrupt(&self, timeout: Option<Duration>) -> Result<(), SessionError> {
-        let deadline = timeout
-            .map(|duration| {
-                Instant::now().checked_add(duration).ok_or_else(|| {
-                    SessionError::Operation(anyhow::anyhow!("invalid session timeout"))
-                })
-            })
-            .transpose()?;
-        let response = self.enqueue_stop(|reply| Command::Interrupt { deadline, reply })?;
+        let deadline = timeout_deadline(timeout)?;
+        let response = self
+            .control
+            .enqueue_stop(|reply| Command::Interrupt { deadline, reply })?;
         let request = async { response.await.map_err(|_| SessionError::Closed)? };
         match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, request)
@@ -122,71 +170,7 @@ impl SessionHandle {
     /// `None` waits without a deadline. A timeout requests forced cleanup and
     /// returns `TimedOut`; the session stays fenced until cleanup settles.
     pub async fn shutdown(&self, timeout: Option<Duration>) -> Result<(), SessionError> {
-        let deadline = timeout
-            .map(|duration| {
-                Instant::now().checked_add(duration).ok_or_else(|| {
-                    SessionError::Operation(anyhow::anyhow!("invalid session timeout"))
-                })
-            })
-            .transpose()?;
-        let response = if self.control.closed.is_cancelled() {
-            None
-        } else {
-            match self.enqueue_stop(|reply| Command::Shutdown { deadline, reply }) {
-                Ok(response) => Some(response),
-                Err(SessionError::Closed) => None,
-                Err(error) => return Err(error),
-            }
-        };
-        let cleanup = self.shutdown_until(response);
-        match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, cleanup)
-                .await
-                .unwrap_or(Err(SessionError::TimedOut)),
-            None => cleanup.await,
-        }
-    }
-
-    async fn shutdown_until(
-        &self,
-        response: Option<oneshot::Receiver<Result<(), SessionError>>>,
-    ) -> Result<(), SessionError> {
-        if let Some(response) = response {
-            match response.await.unwrap_or(Err(SessionError::Closed)) {
-                Err(SessionError::Closed) => self.control.closed.cancelled().await,
-                result => return result,
-            }
-        } else if !self.control.closed.is_cancelled() {
-            self.control.closed.cancelled().await;
-        }
-        match self
-            .control
-            .failure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            Some(error) => Err(SessionError::Operation(anyhow::anyhow!("{error}"))),
-            None => Ok(()),
-        }
-    }
-
-    fn enqueue_stop(
-        &self,
-        command: impl FnOnce(Reply<()>) -> Command,
-    ) -> Result<oneshot::Receiver<Result<(), SessionError>>, SessionError> {
-        if self.control.closed.is_cancelled() {
-            return Err(SessionError::Closed);
-        }
-        let (reply, response) = oneshot::channel();
-        let command = command(reply);
-        // Stop admission must survive a timed-out caller and cannot wait for
-        // ordinary inbox capacity. Its separate lane also preserves call order.
-        self.control
-            .stop_tx
-            .send(command)
-            .map_err(|_| SessionError::Closed)?;
-        Ok(response)
+        self.control.shutdown(timeout).await
     }
 
     /// Compact an idle session explicitly.
@@ -225,6 +209,70 @@ impl SessionHandle {
             .await
             .map_err(|_| SessionError::Closed)?;
         response.await.map_err(|_| SessionError::Closed)?
+    }
+}
+
+impl DriverControl {
+    // Runtime shutdown holds controls directly; it must not create a new
+    // public handle after handle ownership has ended.
+    async fn shutdown(&self, timeout: Option<Duration>) -> Result<(), SessionError> {
+        let deadline = timeout_deadline(timeout)?;
+        let response = if self.closed.is_cancelled() {
+            None
+        } else {
+            match self.enqueue_stop(|reply| Command::Shutdown { deadline, reply }) {
+                Ok(response) => Some(response),
+                Err(SessionError::Closed) => None,
+                Err(error) => return Err(error),
+            }
+        };
+        let cleanup = self.shutdown_until(response);
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, cleanup)
+                .await
+                .unwrap_or(Err(SessionError::TimedOut)),
+            None => cleanup.await,
+        }
+    }
+
+    async fn shutdown_until(
+        &self,
+        response: Option<oneshot::Receiver<Result<(), SessionError>>>,
+    ) -> Result<(), SessionError> {
+        if let Some(response) = response {
+            match response.await.unwrap_or(Err(SessionError::Closed)) {
+                Err(SessionError::Closed) => self.closed.cancelled().await,
+                result => return result,
+            }
+        } else if !self.closed.is_cancelled() {
+            self.closed.cancelled().await;
+        }
+        match self
+            .failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            Some(error) => Err(SessionError::Operation(anyhow::Error::new(error.clone()))),
+            None => Ok(()),
+        }
+    }
+
+    fn enqueue_stop(
+        &self,
+        command: impl FnOnce(Reply<()>) -> Command,
+    ) -> Result<oneshot::Receiver<Result<(), SessionError>>, SessionError> {
+        if self.closed.is_cancelled() {
+            return Err(SessionError::Closed);
+        }
+        let (reply, response) = oneshot::channel();
+        let command = command(reply);
+        // Stop admission must survive a timed-out caller and cannot wait for
+        // ordinary inbox capacity. Its separate lane also preserves call order.
+        self.stop_tx
+            .send(command)
+            .map_err(|_| SessionError::Closed)?;
+        Ok(response)
     }
 }
 
@@ -307,19 +355,17 @@ impl SessionDrivers {
     }
 
     pub(crate) async fn close_all(&self, deadline: Option<Instant>) -> bool {
-        let handles = self
+        let controls = self
             .lock_entries()
             .values()
             .filter_map(|entry| match entry {
-                DriverSlot::Open(driver) | DriverSlot::Failed(driver) => {
-                    driver.upgrade().map(|control| SessionHandle { control })
-                }
+                DriverSlot::Open(driver) | DriverSlot::Failed(driver) => driver.upgrade(),
                 DriverSlot::Opening(_) => None,
             })
             .collect::<Vec<_>>();
-        futures::future::join_all(handles.into_iter().map(|handle| async move {
-            if let Err(error) = handle.shutdown(deadline.map(|d| d.saturating_duration_since(Instant::now()))).await {
-                tracing::warn!(session_id = %handle.id(), %error, "session cleanup failed during runtime shutdown");
+        futures::future::join_all(controls.into_iter().map(|control| async move {
+            if let Err(error) = control.shutdown(deadline.map(|d| d.saturating_duration_since(Instant::now()))).await {
+                tracing::warn!(session_id = %control.id, %error, "session cleanup failed during runtime shutdown");
                 return matches!(error, SessionError::TimedOut);
             }
             false
@@ -349,9 +395,14 @@ impl SessionDrivers {
             tx: tx.clone(),
             stop_tx,
             closed: CancellationToken::new(),
+            final_head: AtomicU64::new(u64::MAX),
             services: services.clone(),
             forwarded: broadcast::channel(FORWARDED_EVENT_CAPACITY).0,
+            status: watch::channel(SessionStatus::Idle).0,
             failure: std::sync::Mutex::new(None),
+        });
+        let token = Arc::new(HandleToken {
+            stop_tx: control.stop_tx.clone(),
         });
         let events = session_events(control.clone(), after);
         let store = Arc::new(SessionInbox { tx });
@@ -362,74 +413,51 @@ impl SessionDrivers {
             subagents,
             store: self.store.clone(),
             control: control.clone(),
+            handles: Arc::downgrade(&token),
             rx,
             stop_rx,
             head: stored.head_sequence,
             last_state_commit: stored.head_sequence,
-            pending: stored.state.pending_inputs,
-            status: SessionStatus::Idle,
-            active: None,
-            wake_requested: false,
-            closing: false,
-            interrupt_waiters: Vec::new(),
-            shutdown_waiters: Vec::new(),
-            cancel_deadline: None,
-            shutdown_deadline: None,
-            accepted: HashMap::new(),
-            delivered: HashSet::new(),
-            deferred: HashSet::new(),
+            inbox: Inbox {
+                pending: stored.state.pending_inputs,
+                ..Inbox::default()
+            },
+            phase: Phase::Idle,
         };
-        let mut delivered = HashSet::new();
-        let mut unsettled = HashMap::new();
         let history = match history {
             Some(history) => history,
             None => services.sessions.replay(&id).await?,
         };
         for event in history {
             let sequence = event.sequence();
-            if let Some(outcome) = input_outcome(&event.payload) {
-                for message_id in delivered.drain() {
-                    unsettled.insert(message_id, outcome.clone());
-                }
-            }
             match event.payload {
                 SessionEventPayload::InputAccepted { message } => {
-                    driver.accepted.insert(message.id, sequence);
+                    driver.inbox.deferred.remove(&message.id);
+                    driver.inbox.accepted.insert(message.id, sequence);
                 }
-                SessionEventPayload::MessageItem {
-                    message: Message::User(message),
-                } if driver.accepted.contains_key(&message.id) => {
-                    delivered.insert(message.id);
+                SessionEventPayload::InputDeferred { message_id, reason } => {
+                    driver.inbox.deferred.insert(message_id, reason);
                 }
-                SessionEventPayload::InputSettled { message_id, .. } => {
-                    unsettled.remove(&message_id);
+                SessionEventPayload::InputDelivered { message_id }
+                | SessionEventPayload::InputRejected { message_id, .. } => {
+                    driver.inbox.deferred.remove(&message_id);
                 }
                 _ => {}
             }
         }
-        // Resume may have recovered a terminal event before the driver existed.
-        // Complete its input correlation from the same durable history.
-        let mut recovered = unsettled.into_iter().collect::<Vec<_>>();
-        recovered.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0));
-        for (message_id, outcome) in recovered {
-            driver
-                .commit_payload(SessionEventPayload::InputSettled {
-                    message_id,
-                    outcome,
-                })
-                .await?;
-        }
-        driver.set_status(SessionStatus::Idle).await?;
+        driver
+            .inbox
+            .deferred
+            .retain(|id, _| driver.inbox.pending.iter().any(|m| &m.id == id));
         driver.defer_pending(InputDeferredReason::Resumed).await?;
         {
             let mut entries = self.lock_entries();
-            // Shutdown cancels the runtime before collecting drivers. Under
-            // this lock an opener either joins that collection or is refused.
             if services.turn_registry.is_shutting_down() {
                 return Err(SessionError::Closed);
             }
             entries.insert(id.clone(), DriverSlot::Open(Arc::downgrade(&control)));
         }
+        services.tool_sessions.open_session(&id);
         let registry = self.clone();
         let task_control = control.clone();
         tokio::spawn(async move {
@@ -437,11 +465,14 @@ impl SessionDrivers {
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("session driver panicked")));
-            if let Err(error) = &result {
+            let failure = result
+                .err()
+                .map(|error| SharedOperationError(Arc::new(error)));
+            if let Some(error) = &failure {
                 *task_control
                     .failure
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner()) = Some(format!("{error:#}"));
+                    .unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                 tracing::error!(session_id = %id, %error, "session driver failed");
                 driver.rx.close();
                 driver.stop_rx.close();
@@ -455,46 +486,31 @@ impl SessionDrivers {
                     id.clone(),
                     DriverSlot::Failed(Arc::downgrade(&task_control)),
                 );
-                // Signal resources before executor joins or recovery writes,
-                // which may still be waiting on uncooperative plugin code.
-                driver.services.tool_sessions.force_stop_session(&id).await;
-                driver.subagents.force_close_session(&id).await;
-                if let Some(active) = driver.active.take() {
-                    active.cancel.cancel();
-                    active.task.abort();
-                    let _ = active.task.await;
-                    if let Some(turn_id) = &active.turn_id {
-                        // The actor cannot serve more commits after failure.
-                        // The Failed slot routes recovery directly to storage.
-                        if let Ok(executor) =
-                            SessionExecutor::new(driver.services.clone(), id.clone())
-                        {
-                            let _ = executor.force_interrupt_turn(turn_id).await;
-                        }
-                    }
-                }
-                let _ = driver
-                    .subagents
-                    .close_session_with_deadline(&id, driver.shutdown_deadline)
-                    .await;
-                let _ = driver.services.tool_sessions.shutdown_session(&id).await;
-                let _ = driver.executor.shutdown("session_failed").await;
+                driver.recover_failed_driver().await;
             }
+            let replies = driver
+                .phase
+                .stop_mut()
+                .map(StopRequest::take_replies)
+                .unwrap_or_default();
+            task_control
+                .final_head
+                .store(driver.head, Ordering::Release);
             registry.release(&id);
+            task_control.status.send_replace(SessionStatus::Closed);
             task_control.closed.cancel();
-            for reply in driver
-                .shutdown_waiters
-                .drain(..)
-                .chain(driver.interrupt_waiters.drain(..))
-            {
-                let response = match &result {
-                    Ok(()) => Ok(()),
-                    Err(error) => Err(SessionError::Operation(anyhow::anyhow!("{error:#}"))),
-                };
-                let _ = reply.send(response);
-            }
+            respond(
+                replies,
+                failure.map_or(Ok(()), |error| Err(anyhow::Error::new(error))),
+            );
         });
-        Ok((SessionHandle { control }, events))
+        Ok((
+            SessionHandle {
+                control,
+                _token: token,
+            },
+            events,
+        ))
     }
 }
 
@@ -574,6 +590,18 @@ pub(crate) struct SessionInbox {
 }
 
 impl SessionInbox {
+    /// Record which input owns a failing admission hook. The actor serializes
+    /// this with stop requests, so a stopped executor cannot claim more work.
+    pub(crate) async fn attempt(&self, message_id: MessageId) -> anyhow::Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Command::AttemptInput(message_id, reply))
+            .await
+            .map_err(|_| anyhow::anyhow!("session is closed"))?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("session is closed"))?
+    }
     /// Await the actor after the executor has stopped sending writes. In-flight
     /// blocking storage operations must finish before recovery reloads state.
     pub(crate) async fn synchronize(&self) -> anyhow::Result<()> {
@@ -593,7 +621,10 @@ impl SessionInbox {
 }
 
 enum Command {
+    Released,
     Submit(UserMessage, Reply<Submission>),
+    Discard(MessageId, Reply<bool>),
+    AttemptInput(MessageId, oneshot::Sender<anyhow::Result<()>>),
     Interrupt {
         deadline: Option<Instant>,
         reply: Reply<()>,
@@ -620,19 +651,179 @@ enum Command {
 struct Active {
     cancel: CancellationToken,
     task: JoinHandle<anyhow::Result<TaskOutcome>>,
-    kind: Work,
-    turn_id: Option<TurnId>,
+}
+
+struct Execution {
+    active: Active,
+    turn_id: TurnId,
+    attempted_input: MessageId,
+}
+
+struct Compaction {
+    active: Active,
+    reply: Reply<()>,
 }
 
 enum TaskOutcome {
     Complete,
     TurnFailed,
+    // No durable TurnStarted was observed: execution has not begun.
+    NotStarted(anyhow::Error),
 }
 
-enum Work {
-    Execution,
-    Compact(Reply<()>),
-    Cleanup,
+enum RunningWork {
+    Execution(Execution),
+    Compaction(Compaction),
+}
+
+impl RunningWork {
+    fn active_mut(&mut self) -> &mut Active {
+        match self {
+            Self::Execution(work) => &mut work.active,
+            Self::Compaction(work) => &mut work.active,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopIntent {
+    Interrupt,
+    Shutdown,
+    Release,
+}
+
+impl StopIntent {
+    fn is_shutdown(self) -> bool {
+        self != Self::Interrupt
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Release => "session_released",
+            Self::Shutdown | Self::Interrupt => "session_closed",
+        }
+    }
+}
+
+struct StopRequest {
+    intent: StopIntent,
+    deadline: Option<Instant>,
+    interrupt_replies: Vec<Reply<()>>,
+    shutdown_replies: Vec<Reply<()>>,
+}
+
+impl StopRequest {
+    fn new(intent: StopIntent, deadline: Option<Instant>) -> Self {
+        Self {
+            intent,
+            deadline,
+            interrupt_replies: Vec::new(),
+            shutdown_replies: Vec::new(),
+        }
+    }
+
+    fn add_deadline(&mut self, deadline: Option<Instant>) {
+        if let Some(deadline) = deadline {
+            self.deadline = Some(self.deadline.map_or(deadline, |old| old.min(deadline)));
+        }
+    }
+
+    fn take_replies(&mut self) -> Vec<Reply<()>> {
+        self.interrupt_replies
+            .drain(..)
+            .chain(self.shutdown_replies.drain(..))
+            .collect()
+    }
+}
+
+// Each phase owns its work and the callers waiting for that work to settle.
+// A shutdown can upgrade Stopping, but cleanup starts exactly once.
+enum Phase {
+    Idle,
+    Executing(Execution),
+    Compacting(Compaction),
+    Stopping {
+        work: RunningWork,
+        stop: StopRequest,
+    },
+    Closing {
+        active: Active,
+        stop: StopRequest,
+    },
+    Closed(StopRequest),
+}
+
+impl Phase {
+    fn status(&self) -> SessionStatus {
+        match self {
+            Self::Idle => SessionStatus::Idle,
+            Self::Closed(_) => SessionStatus::Closed,
+            _ => SessionStatus::Running,
+        }
+    }
+
+    fn active_mut(&mut self) -> Option<&mut Active> {
+        match self {
+            Self::Executing(work) => Some(&mut work.active),
+            Self::Compacting(work) => Some(&mut work.active),
+            Self::Stopping { work, .. } => Some(work.active_mut()),
+            Self::Closing { active, .. } => Some(active),
+            Self::Idle | Self::Closed(_) => None,
+        }
+    }
+
+    fn stop_mut(&mut self) -> Option<&mut StopRequest> {
+        match self {
+            Self::Stopping { stop, .. } | Self::Closing { stop, .. } | Self::Closed(stop) => {
+                Some(stop)
+            }
+            _ => None,
+        }
+    }
+
+    fn is_closing(&self) -> bool {
+        matches!(self, Self::Closing { .. } | Self::Closed(_))
+            || matches!(self, Self::Stopping { stop, .. } if stop.intent.is_shutdown())
+    }
+
+    fn attempted_input(&self) -> Option<&MessageId> {
+        match self {
+            Self::Executing(work)
+            | Self::Stopping {
+                work: RunningWork::Execution(work),
+                ..
+            } => Some(&work.attempted_input),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Inbox {
+    pending: Vec<UserMessage>,
+    accepted: HashMap<MessageId, u64>,
+    deferred: HashMap<MessageId, InputDeferredReason>,
+}
+
+impl Inbox {
+    fn ready(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|message| !self.deferred.contains_key(&message.id))
+    }
+
+    fn deliverable(&self) -> Vec<UserMessage> {
+        self.pending
+            .iter()
+            .filter(|message| {
+                !matches!(
+                    self.deferred.get(&message.id),
+                    Some(InputDeferredReason::ExecutionFailed { .. })
+                )
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 struct Driver {
@@ -641,113 +832,75 @@ struct Driver {
     store: Arc<dyn SessionStore>,
     subagents: RuntimeSubagentControl,
     control: Arc<DriverControl>,
+    handles: Weak<HandleToken>,
     rx: mpsc::Receiver<Command>,
     stop_rx: mpsc::UnboundedReceiver<Command>,
     head: u64,
-    // Routed checkpoints may cross admission/status commits, whose only state
-    // changes are overlaid below. They must never cross another state writer.
+    // Admission commits only modify pending_inputs. Routed state writers may
+    // cross those commits because that field is overlaid below. They may never
+    // cross another routed state replacement.
     last_state_commit: u64,
-    pending: Vec<UserMessage>,
-    accepted: HashMap<MessageId, u64>,
-    delivered: HashSet<MessageId>,
-    deferred: HashSet<MessageId>,
-    status: SessionStatus,
-    active: Option<Active>,
-    wake_requested: bool,
-    closing: bool,
-    interrupt_waiters: Vec<Reply<()>>,
-    shutdown_waiters: Vec<Reply<()>>,
-    cancel_deadline: Option<Instant>,
-    shutdown_deadline: Option<Instant>,
+    inbox: Inbox,
+    phase: Phase,
 }
 
 impl Driver {
+    fn transition(&mut self, phase: Phase) {
+        let status = phase.status();
+        self.phase = phase;
+        self.control.status.send_if_modified(|current| {
+            if *current == status {
+                false
+            } else {
+                *current = status;
+                true
+            }
+        });
+    }
+
     async fn run(&mut self) -> anyhow::Result<()> {
         let runtime_cancel = self.services.turn_registry.child_token();
+        // Subscribe before the first check so completion between a check and
+        // select remains observable. These watches never own a public handle.
+        let mut jobs = self.services.tool_sessions.subscribe_activity();
+        let mut children = self.subagents.subscribe_activity();
         loop {
-            if self.active.is_none() {
-                if self.closing {
-                    self.start_cleanup();
-                } else if self.wake_requested && !self.pending.is_empty() {
-                    self.start_execution().await?;
-                }
+            if matches!(self.phase, Phase::Idle) && self.inbox.ready() {
+                self.start_execution();
             }
+            self.release_if_unowned().await?;
+            let active = self.phase.active_mut().is_some();
+            let deadline = self.phase.stop_mut().and_then(|stop| stop.deadline);
             tokio::select! {
                 biased;
-                _ = async { tokio::time::sleep_until(self.cancel_deadline.unwrap()).await }, if self.cancel_deadline.is_some() => {
-                    self.cancel_deadline = None;
-                    self.force_active();
+                _ = wait_deadline(deadline), if deadline.is_some() => self.force_active(),
+                Some(command) = self.stop_rx.recv() => self.command(command).await?,
+                _ = runtime_cancel.cancelled(), if !self.phase.is_closing() => {
+                    self.request_stop(StopIntent::Shutdown, None, None).await?;
                 }
-                command = self.stop_rx.recv() => {
-                    if let Some(command) = command { self.command(command).await?; }
-                    else { self.closing = true; }
-                }
-                _ = runtime_cancel.cancelled(), if !self.closing => {
-                    self.closing = true;
-                    self.wake_requested = false;
-                    if let Some(active) = &self.active { active.cancel.cancel(); }
-                }
-                command = self.rx.recv() => {
-                    if let Some(command) = command { self.command(command).await?; }
-                    else { self.closing = true; }
-                }
-                outcome = async { (&mut self.active.as_mut().unwrap().task).await }, if self.active.is_some() => {
-                    let active = self.active.take().unwrap();
+                Some(command) = self.rx.recv() => self.command(command).await?,
+                outcome = async { (&mut self.phase.active_mut().expect("active phase").task).await }, if active => {
                     let result = outcome.map_err(anyhow::Error::from).and_then(|result| result);
-                    match active.kind {
-                        Work::Cleanup => {
-                            let status = self.set_status(SessionStatus::Closed).await;
-                            return result.map(|_| ()).and(status);
-                        }
-                        Work::Compact(reply) => {
-                            if let Err(error) = self.set_status(SessionStatus::Idle).await {
-                                let _ = reply.send(Err(SessionError::Operation(anyhow::anyhow!("{error:#}"))));
-                                return Err(error);
-                            }
-                            let response = match &result {
-                                Ok(_) => Ok(()),
-                                Err(error) => Err(SessionError::Operation(anyhow::anyhow!("{error:#}"))),
-                            };
-                            let _ = reply.send(response);
-                        }
-                        Work::Execution => {
-                            if matches!(result, Ok(TaskOutcome::Complete)) && !active.cancel.is_cancelled() && !self.closing && !self.pending.is_empty() {
-                                self.wake_requested = true;
-                            }
-                            if let Err(error) = &result {
-                                if !error.downcast_ref::<halter_protocol::ProviderError>().is_some_and(halter_protocol::ProviderError::is_cancelled) {
-                                    // Ordinary execution failures are durable
-                                    // TurnFailed events. A stream error means
-                                    // finalization failed; close this incarnation.
-                                    return Err(anyhow::anyhow!("{error:#}"));
-                                }
-                                tracing::warn!(session_id = %self.control.id, %error, "session execution failed");
-                            }
-                        }
-                    }
-                    if self.status != SessionStatus::Idle && (!self.wake_requested || self.pending.is_empty() || !self.interrupt_waiters.is_empty()) {
-                        self.set_status(SessionStatus::Idle).await?;
-                    }
-                    if active.cancel.is_cancelled() {
-                        self.defer_pending(if self.closing { InputDeferredReason::Shutdown } else { InputDeferredReason::Interrupted }).await?;
-                    }
-                    for reply in self.interrupt_waiters.drain(..) {
-                        let response = match &result {
-                            Err(error) if !error.downcast_ref::<halter_protocol::ProviderError>().is_some_and(halter_protocol::ProviderError::is_cancelled) => {
-                                Err(SessionError::Operation(anyhow::anyhow!("{error:#}")))
-                            }
-                            _ => Ok(()),
-                        };
-                        let _ = reply.send(response);
-                    }
-                    if !self.closing { self.cancel_deadline = None; }
+                    if self.finish_work(result).await? { return Ok(()); }
                 }
+                _ = jobs.changed() => self.release_if_unowned().await?,
+                _ = children.changed() => self.release_if_unowned().await?,
             }
         }
     }
 
     async fn command(&mut self, command: Command) -> anyhow::Result<()> {
         match command {
+            Command::Released => {
+                if !self.phase.is_closing() && !self.should_release() {
+                    tracing::info!(
+                        session_id = %self.control.id,
+                        foreground = ?self.phase.status(),
+                        "session has no remaining handles; waiting for owned work before release"
+                    );
+                }
+                self.release_if_unowned().await?;
+            }
             Command::Commit {
                 snapshot,
                 expected,
@@ -756,9 +909,6 @@ impl Driver {
                 reply,
             } => {
                 let result = if (state.is_some() || snapshot.is_some()) && events.is_empty() {
-                    // Head-based concurrency cannot distinguish two state-only
-                    // replacements at one sequence. Executor mutations always
-                    // carry an event; enforce that contract at the arbiter.
                     Err(anyhow::anyhow!("session checkpoint requires an event"))
                 } else if let Some(expected) = expected
                     && (expected < self.last_state_commit || expected > self.head)
@@ -781,22 +931,28 @@ impl Driver {
                 let _ = reply.send(result);
             }
             Command::Pending(reply) => {
-                let stopped = self.closing
-                    || self
-                        .active
-                        .as_ref()
-                        .is_some_and(|active| active.cancel.is_cancelled());
-                let _ = reply.send(if stopped {
-                    Vec::new()
+                let _ = reply.send(if matches!(self.phase, Phase::Executing(_)) {
+                    self.inbox.deliverable()
                 } else {
-                    self.pending.clone()
+                    Vec::new()
                 });
             }
+            Command::AttemptInput(id, reply) => {
+                let result = match &mut self.phase {
+                    Phase::Executing(work) => {
+                        work.attempted_input = id;
+                        Ok(())
+                    }
+                    _ => Err(halter_protocol::ProviderError::cancelled().into()),
+                };
+                let _ = reply.send(result);
+            }
             Command::Submit(message, reply) => {
-                if self.closing {
+                if self.phase.is_closing() {
                     let _ = reply.send(Err(SessionError::Closed));
-                } else if let Some(sequence) = self.accepted.get(&message.id).copied() {
+                } else if let Some(sequence) = self.inbox.accepted.get(&message.id).copied() {
                     if let Some(pending) = self
+                        .inbox
                         .pending
                         .iter()
                         .find(|pending| pending.id == message.id)
@@ -806,11 +962,6 @@ impl Driver {
                         let result = self
                             .commit_payload(SessionEventPayload::InputAccepted { message: pending })
                             .await;
-                        if let Ok(sequence) = result {
-                            self.deferred.remove(&id);
-                            self.accepted.insert(id.clone(), sequence);
-                            self.wake_requested = true;
-                        }
                         let _ = reply.send(
                             result
                                 .map(|sequence| Submission {
@@ -825,17 +976,13 @@ impl Driver {
                             sequence,
                         }));
                     }
-                } else if self.pending.len() >= INBOX_CAPACITY {
+                } else if self.inbox.pending.len() >= INBOX_CAPACITY {
                     let _ = reply.send(Err(SessionError::InboxFull));
                 } else {
                     let id = message.id.clone();
                     let result = self
                         .commit_payload(SessionEventPayload::InputAccepted { message })
                         .await;
-                    if let Ok(sequence) = result {
-                        self.accepted.insert(id.clone(), sequence);
-                        self.wake_requested = true;
-                    }
                     let _ = reply.send(
                         result
                             .map(|sequence| Submission {
@@ -846,50 +993,42 @@ impl Driver {
                     );
                 }
             }
-            Command::Interrupt { deadline, reply } => {
-                self.set_cancel_deadline(deadline);
-                self.wake_requested = false;
-                if self.closing {
-                    let _ = reply.send(Err(SessionError::Closed));
-                } else if let Some(active) = &self.active {
-                    active.cancel.cancel();
-                    self.interrupt_waiters.push(reply);
+            Command::Discard(id, reply) => {
+                let result = if self.phase.is_closing() {
+                    Err(SessionError::Closed)
+                } else if !matches!(self.phase, Phase::Idle) {
+                    Err(SessionError::Busy)
+                } else if !self.inbox.pending.iter().any(|message| message.id == id) {
+                    Ok(false)
                 } else {
-                    self.cancel_deadline = None;
-                    self.defer_pending(InputDeferredReason::Interrupted).await?;
-                    let _ = reply.send(Ok(()));
-                }
+                    self.commit_payload(SessionEventPayload::InputRejected {
+                        message_id: id,
+                        reason: "discarded by client".into(),
+                    })
+                    .await
+                    .map(|_| true)
+                    .map_err(SessionError::from)
+                };
+                let _ = reply.send(result);
+            }
+            Command::Interrupt { deadline, reply } => {
+                self.request_stop(StopIntent::Interrupt, deadline, Some(reply))
+                    .await?;
             }
             Command::Shutdown { deadline, reply } => {
-                self.set_cancel_deadline(deadline);
-                if let Some(deadline) = deadline {
-                    self.shutdown_deadline = Some(
-                        self.shutdown_deadline
-                            .map_or(deadline, |existing| existing.min(deadline)),
-                    );
-                }
-                self.closing = true;
-                self.wake_requested = false;
-                self.services
-                    .tool_sessions
-                    .request_stop_session(&self.control.id)
-                    .await;
-                if let Some(active) = &self.active {
-                    active.cancel.cancel();
-                }
-                self.shutdown_waiters.push(reply);
+                self.request_stop(StopIntent::Shutdown, deadline, Some(reply))
+                    .await?;
             }
             Command::Compact {
                 reason,
                 instructions,
                 reply,
             } => {
-                if self.closing {
+                if self.phase.is_closing() {
                     let _ = reply.send(Err(SessionError::Closed));
-                } else if self.active.is_some() {
+                } else if !matches!(self.phase, Phase::Idle) {
                     let _ = reply.send(Err(SessionError::Busy));
                 } else {
-                    self.set_status(SessionStatus::Running).await?;
                     let cancel = self.services.turn_registry.child_token();
                     let task_cancel = cancel.clone();
                     let executor = self.executor.clone();
@@ -899,199 +1038,570 @@ impl Driver {
                             .await
                             .map(|()| TaskOutcome::Complete)
                     });
-                    self.active = Some(Active {
-                        cancel,
-                        task,
-                        kind: Work::Compact(reply),
-                        turn_id: None,
-                    });
+                    self.transition(Phase::Compacting(Compaction {
+                        active: Active { cancel, task },
+                        reply,
+                    }));
                 }
             }
         }
         Ok(())
     }
 
-    async fn start_execution(&mut self) -> anyhow::Result<()> {
-        self.delivered.clear();
-        self.wake_requested = false;
-        self.set_status(SessionStatus::Running).await?;
+    fn should_release(&self) -> bool {
+        matches!(self.phase, Phase::Idle)
+            && !self.inbox.ready()
+            && self.handles.upgrade().is_none()
+            && !self
+                .services
+                .tool_sessions
+                .has_running_jobs(&self.control.id)
+            && !self.subagents.has_running_subagents(&self.control.id)
+    }
+
+    async fn release_if_unowned(&mut self) -> anyhow::Result<()> {
+        if self.should_release() {
+            // Deferred input is already durable and does not request work.
+            // With no token left, clients cannot submit or clone a handle
+            // between this check and closing admission.
+            self.request_stop(StopIntent::Release, None, None).await?;
+        }
+        Ok(())
+    }
+
+    async fn request_stop(
+        &mut self,
+        intent: StopIntent,
+        deadline: Option<Instant>,
+        reply: Option<Reply<()>>,
+    ) -> anyhow::Result<()> {
+        if intent == StopIntent::Interrupt && self.phase.is_closing() {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(SessionError::Closed));
+            }
+            return Ok(());
+        }
+        let first_shutdown = intent.is_shutdown() && !self.phase.is_closing();
+        let phase = std::mem::replace(&mut self.phase, Phase::Idle);
+        let stop = match phase {
+            Phase::Idle => {
+                let mut stop = StopRequest::new(intent, deadline);
+                if let Some(reply) = reply {
+                    if intent.is_shutdown() {
+                        stop.shutdown_replies.push(reply);
+                    } else {
+                        stop.interrupt_replies.push(reply);
+                    }
+                }
+                if intent == StopIntent::Interrupt {
+                    self.defer_pending(InputDeferredReason::Interrupted).await?;
+                    respond(stop.take_replies(), Ok(()));
+                    return Ok(());
+                }
+                self.start_cleanup(stop);
+                if first_shutdown {
+                    self.services
+                        .tool_sessions
+                        .request_stop_session(&self.control.id)
+                        .await;
+                }
+                return Ok(());
+            }
+            Phase::Executing(work) => {
+                work.active.cancel.cancel();
+                let stop = StopRequest::new(intent, deadline);
+                self.phase = Phase::Stopping {
+                    work: RunningWork::Execution(work),
+                    stop,
+                };
+                self.phase.stop_mut().unwrap()
+            }
+            Phase::Compacting(work) => {
+                work.active.cancel.cancel();
+                let stop = StopRequest::new(intent, deadline);
+                self.phase = Phase::Stopping {
+                    work: RunningWork::Compaction(work),
+                    stop,
+                };
+                self.phase.stop_mut().unwrap()
+            }
+            Phase::Stopping { work, stop } => {
+                self.phase = Phase::Stopping { work, stop };
+                self.phase.stop_mut().unwrap()
+            }
+            Phase::Closing { active, stop } => {
+                self.phase = Phase::Closing { active, stop };
+                self.phase.stop_mut().unwrap()
+            }
+            Phase::Closed(stop) => {
+                self.phase = Phase::Closed(stop);
+                self.phase.stop_mut().unwrap()
+            }
+        };
+        stop.add_deadline(deadline);
+        if intent.is_shutdown() && !stop.intent.is_shutdown() {
+            stop.intent = intent;
+        }
+        if let Some(reply) = reply {
+            if intent.is_shutdown() {
+                stop.shutdown_replies.push(reply);
+            } else {
+                stop.interrupt_replies.push(reply);
+            }
+        }
+        if first_shutdown {
+            self.services
+                .tool_sessions
+                .request_stop_session(&self.control.id)
+                .await;
+        }
+        Ok(())
+    }
+
+    fn start_execution(&mut self) {
+        let message = self
+            .inbox
+            .deliverable()
+            .into_iter()
+            .next()
+            .expect("ready input");
+        let attempted_input = message.id.clone();
         let executor = self.executor.clone();
         let cancel = self.services.turn_registry.child_token();
         let task_cancel = cancel.clone();
         let turn = Turn {
             id: TurnId::new(),
-            user_message: self.pending[0].clone(),
+            user_message: message,
             default_model: None,
             subagent_model: None,
         };
         let turn_id = turn.id.clone();
-        let active_turn_id = turn_id.clone();
+        let execution_id = turn_id.clone();
         let session_id = self.control.id.clone();
         let forwarded = self.control.forwarded.clone();
         let task = tokio::spawn(async move {
-            let mut events = executor.submit_turn_with_cancel(turn, task_cancel).await?;
+            let mut events = match executor.submit_turn_with_cancel(turn, task_cancel).await {
+                Ok(events) => events,
+                Err(error) => return Ok(TaskOutcome::NotStarted(error)),
+            };
             let mut outcome = None;
-            // Semantic failures are recorded as events. Drain to completion so
-            // cleanup finishes, but do not automatically retry undelivered input.
-            while let Some(event) = events.try_next().await? {
+            let mut started = false;
+            loop {
+                let event = match events.try_next().await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => break,
+                    Err(error) if !started => return Ok(TaskOutcome::NotStarted(error)),
+                    Err(error) => return Err(error),
+                };
                 if event.session_id != session_id
                     || matches!(event.payload, SessionEventPayload::Lagged { .. })
                 {
                     let _ = forwarded.send(event);
-                } else if matches!(&event.payload, SessionEventPayload::TurnFailed { turn_id: failed, .. } if failed == &turn_id)
-                {
-                    outcome = Some(TaskOutcome::TurnFailed);
-                } else if matches!(&event.payload, SessionEventPayload::TurnCompleted { turn_id: completed, .. } if completed == &turn_id)
-                {
-                    outcome = Some(TaskOutcome::Complete);
+                } else {
+                    match &event.payload {
+                        SessionEventPayload::TurnStarted { turn_id, .. }
+                            if turn_id == &execution_id =>
+                        {
+                            started = true
+                        }
+                        SessionEventPayload::TurnFailed { turn_id, .. }
+                            if turn_id == &execution_id =>
+                        {
+                            outcome = Some(TaskOutcome::TurnFailed)
+                        }
+                        SessionEventPayload::TurnCompleted { turn_id, .. }
+                            if turn_id == &execution_id =>
+                        {
+                            outcome = Some(TaskOutcome::Complete)
+                        }
+                        _ => {}
+                    }
                 }
             }
             outcome.ok_or_else(|| anyhow::anyhow!("execution ended without a terminal event"))
         });
-        self.active = Some(Active {
-            cancel,
-            task,
-            kind: Work::Execution,
-            turn_id: Some(active_turn_id),
-        });
-        Ok(())
+        self.transition(Phase::Executing(Execution {
+            active: Active { cancel, task },
+            turn_id,
+            attempted_input,
+        }));
     }
 
-    fn start_cleanup(&mut self) {
+    async fn finish_work(&mut self, result: anyhow::Result<TaskOutcome>) -> anyhow::Result<bool> {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if matches!(self.phase, Phase::Compacting(_)) => {
+                let Phase::Compacting(work) = std::mem::replace(&mut self.phase, Phase::Idle)
+                else {
+                    unreachable!()
+                };
+                let _ = work.reply.send(Err(SessionError::Operation(error)));
+                self.transition(Phase::Idle);
+                return Ok(false);
+            }
+            Err(error)
+                if matches!(
+                    self.phase,
+                    Phase::Stopping {
+                        work: RunningWork::Compaction(_),
+                        ..
+                    }
+                ) =>
+            {
+                let Phase::Stopping {
+                    work: RunningWork::Compaction(work),
+                    mut stop,
+                } = std::mem::replace(&mut self.phase, Phase::Idle)
+                else {
+                    unreachable!()
+                };
+                let shared = SharedOperationError(Arc::new(error));
+                let _ = work
+                    .reply
+                    .send(Err(SessionError::Operation(anyhow::Error::new(
+                        shared.clone(),
+                    ))));
+                if stop.intent.is_shutdown() {
+                    self.start_cleanup(stop);
+                } else {
+                    self.transition(Phase::Idle);
+                    respond(stop.take_replies(), Err(anyhow::Error::new(shared)));
+                }
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if let TaskOutcome::NotStarted(error) = &result {
+            tracing::warn!(session_id = %self.control.id, %error, "session execution failed before durable start");
+            let reason = if error
+                .downcast_ref::<halter_protocol::ProviderError>()
+                .is_some_and(halter_protocol::ProviderError::is_cancelled)
+            {
+                InputDeferredReason::Interrupted
+            } else {
+                InputDeferredReason::ExecutionFailed {
+                    error: format!("{error:#}"),
+                    retryable: true,
+                }
+            };
+            self.defer_after_failure(reason).await?;
+        }
+        if matches!(self.phase, Phase::Closing { .. }) {
+            self.defer_pending(InputDeferredReason::Shutdown).await?;
+            let Phase::Closing { stop, .. } = std::mem::replace(&mut self.phase, Phase::Idle)
+            else {
+                unreachable!()
+            };
+            self.phase = Phase::Closed(stop);
+            return Ok(true);
+        }
+        if matches!(self.phase, Phase::Stopping { .. }) {
+            let reason = if self.phase.is_closing() {
+                InputDeferredReason::Shutdown
+            } else {
+                InputDeferredReason::Interrupted
+            };
+            self.defer_pending(reason).await?;
+        }
+        match std::mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::Executing(_) => {
+                if self.inbox.ready() {
+                    self.start_execution();
+                } else {
+                    self.transition(Phase::Idle);
+                }
+            }
+            Phase::Compacting(work) => {
+                let _ = work.reply.send(Ok(()));
+                if self.inbox.ready() {
+                    self.start_execution();
+                } else {
+                    self.transition(Phase::Idle);
+                }
+            }
+            Phase::Stopping { work, mut stop } => {
+                if let RunningWork::Compaction(work) = work {
+                    let _ = work.reply.send(Err(SessionError::Operation(
+                        halter_protocol::ProviderError::cancelled().into(),
+                    )));
+                }
+                if stop.intent.is_shutdown() {
+                    self.start_cleanup(stop);
+                } else {
+                    self.transition(Phase::Idle);
+                    respond(stop.take_replies(), Ok(()));
+                }
+            }
+            _ => unreachable!("task completion requires active phase"),
+        }
+        Ok(false)
+    }
+
+    fn start_cleanup(&mut self, stop: StopRequest) {
         let executor = self.executor.clone();
         let sessions = self.services.tool_sessions.clone();
         let subagents = self.subagents.clone();
         let id = self.control.id.clone();
-        let deadline = self.shutdown_deadline;
+        let deadline = stop.deadline;
+        let reason = stop.intent.reason();
         let task = tokio::spawn(async move {
             let children = subagents.close_session_with_deadline(&id, deadline).await;
             let resources = sessions.shutdown_session(&id).await;
-            let hooks = executor.shutdown("session_closed").await;
+            let hooks = executor.shutdown(reason).await;
             children
                 .and(resources)
                 .and(hooks)
                 .map(|()| TaskOutcome::Complete)
         });
-        self.active = Some(Active {
-            cancel: CancellationToken::new(),
-            task,
-            kind: Work::Cleanup,
-            turn_id: None,
+        self.transition(Phase::Closing {
+            active: Active {
+                cancel: CancellationToken::new(),
+                task,
+            },
+            stop,
         });
     }
 
-    fn set_cancel_deadline(&mut self, deadline: Option<Instant>) {
-        if let Some(deadline) = deadline {
-            self.cancel_deadline = Some(
-                self.cancel_deadline
-                    .map_or(deadline, |existing| existing.min(deadline)),
-            );
-        }
-    }
-
     fn force_active(&mut self) {
-        let closing = self.closing;
+        let phase = std::mem::replace(&mut self.phase, Phase::Idle);
         let sessions = self.services.tool_sessions.clone();
         let subagents = self.subagents.clone();
         let id = self.control.id.clone();
-        let force_resources = async move {
-            if closing {
-                sessions.force_stop_session(&id).await;
-                subagents.force_close_session(&id).await;
+        match phase {
+            Phase::Stopping { work, mut stop } => {
+                stop.deadline = None;
+                let closing = stop.intent.is_shutdown();
+                let force_resources = async move {
+                    if closing {
+                        sessions.force_stop_session(&id).await;
+                        subagents.force_close_session(&id).await;
+                    }
+                };
+                let work = match work {
+                    RunningWork::Execution(work) => {
+                        work.active.cancel.cancel();
+                        work.active.task.abort();
+                        let executor = self.executor.clone();
+                        let recovery_id = work.turn_id.clone();
+                        let task = tokio::spawn(async move {
+                            let _ = work.active.task.await;
+                            force_resources.await;
+                            executor
+                                .force_interrupt_turn(&recovery_id)
+                                .await
+                                .map(|()| TaskOutcome::TurnFailed)
+                        });
+                        RunningWork::Execution(Execution {
+                            active: Active {
+                                cancel: work.active.cancel,
+                                task,
+                            },
+                            turn_id: work.turn_id,
+                            attempted_input: work.attempted_input,
+                        })
+                    }
+                    RunningWork::Compaction(work) => {
+                        work.active.cancel.cancel();
+                        work.active.task.abort();
+                        let task = tokio::spawn(async move {
+                            let _ = work.active.task.await;
+                            force_resources.await;
+                            Ok(TaskOutcome::Complete)
+                        });
+                        RunningWork::Compaction(Compaction {
+                            active: Active {
+                                cancel: work.active.cancel,
+                                task,
+                            },
+                            reply: work.reply,
+                        })
+                    }
+                };
+                self.phase = Phase::Stopping { work, stop };
             }
-        };
-        let Some(active) = self.active.take() else {
-            return;
-        };
-        active.cancel.cancel();
-        match active.kind {
-            Work::Execution => {
-                let executor = self.executor.clone();
-                let turn_id = active.turn_id.expect("execution has an internal turn id");
-                let recovery_id = turn_id.clone();
+            Phase::Closing { active, mut stop } => {
+                stop.deadline = None;
                 let task = tokio::spawn(async move {
-                    active.task.abort();
-                    let _ = active.task.await;
-                    force_resources.await;
-                    let result = executor.force_interrupt_turn(&recovery_id).await;
-                    result.map(|()| TaskOutcome::TurnFailed)
-                });
-                self.active = Some(Active {
-                    cancel: active.cancel,
-                    task,
-                    kind: Work::Execution,
-                    turn_id: Some(turn_id),
-                });
-            }
-            Work::Compact(reply) => {
-                active.task.abort();
-                let task = tokio::spawn(async move {
-                    let _ = active.task.await;
-                    force_resources.await;
-                    Err(anyhow::Error::new(SessionError::TimedOut))
-                });
-                self.active = Some(Active {
-                    cancel: active.cancel,
-                    task,
-                    kind: Work::Compact(reply),
-                    turn_id: None,
-                });
-            }
-            Work::Cleanup => {
-                // Cleanup remains owned and the incarnation fenced until it
-                // settles. The caller's deadline bounds waiting, not SQL writes
-                // or already-running blocking plugin code.
-                let task = tokio::spawn(async move {
-                    force_resources.await;
+                    sessions.force_stop_session(&id).await;
+                    subagents.force_close_session(&id).await;
                     active.task.await.map_err(anyhow::Error::from)?
                 });
-                self.active = Some(Active {
-                    cancel: active.cancel,
-                    task,
-                    kind: Work::Cleanup,
-                    turn_id: None,
-                });
+                self.phase = Phase::Closing {
+                    active: Active {
+                        cancel: active.cancel,
+                        task,
+                    },
+                    stop,
+                };
             }
+            phase => self.phase = phase,
         }
     }
 
-    async fn set_status(&mut self, status: SessionStatus) -> anyhow::Result<()> {
-        if status == SessionStatus::Closed {
-            self.defer_pending(InputDeferredReason::Shutdown).await?;
+    async fn recover_failed_driver(&mut self) {
+        let phase = std::mem::replace(&mut self.phase, Phase::Idle);
+        let (work, cleanup, stop) = match phase {
+            Phase::Executing(work) => (
+                Some(RunningWork::Execution(work)),
+                None,
+                StopRequest::new(StopIntent::Shutdown, None),
+            ),
+            Phase::Compacting(work) => (
+                Some(RunningWork::Compaction(work)),
+                None,
+                StopRequest::new(StopIntent::Shutdown, None),
+            ),
+            Phase::Stopping { work, mut stop } => {
+                stop.intent = StopIntent::Shutdown;
+                (Some(work), None, stop)
+            }
+            Phase::Closing { active, stop } => (None, Some(active), stop),
+            Phase::Closed(stop) => {
+                self.phase = Phase::Closed(stop);
+                return;
+            }
+            Phase::Idle => (None, None, StopRequest::new(StopIntent::Shutdown, None)),
+        };
+        self.services
+            .tool_sessions
+            .force_stop_session(&self.control.id)
+            .await;
+        self.subagents.force_close_session(&self.control.id).await;
+        if let Some(work) = work {
+            match work {
+                RunningWork::Execution(work) => {
+                    work.active.cancel.cancel();
+                    work.active.task.abort();
+                    // Fatal finalization can arrive from a task the actor
+                    // already joined. A completed JoinHandle cannot be polled
+                    // twice; only unfinished work still needs settlement.
+                    if !work.active.task.is_finished() {
+                        let _ = work.active.task.await;
+                    }
+                    if let Ok(executor) =
+                        SessionExecutor::new(self.services.clone(), self.control.id.clone())
+                    {
+                        let _ = executor.force_interrupt_turn(&work.turn_id).await;
+                    }
+                }
+                RunningWork::Compaction(work) => {
+                    work.active.cancel.cancel();
+                    work.active.task.abort();
+                    if !work.active.task.is_finished() {
+                        let _ = work.active.task.await;
+                    }
+                    let _ = work.reply.send(Err(SessionError::Closed));
+                }
+            }
         }
-        self.commit_payload(SessionEventPayload::SessionStatusChanged { status })
-            .await
-            .map(|_| ())
+        if let Some(cleanup) = cleanup {
+            // Its result was already awaited by the actor. Do not poll a
+            // completed JoinHandle again or rerun lifecycle hooks.
+            drop(cleanup);
+        } else {
+            let _ = self
+                .subagents
+                .close_session_with_deadline(&self.control.id, stop.deadline)
+                .await;
+            let _ = self
+                .services
+                .tool_sessions
+                .shutdown_session(&self.control.id)
+                .await;
+            let _ = self.executor.shutdown("session_failed").await;
+        }
+        // Fatal errors route directly to the store. Repair remaining inbox
+        // metadata against its current head, never the failed actor's cursor.
+        if let Ok(Some(mut stored)) = self.store.load_session(&self.control.id).await
+            && hydrate_stored_session(self.store.as_ref(), &mut stored)
+                .await
+                .is_ok()
+        {
+            self.head = stored.head_sequence;
+            let events = stored
+                .state
+                .pending_inputs
+                .iter()
+                .filter(|message| !self.inbox.deferred.contains_key(&message.id))
+                .map(|message| {
+                    PendingEvent::new(
+                        self.control.id.clone(),
+                        halter_protocol::Delivery::Lossless,
+                        SessionEventPayload::InputDeferred {
+                            message_id: message.id.clone(),
+                            reason: InputDeferredReason::Shutdown,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !events.is_empty()
+                && let Ok(committed) = self
+                    .store
+                    .commit(
+                        &self.control.id,
+                        None,
+                        Some(stored.head_sequence),
+                        None,
+                        events,
+                    )
+                    .await
+            {
+                for event in committed {
+                    self.head = event.sequence();
+                    self.services.event_bus.publish(event);
+                }
+            }
+        }
+        self.phase = Phase::Closed(stop);
     }
 
     async fn defer_pending(&mut self, reason: InputDeferredReason) -> anyhow::Result<()> {
         let ids = self
+            .inbox
             .pending
             .iter()
-            .filter(|m| !self.deferred.contains(&m.id))
+            .filter(|m| !self.inbox.deferred.contains_key(&m.id))
             .map(|m| m.id.clone())
             .collect::<Vec<_>>();
         for message_id in ids {
             self.commit_payload(SessionEventPayload::InputDeferred {
-                message_id: message_id.clone(),
+                message_id,
                 reason: reason.clone(),
             })
             .await?;
-            self.deferred.insert(message_id);
+        }
+        Ok(())
+    }
+
+    async fn defer_after_failure(&mut self, reason: InputDeferredReason) -> anyhow::Result<()> {
+        let attempted = self.phase.attempted_input().cloned();
+        let ids = self
+            .inbox
+            .pending
+            .iter()
+            .filter(|m| {
+                !self.inbox.deferred.contains_key(&m.id) || Some(&m.id) == attempted.as_ref()
+            })
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>();
+        for message_id in ids {
+            let reason = if Some(&message_id) == attempted.as_ref() {
+                reason.clone()
+            } else {
+                InputDeferredReason::ExecutionStopped
+            };
+            self.commit_payload(SessionEventPayload::InputDeferred { message_id, reason })
+                .await?;
         }
         Ok(())
     }
 
     async fn commit_payload(&mut self, payload: SessionEventPayload) -> anyhow::Result<u64> {
-        // Driver-owned commits change only inbox/lifecycle metadata. Any new
-        // state mutation must use the routed commit path and advance the
-        // last_state_commit watermark, or stale checkpoints could overwrite it.
         debug_assert!(matches!(
             payload,
             SessionEventPayload::InputAccepted { .. }
-                | SessionEventPayload::SessionStatusChanged { .. }
+                | SessionEventPayload::InputRejected { .. }
                 | SessionEventPayload::InputDeferred { .. }
-                | SessionEventPayload::InputSettled { .. }
         ));
         let event = PendingEvent::new(
             self.control.id.clone(),
@@ -1113,113 +1623,154 @@ impl Driver {
         &mut self,
         snapshot: Option<Arc<ResourceSnapshot>>,
         mut state: Option<SessionState>,
-        mut events: Vec<PendingEvent>,
+        events: Vec<PendingEvent>,
     ) -> anyhow::Result<Vec<SessionEvent>> {
         let mut projection = SessionState {
-            pending_inputs: self.pending.clone(),
-            session_status: self.status,
+            pending_inputs: self.inbox.pending.clone(),
             ..SessionState::default()
         };
-        let mut delivered = self.delivered.clone();
-        let mut terminal = None;
-        for event in &events {
-            if let SessionEventPayload::MessageItem {
-                message: Message::User(message),
-            } = &event.payload
-                && projection
+        let mut admitted = self.inbox.accepted.clone();
+        let mut deferred = self.inbox.deferred.clone();
+        let attempted = self.phase.attempted_input().cloned();
+        let mut expanded = Vec::with_capacity(events.len());
+        for event in events {
+            let delivered = match &event.payload {
+                SessionEventPayload::MessageItem {
+                    message: Message::User(message),
+                } if projection
                     .pending_inputs
                     .iter()
-                    .any(|pending| pending.id == message.id)
-            {
-                delivered.insert(message.id.clone());
+                    .any(|pending| pending.id == message.id) =>
+                {
+                    Some(message.id.clone())
+                }
+                _ => None,
+            };
+            if let SessionEventPayload::InputAccepted { message } = &event.payload {
+                deferred.remove(&message.id);
             }
-            if let Some(outcome) = input_outcome(&event.payload) {
-                terminal = Some(outcome);
+            if let SessionEventPayload::InputDeferred { message_id, reason } = &event.payload {
+                deferred.insert(message_id.clone(), reason.clone());
             }
             halter_protocol::fold::apply_event(&mut projection, &event.payload);
-        }
-        let mut deferred_ids = Vec::new();
-        if let Some(outcome) = &terminal {
-            // Settlement shares the terminal commit: no completed execution
-            // can be replayed without the outcome of its delivered inputs.
-            let mut ids = delivered.iter().cloned().collect::<Vec<_>>();
-            ids.sort_by(|a, b| a.0.cmp(&b.0));
-            for message_id in ids {
-                events.push(PendingEvent::new(
-                    self.control.id.clone(),
-                    halter_protocol::Delivery::Lossless,
-                    SessionEventPayload::InputSettled {
-                        message_id,
-                        outcome: outcome.clone(),
-                    },
-                ));
-            }
-            let reason = match outcome {
-                InputOutcome::Interrupted => Some(InputDeferredReason::Interrupted),
-                InputOutcome::Failed { error, retryable } => {
-                    Some(InputDeferredReason::ExecutionFailed {
+            let failure = match &event.payload {
+                SessionEventPayload::TurnFailed {
+                    cancelled,
+                    error,
+                    retryable,
+                    ..
+                } => Some(if *cancelled {
+                    if self.phase.is_closing() {
+                        InputDeferredReason::Shutdown
+                    } else {
+                        InputDeferredReason::Interrupted
+                    }
+                } else {
+                    InputDeferredReason::ExecutionFailed {
                         error: error.clone(),
                         retryable: *retryable,
-                    })
-                }
-                InputOutcome::Completed if self.closing => Some(InputDeferredReason::Shutdown),
-                InputOutcome::Completed => None,
-            };
-            if let Some(reason) = reason {
-                for message in &projection.pending_inputs {
-                    if !self.deferred.contains(&message.id) {
-                        deferred_ids.push(message.id.clone());
-                        events.push(PendingEvent::new(
-                            self.control.id.clone(),
-                            halter_protocol::Delivery::Lossless,
-                            SessionEventPayload::InputDeferred {
-                                message_id: message.id.clone(),
-                                reason: reason.clone(),
-                            },
-                        ));
                     }
+                }),
+                _ => None,
+            };
+            expanded.push(event);
+            if let Some(message_id) = delivered {
+                expanded.push(PendingEvent::new(
+                    self.control.id.clone(),
+                    halter_protocol::Delivery::Lossless,
+                    SessionEventPayload::InputDelivered { message_id },
+                ));
+            }
+            if let Some(reason) = failure {
+                for message in &projection.pending_inputs {
+                    if deferred.contains_key(&message.id)
+                        && !(Some(&message.id) == attempted.as_ref()
+                            && matches!(reason, InputDeferredReason::ExecutionFailed { .. }))
+                    {
+                        continue;
+                    }
+                    let reason = if matches!(reason, InputDeferredReason::ExecutionFailed { .. })
+                        && Some(&message.id) != attempted.as_ref()
+                    {
+                        InputDeferredReason::ExecutionStopped
+                    } else {
+                        reason.clone()
+                    };
+                    deferred.insert(message.id.clone(), reason.clone());
+                    expanded.push(PendingEvent::new(
+                        self.control.id.clone(),
+                        halter_protocol::Delivery::Lossless,
+                        SessionEventPayload::InputDeferred {
+                            message_id: message.id.clone(),
+                            reason,
+                        },
+                    ));
                 }
             }
         }
         if let Some(state) = &mut state {
             state.pending_inputs = projection.pending_inputs.clone();
-            state.session_status = projection.session_status;
         }
         let committed = self
             .store
-            .commit(&self.control.id, snapshot, Some(self.head), state, events)
+            .commit(&self.control.id, snapshot, Some(self.head), state, expanded)
             .await?;
         self.head = committed.last().map_or(self.head, SessionEvent::sequence);
-        self.pending = projection.pending_inputs;
-        self.status = projection.session_status;
-        self.delivered = if terminal.is_some() {
-            HashSet::new()
-        } else {
-            delivered
-        };
-        self.deferred.extend(deferred_ids);
-        self.deferred
-            .retain(|id| self.pending.iter().any(|m| &m.id == id));
-        if terminal.is_some_and(|outcome| outcome != InputOutcome::Completed) {
-            self.wake_requested = false;
+        for event in &committed {
+            if let SessionEventPayload::InputAccepted { message } = &event.payload {
+                admitted.insert(message.id.clone(), event.sequence());
+            }
         }
+        self.inbox.pending = projection.pending_inputs;
+        deferred.retain(|id, _| self.inbox.pending.iter().any(|m| &m.id == id));
+        self.inbox.accepted = admitted;
+        self.inbox.deferred = deferred;
         Ok(committed)
     }
 }
 
-fn input_outcome(payload: &SessionEventPayload) -> Option<InputOutcome> {
-    match payload {
-        SessionEventPayload::TurnCompleted { .. } => Some(InputOutcome::Completed),
-        SessionEventPayload::TurnFailed {
-            cancelled: true, ..
-        } => Some(InputOutcome::Interrupted),
-        SessionEventPayload::TurnFailed {
-            error, retryable, ..
-        } => Some(InputOutcome::Failed {
-            error: error.clone(),
-            retryable: *retryable,
-        }),
-        _ => None,
+async fn wait_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn timeout_deadline(timeout: Option<Duration>) -> Result<Option<Instant>, SessionError> {
+    timeout
+        .map(|duration| {
+            Instant::now()
+                .checked_add(duration)
+                .ok_or_else(|| SessionError::Operation(anyhow::anyhow!("invalid session timeout")))
+        })
+        .transpose()
+}
+
+#[derive(Debug, Clone)]
+struct SharedOperationError(Arc<anyhow::Error>);
+
+impl std::fmt::Display for SharedOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for SharedOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
+fn respond(replies: Vec<Reply<()>>, result: anyhow::Result<()>) {
+    let error = result
+        .err()
+        .map(|error| SharedOperationError(Arc::new(error)));
+    for reply in replies {
+        let response = match &error {
+            Some(error) => Err(SessionError::Operation(anyhow::Error::new(error.clone()))),
+            None => Ok(()),
+        };
+        let _ = reply.send(response);
     }
 }
 
@@ -1234,19 +1785,26 @@ struct EventCursor {
     sequence: u64,
     buffered: std::collections::VecDeque<SessionEvent>,
     replay_needed: bool,
+    closed_reported: bool,
 }
 
 fn session_events(control: Arc<DriverControl>, sequence: u64) -> SessionEventStream {
     let receiver = control.services.event_bus.subscribe_raw();
     let forwarded = control.forwarded.subscribe();
-    stream::try_unfold(EventCursor { control, receiver, forwarded, sequence, buffered: Default::default(), replay_needed: true }, |mut cursor| async move {
+    stream::try_unfold(EventCursor { control, receiver, forwarded, sequence, buffered: Default::default(), replay_needed: true, closed_reported: false }, |mut cursor| async move {
         loop {
+            if cursor.closed_reported { return Ok(None); }
             if let Some(event) = cursor.buffered.pop_front() {
+                if event.sequence() > cursor.control.final_head.load(Ordering::Acquire) { continue; }
                 cursor.sequence = event.sequence();
                 return Ok(Some((event, cursor)));
             }
             if cursor.replay_needed || cursor.control.closed.is_cancelled() {
-                cursor.buffered.extend(cursor.control.services.sessions.replay_after(&cursor.control.id, cursor.sequence).await?);
+                let replay = cursor.control.services.sessions.replay_after(&cursor.control.id, cursor.sequence).await?;
+                // Read the fence after awaiting replay: closure and reopen
+                // may both have happened while the store was being queried.
+                let final_head = cursor.control.final_head.load(Ordering::Acquire);
+                cursor.buffered.extend(replay.into_iter().filter(|event| event.sequence() <= final_head));
                 cursor.replay_needed = false;
             }
             if !cursor.buffered.is_empty() { continue; }
@@ -1259,7 +1817,19 @@ fn session_events(control: Arc<DriverControl>, sequence: u64) -> SessionEventStr
             }
             if cursor.control.closed.is_cancelled() {
                 if let Some(error) = cursor.control.failure.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                    return Err(anyhow::anyhow!("{error}"));
+                    return Err(anyhow::Error::new(error.clone()));
+                }
+                if !cursor.closed_reported {
+                    cursor.closed_reported = true;
+                    // Like Lagged, this is a stream-local notification with
+                    // no durable sequence. Emit after the final replay even
+                    // if this reader was paused throughout session cleanup.
+                    let event = PendingEvent::new(
+                        cursor.control.id.clone(),
+                        halter_protocol::Delivery::BestEffort,
+                        SessionEventPayload::SessionStatusChanged { status: SessionStatus::Closed },
+                    ).into_committed(0);
+                    return Ok(Some((event, cursor)));
                 }
                 return Ok(None);
             }
@@ -1295,6 +1865,32 @@ mod commit_tests {
     use super::*;
 
     #[tokio::test]
+    async fn shared_stop_failures_retain_the_original_typed_cause() {
+        let id = SessionId::new();
+        let (first, first_response) = oneshot::channel();
+        let (second, second_response) = oneshot::channel();
+        respond(
+            vec![first, second],
+            Err(halter_session::SessionCommitConflict {
+                session_id: id.clone(),
+                expected_head_sequence: 5,
+                actual_head_sequence: 7,
+            }
+            .into()),
+        );
+        for response in [first_response, second_response] {
+            let error = response.await.unwrap().unwrap_err();
+            let original = error
+                .operation_error()
+                .unwrap()
+                .downcast_ref::<halter_session::SessionCommitConflict>()
+                .unwrap();
+            assert_eq!(original.session_id, id);
+            assert_eq!(original.actual_head_sequence, 7);
+        }
+    }
+
+    #[tokio::test]
     async fn timed_out_stop_is_still_admitted_when_the_mailbox_was_full() {
         for shutdown in [false, true] {
             let (tx, mut rx) = mpsc::channel(1);
@@ -1306,13 +1902,21 @@ mod commit_tests {
                 tx,
                 stop_tx,
                 closed: CancellationToken::new(),
+                final_head: AtomicU64::new(u64::MAX),
                 services: crate::session_driver_tests::services(Arc::new(
                     halter_providers::FakeProvider::default(),
                 )),
                 forwarded: broadcast::channel(1).0,
+                status: watch::channel(SessionStatus::Idle).0,
                 failure: Mutex::new(None),
             });
-            let handle = SessionHandle { control };
+            let token = Arc::new(HandleToken {
+                stop_tx: control.stop_tx.clone(),
+            });
+            let handle = SessionHandle {
+                control,
+                _token: token,
+            };
             let result = if shutdown {
                 handle.shutdown(Some(Duration::ZERO)).await
             } else {
@@ -1343,7 +1947,7 @@ mod commit_tests {
     }
 
     #[tokio::test]
-    async fn resume_settles_delivered_input_from_a_crashed_execution() {
+    async fn resume_preserves_delivery_without_inventing_request_completion() {
         let services = crate::session_driver_tests::services(Arc::new(
             halter_providers::FakeProvider::default(),
         ));
@@ -1371,6 +1975,9 @@ mod commit_tests {
             SessionEventPayload::MessageItem {
                 message: Message::User(input.clone()),
             },
+            SessionEventPayload::InputDelivered {
+                message_id: input.id.clone(),
+            },
         ];
         let mut state = stored.state;
         for payload in &payloads {
@@ -1394,8 +2001,13 @@ mod commit_tests {
             .unwrap();
         let (session, _events) = runtime.resume_session(id).await.unwrap();
         let log = session.replay().await.unwrap();
-        assert_eq!(log.iter().filter(|event| matches!(&event.payload,
-            SessionEventPayload::InputSettled { message_id, outcome: InputOutcome::Interrupted } if message_id == &input.id)).count(), 1);
+        assert_eq!(
+            log.iter()
+                .filter(|event| matches!(&event.payload,
+            SessionEventPayload::InputDelivered { message_id } if message_id == &input.id))
+                .count(),
+            1
+        );
         session.shutdown(None).await.unwrap();
     }
 
@@ -1420,8 +2032,10 @@ mod commit_tests {
             tx,
             stop_tx,
             closed: CancellationToken::new(),
+            final_head: AtomicU64::new(u64::MAX),
             services: services.clone(),
             forwarded: broadcast::channel(FORWARDED_EVENT_CAPACITY).0,
+            status: watch::channel(SessionStatus::Idle).0,
             failure: Mutex::new(None),
         });
         let mut driver = Driver {
@@ -1430,22 +2044,13 @@ mod commit_tests {
             store: services.sessions.clone(),
             subagents: RuntimeSubagentControl::new(services.clone()),
             control,
+            handles: Weak::new(),
             rx,
             stop_rx,
             head: base,
             last_state_commit: base,
-            pending: Vec::new(),
-            accepted: HashMap::new(),
-            delivered: HashSet::new(),
-            deferred: HashSet::new(),
-            status: SessionStatus::Idle,
-            active: None,
-            wake_requested: false,
-            closing: false,
-            interrupt_waiters: Vec::new(),
-            shutdown_waiters: Vec::new(),
-            cancel_deadline: None,
-            shutdown_deadline: None,
+            inbox: Inbox::default(),
+            phase: Phase::Idle,
         };
         let (reply, response) = oneshot::channel();
         driver

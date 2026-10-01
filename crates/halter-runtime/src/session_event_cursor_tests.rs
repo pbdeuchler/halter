@@ -90,8 +90,10 @@ async fn cursor_ignores_foreign_and_stale_wakes_and_forwarding_but_recovers_gaps
         tx,
         stop_tx: mpsc::unbounded_channel().0,
         closed: CancellationToken::new(),
+        final_head: AtomicU64::new(u64::MAX),
         services: services.clone(),
         forwarded,
+        status: watch::channel(SessionStatus::Idle).0,
         failure: Default::default(),
     });
     let mut events = session_events(control.clone(), 0);
@@ -148,7 +150,17 @@ async fn cursor_ignores_foreign_and_stale_wakes_and_forwarding_but_recovers_gaps
         .commit(&id, None, Some(2), None, vec![input()])
         .await
         .unwrap();
+    control.final_head.store(3, Ordering::Release);
     control.closed.cancel();
     assert_eq!(events.next().await.unwrap().unwrap().sequence(), 3);
+    let closed = events.next().await.unwrap().unwrap();
+    assert_eq!(closed.sequence(), 0);
+    assert_eq!(closed.session_id, id);
+    assert!(matches!(
+        closed.payload,
+        SessionEventPayload::SessionStatusChanged {
+            status: SessionStatus::Closed
+        }
+    ));
     assert!(events.next().await.is_none());
 }

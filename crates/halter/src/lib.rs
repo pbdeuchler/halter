@@ -16,26 +16,32 @@
 //!     let harness = Halter::from_config_file("halter.toml").await?;
 //!     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 //!
-//!     let submission = session.submit(Message::user("Summarize this repository")).await?;
+//!     let listener = tokio::spawn(async move {
+//!         while let Some(event) = events.next().await {
+//!             println!("{:?}", event?.payload);
+//!         }
+//!         Ok::<(), anyhow::Error>(())
+//!     });
 //!
-//!     while let Some(event) = events.next().await {
-//!         let event = event?;
-//!         if event.session_id != *session.id() || event.sequence() < submission.sequence {
-//!             continue;
-//!         }
-//!         println!("{:?}", event.payload);
-//!         match event.payload {
-//!             SessionEventPayload::InputSettled { message_id: id, .. }
-//!             | SessionEventPayload::InputRejected { message_id: id, .. }
-//!             | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
-//!             _ => {}
-//!         }
-//!     }
+//!     session.submit(Message::user("Summarize this repository")).await?;
+//!     session.submit(Message::user("Focus on persistence")).await?;
+//!     tokio::signal::ctrl_c().await?;
 //!     session.shutdown(None).await?;
+//!     listener.await??;
 //!
 //!     Ok(())
 //! }
 //! ```
+//!
+//! Keep a session handle to submit more input across idle periods. Dropping the
+//! last clone releases the session after foreground work, runnable input,
+//! background jobs, and subagents finish. It does not cancel active work.
+//! Event streams and status receivers do not retain the session. Stored history
+//! and deferred input remain available through `resume_session`.
+//!
+//! Clean stream closure emits a transient
+//! `SessionStatusChanged { status: Closed }` after the final committed event.
+//! Its sequence is zero and replay does not include it.
 //!
 //! ## More documentation
 //!
@@ -106,7 +112,7 @@ pub mod prompts {
 pub mod prelude {
     pub use halter_config::{HarnessConfig, PromptsConfig, SystemPromptPreset};
     pub use halter_protocol::{
-        InputDeferredReason, InputOutcome, Message, MessageId, ResourceSnapshot, SessionEvent,
+        InputDeferredReason, Message, MessageId, ResourceSnapshot, SessionEvent,
         SessionEventPayload, SessionId, SessionStatus,
     };
     pub use halter_runtime::SessionHandle as HalterSession;

@@ -133,18 +133,36 @@ impl BrowserSession {
     pub async fn close(mut self) -> anyhow::Result<()> {
         let provider = self.provider.clone();
         let id = self.remote.id.clone();
-        let page_result = self.page.close().await;
-        if let Err(err) = &page_result {
-            debug!(error = %err, "page.close failed during session shutdown");
-        }
-        let release_result = provider.close_session(&id).await;
+        let release_result = release_browser(
+            async { self.page.close().await.map_err(anyhow::Error::from) },
+            provider.close_session(&id),
+        )
+        .await;
         self.closed = release_result.is_ok();
         if let Err(err) = &release_result {
             warn!(error = %err, session_id = %id, "failed to release cloud browser session");
         }
         release_result?;
-        page_result.map_err(|error| anyhow::anyhow!("failed to close browser page: {error}"))?;
         Ok(())
+    }
+}
+
+async fn release_browser(
+    page_close: impl std::future::Future<Output = anyhow::Result<()>>,
+    release: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    tokio::pin!(page_close, release);
+    // Attempt page closure and cloud release independently. Provider release
+    // is authoritative; a lost CDP response must not prevent remote cleanup.
+    tokio::select! {
+        biased;
+        result = &mut page_close => {
+            if let Err(error) = result {
+                debug!(%error, "page.close failed during session shutdown");
+            }
+            release.await
+        }
+        result = &mut release => result,
     }
 }
 
@@ -185,4 +203,32 @@ pub fn default_screenshot_options() -> ScreenshotOptions {
         .screenshot_type(ScreenshotType::Png)
         .full_page(true)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn provider_release_completes_despite_missing_or_failed_page_close() {
+        for missing in [false, true] {
+            let page = async move {
+                if missing {
+                    std::future::pending::<()>().await;
+                }
+                anyhow::bail!("page is already closed")
+            };
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                release_browser(page, async { Ok(()) }),
+            )
+            .await
+            .expect("CDP closure cannot hold up provider release")
+            .unwrap();
+        }
+        let error = release_browser(async { Ok(()) }, async { anyhow::bail!("release failed") })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("release failed"));
+    }
 }

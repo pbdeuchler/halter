@@ -508,7 +508,7 @@ fn track_fired_hook_ids(fired_hook_ids: &mut BTreeSet<String>, dispatch: &Execut
 /// Runtime handle used to create, resume, list, and shut down sessions.
 pub struct SessionRuntime {
     services: Arc<RuntimeServices>,
-    subagents: crate::subagents::RuntimeSubagentControl,
+    pub(crate) subagents: crate::subagents::RuntimeSubagentControl,
     drivers: Arc<crate::session_driver::SessionDrivers>,
 }
 
@@ -552,23 +552,22 @@ impl SessionRuntime {
         let id = init.session_id.clone().unwrap_or_default();
         init.session_id = Some(id.clone());
         let _opening = self.drivers.reserve(&id)?;
-        let result = async {
-            let executor = self.new_session(init).await?;
-            self.drivers
-                .open(
-                    executor,
-                    self.services.clone(),
-                    self.subagents.clone(),
-                    0,
-                    None,
-                )
-                .await
-        }
-        .await;
-        if result.is_err() {
-            self.drivers.release(&id);
-        }
-        result
+        let executor = create_session_seeded(
+            self.services.clone(),
+            init,
+            SessionState::default(),
+            self.services.resources.snapshot(),
+        )
+        .await?;
+        self.drivers
+            .open(
+                executor,
+                self.services.clone(),
+                self.subagents.clone(),
+                0,
+                None,
+            )
+            .await
     }
 
     /// Restore recorded history and pending input into a fresh, idle driver.
@@ -580,41 +579,35 @@ impl SessionRuntime {
             return Err(crate::SessionError::Closed);
         }
         let _opening = self.drivers.reserve(id)?;
-        let result = async {
-            // Bounded child executors belong to their parent even between
-            // executions; opening a driver would introduce a second owner.
-            if self.subagents.owns_session(id).await {
-                return Err(crate::SessionError::AlreadyOpen(id.clone()));
-            }
-            let head = self
-                .services
-                .sessions
-                .load_session(id)
-                .await?
-                .ok_or_else(|| crate::SessionError::NotFound(id.clone()))?
-                .head_sequence;
-            let (executor, history) = self
-                .resume_with_history(id)
-                .await?
-                .ok_or_else(|| crate::SessionError::NotFound(id.clone()))?;
-            self.drivers
-                .open(
-                    executor,
-                    self.services.clone(),
-                    self.subagents.clone(),
-                    head,
-                    Some(history),
-                )
-                .await
+        // Bounded child executors belong to their parent even between
+        // executions; opening a driver would introduce a second owner.
+        if self.subagents.owns_session(id).await {
+            return Err(crate::SessionError::AlreadyOpen(id.clone()));
         }
-        .await;
-        if result.is_err() {
-            self.drivers.release(id);
-        }
-        result
+        let head = self
+            .services
+            .sessions
+            .load_session(id)
+            .await?
+            .ok_or_else(|| crate::SessionError::NotFound(id.clone()))?
+            .head_sequence;
+        let (executor, history) = self
+            .resume_with_history(id)
+            .await?
+            .ok_or_else(|| crate::SessionError::NotFound(id.clone()))?;
+        self.drivers
+            .open(
+                executor,
+                self.services.clone(),
+                self.subagents.clone(),
+                head,
+                Some(history),
+            )
+            .await
     }
 
     /// Create and persist a new session.
+    #[cfg(test)]
     pub(crate) async fn new_session(&self, init: SessionInit) -> anyhow::Result<SessionExecutor> {
         debug!(
             working_dir = %init.working_dir.display(),
@@ -625,13 +618,17 @@ impl SessionRuntime {
             subagent_depth = init.subagent_depth,
             "creating session"
         );
-        create_session_seeded(
+        let executor = create_session_seeded(
             self.services.clone(),
             init,
             SessionState::default(),
             self.services.resources.snapshot(),
         )
-        .await
+        .await?;
+        self.services
+            .tool_sessions
+            .open_session(executor.session_id());
+        Ok(executor)
     }
 
     /// Resume an existing session and fire resume-time hooks.
@@ -640,10 +637,14 @@ impl SessionRuntime {
         &self,
         session_id: &SessionId,
     ) -> anyhow::Result<Option<SessionExecutor>> {
-        Ok(self
+        let executor = self
             .resume_with_history(session_id)
             .await?
-            .map(|(executor, _)| executor))
+            .map(|(executor, _)| executor);
+        if executor.is_some() {
+            self.services.tool_sessions.open_session(session_id);
+        }
+        Ok(executor)
     }
 
     async fn resume_with_history(
@@ -1923,6 +1924,7 @@ impl SessionExecutor {
             if cancel.is_cancelled() {
                 return Err(ProviderError::cancelled().into());
             }
+            driver.attempt(input.id.clone()).await?;
             let dispatch =
                 run_user_prompt_submit(self, fired_hook_ids, hook_ctx, &input.plain_text()).await?;
             track_fired_hook_ids(fired_hook_ids, &dispatch);
@@ -4242,39 +4244,34 @@ mod tests {
             (provider, services, calls)
         }
 
-        async fn idle(events: &mut SessionEventStream) -> Vec<SessionEvent> {
+        async fn idle(
+            session: &crate::SessionHandle,
+            events: &mut SessionEventStream,
+        ) -> Vec<SessionEvent> {
             tokio::time::timeout(Duration::from_secs(5), async {
+                let mut status = session.subscribe_status();
                 let mut collected = Vec::new();
-                let mut running = false;
                 loop {
-                    let event = events
-                        .next()
-                        .await
-                        .expect("live session stream")
-                        .expect("event");
-                    if matches!(
-                        event.payload,
-                        SessionEventPayload::SessionStatusChanged {
-                            status: halter_protocol::SessionStatus::Running
-                        }
-                    ) {
-                        running = true;
-                    }
-                    let done = running
-                        && matches!(
-                            event.payload,
-                            SessionEventPayload::SessionStatusChanged {
-                                status: halter_protocol::SessionStatus::Idle
-                            }
-                        );
+                    let event = events.next().await.expect("live session stream").expect("event");
+                    let terminal = event.session_id == *session.id() && matches!(event.payload,
+                        SessionEventPayload::TurnCompleted { .. } | SessionEventPayload::TurnFailed { .. });
                     collected.push(event);
-                    if done {
-                        return collected;
+                    if terminal { break; }
+                }
+                while *status.borrow() == halter_protocol::SessionStatus::Running {
+                    tokio::select! {
+                        changed = status.changed() => { changed.expect("status remains available"); }
+                        event = events.next() => {
+                            if let Some(event) = event { collected.push(event.expect("event")); }
+                        }
                     }
                 }
-            })
-            .await
-            .expect("execution becomes idle")
+                let head = session.replay().await.unwrap().last().map_or(0, SessionEvent::sequence);
+                while collected.iter().filter(|event| event.session_id == *session.id()).map(SessionEvent::sequence).max().unwrap_or(0) < head {
+                    collected.push(events.next().await.expect("committed event").expect("event"));
+                }
+                collected
+            }).await.expect("execution stops foreground work")
         }
 
         #[tokio::test]
@@ -4313,7 +4310,7 @@ mod tests {
                     SessionEventPayload::MessageItem { message: Message::User(message) } if message.id == correction_id
                 )));
                 provider.release.notify_one();
-                let completed = idle(&mut events).await;
+                let completed = idle(&session, &mut events).await;
                 let terminal = completed
                     .iter()
                     .find(|event| {
@@ -4323,21 +4320,26 @@ mod tests {
                     .sequence();
                 let log = session.replay().await.unwrap();
                 for input_id in [&primary_id, &correction_id] {
-                    let settled = log.iter().filter(|event| matches!(
-                        &event.payload,
-                        SessionEventPayload::InputSettled { message_id, outcome: halter_protocol::InputOutcome::Completed }
-                            if message_id == input_id
-                    )).collect::<Vec<_>>();
-                    assert_eq!(settled.len(), 1, "each delivered input settles once");
+                    let settled = log
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                &event.payload,
+                                SessionEventPayload::InputDelivered { message_id }
+                                    if message_id == input_id
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(settled.len(), 1, "each input records delivery once");
                     assert!(
-                        settled[0].sequence() > terminal,
-                        "settlement follows terminal execution"
+                        settled[0].sequence() < terminal,
+                        "delivery precedes terminal execution"
                     );
                     assert!(
                         completed
                             .iter()
                             .any(|event| event.sequence() == settled[0].sequence()),
-                        "settlement is in the terminal event batch"
+                        "delivery is visible in the execution history"
                     );
                 }
                 assert!(
@@ -4414,7 +4416,7 @@ mod tests {
                     provider.release.notify_one();
                     id
                 };
-                let completed = idle(&mut events).await;
+                let completed = idle(&session, &mut events).await;
                 assert!(completed.iter().any(|event| matches!(
                     &event.payload,
                     SessionEventPayload::InputRejected { message_id, reason }
@@ -4493,7 +4495,7 @@ mod tests {
                 .await
                 .unwrap()
                 .message_id;
-            let completed = idle(&mut events).await;
+            let completed = idle(&session, &mut events).await;
             assert!(completed.iter().any(|event| matches!(
                 &event.payload,
                 SessionEventPayload::InputRejected { message_id, .. } if message_id == &rejected.id
@@ -4541,7 +4543,7 @@ mod tests {
                 .unwrap()
                 .message_id;
             session.interrupt(None).await.unwrap();
-            let cancelled = idle(&mut events).await;
+            let cancelled = idle(&session, &mut events).await;
             assert!(cancelled.iter().any(|event| matches!(
                 event.payload,
                 SessionEventPayload::TurnFailed {
@@ -4564,7 +4566,7 @@ mod tests {
             assert_eq!(provider.requests.lock().unwrap().len(), 1);
 
             session.submit(Message::user("continue")).await.unwrap();
-            let completed = idle(&mut events).await;
+            let completed = idle(&session, &mut events).await;
             assert!(
                 !completed
                     .iter()
@@ -4677,7 +4679,7 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                    idle(&mut events).await;
+                    idle(&session, &mut events).await;
                 }
                 assert!(
                     dropped.load(Ordering::SeqCst),
@@ -4709,16 +4711,13 @@ mod tests {
                     1
                 );
                 if close {
-                    assert_eq!(
-                        stored.state.session_status,
-                        halter_protocol::SessionStatus::Closed
-                    );
+                    assert_eq!(session.status(), halter_protocol::SessionStatus::Closed);
                 } else {
                     session
                         .submit(Message::user("continue after interruption"))
                         .await
                         .unwrap();
-                    idle(&mut events).await;
+                    idle(&session, &mut events).await;
                     let requests = provider.requests.lock().unwrap().clone();
                     assert_eq!(requests.len(), 2);
                     let call_ids = requests[1]
@@ -4896,7 +4895,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let cancelled = idle(&mut events).await;
+            let cancelled = idle(&session, &mut events).await;
             assert!(cancelled.iter().any(|event| matches!(
                 &event.payload,
                 SessionEventPayload::DeltaItem { delta } if delta.text == "partial answer"
@@ -4931,7 +4930,7 @@ mod tests {
             assert!(stored.state.pending_tool_calls.is_empty());
 
             session.submit(Message::user("continue")).await.unwrap();
-            idle(&mut events).await;
+            idle(&session, &mut events).await;
             let requests = provider.requests.lock().unwrap().clone();
             assert_eq!(requests.len(), 2);
             assert_eq!(requests[1].previous_response_id, None);
@@ -5012,7 +5011,7 @@ mod tests {
                         id
                     );
                 }
-                let completed = idle(&mut events).await;
+                let completed = idle(&session, &mut events).await;
                 assert_eq!(
                     completed
                         .iter()
@@ -5040,16 +5039,150 @@ mod tests {
                     .unwrap();
                 assert_eq!(stored.state.pending_inputs.len(), 1);
                 assert_eq!(stored.state.pending_inputs[0].id, id);
-                assert_eq!(
-                    stored.state.session_status,
-                    halter_protocol::SessionStatus::Idle
-                );
+                assert_eq!(session.status(), halter_protocol::SessionStatus::Idle);
                 assert!(stored.state.open_turn.is_none());
                 assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
                 assert!(provider.requests.lock().unwrap().is_empty());
             }
             session.shutdown(None).await.unwrap();
             assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn failing_steering_hook_quarantines_its_input_and_later_messages_continue() {
+            let root = tempfile::tempdir().unwrap();
+            let (provider, mut services, _) = setup(root.path(), false);
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let hook_attempts = attempts.clone();
+            let mut hooks = RegisteredHooks::default();
+            hooks.register(
+                PluginId::from("fail-one-input"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(HookEventName::UserPromptSubmit, move |input| {
+                    let fail = input.string_field("prompt") == Some("bad correction");
+                    let attempts = hook_attempts.clone();
+                    async move {
+                        if fail {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            panic!("steering hook failure");
+                        }
+                        HookResponse::passthrough()
+                    }
+                }),
+            );
+            Arc::get_mut(&mut services).unwrap().registered_hooks = Arc::new(hooks);
+            let runtime = SessionRuntime::new(services);
+            let (session, mut events) = runtime
+                .create_session(SessionInit {
+                    working_dir: root.path().into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            session.submit(Message::user("start task")).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), provider.started.notified())
+                .await
+                .unwrap();
+            let bad_message = Message::user("bad correction");
+            let bad = session.submit(bad_message.clone()).await.unwrap();
+            provider.release.notify_one();
+            let failed = idle(&session, &mut events).await;
+            assert!(failed.iter().any(|event| matches!(&event.payload,
+                SessionEventPayload::InputDeferred { message_id, reason: halter_protocol::InputDeferredReason::ExecutionFailed { .. } }
+                    if message_id == &bad.message_id
+            )));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            let fresh = session
+                .submit(Message::user("new correction"))
+                .await
+                .unwrap();
+            let continued = idle(&session, &mut events).await;
+            assert!(continued.iter().any(|event| matches!(&event.payload,
+                SessionEventPayload::InputDelivered { message_id } if message_id == &fresh.message_id
+            )));
+            assert!(!continued.iter().any(|event| matches!(&event.payload,
+                SessionEventPayload::InputDelivered { message_id } if message_id == &bad.message_id
+            )));
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "new input must not retry the failed steering hook"
+            );
+            session.submit(bad_message).await.unwrap();
+            idle(&session, &mut events).await;
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                2,
+                "same-ID retry explicitly runs its hook again"
+            );
+            assert!(session.discard(&bad.message_id).await.unwrap());
+            session.shutdown(None).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn repeated_shutdown_after_resource_cleanup_does_not_poison_reopen() {
+            let root = tempfile::tempdir().unwrap();
+            let (_, mut services, _) = setup(root.path(), false);
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut hooks = RegisteredHooks::default();
+            let hook_started = started.clone();
+            let hook_release = release.clone();
+            hooks.register(
+                PluginId::from("pause-session-end"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(HookEventName::SessionEnd, move |_| {
+                    let started = hook_started.clone();
+                    let release = hook_release.clone();
+                    let calls = calls.clone();
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            started.notify_one();
+                            release.acquire().await.unwrap().forget();
+                        }
+                        HookResponse::passthrough()
+                    }
+                }),
+            );
+            Arc::get_mut(&mut services).unwrap().registered_hooks = Arc::new(hooks);
+            let runtime = SessionRuntime::new(services.clone());
+            let (session, _) = runtime
+                .create_session(SessionInit {
+                    working_dir: root.path().into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let _ = services.tool_sessions.shell_session(session.id());
+            let first_handle = session.clone();
+            let first = tokio::spawn(async move { first_handle.shutdown(None).await });
+            tokio::time::timeout(Duration::from_secs(5), started.notified())
+                .await
+                .unwrap();
+            assert!(!services.tool_sessions.has_process_state(session.id()));
+            assert!(matches!(
+                session.shutdown(Some(Duration::ZERO)).await,
+                Err(crate::SessionError::TimedOut)
+            ));
+            let retry_handle = session.clone();
+            let retry = tokio::spawn(async move { retry_handle.shutdown(None).await });
+            assert!(matches!(
+                session.compact("closed", None).await,
+                Err(crate::SessionError::Closed)
+            ));
+            assert!(
+                !services.tool_sessions.has_process_state(session.id()),
+                "retry must not recreate closed slots"
+            );
+            release.add_permits(1);
+            first.await.unwrap().unwrap();
+            retry.await.unwrap().unwrap();
+            assert_eq!(session.status(), halter_protocol::SessionStatus::Closed);
+            let (reopened, _) = runtime.resume_session(session.id()).await.unwrap();
+            assert_eq!(reopened.status(), halter_protocol::SessionStatus::Idle);
+            assert!(!services.tool_sessions.has_process_state(reopened.id()));
+            reopened.shutdown(None).await.unwrap();
         }
 
         #[tokio::test]
@@ -5089,7 +5222,7 @@ mod tests {
                         id
                     );
                 }
-                let completed = idle(&mut events).await;
+                let completed = idle(&session, &mut events).await;
                 let failures = completed
                     .iter()
                     .filter(|event| matches!(event.payload, SessionEventPayload::TurnFailed { .. }))
@@ -5143,9 +5276,17 @@ mod tests {
                     .await
                     .unwrap();
                 session.submit(Message::user(prompt)).await.unwrap();
-                let mut observed = idle(&mut events).await;
+                let mut observed = idle(&session, &mut events).await;
                 session.shutdown(None).await.unwrap();
                 observed.extend(events.try_collect::<Vec<_>>().await.unwrap());
+
+                assert!(matches!(
+                    observed.last().unwrap().payload,
+                    SessionEventPayload::SessionStatusChanged {
+                        status: halter_protocol::SessionStatus::Closed
+                    }
+                ));
+                assert_eq!(observed.last().unwrap().sequence(), 0);
 
                 let forwarded = forwarded_events(&observed, session.id());
                 match (forwarding, cap) {
@@ -5167,7 +5308,7 @@ mod tests {
                 }
                 let parent_sequences = observed
                     .iter()
-                    .filter(|event| &event.session_id == session.id())
+                    .filter(|event| &event.session_id == session.id() && event.sequence() != 0)
                     .map(SessionEvent::sequence)
                     .collect::<Vec<_>>();
                 let log_sequences = session
@@ -5234,7 +5375,7 @@ mod tests {
                     hydrate_stored_session(services.sessions.as_ref(), &mut stored)
                         .await
                         .unwrap();
-                    if stored.state.session_status == halter_protocol::SessionStatus::Idle
+                    if session.status() == halter_protocol::SessionStatus::Idle
                         && stored.state.open_turn.is_none()
                         && stored.state.pending_inputs.is_empty()
                     {
@@ -5247,6 +5388,13 @@ mod tests {
             .expect("parent finishes while event consumption is delayed");
             session.shutdown(None).await.unwrap();
             let observed = events.try_collect::<Vec<_>>().await.unwrap();
+            assert!(matches!(
+                observed.last().unwrap().payload,
+                SessionEventPayload::SessionStatusChanged {
+                    status: halter_protocol::SessionStatus::Closed
+                }
+            ));
+            assert_eq!(observed.last().unwrap().sequence(), 0);
             assert_eq!(forwarded_events(&observed, session.id()).len(), 128);
             assert!(observed.iter().any(|event| matches!(
                 event.payload,
@@ -5254,7 +5402,7 @@ mod tests {
             )));
             let parent_sequences = observed
                 .iter()
-                .filter(|event| &event.session_id == session.id())
+                .filter(|event| &event.session_id == session.id() && event.sequence() != 0)
                 .map(SessionEvent::sequence)
                 .collect::<Vec<_>>();
             let log_sequences = session
@@ -5317,7 +5465,7 @@ mod tests {
                 .unwrap()
                 .message_id;
             provider.release.notify_one();
-            let completed = idle(&mut events).await;
+            let completed = idle(&session, &mut events).await;
             assert!(
                 !completed
                     .iter()

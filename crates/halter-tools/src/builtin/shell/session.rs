@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::ToolEventSink;
 
 use super::streaming::{collect_output, pipe_to_files};
-use crate::builtin::process::{kill_process_group, kill_tree};
+use crate::builtin::process::{kill_process_group, signal_process};
 
 const TERM_SIGNAL: i32 = 15;
 const KILL_SIGNAL: i32 = 9;
@@ -51,11 +51,18 @@ impl std::ops::Deref for ShellSession {
 }
 
 impl ShellSession {
-    pub(crate) fn new(lifetime: CancellationToken) -> Self {
+    pub(crate) fn new(
+        lifetime: CancellationToken,
+        activity: tokio::sync::watch::Sender<()>,
+    ) -> Self {
         Self {
             lifetime,
+            processes: brush_core::processes::ProcessTracker::with_activity(activity),
             ..Self::default()
         }
+    }
+    pub(crate) fn has_running(&self) -> bool {
+        self.processes.has_running()
     }
     pub(crate) fn request_stop(&self, force: bool) {
         self.lifetime.cancel();
@@ -637,11 +644,15 @@ async fn terminate_background_jobs(shell: &BrushShell) {
         }
     }
 
+    let mut signalled = false;
     for &pgid in &pgids {
-        let _ = kill_process_group(pgid, TERM_SIGNAL);
+        signalled |= kill_process_group(pgid, TERM_SIGNAL);
     }
     for &pid in &pids {
-        let _ = kill_tree(pid, TERM_SIGNAL);
+        signalled |= signal_process(pid, TERM_SIGNAL);
+    }
+    if !signalled {
+        return;
     }
 
     time::sleep(POST_EXIT_KILL_DELAY).await;
@@ -649,17 +660,16 @@ async fn terminate_background_jobs(shell: &BrushShell) {
         let _ = kill_process_group(pgid, KILL_SIGNAL);
     }
     for pid in pids {
-        let _ = kill_tree(pid, KILL_SIGNAL);
+        let _ = signal_process(pid, KILL_SIGNAL);
     }
 }
 
 #[cfg(not(unix))]
 async fn terminate_background_jobs(shell: &BrushShell) {
-    // Windows has no Unix signal grace period. kill_tree uses native process
-    // termination, followed by the caller awaiting Brush's child handles.
+    // Brush's process tracker uses native tree termination on Windows.
     for job in &shell.jobs().jobs {
         if let Some(pid) = job.representative_pid() {
-            kill_tree(pid, KILL_SIGNAL);
+            signal_process(pid, KILL_SIGNAL);
         }
     }
 }
@@ -667,6 +677,69 @@ async fn terminate_background_jobs(shell: &BrushShell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_background_activity_finishes_without_relocking_shell() {
+        let store = crate::ToolSessionStore::default();
+        let id = halter_protocol::SessionId::new();
+        store.open_session(&id);
+        let mut activity = store.subscribe_activity();
+        let session = store.shell_session(&id);
+        run_persistent_shell(
+            session.clone(),
+            ShellRunOptions {
+                command: "sleep 30 &".to_owned(),
+                cwd: None,
+                default_cwd: None,
+                env: None,
+                timeout: None,
+            },
+            std::sync::Arc::new(crate::NoopToolEventSink),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            store.has_running_jobs(&id),
+            "the asynchronous shell job survives command completion"
+        );
+        // Holding the shell execution lock cannot prevent activity inspection
+        // or final completion notification from the owned job task.
+        let shell = session.lock().await;
+        activity.borrow_and_update();
+        session.processes.force_stop();
+        time::timeout(Duration::from_secs(5), async {
+            while store.has_running_jobs(&id) {
+                activity.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the shell job publishes completion without a new command");
+        assert!(shell.is_some(), "the persistent shell slot remains open");
+        drop(shell);
+        store.shutdown_session(&id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_reaps_empty_group_without_waiting_full_term_grace() {
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("30").process_group(0).kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+        let mut child = brush_core::processes::ChildProcess::new(child, Some(pid), Some(pid));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(450), child.wait(Some(cancel)))
+            .await
+            .expect("an empty group needs no remaining TERM grace")
+            .unwrap();
+        assert!(matches!(
+            result,
+            brush_core::processes::ProcessWaitResult::Cancelled
+        ));
+    }
 
     #[test]
     fn inherit_env_var_uses_allowlist() {

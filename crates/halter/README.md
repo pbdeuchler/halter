@@ -16,21 +16,17 @@ async fn main() -> anyhow::Result<()> {
     let harness = Halter::from_config_file("halter.toml").await?;
     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 
-    let submission = session.submit(Message::user("Summarize this repository")).await?;
-    while let Some(event) = events.next().await {
-        let event = event?;
-        if event.session_id != *session.id() || event.sequence() < submission.sequence {
-            continue;
+    let listener = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            println!("{:?}", event?.payload);
         }
-        println!("{:?}", event.payload);
-        match event.payload {
-            SessionEventPayload::InputSettled { message_id: id, .. }
-            | SessionEventPayload::InputRejected { message_id: id, .. }
-            | SessionEventPayload::InputDeferred { message_id: id, .. } if id == submission.message_id => break,
-            _ => {}
-        }
-    }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    session.submit(Message::user("Summarize this repository")).await?;
+    tokio::signal::ctrl_c().await?;
     session.shutdown(None).await?;
+    listener.await??;
 
     Ok(())
 }
@@ -54,20 +50,46 @@ The `halter` crate keeps optional capabilities out of the default build. No feat
 | `sqlite`         | Enables SQLite-backed session persistence and the matching config schema.                                                                | `rusqlite`                                                                                                        | Allows `sessions.backend = "sqlite"` and exposes `halter::session::SqliteSessionStore`. The default backend remains memory unless config selects SQLite.                          |
 
 `submit` returns `Submission { message_id, sequence }` after input is committed
-to the configured session store. While
-execution is active, further submissions queue for the next safe boundary.
-Ignore events before `submission.sequence`, then match `submission.message_id`
-in `InputSettled` for its execution outcome. `InputRejected`
-reports hook rejection; `InputDeferred` means the input is still queued.
+to the configured session store. Further submissions queue for the next safe
+boundary during active execution. `InputDelivered` records when accepted input
+enters history; `InputRejected` records removal without delivery. `InputDeferred`
+means the input remains queued. These records do not promise a final reply or
+that background work has finished.
+
+An input deferred with `ExecutionFailed` requires explicit same-ID retry;
+unrelated messages skip it. Untouched followers marked `ExecutionStopped` remain
+eligible when a later submission starts work.
+
+`session.status()` reads current foreground activity. `session.subscribe_status()`
+returns a watch receiver initialized with the current `Idle`, `Running`, or
+`Closed` value. Activity belongs to the live handle and is not restored from the
+log. Watch updates may coalesce; an idle session can still own background processes.
+
+A clean stream closure emits one transient `SessionStatusChanged { status: Closed }`
+after the final committed event. Its sequence is zero; replay does not contain it.
+
+`session.discard(&message_id)` removes queued input while idle and records
+`InputRejected`. It returns whether an entry was removed. Interrupt active
+foreground work before discarding; retained deferred entries count toward inbox
+capacity.
+
 `interrupt(None)` waits for cancellation and cleanup without closing the handle.
 `shutdown(None)` closes the live driver and stream; `harness.resume_session(id)`
 reopens the stored conversation idle with fresh handles.
+
+Keep a handle to submit more input across idle periods. Dropping the last clone
+releases the session after foreground work, runnable input, background jobs, and
+subagents finish. It does not cancel active work. Event streams and status receivers
+do not retain the session; dropping a stream does not stop execution. Release runs
+cleanup and `SessionEnd` with reason `session_released`. Stored history and deferred
+input remain available for resume.
+
 Use `Some(duration)` to bound the caller's wait for cleanup. Expiry returns
 `SessionError::TimedOut` and requests forced recovery; call again with `None`
 to await settlement. Storage writes or blocking code can delay final settlement.
 Queued same-ID retries emit a fresh `InputAccepted` whose
-sequence is returned in the receipt, without duplicating input. Already settled
-or rejected IDs start no work; their outcomes remain available through `replay()`.
+sequence is returned in the receipt, without duplicating input. Already delivered
+or rejected IDs start no work; their records remain available through `replay()`.
 
 ## More documentation
 
