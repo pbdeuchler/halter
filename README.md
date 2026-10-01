@@ -304,7 +304,8 @@ Base system-prompt precedence, most specific first: an explicit per-session prom
 
 - providers
 - model roles (`default`, `small`, `subagent`), with `default` and `subagent`
-  optionally backed by a `"model_judge"` panel via `[models.model_judge]`
+  optionally backed by an experimental `"model_judge"` panel via
+  `[models.model_judge]`
 - resource roots
 - prompts (a built-in `preset` plus a full `system_prompt` override)
 - context compaction settings
@@ -600,6 +601,9 @@ OpenAI-compatible values and maps them to the nearest supported Anthropic
 thinking mode where necessary.
 
 #### Model Judge
+
+> [!WARNING]
+> **This feature is very experimental and there is a good chance it goes away, do not rely on this.**
 
 The `models.default` and `models.subagent` slots accept either an inline model
 (the form above) or the string `"model_judge"`, which references a shared
