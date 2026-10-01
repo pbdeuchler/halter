@@ -11,6 +11,10 @@ use crate::{
     variables::{self, ArrayLiteral},
 };
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_recursion adds must_use to an already must-use future"
+)]
 #[async_recursion::async_recursion]
 pub(crate) async fn eval_extended_test_expr(
     expr: &ast::ExtendedTestExpr,
