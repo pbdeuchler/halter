@@ -406,7 +406,7 @@ fn process_group_is_gone(group: i32) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn process_group_is_gone(_group: i32) -> bool {
+const fn process_group_is_gone(_group: i32) -> bool {
     false
 }
 
