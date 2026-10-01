@@ -601,6 +601,9 @@ thinking mode where necessary.
 
 #### Model Judge
 
+> [!WARNING]
+> **This feature is very experimental and there is a good chance it goes away, do not rely on this.**
+
 The `models.default` and `models.subagent` slots accept either an inline model
 (the form above) or the string `"model_judge"`, which references a shared
 `[models.model_judge]` block. A model-judge slot deliberates over a panel of
