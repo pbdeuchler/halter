@@ -45,16 +45,19 @@ use halter::prelude::*;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let harness = Halter::from_config_file("halter.toml").await?;
-    let session = harness.new_session(SessionInit::default()).await?;
+    let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 
-    let mut events = session
-        .submit_turn(Turn::user("Summarize the session persistence design"))
-        .await?;
+    let listener = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            println!("{:?}", event?.payload);
+        }
+        Ok::<(), anyhow::Error>(())
+    });
 
-    while let Some(event) = events.next().await {
-        let event = event?;
-        println!("{:?}", event.payload);
-    }
+    session.submit(Message::user("Summarize the session persistence design")).await?;
+    tokio::signal::ctrl_c().await?;
+    session.shutdown(None).await?;
+    listener.await??;
 
     Ok(())
 }
@@ -67,7 +70,7 @@ This code does all of the following:
 - builds providers, tools, hooks, policy, and session storage
 - creates a runtime
 - creates a session
-- executes one turn and streams the resulting events
+- durably accepts input and streams session events until shutdown
 
 ### Detailed events
 
@@ -79,27 +82,34 @@ use halter::prelude::*;
 async fn main() -> anyhow::Result<()> {
     let harness = Halter::from_config_file("halter.toml").await?;
 
-    let session = harness
+    let (session, mut stream) = harness
         .new_session(SessionInit {
             working_dir: std::env::current_dir()?,
             ..SessionInit::default()
         })
         .await?;
 
-    let mut stream = session.submit_turn(Turn::user("List the major crates in this repo")).await?;
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        match event.payload {
-            SessionEventPayload::DeltaItem { delta } => print!("{}", delta.text),
-            SessionEventPayload::TurnCompleted { usage, .. } => {
-                println!("\nusage: in={} out={}", usage.input_tokens, usage.output_tokens);
+    let listener = tokio::spawn(async move {
+        while let Some(event) = stream.next().await {
+            match event?.payload {
+                SessionEventPayload::DeltaItem { delta } => print!("{}", delta.text),
+                SessionEventPayload::ToolOutput { chunk, .. } => print!("{chunk}"),
+                SessionEventPayload::InputDelivered { message_id } => {
+                    println!("input {message_id} entered history");
+                }
+                SessionEventPayload::InputRejected { message_id, reason } => {
+                    eprintln!("input {message_id} rejected: {reason}");
+                }
+                _ => {}
             }
-            SessionEventPayload::TurnFailed { error, .. } => {
-                eprintln!("turn failed: {error}");
-            }
-            _ => {}
         }
-    }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    session.submit(Message::user("List the major crates in this repo")).await?;
+    tokio::signal::ctrl_c().await?;
+    session.shutdown(None).await?;
+    listener.await??;
 
     Ok(())
 }
@@ -140,7 +150,8 @@ async fn main() -> anyhow::Result<()> {
     let snapshot = ResourceSnapshot::empty();
 
     let harness = Halter::from_config(config, snapshot).await?;
-    let _session = harness.new_session(SessionInit::default()).await?;
+    let (session, _events) = harness.new_session(SessionInit::default()).await?;
+    session.shutdown(None).await?;
     Ok(())
 }
 ```
@@ -261,7 +272,7 @@ use halter::prelude::*;
 use halter::prompts;
 
 // Spin up a coding agent in one line:
-let session = harness
+let (session, events) = harness
     .new_session(
         SessionInit::default()
             .with_system_prompt(prompts::default_coding_agent_prompt())
@@ -587,7 +598,7 @@ backend = "memory"
 # session store via `session.export_trace()`, with or without this setting.
 # traces_dir = "/tmp/halter/traces"
 
-# Optional. Keep off unless the caller wants the parent turn stream to include
+# Optional. Keep off unless the caller wants the parent session stream to include
 # raw events from subagents spawned under that parent.
 # subagent_event_forwarding = "off"
 # subagent_event_forwarding = "all"
@@ -705,7 +716,9 @@ use halter_config::{
     ProvidersConfig, ResourcesConfig, RuntimeConfig, SearchRoots, SessionBackend,
     SessionsConfig, ShellPolicyConfig, ToolsConfig,
 };
-use halter_protocol::{ReasoningEffort, SkillId, Turn};
+use futures::StreamExt;
+use halter::prelude::*;
+use halter_protocol::{ReasoningEffort, SkillId};
 
 use halter_runtime::SessionInit;
 
@@ -846,10 +859,18 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .await?;
 
-    let session = harness.new_session(SessionInit::default()).await?;
-    let _events = session
-        .submit_turn(Turn::user("Describe the active runtime and available skills"))
-        .await?;
+    let (session, mut events) = harness.new_session(SessionInit::default()).await?;
+    let listener = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            println!("{:?}", event?.payload);
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    session.submit(Message::user("Describe the active runtime and available skills")).await?;
+    tokio::signal::ctrl_c().await?;
+    session.shutdown(None).await?;
+    listener.await??;
 
     Ok(())
 }
@@ -1027,26 +1048,105 @@ It owns:
 - subagent lineage and coordination
 - session replay/resume
 
-The public session handle is `SessionHandle`; `HalterSession` remains a backwards-compatible alias.
+The SDK returns a cloneable `SessionHandle` and one continuous `SessionEventStream`.
+`HalterSession` aliases this handle in the SDK prelude. Internal execution IDs
+remain in diagnostic events; clients submit messages and control the session.
 
-#### Cancellation
+#### Input, interruption, and reopening
 
-`submit_turn` and `compact` are cancelled only by runtime shutdown. Dropping
-the turn's event stream does **not** cancel the turn. To cancel one yourself,
-pass a `CancellationToken`:
+`submit(Message::user(...)).await` returns a submission receipt after the session store
+has committed the input. While idle, submission starts execution. While a provider
+or foreground tool is running, input queues and is delivered at the next safe
+conversation boundary. A `MessageItem` event confirms delivery into history.
+Acceptance is durable only as far as the configured store: use SQLite for recovery
+after process exit. An in-memory store lasts only as long as the process.
 
 ```rust
-let cancel = tokio_util::sync::CancellationToken::new();
-let turn = session.submit_turn_with_cancel(request, cancel.clone()).await?;
-// later: cancel.cancel(); the turn fails as cancelled.
+let (session, mut events) = harness.new_session(SessionInit::default()).await?;
+let session_id = session.id().clone();
+session.submit(Message::user("Refactor the parser")).await?;
+session.submit(Message::user("Keep its public API unchanged")).await?;
+session.interrupt(None).await?;
+session.shutdown(None).await?;
+
+// A fresh driver starts idle with the stored conversation and pending input.
+let (session, events) = harness.resume_session(&session_id).await?;
+session.submit(Message::user("Continue with the parser tests")).await?;
 ```
 
-`compact_with_cancel(trigger, instructions, cancel)` does the same for
-compaction. The token reaches every external call a turn makes: provider
-requests, rate-limit waits, model-judge panels, hooks, subagent spawn/wait,
-and browser actions. SDK hooks get it as `HookInput::cancel`, and custom
-`SubagentControl` implementations get it on `spawn` and `wait`. Subagents
-themselves outlive their parent turn and stop at runtime shutdown.
+`interrupt(None)` waits for cancellation, foreground-tool cleanup, and final state
+commits. Earlier accepted input remains recorded but does not restart execution
+until a later submission. Cancellation cannot undo effects already performed by
+a tool. Custom tools must honor the cancellation token and clean up their resources.
+
+`shutdown(None)` closes the driver, its handles, and its stream, and cleans up owned
+resources. The stored conversation can be reopened; old handles stay closed.
+Reopening restores history and pending input without rerunning tools or launching
+old processes. Dropping an event stream does not stop execution.
+
+Keep a session handle to submit more input across idle periods. Dropping its last
+clone releases the driver after foreground work, runnable queued input, background
+jobs, and subagents finish. Active work continues normally. Event streams and status
+receivers do not retain the driver. Release runs cleanup and the `SessionEnd` hook
+with reason `session_released`; history and deferred input remain available for resume.
+
+Release also closes child agents, including completed ones. After reopening the
+parent, spawn new child agents; the previous children's conversations remain
+stored and can be reopened separately by session ID.
+
+A persistent PTY, shell job such as `sleep infinity &`, or managed background
+process can keep a session open indefinitely after its last handle is dropped.
+Retain a handle when you need to stop that work explicitly. Otherwise, runtime
+shutdown is the remaining way to close it.
+
+The stream stays open through idle periods and interruptions. Read
+`session.status()` for current foreground activity or use
+`session.subscribe_status()` to watch `Running`, `Idle`, and `Closed`. This status
+belongs to the live handle and is not persisted in the log. A watch receiver starts
+with the current value and may coalesce changes. An idle session may still own
+background processes. Provider deltas and tool output retain their existing
+buffering behavior.
+
+When a live stream closes cleanly, it emits one transient
+`SessionStatusChanged { status: Closed }` after its final committed event, then ends.
+This notification has sequence zero and does not appear in replay.
+
+```rust
+let mut activity = session.subscribe_status();
+loop {
+    let current = *activity.borrow_and_update();
+    println!("session activity: {current:?}");
+    if current == SessionStatus::Closed || activity.changed().await.is_err() {
+        break;
+    }
+}
+```
+
+`submit` returns `Submission { message_id, sequence }` after acceptance commits.
+`InputDelivered` records when accepted input enters conversation history.
+`InputRejected` records removal without delivery; `InputDeferred` records input
+that remains queued. These events describe what happened to the input, without
+promising a final reply or completion of background work. Several steering messages
+can influence the same foreground execution.
+
+An input deferred with `ExecutionFailed` requires an explicit same-ID retry;
+unrelated new messages skip it. `ExecutionStopped` marks untouched followers,
+which remain eligible when a later submission starts foreground work.
+
+When retrying a queued message with the same ID, the receipt identifies its fresh
+`InputAccepted` sequence. Ignore earlier events on a retained stream. Retry
+preserves the original contents and does not duplicate the inbox entry.
+Submitting an already
+delivered or rejected ID starts no new work; read its records with `replay()`.
+To remove queued input, call `session.discard(&message_id)` while idle. It records
+`InputRejected` and returns whether an entry was removed. Use `interrupt(None)`
+first if foreground work is active. Retained deferred entries count toward inbox
+capacity; discarding unwanted input releases its slot.
+Pass `Some(duration)` to `interrupt` or `shutdown` to set a cooperative cleanup
+deadline; `None` waits without a deadline. Expiry returns `SessionError::TimedOut`
+and requests forced recovery. Call the control method again with `None` to
+await settlement. In-flight storage writes or blocking code may delay settlement;
+a shutting-down session stays fenced until cleanup finishes.
 
 > [!NOTE]
 > halter implements its own compaction strategy. This can be less token efficient than managed compaction from inference providers or frontier harnesses. The goal is a higher-quality context window, which can reduce overall token use throughout the turn and gives halter a consistent baseline across providers and models.

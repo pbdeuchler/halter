@@ -78,7 +78,7 @@ impl EventBus {
     }
 }
 
-fn lagged_event(dropped: u64) -> SessionEvent {
+pub(crate) fn lagged_event(dropped: u64) -> SessionEvent {
     PendingEvent::new(
         SessionId::from(BUS_SESSION_ID),
         Delivery::BestEffort,

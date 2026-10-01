@@ -373,6 +373,118 @@ async fn fold_of_full_log_matches_state_checkpoint() {
     }
 }
 
+#[tokio::test]
+async fn durable_inbox_replays_from_a_stale_checkpoint_and_survives_context_rewrites() {
+    for (backend, store) in backends() {
+        let session = test_session("durable-inbox");
+        store.create_session(session.clone()).await.expect(backend);
+        let session_id = &session.blueprint.session_id;
+        let delivered = UserMessage::text("first");
+        let rejected = UserMessage::text("second");
+        let pending = UserMessage::text("continue later");
+        let event = |payload| PendingEvent::new(session_id.clone(), Delivery::Lossless, payload);
+        // Acceptance can advance the durable log while its checkpoint lags.
+        store
+            .commit(
+                session_id,
+                None,
+                Some(0),
+                None,
+                vec![
+                    event(SessionEventPayload::InputAccepted {
+                        message: delivered.clone(),
+                    }),
+                    event(SessionEventPayload::InputAccepted {
+                        message: rejected.clone(),
+                    }),
+                    event(SessionEventPayload::InputAccepted {
+                        message: pending.clone(),
+                    }),
+                ],
+            )
+            .await
+            .expect(backend);
+
+        let checkpoint = store
+            .load_session(session_id)
+            .await
+            .expect(backend)
+            .expect(backend);
+        assert_eq!(checkpoint.state_sequence, 0, "{backend}");
+        assert_eq!(checkpoint.head_sequence, 3, "{backend}");
+        let tail = store
+            .replay_after(session_id, checkpoint.state_sequence)
+            .await
+            .expect(backend);
+        let mut state = fold::fold_events(checkpoint.state, &tail);
+        assert_eq!(
+            state.pending_inputs,
+            [delivered.clone(), rejected.clone(), pending.clone()],
+            "{backend}"
+        );
+        assert!(state.messages.is_empty(), "{backend}");
+        assert_eq!(
+            state.token_ledger,
+            halter_protocol::TokenLedger::default(),
+            "{backend}"
+        );
+
+        let mut head = checkpoint.head_sequence;
+        for payloads in [
+            vec![SessionEventPayload::ContextWindowRolledOver {
+                summary: "new window".to_owned(),
+                effects: Box::new(CompactionEventEffects {
+                    messages: vec![],
+                    compacted_prefix: vec![],
+                    usage: Usage::default(),
+                }),
+            }],
+            vec![
+                SessionEventPayload::MessageItem {
+                    message: Message::User(delivered.clone()),
+                },
+                SessionEventPayload::InputDelivered {
+                    message_id: delivered.id.clone(),
+                },
+            ],
+            vec![SessionEventPayload::InputRejected {
+                message_id: rejected.id.clone(),
+                reason: "invalid input".to_owned(),
+            }],
+        ] {
+            for payload in &payloads {
+                fold::apply_event(&mut state, payload);
+            }
+            head = commit_events(
+                store.as_ref(),
+                session_id,
+                head,
+                &state,
+                payloads.into_iter().map(event).collect(),
+            )
+            .await;
+        }
+
+        let checkpoint = store
+            .load_session(session_id)
+            .await
+            .expect(backend)
+            .expect(backend);
+        assert_eq!(checkpoint.state.pending_inputs, [pending], "{backend}");
+        assert_eq!(
+            checkpoint.state.messages,
+            [Message::User(delivered)],
+            "{backend}"
+        );
+        let replayed = store.replay(session_id).await.expect(backend);
+        let folded = fold::fold_events(SessionState::default(), &replayed);
+        assert!(
+            fold::covered_state_matches(&folded, &checkpoint.state),
+            "{backend}"
+        );
+    }
+}
+
 async fn commit_events(
     store: &dyn SessionStore,
     session_id: &SessionId,

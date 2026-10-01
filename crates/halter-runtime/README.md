@@ -15,7 +15,7 @@ If `halter` is the assembly layer, `halter-runtime` is the component that does t
 Use this crate when you need to:
 
 - create or resume sessions programmatically
-- submit turns and consume runtime events
+- submit messages and consume session events
 - manage context compaction
 - integrate custom prompt assembly or context strategies
 - coordinate subagents
@@ -39,7 +39,7 @@ this crate explains the core machinery.
 Key exports include:
 
 - `SessionRuntime`
-- `HalterSession`
+- `SessionHandle`, `SessionEventStream`, `SessionError`, `Submission`
 - `SessionInit`
 - `RuntimeServices`
 - `ResourceHandle`
@@ -61,14 +61,14 @@ At a high level, `halter-runtime` owns the session lifecycle.
 A typical flow looks like this:
 
 1. create `SessionRuntime`
-2. open a new session with `new_session(...)`
-3. receive a `HalterSession` handle
-4. submit turns with `submit_turn(...)`
-5. observe emitted `SessionEvent`s via the event bus and/or session store
-6. optionally compact, replay, resume, notify, or shut down the session
+2. open a session with `create_session(...)`
+3. receive a `SessionHandle` and continuous `SessionEventStream`
+4. submit user messages with `submit(...)`
+5. consume session events and watch foreground activity through the session handle
+6. interrupt, compact, replay, close, or reopen the conversation
 
 `SessionRuntime` is the factory and coordinator.
-`HalterSession` is the live handle for one session.
+`SessionHandle` controls one live session driver.
 
 ---
 
@@ -80,8 +80,9 @@ Important methods:
 
 - `new`
 - `subagent_control`
-- `new_session`
-- `resume`
+- `create_session`
+- `resume_session`
+- `shutdown`
 - `list_sessions`
 - `replace_resources`
 
@@ -140,68 +141,124 @@ A parent session spawning a subagent would set:
 
 ## Creating a session
 
-Typical sketch:
-
 ```rust
 use halter_runtime::{SessionInit, SessionRuntime};
 
 async fn start(runtime: &SessionRuntime) -> anyhow::Result<()> {
-    let session = runtime.new_session(SessionInit {
-        session_id: None,
-        parent_session_id: None,
-        working_dir: Some(std::env::current_dir()?),
-        system_prompt_seed: None,
-        max_turns: None,
-        default_model: None,
-        subagent_model: None,
-        subagent_depth: 0,
+    let (session, events) = runtime.create_session(SessionInit {
+        working_dir: std::env::current_dir()?,
+        ..SessionInit::default()
     }).await?;
 
-    // use session here
+    session.shutdown(None).await?;
     Ok(())
 }
 ```
 
-The top-level `halter` crate wraps this with simpler convenience APIs.
+The top-level SDK exposes this as `Halter::new_session`.
 
 ---
 
-## `HalterSession` / `SessionHandle`
+## `SessionHandle`
 
-`SessionHandle` is the live control surface for a single session.
-`HalterSession` is a backwards-compatible alias for `SessionHandle`.
+The handle is cloneable; one event receiver accompanies each newly opened driver.
+Keep a handle to submit more input across idle periods. Dropping the last handle
+releases the driver after foreground work, queued runnable input, background jobs,
+and subagents finish. It does not cancel active execution. Event streams and status
+receivers do not retain the session. Dropping a stream does not stop execution.
 
-The handle is cheaply cloneable: each clone is an `Arc` bump on the
-shared session state. Hook eviction is *session*-scoped: hooks
-registered for the session are evicted from the runtime store only when
-the last live handle for that session id — clones and independently
-constructed handles alike — is dropped, not when an arbitrary handle
-goes out of scope (this is the AC2.1 guarantee — pre-Phase-3 a clone
-moved into the spawned turn loop would evict hooks under the still-live
-caller handle, and per-handle guards later reintroduced the same bug for
-the temporary parent handles built during subagent hook dispatch).
+Release runs resource cleanup and the `SessionEnd` hook with reason
+`session_released`. Deferred input and history remain stored for `resume_session`,
+which opens a fresh idle driver. Use `shutdown(None)` to cancel work and close the
+session explicitly. Old handles stay closed when the stored conversation is reopened.
+
+Release closes child agents, including completed ones, just as explicit shutdown
+does. Reopening the parent does not reactivate those agents. Spawn replacements,
+or reopen a child's stored conversation separately by its session ID.
+
+A persistent PTY or background job can keep a session open indefinitely after
+its last handle is dropped. Keep a handle if you need to stop that work
+explicitly; otherwise only runtime shutdown can close it.
 
 Important methods:
 
-- `session_id`
-- `submit_turn`
-- `replay`
-- `shutdown`
-- `notify`
+- `id()` / `session_id()`
+- `submit(Message::user(...))`
+- `discard(&message_id)`
+- `status()` / `subscribe_status()`
+- `interrupt(timeout)`
+- `shutdown(timeout)`
+- `replay()` / `export_trace()`
 - `compact(trigger, custom_instructions)`
 
-### `submit_turn(...)`
+### `submit(...)`
 
-This is the main way to drive work.
+Returns `Submission { message_id, sequence }` after input commits to the session
+store. `sequence` identifies the acknowledged `InputAccepted` event. Idle
+sessions start execution. During inference or a foreground tool, accepted input
+queues until a safe boundary after outstanding tool results. `InputDelivered`
+records delivery alongside the user `MessageItem`. The pending inbox lives outside the compaction
+window, so rollover cannot discard accepted input.
 
-Conceptually, submitting a turn causes the runtime to:
+Only user messages are accepted. Assistant responses and tool results remain
+runtime-owned. Admission is bounded; submission can return `InboxFull` or
+`Closed`. Recoverability after process exit depends on the configured store.
 
-1. persist the user input/event
-2. assemble prompt context
-3. invoke provider inference
-4. execute tool calls if requested
-5. emit session events
-6. persist the resulting timeline updates
+`InputRejected` records removal without delivery. `InputDeferred` reports input still
+queued after interruption, failure, shutdown, or idle resume. Deferral preserves
+the input for later execution. These events describe admission and delivery;
+they do not promise a final reply or completion of background work.
+
+`ExecutionFailed` defers the input whose attempt failed before delivery. New
+messages skip that entry; resubmit its ID to retry it or discard it while idle.
+`ExecutionStopped` marks untouched inputs after that failure. They remain eligible
+for delivery when a later submission starts foreground work.
+
+The `retryable` flag describes the failure, not a scheduling policy. Even when
+it is `true`, an `ExecutionFailed` input needs an explicit resubmission of its ID.
+
+The receipt's sequence identifies the acceptance in replay. Submitting the same queued ID
+records a fresh acceptance boundary with its original contents, without adding
+a duplicate inbox entry. A delivered or rejected ID is an idempotent lookup:
+submission returns its ID and recorded acceptance sequence without a new event
+or execution. Use `replay()` to read its recorded events.
+
+### `status()` and `subscribe_status()`
+
+`status()` reads the current `Idle`, `Running`, or `Closed` state of this handle.
+`subscribe_status()` returns a watch receiver initialized with that value. Changes
+may coalesce; the receiver exposes current activity, not a durable transition log.
+Activity includes inference, foreground tools, and compaction. Background processes
+can remain active while the session is idle. Status belongs to the live incarnation
+and is not persisted or restored from the session log.
+
+A clean event stream closure emits one transient
+`SessionStatusChanged { status: Closed }` after all committed events, then ends.
+This notification has sequence zero and is absent from replay. Status receivers
+also report `Closed`; neither kind of receiver keeps the driver alive.
+
+### `discard(&message_id)`
+
+Remove queued input while idle, recording `InputRejected` without adding it to
+history. The method returns `true` when it removes an entry and `false` when the
+ID is no longer pending. It returns `Busy` during execution, compaction, or
+cancellation cleanup; use `interrupt(None)` first when necessary. All retained
+input counts toward inbox capacity, including deferred entries, so discarding
+an unwanted entry also releases capacity.
+
+### `interrupt(timeout)`
+
+`interrupt(None)` cancels foreground execution and waits for tool cleanup and
+final commits. `Some(duration)` bounds the caller's wait for cooperative
+cancellation. If it expires, the method returns `SessionError::TimedOut` and
+requests forced recovery; call `interrupt(None)` to await settlement. In-flight
+storage writes or blocking code can delay final settlement.
+Earlier pending input remains recorded without automatically restarting execution.
+A later submission starts work again. Cancellation cannot undo completed effects,
+and custom tools must honor their token and settle their owned resources.
+
+The SDK's `HalterSession` prelude alias names `SessionHandle`; clients submit
+messages and control the session without constructing turns.
 
 ### `replay()`
 
@@ -231,10 +288,6 @@ The live trace survives resume: `resume` reopens `<session_id>.txt` for
 appending (writing the header only for a new file), and each restored
 subagent rejoins its parent's trace without a second `subagent_header`.
 
-### `notify(...)`
-
-Injects runtime notifications into the session stream.
-
 ### `compact(...)`
 
 Runs one compaction pass through the configured `CompactionStrategy`, with
@@ -248,9 +301,15 @@ error like:
 
 > `failed to compact session: provider '{}' does not support compaction`
 
-### `shutdown()`
+### `shutdown(timeout)`
 
-Gracefully stops the session.
+Closes the live driver, cancels foreground work, and awaits cleanup of owned
+subagents and tool resources. The event stream ends. Stored history remains
+available to `resume_session`, which creates a fresh driver starting idle.
+`None` waits for cleanup. `Some(duration)` bounds the wait; on timeout the method
+returns `SessionError::TimedOut` and requests forced process cleanup. The session
+stays fenced against reopening until cleanup and final commits settle. Call
+`shutdown(None)` to await that cleanup.
 
 ---
 
@@ -494,9 +553,10 @@ Existing sessions keep running against the runtime, but new prompt assembly oper
 
 ## Resuming and listing sessions
 
-### `resume(session_id)`
+### `resume_session(session_id)`
 
-Resumes a previously persisted session.
+Reopens a stored conversation with a fresh handle and event stream, starting idle.
+Recorded tool results remain history; tools and old background processes are not restarted.
 
 Use this when you have a durable session store and want continuity across process restarts.
 
@@ -546,6 +606,9 @@ Subagent control is also coordinated with the tool layer, where tools like
 `wait_agent` while work is running, or `close_agent` to cancel it. A timed-out
 `wait_agent` response includes `target_statuses` so callers can see the current
 state of every requested child.
+`close_agent` accepts optional `timeout_ms` to bound waiting for cancellation and
+cleanup. Omitting it waits without a deadline. Expiry returns a timeout error
+and requests forced cleanup; final settlement can continue afterward.
 
 The parent's log records each child. Every spawn, turn start, turn finish and
 close appends a `SubagentUpdated` event, which is folded into
@@ -616,13 +679,27 @@ provider is called.
 
 ### Event backpressure
 
-If subscribers are slow, `EventBus` can drop events depending on capacity and downstream behavior.
+The underlying `EventBus` can drop events for slow subscribers. The session
+stream uses committed sequence numbers to recover its own events from storage.
 
-The per-turn stream can also include subagent events when `subagent_event_forwarding` is enabled for the session. Forwarded events keep the child `session_id`; the configured forwarding cap emits a synthetic `Lagged` event and stops forwarding for that parent turn when exceeded.
+The session stream also includes subagent events when `subagent_event_forwarding`
+is enabled. Forwarded events keep the child `session_id` and use a bounded,
+128-event buffer. Slow consumers receive a synthetic `Lagged` event when that
+buffer overflows. The configured forwarding cap also emits `Lagged` and stops
+forwarding for the current execution when exceeded. These transient events do
+not advance the parent's replay cursor; recover child history from its log or
+export the parent's trace to include child activity.
 
 ### Persistence conflicts and the session write lease
 
-Each session has one writer at a time. A turn, `compact`, `shutdown` or `resume` holds the session's write lease for its whole duration; a second one started meanwhile waits for it instead of racing it on `expected_head_sequence`. A writer that re-enters its own session (for example a hook calling `compact` on the session running it) deadlocks, so don't. Hook dispatches that fire outside the writer (`SubagentStart`, `SubagentStop`, `notify`) queue behind the lease and commit, in order, right after the writer releases it (so after the turn's `TurnCompleted`/`TurnFailed`); with no writer they commit immediately. A `once` hook that already ran in a queued dispatch is skipped by the dispatches after it. Subagent records touch no transcript, so the writer takes them at each of its own commits instead: a spawn's record commits with the tool result that gives the model the agent id. The lease is process-local: two processes writing the same session still surface `SessionCommitConflict` from `halter-session`.
+An open session driver serializes commits, including input acceptance while a
+provider or tool runs. The executor's store operations route through that driver,
+which owns the current commit head. The execution lease still protects internal
+conversation operations and hook ordering. Manual `compact` returns `Busy` during
+execution. Avoid calling it from a hook on its own active session.
+
+The lease and driver registry are process-local. Two processes writing the same
+session still surface `SessionCommitConflict` from `halter-session`.
 
 A turn that never finished, because the process crashed or the turn task was aborted, stays open in `SessionState::open_turn`. The next writer (`resume` or the next turn) closes it with `TurnFailed { cancelled: true, retryable: false }` before logging anything else. Tool batches are checkpointed before they run and after their results. Any tool call still without a result when a turn is closed, whether interrupted or failed, gets an error result that says whether it had started (so it may have had side effects) or never ran.
 
@@ -645,30 +722,35 @@ parent's concrete model instead of recursively entering the wrapper again.
 
 ---
 
-## Example: building a simple runner abstraction
+## Example: keeping a session open
 
 ```rust
+use futures::StreamExt;
+use halter_protocol::Message;
 use halter_runtime::{SessionInit, SessionRuntime};
 
-pub async fn run_once(runtime: &SessionRuntime, prompt: &str) -> anyhow::Result<()> {
-    let session = runtime.new_session(SessionInit {
-        session_id: None,
-        parent_session_id: None,
-        working_dir: Some(std::env::current_dir()?),
-        system_prompt_seed: None,
-        max_turns: Some(1),
-        default_model: None,
-        subagent_model: None,
-        subagent_depth: 0,
+pub async fn interact(runtime: &SessionRuntime, prompt: &str) -> anyhow::Result<()> {
+    let (session, mut events) = runtime.create_session(SessionInit {
+        working_dir: std::env::current_dir()?,
+        ..SessionInit::default()
     }).await?;
-
-    session.submit_turn(prompt).await?;
-    session.shutdown().await?;
+    let listener = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            println!("{:?}", event?.payload);
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    session.submit(Message::user(prompt)).await?;
+    tokio::signal::ctrl_c().await?;
+    session.shutdown(None).await?;
+    listener.await??;
     Ok(())
 }
 ```
 
-This is not the full richness of the runtime, but it shows the core shape.
+
+The event listener stays attached across foreground executions and idle periods.
+The client chooses when to shut down the session.
 
 ---
 

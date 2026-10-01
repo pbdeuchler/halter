@@ -94,6 +94,7 @@ The runtime asks for a tool by name. This crate decides:
 - `GrepTool`
 - `ShellTool`
 - `ProcessTool`
+- `BackgroundTool`
 
 ### Optional tools by Cargo feature
 
@@ -379,6 +380,38 @@ If your workflow needs `python`, `just`, `make`, `npm`, `docker`, or `sort`, add
 
 ---
 
+## `background`
+
+Use `background` for managed commands that should survive agent interruption,
+such as a development server. It has five actions:
+
+| Action | Input | Result |
+| --- | --- | --- |
+| `spawn` | `command`, optional `cwd` and `env` | Opaque job ID, PID, command and status |
+| `list` | — | Running and completed job records |
+| `output` | `id`, optional byte `cursor` | Combined stdout/stderr, cursors and truncation flag |
+| `kill` | `id` | Final status after termination and child reaping |
+| `prune` | — | Removes finished job records and output; preserves running jobs |
+
+Jobs use independent shells. `cwd` defaults to the session working directory;
+relative paths resolve against it. Persistent shell variables and functions
+aren't inherited. Spawning applies the shell command policy and authorizes the
+working directory through the read policy. The environment contains shell
+essentials plus explicit overrides.
+
+Each job retains the latest 64 KiB of output. `next_cursor` counts all bytes
+produced, including discarded bytes; `truncated` indicates that the requested
+cursor predates retained output. Text uses lossy UTF-8 decoding. A session
+retains running and completed job records until shutdown or explicit pruning.
+
+Session shutdown terminates jobs and awaits their monitors. Unix jobs receive
+TERM, a 500 ms grace period, then KILL for the owned process group and currently
+discoverable descendants. Background spawn is currently Unix-only: Windows
+needs command authorization matching its shell grammar before it can be enabled. Commands
+that deliberately escape process-group and ancestry ownership aren't supported.
+Output and live process ownership are process-local: resume doesn't relaunch
+jobs or use saved PIDs to signal processes.
+
 ## `process`
 
 Inspects or terminates process trees.
@@ -638,6 +671,11 @@ Typical input:
 ```
 
 Use it to clean up control surfaces once delegated work is done.
+Omit `timeout_ms` to wait for cancellation and cleanup without a deadline. Set
+it to bound the caller's wait, for example `{ "target": "agent-uuid",
+"timeout_ms": 1000 }`. On expiry the operation returns a timeout error and
+requests forced cleanup. Storage writes or already-running blocking work may
+delay final settlement; closing continues after the caller stops waiting.
 
 ---
 
@@ -703,6 +741,12 @@ This is what makes tools runtime-aware rather than mere pure functions.
 ## Tool session store integration
 
 `ToolSessionStore` exists so tool execution can coordinate with session-related state when needed.
+
+The session runtime opens process admission automatically. If you execute tools
+directly, call `tool_sessions.open_session(&session_id)` before using shell,
+background, PTY, or browser tools. Shutdown removes admission; later lookups
+reject process work without retaining a closed-session marker. Reopening admits
+a fresh process lifetime.
 
 This matters most for:
 

@@ -17,7 +17,7 @@ use halter_tools::Tool;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::CompactionEffects;
-use crate::session::SessionHandle;
+use crate::session::SessionExecutor;
 
 /// Why a compaction pass is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +27,7 @@ pub enum CompactionTrigger<'a> {
     /// The token ledger reached `context.compaction_threshold`. A failure
     /// degrades the turn to an uncompacted context with a warning event.
     Automatic,
-    /// `HalterSession::compact` was called. A failure propagates to the
+    /// `SessionHandle::compact` was called. A failure propagates to the
     /// caller, who asked for compaction explicitly and needs to know it did
     /// not happen.
     Manual {
@@ -158,7 +158,7 @@ pub fn compaction_instructions(custom_instructions: Option<&str>) -> String {
 /// Every message appended this way is replaced when the returned
 /// [`CompactionEffects`] apply; the event log keeps the whole exchange.
 pub struct CompactionContext<'a> {
-    session: &'a SessionHandle,
+    session: &'a SessionExecutor,
     blueprint: &'a SessionBlueprint,
     snapshot: Arc<ResourceSnapshot>,
     state: &'a mut SessionState,
@@ -176,7 +176,7 @@ pub struct CompactionContext<'a> {
 impl<'a> CompactionContext<'a> {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
-        session: &'a SessionHandle,
+        session: &'a SessionExecutor,
         blueprint: &'a SessionBlueprint,
         snapshot: Arc<ResourceSnapshot>,
         state: &'a mut SessionState,

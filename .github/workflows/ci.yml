@@ -26,9 +26,15 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
-      - run: cargo test --workspace --all-features
+      - run: cargo nextest run --workspace --all-features
+        timeout-minutes: 20
+      - run: cargo test --workspace --all-features --doc
+        timeout-minutes: 10
 
   # The no-sqlite default build is what most library consumers get; compile
   # and test it explicitly.
@@ -42,8 +48,14 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo nextest run --workspace
+        timeout-minutes: 20
+      - run: cargo test --workspace --doc
+        timeout-minutes: 10
 
   # Keep the toolchain version in sync with `rust-version` in Cargo.toml.
   msrv:
@@ -54,8 +66,14 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - run: cargo check --workspace --all-features --all-targets
-      - run: cargo test --workspace --all-features
+      - run: cargo nextest run --workspace --all-features
+        timeout-minutes: 20
+      - run: cargo test --workspace --all-features --doc
+        timeout-minutes: 10
 
   # Compiles the `#[cfg(windows)]` branches natively (check only, no tests).
   windows:

@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::ToolEventSink;
 
 use super::streaming::{collect_output, pipe_to_files};
-use crate::builtin::process::{kill_process_group, kill_tree};
+use crate::builtin::process::{kill_process_group, signal_process};
 
 const TERM_SIGNAL: i32 = 15;
 const KILL_SIGNAL: i32 = 9;
@@ -31,6 +31,73 @@ const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub struct ShellSessionCore {
     pub shell: BrushShell,
+    lifetime: CancellationToken,
+    processes: brush_core::processes::ProcessTracker,
+}
+
+/// Process controls stay accessible while Brush holds its execution lock.
+#[derive(Default)]
+pub struct ShellSession {
+    core: TokioMutex<Option<ShellSessionCore>>,
+    lifetime: CancellationToken,
+    processes: brush_core::processes::ProcessTracker,
+}
+
+impl std::ops::Deref for ShellSession {
+    type Target = TokioMutex<Option<ShellSessionCore>>;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl ShellSession {
+    pub(crate) fn new(
+        lifetime: CancellationToken,
+        activity: tokio::sync::watch::Sender<()>,
+    ) -> Self {
+        Self {
+            lifetime,
+            processes: brush_core::processes::ProcessTracker::with_activity(activity),
+            ..Self::default()
+        }
+    }
+    pub(crate) fn has_running(&self) -> bool {
+        self.processes.has_running()
+    }
+    pub(crate) fn request_stop(&self, force: bool) {
+        self.lifetime.cancel();
+        if force {
+            self.processes.force_stop();
+        }
+    }
+}
+
+impl ShellSessionCore {
+    async fn shutdown(mut self) -> anyhow::Result<()> {
+        self.lifetime.cancel();
+        terminate_background_jobs(&self.shell).await;
+        let mut errors = Vec::new();
+        for job in &mut self.shell.jobs_mut().jobs {
+            if let Err(error) = job.wait().await
+                && !matches!(error.kind(), brush_core::error::ErrorKind::Interrupted)
+            {
+                errors.push(error.to_string());
+            }
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "failed to reap persistent shell jobs: {}",
+            errors.join("; ")
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ShellSessionCore {
+    fn drop(&mut self) {
+        self.lifetime.cancel();
+        self.processes.force_stop();
+    }
 }
 
 pub struct ShellRunOptions {
@@ -56,12 +123,32 @@ struct ShellCommandOutput {
 }
 
 pub async fn run_persistent_shell(
-    session: std::sync::Arc<TokioMutex<Option<ShellSessionCore>>>,
+    session: std::sync::Arc<ShellSession>,
     options: ShellRunOptions,
     emit: std::sync::Arc<dyn ToolEventSink>,
     cancel: CancellationToken,
 ) -> anyhow::Result<ShellRunResult> {
     let run_cancel = CancellationToken::new();
+    struct CancelOnDrop {
+        cancel: CancellationToken,
+        processes: brush_core::processes::ProcessTracker,
+        armed: bool,
+    }
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            if self.armed {
+                self.cancel.cancel();
+                self.processes.force_stop();
+            }
+        }
+    }
+    // A force-aborted tool future must signal its separately spawned worker.
+    // Otherwise dropping that worker's handle would detach running children.
+    let mut abort_guard = CancelOnDrop {
+        cancel: run_cancel.clone(),
+        processes: session.processes.clone(),
+        armed: true,
+    };
     let mut task = tokio::spawn({
         let session = session.clone();
         let emit = emit.clone();
@@ -75,10 +162,16 @@ pub async fn run_persistent_shell(
         let run_cancel = run_cancel.clone();
         async move {
             let mut guard = session.lock().await;
+            anyhow::ensure!(
+                !session.lifetime.is_cancelled(),
+                "failed to execute shell: session is closed"
+            );
             let shell = match &mut *guard {
                 Some(shell) => shell,
                 None => {
-                    let mut shell = create_session().await?;
+                    let mut shell =
+                        create_session(session.lifetime.child_token(), session.processes.clone())
+                            .await?;
                     if let Some(cwd) = options.default_cwd.as_deref() {
                         shell.shell.set_working_dir(cwd).map_err(|error| {
                             anyhow::anyhow!("failed to set default shell cwd: {error}")
@@ -92,8 +185,9 @@ pub async fn run_persistent_shell(
             if !result
                 .as_ref()
                 .is_ok_and(|output| session_keepalive(&output.result))
+                && let Some(shell) = guard.take()
             {
-                *guard = None;
+                shell.shutdown().await?;
             }
             result
         }
@@ -129,6 +223,8 @@ pub async fn run_persistent_shell(
         }
     };
 
+    abort_guard.armed = false;
+
     Ok(ShellRunResult {
         exit_code: Some(exit_code(&outcome.result)),
         stdout: outcome.stdout,
@@ -139,7 +235,7 @@ pub async fn run_persistent_shell(
 }
 
 async fn cancel_shell_task(
-    session: &std::sync::Arc<TokioMutex<Option<ShellSessionCore>>>,
+    session: &std::sync::Arc<ShellSession>,
     run_cancel: &CancellationToken,
     task: &mut tokio::task::JoinHandle<anyhow::Result<ShellCommandOutput>>,
 ) {
@@ -151,15 +247,26 @@ async fn cancel_shell_task(
     reset_shell_session(session).await;
 }
 
-async fn reset_shell_session(session: &std::sync::Arc<TokioMutex<Option<ShellSessionCore>>>) {
-    let mut guard = session.lock().await;
-    if let Some(shell) = guard.as_ref() {
-        terminate_background_jobs(&shell.shell).await;
+async fn reset_shell_session(session: &std::sync::Arc<ShellSession>) {
+    if let Err(error) = shutdown_shell_session(session).await {
+        tracing::warn!(%error, "failed to reap persistent shell jobs");
     }
-    *guard = None;
 }
 
-async fn create_session() -> anyhow::Result<ShellSessionCore> {
+pub(crate) async fn shutdown_shell_session(
+    session: &std::sync::Arc<ShellSession>,
+) -> anyhow::Result<()> {
+    let mut guard = session.lock().await;
+    if let Some(shell) = guard.take() {
+        shell.shutdown().await?;
+    }
+    Ok(())
+}
+
+async fn create_session(
+    lifetime: CancellationToken,
+    processes: brush_core::processes::ProcessTracker,
+) -> anyhow::Result<ShellSessionCore> {
     let mut shell = BrushShell::builder()
         .interactive(false)
         .login(false)
@@ -196,7 +303,11 @@ async fn create_session() -> anyhow::Result<ShellSessionCore> {
         shell.env_mut().set_global("PATH", variable)?;
     }
 
-    Ok(ShellSessionCore { shell })
+    Ok(ShellSessionCore {
+        shell,
+        lifetime,
+        processes,
+    })
 }
 
 async fn run_shell_command(
@@ -220,7 +331,9 @@ async fn run_shell_command(
     params.set_fd(OpenFiles::STDOUT_FD, OpenFile::from(stdout_writer));
     params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(stderr_writer));
     params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
-    params.set_cancel_token(cancel.clone());
+    let scoped_cancel = session.lifetime.child_token();
+    params.set_cancel_token(scoped_cancel.clone());
+    params.set_process_tracker(session.processes.clone());
 
     let mut env_scope_pushed = false;
     if let Some(env) = options.env.as_ref() {
@@ -260,10 +373,20 @@ async fn run_shell_command(
         activity_tx,
     ));
 
-    let result = session
-        .shell
-        .run_string(options.command.clone(), &SourceInfo::default(), &params)
-        .await;
+    let source = SourceInfo::default();
+    let result = {
+        let execution = session
+            .shell
+            .run_string(options.command.clone(), &source, &params);
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => result,
+            _ = cancel.cancelled() => {
+                scoped_cancel.cancel();
+                execution.await
+            }
+        }
+    };
 
     if cancel.is_cancelled() {
         terminate_background_jobs(&session.shell).await;
@@ -521,11 +644,15 @@ async fn terminate_background_jobs(shell: &BrushShell) {
         }
     }
 
+    let mut signalled = false;
     for &pgid in &pgids {
-        let _ = kill_process_group(pgid, TERM_SIGNAL);
+        signalled |= kill_process_group(pgid, TERM_SIGNAL);
     }
     for &pid in &pids {
-        let _ = kill_tree(pid, TERM_SIGNAL);
+        signalled |= signal_process(pid, TERM_SIGNAL);
+    }
+    if !signalled {
+        return;
     }
 
     time::sleep(POST_EXIT_KILL_DELAY).await;
@@ -533,16 +660,86 @@ async fn terminate_background_jobs(shell: &BrushShell) {
         let _ = kill_process_group(pgid, KILL_SIGNAL);
     }
     for pid in pids {
-        let _ = kill_tree(pid, KILL_SIGNAL);
+        let _ = signal_process(pid, KILL_SIGNAL);
     }
 }
 
 #[cfg(not(unix))]
-async fn terminate_background_jobs(_shell: &BrushShell) {}
+async fn terminate_background_jobs(shell: &BrushShell) {
+    // Brush's process tracker uses native tree termination on Windows.
+    for job in &shell.jobs().jobs {
+        if let Some(pid) = job.representative_pid() {
+            signal_process(pid, KILL_SIGNAL);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_background_activity_finishes_without_relocking_shell() {
+        let store = crate::ToolSessionStore::default();
+        let id = halter_protocol::SessionId::new();
+        store.open_session(&id);
+        let mut activity = store.subscribe_activity();
+        let session = store.shell_session(&id);
+        run_persistent_shell(
+            session.clone(),
+            ShellRunOptions {
+                command: "sleep 30 &".to_owned(),
+                cwd: None,
+                default_cwd: None,
+                env: None,
+                timeout: None,
+            },
+            std::sync::Arc::new(crate::NoopToolEventSink),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            store.has_running_jobs(&id),
+            "the asynchronous shell job survives command completion"
+        );
+        // Holding the shell execution lock cannot prevent activity inspection
+        // or final completion notification from the owned job task.
+        let shell = session.lock().await;
+        activity.borrow_and_update();
+        session.processes.force_stop();
+        time::timeout(Duration::from_secs(5), async {
+            while store.has_running_jobs(&id) {
+                activity.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the shell job publishes completion without a new command");
+        assert!(shell.is_some(), "the persistent shell slot remains open");
+        drop(shell);
+        store.shutdown_session(&id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_reaps_empty_group_without_waiting_full_term_grace() {
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("30").process_group(0).kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+        let mut child = brush_core::processes::ChildProcess::new(child, Some(pid), Some(pid));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(450), child.wait(Some(cancel)))
+            .await
+            .expect("an empty group needs no remaining TERM grace")
+            .unwrap();
+        assert!(matches!(
+            result,
+            brush_core::processes::ProcessWaitResult::Cancelled
+        ));
+    }
 
     #[test]
     fn inherit_env_var_uses_allowlist() {

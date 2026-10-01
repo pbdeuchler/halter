@@ -41,9 +41,19 @@ pub struct ExecutionParameters {
     /// Optionally provides a cancellation token; when triggered, execution
     /// is interrupted as promptly as practical.
     cancel_token: Option<CancellationToken>,
+    process_tracker: Option<crate::processes::ProcessTracker>,
 }
 
 impl ExecutionParameters {
+    /// Attach ownership tracking shared by every child of this execution.
+    pub fn set_process_tracker(&mut self, tracker: crate::processes::ProcessTracker) {
+        self.process_tracker = Some(tracker);
+    }
+
+    pub(crate) fn process_tracker(&self) -> Option<crate::processes::ProcessTracker> {
+        self.process_tracker.clone()
+    }
+
     /// Returns the standard input file; usable with `write!` et al.
     ///
     /// # Arguments
@@ -329,7 +339,9 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
     }
 
+    let activity = params.process_tracker().map(|tracker| tracker.start_task());
     let join_handle = tokio::spawn(async move {
+        let _activity = activity;
         cloned_ao_list
             .execute(&mut cloned_shell, &cloned_params)
             .await
@@ -809,7 +821,9 @@ impl Execute for ast::CoprocessCommand {
             .set_fd(OpenFiles::STDOUT_FD, stdout_writer.into());
 
         let body = self.body.clone();
+        let activity = params.process_tracker().map(|tracker| tracker.start_task());
         let join_handle = tokio::spawn(async move {
+            let _activity = activity;
             let pipeline_context = PipelineExecutionContext {
                 shell: commands::ShellForCommand::ParentShell(&mut child_shell),
                 process_group_id: None,

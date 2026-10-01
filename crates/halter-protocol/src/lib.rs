@@ -606,6 +606,14 @@ pub enum Message {
     Tool(ToolResultMessage),
 }
 
+impl Message {
+    /// Build a text-only user message with a fresh id and current timestamp.
+    #[must_use]
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::User(UserMessage::text(text))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 /// Incremental provider output event.
@@ -755,6 +763,11 @@ pub struct WaitSubagentRequest {
 /// Request payload for closing a subagent.
 pub struct CloseSubagentRequest {
     pub target: AgentId,
+    /// Bound the caller's wait for cancellation and cleanup. Omit to wait
+    /// without a deadline. Expiry requests forced cleanup; settlement may
+    /// continue after the timeout error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -969,7 +982,43 @@ pub struct RestoredContext {
 /// so an older build never appends to a log it cannot fully read. Bump it
 /// once per release that adds an event kind or field an older fold would
 /// misread.
-pub const SESSION_LOG_FORMAT: u32 = 1;
+pub const SESSION_LOG_FORMAT: u32 = 2;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+/// Current foreground activity of a live session driver. Not persisted.
+pub enum SessionStatus {
+    /// The driver is open and no foreground execution is active. Input may
+    /// remain queued and background processes may still be running.
+    #[default]
+    Idle,
+    /// The driver is executing accepted input or compacting the conversation.
+    Running,
+    /// The driver has stopped and its handles are closed.
+    Closed,
+}
+
+/// Why accepted input is still queued rather than executing.
+/// Deferral preserves the input and permits a later explicit retry.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputDeferredReason {
+    Interrupted,
+    /// This input's attempt failed before delivery. Resubmit the same ID to
+    /// retry it; unrelated new input does not retry the failing entry, even
+    /// when `retryable` is true. That flag classifies the failure and never
+    /// schedules an automatic retry.
+    ExecutionFailed {
+        error: String,
+        retryable: bool,
+    },
+    /// Earlier execution failed before this input was attempted. A later
+    /// submission starts execution and makes these inputs eligible for delivery
+    /// alongside the newly submitted message.
+    ExecutionStopped,
+    Shutdown,
+    Resumed,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -980,6 +1029,34 @@ pub enum SessionEventPayload {
     /// resume commits always advance the event log (head-sequence
     /// concurrency control relies on every mutation appending an event).
     SessionResumed,
+    /// Input durably accepted into the session inbox. It enters the
+    /// provider-facing transcript only when delivered as a `MessageItem`.
+    /// Explicit retry of a queued ID emits another acceptance boundary with
+    /// its original contents; replay adds that ID to the inbox at most once.
+    InputAccepted {
+        message: UserMessage,
+    },
+    /// Accepted input removed from the inbox without transcript delivery.
+    InputRejected {
+        message_id: MessageId,
+        reason: String,
+    },
+    /// Accepted input entered the conversation history. Committed alongside
+    /// its user `MessageItem`; subsequent work may continue indefinitely.
+    InputDelivered {
+        message_id: MessageId,
+    },
+    /// Input remains in the inbox for later execution.
+    InputDeferred {
+        message_id: MessageId,
+        reason: InputDeferredReason,
+    },
+    /// Legacy durable events remain readable. Live activity uses status
+    /// watches; a stream-local `Closed` event ends a clean session stream.
+    /// That notification has sequence zero and is not written to the log.
+    SessionStatusChanged {
+        status: SessionStatus,
+    },
     Warning {
         message: String,
     },
@@ -1610,6 +1687,11 @@ pub struct SessionBlueprint {
 /// Mutable state persisted for a session.
 pub struct SessionState {
     pub messages: Vec<Message>,
+    /// Durably accepted input awaiting delivery at a safe conversation
+    /// boundary. Kept outside the replaceable transcript window so context
+    /// compaction cannot discard it.
+    #[serde(default)]
+    pub pending_inputs: Vec<UserMessage>,
     #[serde(default)]
     pub compacted_prefix: Vec<Value>,
     pub appended_prompt_segments: Vec<PromptSegment>,
@@ -1661,8 +1743,12 @@ impl SessionState {
     /// Append a message to the transcript and account for it in the token
     /// ledger. The single door for transcript growth: the runtime and the
     /// event fold both go through it, so the ledger never drifts from the
-    /// messages it describes.
+    /// messages it describes. User messages also remove matching accepted
+    /// input from the pending inbox as part of the delivery transition.
     pub fn append(&mut self, message: Message) {
+        if let Message::User(user) = &message {
+            self.pending_inputs.retain(|pending| pending.id != user.id);
+        }
         self.token_ledger.record(&message);
         self.messages.push(message);
     }
@@ -1985,8 +2071,170 @@ pub struct SubagentResult {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn close_subagent_timeout_is_optional_and_defaults_to_unlimited() {
+        for input in [
+            serde_json::json!({ "target": "agent-1" }),
+            serde_json::json!({ "target": "agent-1", "timeout_ms": null }),
+        ] {
+            let request: CloseSubagentRequest = serde_json::from_value(input).unwrap();
+            assert_eq!(request.timeout_ms, None);
+            assert_eq!(
+                serde_json::to_value(request).unwrap(),
+                serde_json::json!({ "target": "agent-1" })
+            );
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(CloseSubagentRequest)).unwrap();
+        assert_eq!(schema["required"], serde_json::json!(["target"]));
+        assert!(schema["properties"]["timeout_ms"].is_object());
+    }
+
+    proptest! {
+        #[test]
+        fn close_subagent_request_roundtrips_optional_deadlines(
+            timeout_ms in proptest::option::of(any::<u64>())
+        ) {
+            let request = CloseSubagentRequest {
+                target: AgentId::from("agent-1"),
+                timeout_ms,
+            };
+            let encoded = serde_json::to_value(&request).unwrap();
+            prop_assert_eq!(encoded.get("timeout_ms").is_some(), timeout_ms.is_some());
+            prop_assert_eq!(serde_json::from_value::<CloseSubagentRequest>(encoded).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn session_status_wire_values_roundtrip_and_match_schema() {
+        let cases = [
+            (SessionStatus::Idle, "idle"),
+            (SessionStatus::Running, "running"),
+            (SessionStatus::Closed, "closed"),
+        ];
+        for (status, wire_value) in cases {
+            let encoded = serde_json::to_value(status).expect("serialize status");
+            assert_eq!(encoded, wire_value);
+            assert_eq!(
+                serde_json::from_value::<SessionStatus>(encoded).expect("deserialize status"),
+                status,
+            );
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(SessionStatus))
+            .expect("serialize status schema");
+        let wire_values: Vec<_> = schema["oneOf"]
+            .as_array()
+            .expect("status variants")
+            .iter()
+            .map(|variant| variant["enum"][0].as_str().expect("status wire value"))
+            .collect();
+        assert_eq!(wire_values, ["idle", "running", "closed"]);
+    }
+
+    #[test]
+    fn inbox_events_have_strict_wire_shapes_and_schema() {
+        let message = UserMessage::text("keep the public API");
+        let cases = [
+            (
+                "input_accepted",
+                SessionEventPayload::InputAccepted {
+                    message: message.clone(),
+                },
+                "message",
+            ),
+            (
+                "input_rejected",
+                SessionEventPayload::InputRejected {
+                    message_id: message.id.clone(),
+                    reason: "invalid input".to_owned(),
+                },
+                "message_id",
+            ),
+            (
+                "input_delivered",
+                SessionEventPayload::InputDelivered {
+                    message_id: message.id.clone(),
+                },
+                "message_id",
+            ),
+            (
+                "input_deferred",
+                SessionEventPayload::InputDeferred {
+                    message_id: message.id,
+                    reason: InputDeferredReason::Interrupted,
+                },
+                "reason",
+            ),
+        ];
+        let schema = serde_json::to_value(schemars::schema_for!(SessionEventPayload))
+            .expect("serialize event schema");
+        let variants = schema["oneOf"].as_array().expect("event variants");
+        for (kind, payload, required_field) in cases {
+            let mut encoded = serde_json::to_value(&payload).expect("serialize event");
+            assert_eq!(encoded["kind"], kind);
+            assert_eq!(
+                serde_json::from_value::<SessionEventPayload>(encoded.clone()).unwrap(),
+                payload
+            );
+            let variant = variants
+                .iter()
+                .find(|variant| variant["properties"]["kind"]["enum"][0] == kind)
+                .expect("event kind is represented in schema");
+            let properties = variant["properties"]
+                .as_object()
+                .expect("event schema fields");
+            for key in encoded.as_object().expect("event fields").keys() {
+                assert!(properties.contains_key(key), "{kind}: schema missing {key}");
+            }
+            encoded.as_object_mut().unwrap().remove(required_field);
+            assert!(
+                serde_json::from_value::<SessionEventPayload>(encoded).is_err(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_checkpoints_default_to_an_empty_inbox() {
+        let mut checkpoint = serde_json::to_value(SessionState::default()).unwrap();
+        let fields = checkpoint.as_object_mut().unwrap();
+        fields.remove("pending_inputs");
+        let restored: SessionState = serde_json::from_value(checkpoint).unwrap();
+        assert!(restored.pending_inputs.is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn accepted_input_and_checkpoint_serialization_preserve_content(
+            text in ".{0,128}",
+            reason in ".{0,128}",
+        ) {
+            let message = UserMessage::text(text);
+            for payload in [
+                SessionEventPayload::InputAccepted { message: message.clone() },
+                SessionEventPayload::InputRejected { message_id: message.id.clone(), reason: reason.clone() },
+                SessionEventPayload::InputDelivered { message_id: message.id.clone() },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::Interrupted },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::ExecutionFailed { error: reason, retryable: false } },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::ExecutionStopped },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::Shutdown },
+                SessionEventPayload::InputDeferred { message_id: message.id.clone(), reason: InputDeferredReason::Resumed },
+            ] {
+                let encoded = serde_json::to_vec(&payload).unwrap();
+                let decoded: SessionEventPayload = serde_json::from_slice(&encoded).unwrap();
+                prop_assert_eq!(decoded, payload);
+            }
+            let state = SessionState {
+                pending_inputs: vec![message],
+                ..SessionState::default()
+            };
+            let restored: SessionState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            prop_assert_eq!(restored, state);
+        }
+    }
 
     #[test]
     fn reasoning_effort_wire_values_roundtrip_and_match_schema() {

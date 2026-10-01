@@ -221,7 +221,7 @@ impl Tool for SendInputTool {
     fn spec(&self) -> ToolSpec {
         subagent_spec(
             "send_input",
-            "Send a follow-up task to an existing child session. Only works after the child has reached a terminal state (completed, failed, cancelled, or closed). Use wait_agent to wait for completion, or close_agent to stop a running agent.",
+            "Send a follow-up task to an existing child session after it reaches a terminal state (completed, failed, or cancelled). Closed children no longer accept input. Use wait_agent to wait for completion, or close_agent to stop a running agent.",
             json!({
                 "type": "object",
                 "properties": {
@@ -310,16 +310,24 @@ impl Tool for CloseAgentTool {
     fn spec(&self) -> ToolSpec {
         subagent_spec(
             "close_agent",
-            "Close an existing child session, stopping any in-progress work. Use this to cancel a running agent or clean up a finished one. The closed agent will no longer accept send_input calls.",
+            "Close an existing child session, stopping any in-progress work. Use this to cancel a running agent or clean up a finished one. Omit timeout_ms to wait for cleanup without a deadline; setting it bounds the wait and requests forced cleanup on timeout. The closed agent will no longer accept send_input calls.",
             json!({
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string" }
+                    "target": { "type": "string" },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional cancellation and cleanup timeout in milliseconds. Omit to wait without a deadline."
+                    }
                 },
                 "required": ["target"],
             }),
             ToolConcurrency::Exclusive,
-            subagent_capabilities(false),
+            ToolCapabilities {
+                long_running: true,
+                ..subagent_capabilities(false)
+            },
         )
     }
 
@@ -340,7 +348,7 @@ impl Tool for CloseAgentTool {
 /// only in name, description, input_schema, concurrency, and long_running,
 /// so centralizing the scaffolding here (finding M45) removes four
 /// near-identical ToolSpec blocks and keeps their shared flags
-/// (mutating=false, approval=false, cancellable=false) in one place.
+/// (mutating=false, approval=false) in one place.
 fn subagent_spec(
     name: &'static str,
     description: &'static str,
@@ -402,6 +410,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSubagentControl {
         requests: Mutex<Vec<SpawnSubagentRequest>>,
+        close_requests: Mutex<Vec<CloseSubagentRequest>>,
     }
 
     #[async_trait]
@@ -446,11 +455,70 @@ mod tests {
 
         async fn close(
             &self,
-            _request: CloseSubagentRequest,
+            request: CloseSubagentRequest,
         ) -> anyhow::Result<CloseSubagentResponse> {
-            unreachable!(
-                "RecordingSubagentControl::close was called, but this test does not exercise close_agent"
-            )
+            let previous_status = SubagentStatus {
+                agent_id: request.target.clone(),
+                session_id: SessionId::from("session-1"),
+                agent_type: None,
+                task: "delegate this".to_owned(),
+                state: SubagentState::Completed,
+                last_message: None,
+                usage: None,
+                error: None,
+            };
+            self.close_requests
+                .lock()
+                .expect("close requests")
+                .push(request);
+            Ok(CloseSubagentResponse { previous_status })
+        }
+    }
+
+    #[tokio::test]
+    async fn close_agent_forwards_optional_cleanup_deadlines() {
+        for (input, timeout_ms) in [
+            (json!({ "target": "agent-1" }), None),
+            (json!({ "target": "agent-1", "timeout_ms": null }), None),
+            (json!({ "target": "agent-1", "timeout_ms": 0 }), Some(0)),
+            (json!({ "target": "agent-1", "timeout_ms": 25 }), Some(25)),
+            (
+                json!({ "target": "agent-1", "timeout_ms": u64::MAX }),
+                Some(u64::MAX),
+            ),
+        ] {
+            let control = Arc::new(RecordingSubagentControl::default());
+            let tool = CloseAgentTool::new(control.clone());
+            let context = ToolContext {
+                session_id: SessionId::new(),
+                working_dir: ".".into(),
+                path_locks: Arc::new(crate::PathLockMap::default()),
+                tool_sessions: Arc::new(crate::ToolSessionStore::default()),
+                snapshot: Arc::new(ResourceSnapshot::empty()),
+                cancel: CancellationToken::new(),
+                emit: Arc::new(NoopToolEventSink),
+                policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default())),
+                shell_timeout_secs: 30,
+                subagent_parent: None,
+            };
+            let ToolResult::Json { value } = tool.execute(context, input).await.unwrap() else {
+                panic!("expected close response");
+            };
+            assert_eq!(value["previous_status"]["agent_id"], "agent-1");
+            assert_eq!(
+                *control.close_requests.lock().unwrap(),
+                vec![CloseSubagentRequest {
+                    target: AgentId::from("agent-1"),
+                    timeout_ms
+                }]
+            );
+            let spec = tool.spec();
+            assert_eq!(spec.input_schema["required"], json!(["target"]));
+            assert_eq!(
+                spec.input_schema["properties"]["timeout_ms"]["type"],
+                "integer"
+            );
+            assert_eq!(spec.input_schema["properties"]["timeout_ms"]["minimum"], 0);
         }
     }
 

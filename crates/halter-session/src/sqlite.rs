@@ -14,7 +14,7 @@ use halter_protocol::{
     SessionEventPayload, SessionId, SessionState,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{SessionCommitConflict, SessionStore, StoredSession};
 
@@ -86,6 +86,7 @@ const _: () = {
 /// these serve `load`/`replay`/`list` while a write transaction is open on
 /// the single writer connection.
 const READ_POOL_SIZE: usize = 4;
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sqlite-backed session store.
 ///
@@ -96,6 +97,7 @@ const READ_POOL_SIZE: usize = 4;
 /// open a distinct database) and reads fall back to the writer connection.
 pub struct SqliteSessionStore {
     writer: Arc<Mutex<Connection>>,
+    writer_operations: Arc<tokio::sync::Mutex<()>>,
     readers: Arc<ReadPool>,
 }
 
@@ -146,6 +148,7 @@ impl SqliteSessionStore {
 
         Ok(Self {
             writer: Arc::new(Mutex::new(connection)),
+            writer_operations: Arc::new(tokio::sync::Mutex::new(())),
             readers: Arc::new(ReadPool {
                 connections: readers,
                 next: AtomicUsize::new(0),
@@ -164,8 +167,12 @@ impl SqliteSessionStore {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        // Native writes outlive an aborted caller. Transfer admission into the
+        // blocking closure so recovery can wait for them to settle.
+        let operation = self.writer_operations.clone().lock_owned().await;
         let connection = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || {
+            let _operation = operation;
             let mut guard = connection
                 .lock()
                 .map_err(|_| anyhow::anyhow!("failed to lock sqlite session store connection"))?;
@@ -208,7 +215,7 @@ fn open_read_connection(path: &Path) -> Result<Connection> {
         )
     })?;
     connection
-        .busy_timeout(Duration::from_millis(5_000))
+        .busy_timeout(BUSY_TIMEOUT)
         .context("failed to set sqlite busy timeout")?;
     connection
         .pragma_update(None, "cache_size", -8_000i64)
@@ -218,11 +225,18 @@ fn open_read_connection(path: &Path) -> Result<Connection> {
 
 #[async_trait]
 impl SessionStore for SqliteSessionStore {
+    async fn synchronize(&self, _session_id: &SessionId) -> Result<()> {
+        let _operation = self.writer_operations.lock().await;
+        Ok(())
+    }
+
     async fn create_session(&self, session: StoredSession) -> Result<()> {
         let session_id = session.blueprint.session_id.clone();
         debug!(session_id = %session_id, "creating sqlite session");
-        self.with_conn(move |conn| create_session_with_conn(conn, session))
-            .await
+        self.with_conn(move |conn| {
+            retry_transaction(conn, |conn| create_session_with_conn(conn, &session))
+        })
+        .await
     }
 
     async fn load_session(&self, session_id: &SessionId) -> Result<Option<StoredSession>> {
@@ -245,14 +259,16 @@ impl SessionStore for SqliteSessionStore {
     ) -> Result<Vec<SessionEvent>> {
         let session_id = session_id.clone();
         self.with_conn(move |conn| {
-            commit_with_conn(
-                conn,
-                &session_id,
-                snapshot,
-                expected_head_sequence,
-                state,
-                events,
-            )
+            retry_transaction(conn, |conn| {
+                commit_with_conn(
+                    conn,
+                    &session_id,
+                    snapshot.as_deref(),
+                    expected_head_sequence,
+                    state.as_ref(),
+                    &events,
+                )
+            })
         })
         .await
     }
@@ -284,7 +300,50 @@ impl SessionStore for SqliteSessionStore {
     }
 }
 
-fn create_session_with_conn(conn: &mut Connection, session: StoredSession) -> Result<()> {
+/// Retry only SQLite contention after a failed transaction has rolled back.
+/// The connection's existing busy timeout is the total contention budget,
+/// including SQLite's own waits; a persistent lock still reaches the caller.
+fn retry_transaction<T>(
+    conn: &mut Connection,
+    mut operation: impl FnMut(&mut Connection) -> Result<T>,
+) -> Result<T> {
+    let timeout_ms: u64 = conn
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .context("failed to read sqlite busy timeout")?;
+    let budget = Duration::from_millis(timeout_ms);
+    let started = Instant::now();
+    let result = loop {
+        conn.busy_timeout(budget.saturating_sub(started.elapsed()))
+            .context("failed to set sqlite transaction busy timeout")?;
+        match operation(conn) {
+            Err(error)
+                if is_contention(&error) && conn.is_autocommit() && started.elapsed() < budget =>
+            {
+                debug!(error = %error, "retrying rolled-back sqlite transaction");
+                std::thread::sleep(
+                    Duration::from_millis(10).min(budget.saturating_sub(started.elapsed())),
+                );
+            }
+            result => break result,
+        }
+    };
+    // A timeout restoration failure must not turn a committed write into an
+    // apparent failure: callers might otherwise execute it again.
+    if let Err(error) = conn.busy_timeout(budget) {
+        warn!(%error, "failed to restore sqlite busy timeout");
+    }
+    result
+}
+
+fn is_contention(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(details, _))
+            if matches!(details.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn create_session_with_conn(conn: &mut Connection, session: &StoredSession) -> Result<()> {
     ensure_snapshot_revision_matches(&session.blueprint, session.snapshot.as_ref())?;
     if session.state_sequence != 0 || session.head_sequence != 0 {
         anyhow::bail!(
@@ -411,10 +470,10 @@ fn load_session_with_conn(
 fn commit_with_conn(
     conn: &mut Connection,
     session_id: &SessionId,
-    snapshot: Option<Arc<ResourceSnapshot>>,
+    snapshot: Option<&ResourceSnapshot>,
     expected_head_sequence: Option<u64>,
-    state: Option<SessionState>,
-    events: Vec<PendingEvent>,
+    state: Option<&SessionState>,
+    events: &[PendingEvent],
 ) -> Result<Vec<SessionEvent>> {
     let started_at = Instant::now();
     let tx = conn
@@ -467,8 +526,8 @@ fn commit_with_conn(
     }
     let new_head = current_head + events.len() as u64;
 
-    if let Some(snapshot) = snapshot.as_ref() {
-        store_snapshot(&tx, snapshot.as_ref())?;
+    if let Some(snapshot) = snapshot {
+        store_snapshot(&tx, snapshot)?;
         let mut blueprint: SessionBlueprint = serde_json::from_str(&blueprint_json)
             .context("failed to deserialize session blueprint")?;
         blueprint.snapshot_revision = snapshot.revision.clone();
@@ -487,7 +546,7 @@ fn commit_with_conn(
         .with_context(|| format!("failed to update snapshot for session '{}'", session_id.0))?;
     }
 
-    if let Some(state) = state.as_ref() {
+    if let Some(state) = state {
         let state_json =
             serde_json::to_string(state).context("failed to serialize session state")?;
         tx.execute(
@@ -502,7 +561,7 @@ fn commit_with_conn(
     }
 
     let mut committed = Vec::with_capacity(events.len());
-    for (offset, event) in events.into_iter().enumerate() {
+    for (offset, event) in events.iter().enumerate() {
         let sequence = current_head + 1 + offset as u64;
         let payload_json = serde_json::to_string(&event.payload)
             .context("failed to serialize session event payload")?;
@@ -527,7 +586,7 @@ fn commit_with_conn(
             PendingEvent {
                 session_id: session_id.clone(),
                 delivery: event.delivery,
-                payload: event.payload,
+                payload: event.payload.clone(),
             }
             .into_committed(sequence),
         );
@@ -623,7 +682,7 @@ fn configure_connection(conn: &Connection) -> Result<()> {
         .context("failed to set sqlite synchronous mode")?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .context("failed to enable sqlite foreign keys")?;
-    conn.busy_timeout(Duration::from_millis(5_000))
+    conn.busy_timeout(BUSY_TIMEOUT)
         .context("failed to set sqlite busy timeout")?;
     conn.pragma_update(None, "cache_size", -8_000i64)
         .context("failed to set sqlite cache size")?;
@@ -832,6 +891,218 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_barrier_waits_for_native_write_after_caller_is_aborted() {
+        let temp = tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open(temp.path().join("recovery.db")).unwrap());
+        let session = test_session("cancelled-writer", "revision-a");
+        let id = session.blueprint.session_id.clone();
+        store.create_session(session).await.unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let write_id = id.clone();
+        let writer = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .with_conn(move |conn| {
+                        let _ = started.send(());
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                        commit_with_conn(
+                            conn,
+                            &write_id,
+                            None,
+                            Some(0),
+                            None,
+                            &[test_event("finished native write", Delivery::Lossless)],
+                        )
+                    })
+                    .await
+            }
+        });
+        waiting.await.unwrap();
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        // WAL reads remain independent of the blocked writer, while recovery
+        // explicitly waits for the write abandoned by its original caller.
+        assert_eq!(
+            store
+                .load_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_sequence,
+            0
+        );
+        let barrier = store.synchronize(&id);
+        tokio::pin!(barrier);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(barrier.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), barrier)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_sequence,
+            1
+        );
+        assert_eq!(store.replay(&id).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn locked_commit_retries_atomically_and_rechecks_expected_head() {
+        for competing_write in [false, true] {
+            let temp = tempdir().expect("tempdir");
+            let path = temp.path().join("shared.db");
+            let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_SHARED_CACHE;
+            let mut writer = Connection::open_with_flags(&path, flags).expect("writer");
+            configure_connection(&writer).expect("configure writer");
+            writer.busy_timeout(Duration::from_secs(1)).unwrap();
+            run_migrations(&mut writer, MIGRATIONS).expect("migrations");
+            let session = test_session("locked", "revision-a");
+            create_session_with_conn(&mut writer, &session).expect("create session");
+
+            let mut blocker = Connection::open_with_flags(&path, flags).expect("blocker");
+            blocker
+                .execute_batch("BEGIN; SELECT * FROM events;")
+                .unwrap();
+            let (release, wait_for_release) = std::sync::mpsc::channel();
+            let (released, wait_until_released) = std::sync::mpsc::channel();
+            let competing_session = session.blueprint.session_id.clone();
+            let releasing = std::thread::spawn(move || {
+                wait_for_release
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                blocker.execute_batch("ROLLBACK").unwrap();
+                if competing_write {
+                    commit_with_conn(
+                        &mut blocker,
+                        &competing_session,
+                        None,
+                        Some(0),
+                        None,
+                        &[test_event("concurrent", Delivery::Lossless)],
+                    )
+                    .unwrap();
+                }
+                released.send(()).unwrap();
+            });
+            let changed_state = test_state("changed");
+            let inputs = [test_event("once", Delivery::Lossless)];
+            let mut attempts = 0;
+            let committed = retry_transaction(&mut writer, |conn| {
+                attempts += 1;
+                let result = commit_with_conn(
+                    conn,
+                    &session.blueprint.session_id,
+                    None,
+                    Some(0),
+                    Some(&changed_state),
+                    &inputs,
+                );
+                if attempts == 1 {
+                    let error = result.as_ref().expect_err("events table is locked");
+                    assert!(is_contention(error), "{error:#}");
+                    assert!(conn.is_autocommit(), "failed transaction rolled back");
+                    let stored = load_session_with_conn(conn, &session.blueprint.session_id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(stored.state, session.state, "checkpoint rolled back too");
+                    release.send(()).unwrap();
+                    wait_until_released
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                }
+                result
+            });
+            releasing.join().unwrap();
+            assert!(attempts >= 2);
+            let expected_state = if competing_write {
+                assert!(
+                    committed
+                        .unwrap_err()
+                        .downcast_ref::<SessionCommitConflict>()
+                        .is_some()
+                );
+                &session.state
+            } else {
+                let committed = committed.expect("retry succeeds when table lock is released");
+                assert_eq!(committed.len(), 1);
+                assert_eq!(committed[0].sequence(), 1);
+                &changed_state
+            };
+            assert_eq!(
+                replay_with_conn(&writer, &session.blueprint.session_id)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                &load_session_with_conn(&writer, &session.blueprint.session_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                expected_state
+            );
+            let timeout: u64 = writer
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(timeout, 1000, "restore the configured timeout");
+        }
+    }
+
+    #[test]
+    fn transaction_contention_budget_and_permanent_errors_are_bounded() {
+        for (code, retried) in [
+            (rusqlite::ffi::SQLITE_BUSY, true),
+            (rusqlite::ffi::SQLITE_LOCKED, true),
+            (rusqlite::ffi::SQLITE_READONLY, false),
+            (rusqlite::ffi::SQLITE_CONSTRAINT, false),
+        ] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.busy_timeout(Duration::from_millis(20)).unwrap();
+            let mut attempts = 0;
+            let result: Result<()> = retry_transaction(&mut conn, |_conn| {
+                attempts += 1;
+                Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into())
+            });
+            let error = result.unwrap_err();
+            assert_eq!(is_contention(&error), retried);
+            assert_eq!(attempts > 1, retried, "code {code}");
+            assert!(attempts <= 4, "contention budget bounds retries");
+        }
+    }
+
+    #[test]
+    fn contention_is_not_retried_if_rollback_has_not_finished() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let mut attempts = 0;
+        let result: Result<()> = retry_transaction(&mut conn, |conn| {
+            attempts += 1;
+            conn.execute_batch("BEGIN").unwrap();
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+                None,
+            )
+            .into())
+        });
+        assert!(is_contention(&result.unwrap_err()));
+        assert_eq!(attempts, 1);
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
 
     #[tokio::test]
     async fn open_in_memory_creates_schema() {

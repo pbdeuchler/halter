@@ -18,7 +18,7 @@ use halter::prelude::*;
 use halter_config::{export_json_schema, generate_starter_config, load_path};
 use halter_protocol::{AssistantMessage, SessionEvent, SessionEventPayload};
 use run_output::{
-    JsonResultTracker, RunOutputArgs, RunOutputMode, strip_signatures_from_assistant_message,
+    ForegroundRun, RunOutputArgs, RunOutputMode, strip_signatures_from_assistant_message,
     strip_signatures_from_session_event,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -220,54 +220,53 @@ async fn run_once(
         "running single turn"
     );
     let harness = Halter::from_config_file(path).await?;
-    let session = harness.new_session(SessionInit::default()).await?;
+    let (session, mut events) = harness.new_session(SessionInit::default()).await?;
     let (result, reason) = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
             info!("ctrl-c received, draining runtime before exit");
             (Err(anyhow::anyhow!("interrupted by signal")), "interrupted")
         }
-        result = run_once_body(&session, task, output_mode, output) => (result, "run_complete"),
+        result = run_once_body(&session, &mut events, task, output_mode, output) => (result, "run_complete"),
     };
     drain_then_end_session(&harness, &session, result, reason).await
 }
 
 async fn run_once_body(
     session: &HalterSession,
+    events: &mut SessionEventStream,
     task: &str,
     output_mode: RunOutputMode,
     output: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let mut events = session.submit_turn(Turn::user(task)).await?;
-
-    match output_mode {
-        RunOutputMode::StreamingJson => {
-            while let Some(event) = events.next().await {
-                write_json_event(output, &event?)?;
-            }
-            Ok(())
+    let submission = session.submit(Message::user(task)).await?;
+    let mut foreground = ForegroundRun::new(submission.message_id.clone());
+    while let Some(event) = events.next().await {
+        let event = event?;
+        if output_mode == RunOutputMode::StreamingJson {
+            write_json_event(output, &event)?;
         }
-        RunOutputMode::JsonResult => {
-            let mut tracker = JsonResultTracker::default();
-            while let Some(event) = events.next().await {
-                let event = event?;
-                if let Some(result) = tracker
-                    .observe(&event.payload)
-                    .map_err(anyhow::Error::msg)?
-                {
-                    write_json_result(output, result)?;
-                    return Ok(());
-                }
+        if event.session_id != *session.id() || event.sequence() < submission.sequence {
+            continue;
+        }
+        if foreground
+            .observe(&event.payload)
+            .map_err(anyhow::Error::msg)?
+        {
+            if output_mode == RunOutputMode::JsonResult {
+                let result = foreground.final_result().map_err(anyhow::Error::msg)?;
+                write_json_result(output, result)?;
             }
-            anyhow::bail!("failed to receive final assistant result")
+            return Ok(());
         }
     }
+    anyhow::bail!("session closed before foreground execution stopped")
 }
 
 async fn chat(path: &Path, output: &mut dyn Write) -> anyhow::Result<()> {
     info!(path = %path.display(), "starting chat session");
     let harness = Halter::from_config_file(path).await?;
-    let session = harness.new_session(SessionInit::default()).await?;
+    let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 
     let (result, reason) = tokio::select! {
         biased;
@@ -275,19 +274,19 @@ async fn chat(path: &Path, output: &mut dyn Write) -> anyhow::Result<()> {
             info!("ctrl-c received, draining runtime before exit");
             (Err(anyhow::anyhow!("interrupted by signal")), "interrupted")
         }
-        result = chat_body(&session, output) => (result, "chat_complete"),
+        result = chat_body(&session, &mut events, output) => (result, "chat_complete"),
     };
     drain_then_end_session(&harness, &session, result, reason).await
 }
 
-/// Drain in-flight turns before running session-end hooks: `shutdown` waits
-/// for the session's write lease, which an undrained turn still holds.
+/// Close the session driver before stopping its runtime.
 async fn drain_then_end_session(
     harness: &Halter,
     session: &HalterSession,
     result: anyhow::Result<()>,
     reason: &str,
 ) -> anyhow::Result<()> {
+    let session_shutdown = session.shutdown(Some(SHUTDOWN_DRAIN)).await;
     let report = harness.shutdown(SHUTDOWN_DRAIN).await;
     info!(
         drained = report.turns_drained,
@@ -296,12 +295,15 @@ async fn drain_then_end_session(
         reason,
         "runtime drained"
     );
-    let session_shutdown = session.shutdown(reason).await;
     result?;
-    session_shutdown
+    session_shutdown.map_err(Into::into)
 }
 
-async fn chat_body(session: &HalterSession, output: &mut dyn Write) -> anyhow::Result<()> {
+async fn chat_body(
+    session: &HalterSession,
+    events: &mut SessionEventStream,
+    output: &mut dyn Write,
+) -> anyhow::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
@@ -311,9 +313,24 @@ async fn chat_body(session: &HalterSession, output: &mut dyn Write) -> anyhow::R
             continue;
         }
 
-        let mut events = session.submit_turn(Turn::user(line)).await?;
+        let submission = session.submit(Message::user(line)).await?;
+        let mut foreground = ForegroundRun::new(submission.message_id.clone());
+        let mut completed = false;
         while let Some(event) = events.next().await {
-            match event?.payload {
+            let event = event?;
+            if event.session_id != *session.id() || event.sequence() < submission.sequence {
+                continue;
+            }
+            if foreground
+                .observe(&event.payload)
+                .map_err(anyhow::Error::msg)?
+            {
+                completed = true;
+                writeln!(output).context("failed to write output")?;
+                output.flush().context("failed to flush output")?;
+                break;
+            }
+            match event.payload {
                 SessionEventPayload::DeltaItem { delta } => {
                     write!(output, "{}", delta.text).context("failed to write output")?;
                     output.flush().context("failed to flush output")?;
@@ -322,14 +339,11 @@ async fn chat_body(session: &HalterSession, output: &mut dyn Write) -> anyhow::R
                     write!(output, "{}", chunk).context("failed to write output")?;
                     output.flush().context("failed to flush output")?;
                 }
-                SessionEventPayload::TurnCompleted { .. } => {
-                    writeln!(output).context("failed to write output")?;
-                    output.flush().context("failed to flush output")?;
-                    break;
-                }
-                SessionEventPayload::TurnFailed { error, .. } => anyhow::bail!(error),
                 _ => {}
             }
+        }
+        if !completed {
+            anyhow::bail!("session closed before execution completed");
         }
     }
     Ok(())

@@ -14,19 +14,34 @@
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let harness = Halter::from_config_file("halter.toml").await?;
-//!     let session = harness.new_session(SessionInit::default()).await?;
+//!     let (session, mut events) = harness.new_session(SessionInit::default()).await?;
 //!
-//!     let mut events = session
-//!         .submit_turn(Turn::user("Summarize this repository"))
-//!         .await?;
+//!     let listener = tokio::spawn(async move {
+//!         while let Some(event) = events.next().await {
+//!             println!("{:?}", event?.payload);
+//!         }
+//!         Ok::<(), anyhow::Error>(())
+//!     });
 //!
-//!     while let Some(event) = events.next().await {
-//!         println!("{:?}", event?.payload);
-//!     }
+//!     session.submit(Message::user("Summarize this repository")).await?;
+//!     session.submit(Message::user("Focus on persistence")).await?;
+//!     tokio::signal::ctrl_c().await?;
+//!     session.shutdown(None).await?;
+//!     listener.await??;
 //!
 //!     Ok(())
 //! }
 //! ```
+//!
+//! Keep a session handle to submit more input across idle periods. Dropping the
+//! last clone releases the session after foreground work, runnable input,
+//! background jobs, and subagents finish. It does not cancel active work.
+//! Event streams and status receivers do not retain the session. Stored history
+//! and deferred input remain available through `resume_session`.
+//!
+//! Clean stream closure emits a transient
+//! `SessionStatusChanged { status: Closed }` after the final committed event.
+//! Its sequence is zero and replay does not include it.
 //!
 //! ## More documentation
 //!
@@ -44,6 +59,7 @@ pub use halter_config::{
     LoadedOutputStyle, LoadedPlugin, LoadedResourceFile, LoadedSkill, PluginDefaults, PluginLoader,
     SkillLoader,
 };
+pub use halter_runtime::{SessionError, SessionEventStream, SessionHandle, Submission};
 pub use resources::{CompiledResources, ResourceCompiler};
 
 pub mod session {
@@ -96,9 +112,14 @@ pub mod prompts {
 pub mod prelude {
     pub use halter_config::{HarnessConfig, PromptsConfig, SystemPromptPreset};
     pub use halter_protocol::{
-        Message, ResourceSnapshot, SessionEvent, SessionEventPayload, SessionId, Turn,
+        InputDeferredReason, Message, MessageId, ResourceSnapshot, SessionEvent,
+        SessionEventPayload, SessionId, SessionStatus,
     };
-    pub use halter_runtime::{HalterSession, SessionInit, SessionRuntime, SubagentEventForwarding};
+    pub use halter_runtime::SessionHandle as HalterSession;
+    pub use halter_runtime::{
+        SessionError, SessionEventStream, SessionHandle, SessionInit, SessionRuntime,
+        SubagentEventForwarding, Submission,
+    };
 
     pub use crate::compaction;
     pub use crate::prompts;

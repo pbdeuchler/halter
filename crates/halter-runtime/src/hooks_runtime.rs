@@ -73,7 +73,7 @@ pub enum CommandOutputParseError {
 use crate::session::{
     MaterializedAssistantMessage, create_session_seeded, materialize_assistant_message,
 };
-use crate::{HalterSession, ResourceHandle, RuntimeServices, SessionInit};
+use crate::{ResourceHandle, RuntimeServices, SessionExecutor, SessionInit};
 
 #[derive(Clone, Copy)]
 /// Shared context included in hook payloads for one invocation.
@@ -99,8 +99,8 @@ pub struct ExecutedHookDispatch {
 }
 
 /// Run `SessionStart` hooks.
-pub async fn run_session_start(
-    sess: &HalterSession,
+pub(crate) async fn run_session_start(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     source: HookSessionStartSource,
@@ -127,8 +127,8 @@ pub async fn run_session_start(
 }
 
 /// Run `SessionEnd` hooks.
-pub async fn run_session_end(
-    sess: &HalterSession,
+pub(crate) async fn run_session_end(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     reason: &str,
@@ -154,8 +154,8 @@ pub async fn run_session_end(
 }
 
 /// Run `UserPromptSubmit` hooks.
-pub async fn run_user_prompt_submit(
-    sess: &HalterSession,
+pub(crate) async fn run_user_prompt_submit(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     prompt: &str,
@@ -181,8 +181,8 @@ pub async fn run_user_prompt_submit(
 }
 
 /// Run `PreToolUse` hooks for a tool call.
-pub async fn run_pre_tool_use(
-    sess: &HalterSession,
+pub(crate) async fn run_pre_tool_use(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     call: &ToolCall,
@@ -210,8 +210,8 @@ pub async fn run_pre_tool_use(
 }
 
 /// Run `PostToolUse` hooks after a successful tool call.
-pub async fn run_post_tool_use(
-    sess: &HalterSession,
+pub(crate) async fn run_post_tool_use(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     call: &ToolCall,
@@ -241,8 +241,8 @@ pub async fn run_post_tool_use(
 }
 
 /// Run `PostToolUseFailure` hooks after a failed tool call.
-pub async fn run_post_tool_use_failure(
-    sess: &HalterSession,
+pub(crate) async fn run_post_tool_use_failure(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     call: &ToolCall,
@@ -272,8 +272,8 @@ pub async fn run_post_tool_use_failure(
 }
 
 /// Run `Stop` hooks at the end of assistant generation.
-pub async fn run_stop(
-    sess: &HalterSession,
+pub(crate) async fn run_stop(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     last_message: Option<&AssistantMessage>,
@@ -301,8 +301,8 @@ pub async fn run_stop(
 }
 
 /// Run `SubagentStart` hooks.
-pub async fn run_subagent_start(
-    sess: &HalterSession,
+pub(crate) async fn run_subagent_start(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     agent_id: &halter_protocol::AgentId,
@@ -332,8 +332,8 @@ pub async fn run_subagent_start(
 }
 
 /// Run `SubagentStop` hooks.
-pub async fn run_subagent_stop(
-    sess: &HalterSession,
+pub(crate) async fn run_subagent_stop(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     agent_id: &halter_protocol::AgentId,
@@ -372,8 +372,8 @@ pub async fn run_subagent_stop(
 }
 
 /// Run `PreCompact` hooks before a compaction attempt.
-pub async fn run_pre_compact(
-    sess: &HalterSession,
+pub(crate) async fn run_pre_compact(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     trigger: &str,
@@ -401,8 +401,8 @@ pub async fn run_pre_compact(
 }
 
 /// Run `PostCompact` hooks after compaction.
-pub async fn run_post_compact(
-    sess: &HalterSession,
+pub(crate) async fn run_post_compact(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     trigger: &str,
@@ -430,8 +430,9 @@ pub async fn run_post_compact(
 }
 
 /// Run `Notification` hooks.
-pub async fn run_notification(
-    sess: &HalterSession,
+#[cfg(test)]
+pub(crate) async fn run_notification(
+    sess: &SessionExecutor,
     fired_hook_ids: &BTreeSet<String>,
     ctx: HookInvocationContext<'_>,
     notification_type: &str,
@@ -459,7 +460,7 @@ pub async fn run_notification(
 }
 
 async fn execute_hooks(
-    sess: &HalterSession,
+    sess: &SessionExecutor,
     request: HookDispatchRequest,
     cancel: &CancellationToken,
 ) -> anyhow::Result<ExecutedHookDispatch> {
@@ -523,7 +524,7 @@ struct HandlerRunResult {
 }
 
 async fn run_handler(
-    sess: &HalterSession,
+    sess: &SessionExecutor,
     request: &HookDispatchRequest,
     handler: Arc<ConfiguredHandler>,
     preview: HookRunSummary,
@@ -602,7 +603,7 @@ impl HandlerExecution {
 }
 
 async fn execute_handler(
-    sess: &HalterSession,
+    sess: &SessionExecutor,
     request: &HookDispatchRequest,
     handler: &ConfiguredHandler,
     cancel: CancellationToken,
@@ -720,7 +721,7 @@ async fn run_sdk_hook(
 }
 
 async fn run_http(
-    sess: &HalterSession,
+    sess: &SessionExecutor,
     handler: &ConfiguredHandler,
     config: &HttpHookConfig,
     request: &HookDispatchRequest,
@@ -815,7 +816,7 @@ async fn accumulate_response_body_bounded(
 }
 
 async fn run_prompt(
-    sess: &HalterSession,
+    sess: &SessionExecutor,
     timeout_limit: std::time::Duration,
     config: &PromptHookConfig,
     request: &HookDispatchRequest,
@@ -862,7 +863,7 @@ async fn run_prompt(
 }
 
 async fn run_agent(
-    sess: &HalterSession,
+    sess: &SessionExecutor,
     timeout_limit: std::time::Duration,
     config: &AgentHookConfig,
     request: &HookDispatchRequest,
@@ -922,39 +923,26 @@ async fn run_agent(
     };
     let initial_state = SessionState::default();
     let agent_session = create_session_seeded(services, init, initial_state, resources).await?;
-    let payload_json = serde_json::to_string_pretty(&request.payload)?;
+    let turn = Turn::user(serde_json::to_string_pretty(&request.payload)?);
+    let temporary = crate::temporary_session::TemporarySession::new(&agent_session, &turn.id);
     let agent_cancel = cancel.child_token();
     let turn_cancel = agent_cancel.clone();
     // Any exit (cancel, timeout, this future dropped) stops the hook agent.
     let _agent_guard = agent_cancel.drop_guard();
-    // Hook agents run on the ambient tokio runtime via `tokio::spawn`. The
-    // earlier `spawn_blocking + Handle::block_on` pattern only worked when the
-    // outer caller was itself blocking; any future async caller would
-    // deadlock. AC2.8 requires the dispatch path to stay fully async.
-    //
-    // `run_hook_agent_turn` returns a typed `BoxFuture` so `tokio::spawn`'s
-    // auto-`Send` check is satisfied by the concrete pointer type and does
-    // not have to recurse through `run_agent`'s own opaque return.
-    let mut agent_task = tokio::spawn(run_hook_agent_turn(
-        agent_session,
-        payload_json,
-        turn_cancel,
-    ));
-    let events = tokio::select! {
-        _ = cancel.cancelled() => {
-            agent_task.abort();
-            return Ok(HandlerExecution::Cancelled);
-        }
-        result = timeout(timeout_limit, &mut agent_task) => match result {
-            Ok(events) => events
-                .context("failed to join hook agent task")?
-                .context("failed to execute hook agent")?,
-            Err(_) => {
-                agent_task.abort();
-                anyhow::bail!("hook agent timed out");
-            }
+    // Poll submission here so abandoning this future cannot leave a wrapper
+    // task registering execution after the temporary owner starts cleanup.
+    let outcome = tokio::select! {
+        _ = cancel.cancelled() => Ok(None),
+        result = timeout(timeout_limit, run_hook_agent_turn(agent_session, turn, turn_cancel)) => match result {
+            Ok(events) => events.context("failed to execute hook agent").map(Some),
+            Err(_) => Err(anyhow::anyhow!("hook agent timed out")),
         },
     };
+    let cleanup = temporary.finish().await;
+    let Some(events) = outcome? else {
+        return Ok(HandlerExecution::Cancelled);
+    };
+    cleanup?;
     let output = crate::subagent_session::extract_subagent_output(&events)
         .context("hook agent did not produce a final assistant message")?;
     Ok(HandlerExecution::completed(parse_json_hook_output(
@@ -962,26 +950,24 @@ async fn run_agent(
     )?))
 }
 
-// Returns a `BoxFuture` rather than `async fn` so the spawn caller has a
-// concrete `Pin<Box<dyn Future + Send>>` to hand to `tokio::spawn`. Returning
-// `impl Future` would force `tokio::spawn`'s `Send` check to recurse through
-// `submit_turn_with_cancel` -> hook dispatch -> `run_agent`, producing an
-// inference cycle on `run_agent`'s own opaque return type.
+// Returns a `BoxFuture` rather than `async fn` so Send inference does not
+// recurse through `submit_turn_with_cancel` -> hook dispatch -> `run_agent`,
+// producing an inference cycle on `run_agent`'s own opaque return type.
 fn run_hook_agent_turn(
-    agent_session: HalterSession,
-    payload_json: String,
+    agent_session: SessionExecutor,
+    turn: Turn,
     turn_cancel: CancellationToken,
 ) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<halter_protocol::SessionEvent>>> {
     Box::pin(async move {
         let stream = agent_session
-            .submit_turn_with_cancel(Turn::user(payload_json), turn_cancel)
+            .submit_turn_with_cancel(turn, turn_cancel)
             .await?;
         stream.try_collect::<Vec<_>>().await
     })
 }
 
 fn resolve_prompt_model(
-    sess: &HalterSession,
+    sess: &SessionExecutor,
     override_model: Option<&str>,
 ) -> anyhow::Result<halter_protocol::ResolvedModel> {
     match override_model {
@@ -994,7 +980,7 @@ fn resolve_prompt_model(
 }
 
 fn resolve_agent_model(
-    sess: &HalterSession,
+    sess: &SessionExecutor,
     override_model: Option<&str>,
 ) -> anyhow::Result<halter_protocol::ResolvedModel> {
     match override_model {
@@ -1143,7 +1129,7 @@ fn expand_placeholders(value: &str, plugin_root: &Path) -> String {
 }
 
 fn base_payload(
-    sess: &HalterSession,
+    sess: &SessionExecutor,
     ctx: &HookInvocationContext<'_>,
     event_name: HookEventName,
     extra: Value,
@@ -1412,6 +1398,10 @@ fn hash_text(text: &str) -> String {
     hasher.update(text.as_bytes());
     format!("{:x}", hasher.finalize())
 }
+
+#[cfg(all(test, unix))]
+#[path = "hook_agent_cleanup_tests.rs"]
+mod agent_cleanup_tests;
 
 #[cfg(test)]
 mod tests {

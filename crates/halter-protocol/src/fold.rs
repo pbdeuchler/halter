@@ -32,6 +32,9 @@
 //! - `compaction_notifications` — inserted by
 //!   [`SessionEventPayload::CompactionNotified`], cleared by each
 //!   state-rewriting compaction.
+//! - `pending_inputs` — queued by [`SessionEventPayload::InputAccepted`],
+//!   removed by matching user `MessageItem` delivery or `InputRejected`.
+//!   Context rewrites leave this inbox intact.
 //!
 //! Runtime bookkeeping fields (`pending_tool_calls`, `fired_hook_ids`,
 //! `appended_prompt_segments`, `lineage`, hook latches, and
@@ -55,6 +58,20 @@ use crate::{Message, SessionEvent, SessionEventPayload, SessionState};
 /// tool output chunks — are no-ops.
 pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
     match payload {
+        SessionEventPayload::InputAccepted { message } => {
+            if !state
+                .pending_inputs
+                .iter()
+                .any(|pending| pending.id == message.id)
+            {
+                state.pending_inputs.push(message.clone());
+            }
+        }
+        SessionEventPayload::InputRejected { message_id, .. } => {
+            state
+                .pending_inputs
+                .retain(|message| &message.id != message_id);
+        }
         SessionEventPayload::MessageItem { message }
         | SessionEventPayload::MessageRecorded { message } => {
             if let Message::Assistant(assistant) = message
@@ -103,6 +120,9 @@ pub fn apply_event(state: &mut SessionState, payload: &SessionEventPayload) {
         SessionEventPayload::ContextCompacted { effects: None, .. }
         | SessionEventPayload::SessionStarted
         | SessionEventPayload::SessionResumed
+        | SessionEventPayload::InputDelivered { .. }
+        | SessionEventPayload::InputDeferred { .. }
+        | SessionEventPayload::SessionStatusChanged { .. }
         | SessionEventPayload::Warning { .. }
         | SessionEventPayload::TurnStarted { .. }
         | SessionEventPayload::DeltaItem { .. }
@@ -151,6 +171,7 @@ pub fn fold_events(mut state: SessionState, events: &[SessionEvent]) -> SessionS
 #[must_use]
 pub fn covered_state_matches(a: &SessionState, b: &SessionState) -> bool {
     a.messages == b.messages
+        && a.pending_inputs == b.pending_inputs
         && a.compacted_prefix == b.compacted_prefix
         && a.usage_so_far == b.usage_so_far
         && a.token_ledger == b.token_ledger
@@ -168,7 +189,7 @@ mod tests {
     use super::*;
     use crate::{
         AssistantMessage, CompactionEventEffects, Delivery, MessageId, PendingEvent, ReplayMeta,
-        SessionId, StopReason, TokenLedger, Usage, UserMessage,
+        SessionId, SessionStatus, StopReason, TokenLedger, Usage, UserMessage,
     };
 
     fn assistant_message(text: &str, usage: Option<Usage>) -> Message {
@@ -226,6 +247,167 @@ mod tests {
                 ..TokenLedger::default()
             }
         );
+    }
+
+    #[test]
+    fn accepted_input_enters_history_only_on_delivery() {
+        let first = UserMessage::text("first");
+        let second = UserMessage::text("second");
+        let mut accepted = SessionState::default();
+        for message in [&first, &second] {
+            apply_event(
+                &mut accepted,
+                &SessionEventPayload::InputAccepted {
+                    message: message.clone(),
+                },
+            );
+        }
+        assert_eq!(accepted.pending_inputs, [first.clone(), second.clone()]);
+        assert!(accepted.messages.is_empty());
+        assert_eq!(accepted.token_ledger, TokenLedger::default());
+
+        let cases = [
+            (
+                "delivered",
+                SessionEventPayload::MessageItem {
+                    message: Message::User(first.clone()),
+                },
+                vec![second.clone()],
+                vec![Message::User(first.clone())],
+            ),
+            (
+                "recorded only",
+                SessionEventPayload::MessageRecorded {
+                    message: Message::User(first.clone()),
+                },
+                vec![first.clone(), second.clone()],
+                vec![],
+            ),
+            (
+                "rejected",
+                SessionEventPayload::InputRejected {
+                    message_id: first.id.clone(),
+                    reason: "invalid input".to_owned(),
+                },
+                vec![second.clone()],
+                vec![],
+            ),
+            (
+                "unrelated rejection",
+                SessionEventPayload::InputRejected {
+                    message_id: MessageId::from("not-pending"),
+                    reason: "invalid input".to_owned(),
+                },
+                vec![first.clone(), second.clone()],
+                vec![],
+            ),
+            (
+                "deferred input stays queued",
+                SessionEventPayload::InputDeferred {
+                    message_id: first.id.clone(),
+                    reason: crate::InputDeferredReason::Interrupted,
+                },
+                vec![first.clone(), second.clone()],
+                vec![],
+            ),
+            (
+                "delivery notification leaves the transcript transition to MessageItem",
+                SessionEventPayload::InputDelivered {
+                    message_id: first.id.clone(),
+                },
+                vec![first.clone(), second.clone()],
+                vec![],
+            ),
+        ];
+        for (name, payload, pending_inputs, messages) in cases {
+            let mut state = accepted.clone();
+            apply_event(&mut state, &payload);
+            assert_eq!(state.pending_inputs, pending_inputs, "{name}");
+            assert_eq!(state.messages, messages, "{name}");
+            assert_eq!(
+                state.token_ledger,
+                TokenLedger::inferred_from(&[], &state.messages),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_acceptance_keeps_one_canonical_queued_message() {
+        let original = UserMessage::text("original task");
+        let mut replacement = UserMessage::text("different task");
+        replacement.id = original.id.clone();
+        let mut state = SessionState::default();
+        for message in [original.clone(), replacement, original.clone()] {
+            apply_event(&mut state, &SessionEventPayload::InputAccepted { message });
+        }
+        assert_eq!(state.pending_inputs, [original]);
+        assert!(state.messages.is_empty());
+        assert_eq!(state.token_ledger, TokenLedger::default());
+    }
+
+    #[test]
+    fn context_rewrites_preserve_pending_input() {
+        let pending = UserMessage::text("keep the public API");
+        let window = vec![Message::user("rewritten context")];
+        let effects = CompactionEventEffects {
+            messages: window.clone(),
+            compacted_prefix: vec![],
+            usage: Usage::default(),
+        };
+        let cases = [
+            SessionEventPayload::ContextCompacted {
+                summary: "compacted".to_owned(),
+                effects: Some(Box::new(effects.clone())),
+            },
+            SessionEventPayload::ContextWindowRolledOver {
+                summary: "rolled over".to_owned(),
+                effects: Box::new(effects),
+            },
+            SessionEventPayload::ContextRestored {
+                reason: "failed compaction".to_owned(),
+                effects: Box::new(crate::RestoredContext {
+                    messages: window.clone(),
+                    compacted_prefix: vec![],
+                    token_ledger: TokenLedger::inferred_from(&[], &window),
+                }),
+            },
+        ];
+        for payload in cases {
+            let mut state = SessionState {
+                pending_inputs: vec![pending.clone()],
+                ..SessionState::default()
+            };
+            state.append(Message::user("old context"));
+            apply_event(&mut state, &payload);
+            assert_eq!(state.messages, window, "{payload:?}");
+            assert_eq!(
+                state.pending_inputs,
+                std::slice::from_ref(&pending),
+                "{payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_session_status_events_leave_durable_state_untouched() {
+        let pending = UserMessage::text("continue later");
+        let mut state = SessionState {
+            pending_inputs: vec![pending.clone()],
+            ..SessionState::default()
+        };
+        for status in [
+            SessionStatus::Running,
+            SessionStatus::Closed,
+            SessionStatus::Idle,
+        ] {
+            apply_event(
+                &mut state,
+                &SessionEventPayload::SessionStatusChanged { status },
+            );
+            assert_eq!(state.pending_inputs, std::slice::from_ref(&pending));
+            assert_eq!(state.messages, Vec::<Message>::new());
+        }
     }
 
     #[test]
@@ -638,6 +820,12 @@ mod tests {
             ..base.clone()
         };
         assert!(!covered_state_matches(&base, &window_differs));
+
+        let inbox_differs = SessionState {
+            pending_inputs: vec![UserMessage::text("pending")],
+            ..base.clone()
+        };
+        assert!(!covered_state_matches(&base, &inbox_differs));
     }
 
     fn fold_payload_strategy() -> impl Strategy<Value = SessionEventPayload> {
@@ -679,11 +867,22 @@ mod tests {
                     usage: Usage::default(),
                 })),
             });
+        let input = "[a-zA-Z0-9 ]{0,32}".prop_map(|text| SessionEventPayload::InputAccepted {
+            message: UserMessage::text(text),
+        });
+        let status = prop_oneof![
+            Just(SessionStatus::Idle),
+            Just(SessionStatus::Running),
+            Just(SessionStatus::Closed),
+        ]
+        .prop_map(|status| SessionEventPayload::SessionStatusChanged { status });
 
         prop_oneof![
             4 => user_message,
             4 => assistant_message,
             2 => compaction,
+            2 => input,
+            1 => status,
             1 => Just(SessionEventPayload::SessionStarted),
             1 => Just(SessionEventPayload::SessionResumed),
         ]
@@ -734,6 +933,60 @@ mod tests {
             let folded = fold_events(SessionState::default(), &events);
 
             prop_assert_eq!(folded.messages, expected);
+        }
+
+        #[test]
+        fn accepted_inputs_are_partitioned_into_delivered_rejected_and_pending(
+            inputs in prop::collection::vec(("[a-zA-Z0-9 ]{0,32}", 0u8..3), 0..40),
+            split_seed in any::<usize>(),
+        ) {
+            let inputs: Vec<_> = inputs.into_iter()
+                .map(|(text, disposition)| (UserMessage::text(text), disposition))
+                .collect();
+            let mut events = vec![];
+            for (message, _) in &inputs {
+                events.push(committed(events.len() as u64 + 1, SessionEventPayload::InputAccepted {
+                    message: message.clone(),
+                }));
+                // A deferred input can be explicitly retried before delivery.
+                events.push(committed(events.len() as u64 + 1, SessionEventPayload::InputDeferred {
+                    message_id: message.id.clone(),
+                    reason: crate::InputDeferredReason::Interrupted,
+                }));
+                events.push(committed(events.len() as u64 + 1, SessionEventPayload::InputAccepted {
+                    message: message.clone(),
+                }));
+            }
+            for (message, disposition) in &inputs {
+                let payload = match disposition {
+                    0 => continue,
+                    1 => SessionEventPayload::MessageItem { message: Message::User(message.clone()) },
+                    _ => SessionEventPayload::InputRejected {
+                        message_id: message.id.clone(),
+                        reason: "rejected".to_owned(),
+                    },
+                };
+                events.push(committed(events.len() as u64 + 1, payload));
+            }
+
+            let expected_pending: Vec<_> = inputs.iter()
+                .filter(|(_, disposition)| *disposition == 0)
+                .map(|(message, _)| message.clone())
+                .collect();
+            let expected_delivered: Vec<_> = inputs.iter()
+                .filter(|(_, disposition)| *disposition == 1)
+                .map(|(message, _)| Message::User(message.clone()))
+                .collect();
+            let split = split_seed % (events.len() + 1);
+            let checkpoint = fold_events(SessionState::default(), &events[..split]);
+            // Resume from the serialized checkpoint, as persistent stores do.
+            let checkpoint = serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+            let resumed = fold_events(checkpoint, &events[split..]);
+
+            prop_assert_eq!(&resumed.pending_inputs, &expected_pending);
+            prop_assert_eq!(&resumed.messages, &expected_delivered);
+            prop_assert_eq!(resumed.token_ledger, TokenLedger::inferred_from(&[], &expected_delivered));
+            prop_assert_eq!(resumed, fold_events(SessionState::default(), &events));
         }
     }
 }

@@ -147,6 +147,7 @@ features = [
     "rt-multi-thread",
     "signal",
     "sync",
+    "time",
 ]
 
 [target.'cfg(target_family = "wasm")'.dependencies.tokio]

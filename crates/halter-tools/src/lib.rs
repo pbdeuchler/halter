@@ -23,8 +23,9 @@ pub use builtin::ProfilingTool;
 pub use builtin::PtyTool;
 pub use builtin::fs_lock::PathLockMap;
 pub use builtin::{
-    EditTool, GlobTool, GrepTool, InMemoryTaskStore, ProcessTool, ReadTool, ShellTool, Task,
-    TaskList, TaskStatus, TaskStore, TaskSummary, TaskTool, WriteTool, register_builtin_tools,
+    BackgroundTool, EditTool, GlobTool, GrepTool, InMemoryTaskStore, ProcessTool, ReadTool,
+    ShellTool, Task, TaskList, TaskStatus, TaskStore, TaskSummary, TaskTool, WriteTool,
+    register_builtin_tools,
 };
 pub use notes::{
     FsNotes, LineRange, MAX_NOTE_BYTES, NotesBackend, NotesRequest, NotesTool,

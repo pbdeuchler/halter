@@ -25,9 +25,13 @@ mod model_summary;
 mod prompt;
 mod provider_default;
 mod session;
+mod session_driver;
+#[cfg(test)]
+mod session_driver_tests;
 mod session_lease;
 mod subagent_session;
 mod subagents;
+mod temporary_session;
 mod trace_export;
 mod trace_format;
 mod trace_recorder;
@@ -47,21 +51,25 @@ pub use provider_default::ProviderDefault;
 
 pub use event_bus::EventBus;
 pub use halter_protocol::SubagentEventForwarding;
-pub use hooks_runtime::{
-    ExecutedHookDispatch, HookInvocationContext, run_notification, run_post_compact,
-    run_post_tool_use, run_post_tool_use_failure, run_pre_compact, run_pre_tool_use,
-    run_session_end, run_session_start, run_stop, run_subagent_start, run_subagent_stop,
-    run_user_prompt_submit,
+#[cfg(test)]
+pub(crate) use hooks_runtime::run_notification;
+pub use hooks_runtime::{ExecutedHookDispatch, HookInvocationContext};
+pub(crate) use hooks_runtime::{
+    run_post_compact, run_post_tool_use, run_post_tool_use_failure, run_pre_compact,
+    run_pre_tool_use, run_session_end, run_session_start, run_stop, run_subagent_start,
+    run_subagent_stop, run_user_prompt_submit,
 };
 pub use prompt::{
     DefaultPromptAssembler, PromptAssembler, appended_system_prompt_segment,
     coding_agent_prompt_segment, default_coding_agent_prompt, default_compaction_prompt,
     default_system_prompt, default_system_prompt_segment, system_prompt_segment,
 };
+pub use session::SessionEventStream;
+pub(crate) use session::SessionExecutor;
 pub use session::{
-    HalterSession, ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit,
-    SessionRuntime,
+    ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit, SessionRuntime,
 };
+pub use session_driver::{SessionError, SessionHandle, Submission};
 pub use session_lease::SessionLeases;
 pub use trace_export::export_session_trace;
 pub use trace_recorder::TraceRecorder;

@@ -273,6 +273,11 @@ pub fn kill_tree(pid: i32, signal: i32) -> Vec<KillTreeEntry> {
     report
 }
 
+/// Signal one process without performing an ancestry scan.
+pub(crate) fn signal_process(pid: i32, signal: i32) -> bool {
+    platform::kill_pid(pid, signal)
+}
+
 #[cfg_attr(not(feature = "pty"), allow(dead_code))]
 /// Return the process group id for a pid when the platform supports it.
 pub fn process_group_id(pid: i32) -> Option<i32> {
