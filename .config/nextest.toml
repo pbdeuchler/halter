@@ -1,0 +1,4 @@
+# A blocked native worker can outlive an async test timeout and hang runtime
+# teardown. Run each test in its own process and bound its entire lifetime.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 2, grace-period = "5s" }

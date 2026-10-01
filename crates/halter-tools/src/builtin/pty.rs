@@ -493,13 +493,34 @@ fn run_pty_loop(
     let mut reader_closed = false;
 
     let outcome = (|| -> anyhow::Result<()> {
-        loop {
+        'running: loop {
+            if termination.lock().stopped
+                || timeout.is_some_and(|timeout| start.elapsed() >= timeout)
+            {
+                break;
+            }
             drain_reader_output(&reader_rx, &emit, &mut reader_closed);
 
             match control_rx.recv_timeout(CONTROL_POLL_INTERVAL) {
                 Ok(message) => match message {
                     ControlMessage::Input(input) => {
-                        let _ = writer.write_all(input.as_bytes());
+                        let mut remaining = input.as_bytes();
+                        while !remaining.is_empty() {
+                            if termination.lock().stopped
+                                || timeout.is_some_and(|timeout| start.elapsed() >= timeout)
+                            {
+                                break 'running;
+                            }
+                            match writer.write(remaining) {
+                                Ok(0) => break,
+                                Ok(count) => remaining = &remaining[count..],
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::sleep(CONTROL_POLL_INTERVAL);
+                                }
+                                Err(_) => break,
+                            }
+                        }
                         let _ = writer.flush();
                     }
                     ControlMessage::Resize { cols, rows } => {
@@ -589,7 +610,14 @@ fn spawn_reader_thread(mut reader: PtyReader, tx: mpsc::Sender<ReaderEvent>) -> 
                         return;
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
                 Err(_) => break,
             }
         }
@@ -612,6 +640,16 @@ fn prepare_reader(master: &dyn portable_pty::MasterPty) -> anyhow::Result<PtyRea
     let fd = master
         .as_raw_fd()
         .ok_or_else(|| anyhow::anyhow!("PTY reader has no native descriptor"))?;
+    // The master, reader and portable-pty writer share these status flags.
+    // Linux can keep a full-buffer master write blocked after the slave exits;
+    // even the writer's destructor writes EOF. Keep every write nonblocking.
+    // SAFETY: both fcntl calls borrow the live master descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    anyhow::ensure!(
+        flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
+        "failed to make PTY IO nonblocking: {}",
+        std::io::Error::last_os_error()
+    );
     // SAFETY: duplicate the borrowed descriptor; the resulting File owns only
     // the new descriptor and outlives the master during bounded output drain.
     let reader = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -839,6 +877,74 @@ mod security_tests {
             super::super::process::signal_process(descendant, KILL_SIGNAL);
         }
         assert!(!alive, "PTY descendant survived leader completion");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_backpressure_preserves_bytes_and_respects_timeout() {
+        for (command, reads_input) in [("head -c 65536 > input", true), ("sleep 30", false)] {
+            let root = tempfile::tempdir().unwrap();
+            let config = PtyConfig {
+                command: format!("stty raw -echo; printf ready > ready; {command}"),
+                cwd: Some(root.path().to_string_lossy().into_owned()),
+                env: None,
+                cols: 120,
+                rows: 40,
+                timeout: None,
+            };
+            let state = prepare_pty(&config, Arc::default(), &CancellationToken::new()).unwrap();
+            let ready_by = Instant::now() + Duration::from_secs(5);
+            while !root.path().join("ready").exists() {
+                assert!(Instant::now() < ready_by, "PTY did not enter raw mode");
+                std::thread::sleep(CONTROL_POLL_INTERVAL);
+            }
+            let input = "x".repeat(64 * 1024);
+            let (control, receiver) = mpsc::channel();
+            control.send(ControlMessage::Input(input.clone())).unwrap();
+            let timeout = Duration::from_secs(if reads_input { 10 } else { 2 });
+            let began = Instant::now();
+            run_pty_loop(state, Some(timeout), receiver, Arc::new(NoopToolEventSink)).unwrap();
+            assert!(
+                began.elapsed() < timeout + Duration::from_secs(2),
+                "{command}"
+            );
+            if reads_input {
+                let stored = std::fs::read(root.path().join("input")).unwrap();
+                assert!(
+                    stored == input.as_bytes(),
+                    "PTY preserved {} of {} input bytes",
+                    stored.len(),
+                    input.len()
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_input_buffer_does_not_block_writer_or_its_destructor() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let fd = pair.master.as_raw_fd().unwrap();
+        // SAFETY: termios is initialized by tcgetattr, and all calls borrow
+        // the master descriptor owned by pair for the duration of the test.
+        unsafe {
+            let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+            assert_eq!(libc::tcgetattr(fd, termios.as_mut_ptr()), 0);
+            let mut termios = termios.assume_init();
+            libc::cfmakeraw(&mut termios);
+            assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &termios), 0);
+        }
+        let _reader = prepare_reader(pair.master.as_ref()).unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        let error = writer.write_all(&vec![b'x'; 1024 * 1024]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+
+        // Keep the unread slave open and its input buffer full. portable-pty
+        // writes EOF from Drop, which must not block on that same buffer.
+        let began = Instant::now();
+        drop(writer);
+        assert!(began.elapsed() < Duration::from_secs(2));
+        drop(pair);
     }
 
     #[cfg(unix)]

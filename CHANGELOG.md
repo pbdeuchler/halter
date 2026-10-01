@@ -137,7 +137,9 @@ the public SDK/runtime APIs and event protocol on the pre-1.0 line.
   abandoning their waits; forced cancellation also signals separate workers.
   Session shutdown cleans up owned shell jobs, managed background processes, and
   PTYs. PTY kill waits for process, worker, and reader cleanup; cancellable readers
-  prevent an inherited slave descriptor from hanging shutdown.
+  prevent an inherited slave descriptor from hanging shutdown. Unix PTY input
+  uses nonblocking writes so a full input buffer cannot hang shutdown or bypass
+  the PTY timeout, including when the child exits before consuming input.
 - PTY working directories default to the session directory, resolve relative
   paths against it, and pass read-policy authorization before spawning.
 - Browser cleanup attempts cloud release independently of page closure, so a
