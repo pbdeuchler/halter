@@ -23,10 +23,22 @@ full = ["advanced-tools", "ast-tools", "browser-tools", "image-tools", "pty", "p
 sqlite = ["halter-config/sqlite", "halter-session/sqlite"]
 remote-plugins = ["halter-config/remote-plugins"]
 telemetry = ["dep:tracing-subscriber"]
+otel = [
+    "telemetry",
+    "dep:bytes",
+    "dep:opentelemetry",
+    "dep:opentelemetry-http",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-semantic-conventions",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+    "dep:reqwest",
+]
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bytes = { workspace = true, optional = true }
 halter-config = { path = "../halter-config", version = "0.9.0" }
 halter-hooks = { path = "../halter-hooks", version = "0.9.0" }
 halter-protocol = { path = "../halter-protocol", version = "0.9.0" }
@@ -34,12 +46,20 @@ halter-providers = { path = "../halter-providers", version = "0.9.0" }
 halter-runtime = { path = "../halter-runtime", version = "0.9.0" }
 halter-session = { path = "../halter-session", version = "0.9.0" }
 halter-tools = { path = "../halter-tools", version = "0.9.0" }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-http = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile.workspace = true

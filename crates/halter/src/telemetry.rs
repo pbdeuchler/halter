@@ -85,6 +85,14 @@ use tracing_subscriber::{
 /// version that this module's signatures use.
 pub use tracing_subscriber;
 
+/// OTLP trace and metric export, behind the `otel` feature (implies
+/// `telemetry`). See [`otel::OtelConfig`] for the entry point. Nothing in
+/// this module installs global OpenTelemetry state; it only builds
+/// `tracing_subscriber::Layer`s and a shutdown guard that the caller composes
+/// with [`TelemetryConfig::try_init_with`] (or manually).
+#[cfg(feature = "otel")]
+pub mod otel;
+
 /// Directives used when `RUST_LOG` is unset or blank (and no explicit
 /// directives were configured).
 pub const DEFAULT_DIRECTIVES: &str = "warn";
