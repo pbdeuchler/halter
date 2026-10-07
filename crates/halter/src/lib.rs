@@ -73,6 +73,9 @@ pub mod session {
     pub use halter_session::SqliteSessionStore;
 }
 
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
+
 pub mod providers {
     pub use halter_providers::{
         DefaultProviderErrorClassifier, ProviderErrorClassifier, ProviderErrorKind,
