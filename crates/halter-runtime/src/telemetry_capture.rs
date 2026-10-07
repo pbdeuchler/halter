@@ -17,6 +17,8 @@ use tracing_subscriber::registry::LookupSpan;
 pub(crate) struct Capture {
     spans: Arc<Mutex<Vec<CapturedSpan>>>,
     events: Arc<Mutex<Vec<CapturedEvent>>>,
+    /// `(span name, field name)` for every `Span::record` call.
+    records: Arc<Mutex<Vec<(&'static str, String)>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,9 +114,15 @@ where
         });
     }
 
-    fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
         let mut visitor = FieldVisitor::default();
         values.record(&mut visitor);
+        if let Some(span) = ctx.span(id) {
+            let mut records = self.records.lock().expect("records");
+            for field in visitor.0.keys() {
+                records.push((span.name(), field.clone()));
+            }
+        }
         let mut spans = self.spans.lock().expect("spans");
         // Span ids are reused after close; the latest span with the id is
         // the live one.
@@ -167,6 +175,16 @@ impl Capture {
             .filter(|span| span.name == name)
             .cloned()
             .collect()
+    }
+
+    /// How many times `field` was recorded on spans named `span`.
+    pub(crate) fn record_count(&self, span: &str, field: &str) -> usize {
+        self.records
+            .lock()
+            .expect("records")
+            .iter()
+            .filter(|(name, recorded)| *name == span && recorded == field)
+            .count()
     }
 
     pub(crate) fn events_with_message(&self, message: &str) -> Vec<CapturedEvent> {

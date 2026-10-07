@@ -854,6 +854,9 @@ impl SessionExecutor {
             outcome = Empty,
         );
         let task_span = turn_span.clone();
+        // Moved into the task, so a task the registry aborts (even before its
+        // first poll) still closes its span with `outcome = "aborted"`.
+        let turn_outcome = crate::span_outcome::SpanOutcome::new(turn_span.clone());
         let handle = tokio::spawn(
             async move {
                 if registered_rx.await.is_err() {
@@ -862,6 +865,7 @@ impl SessionExecutor {
                 // The registry's supervisor deregisters only after this actual
                 // executor has settled, including dropping its session lease.
                 let _parent_stream_registration = parent_stream_registration;
+                let mut turn_outcome = turn_outcome;
 
                 let blueprint = stored.blueprint.clone();
                 // The lease guarantees no turn is running, so an open turn in the
@@ -897,7 +901,7 @@ impl SessionExecutor {
                             error = %error,
                             "failed to commit turn start"
                         );
-                        task_span.record("outcome", "failed");
+                        turn_outcome.record("failed");
                         live.emit_error(error);
                         return;
                     }
@@ -943,7 +947,7 @@ impl SessionExecutor {
                     Err(error) => Err(error),
                 };
                 if outcome.is_ok() {
-                    task_span.record("outcome", "completed");
+                    turn_outcome.record("completed");
                 }
                 if let Err(error) = outcome {
                     let provider_error = error.downcast_ref::<ProviderError>();
@@ -952,7 +956,7 @@ impl SessionExecutor {
                         .unwrap_or(false);
                     let cancelled = task_cancel_status.is_cancelled()
                         || provider_error.is_some_and(ProviderError::is_cancelled);
-                    task_span.record("outcome", if cancelled { "cancelled" } else { "failed" });
+                    turn_outcome.record(if cancelled { "cancelled" } else { "failed" });
                     error!(
                         session_id = %session.session_id,
                         turn_id = %turn.id,
@@ -2064,6 +2068,7 @@ impl SessionExecutor {
                     outcome = Empty,
                     is_error = Empty,
                 );
+                let mut outcome = crate::span_outcome::SpanOutcome::new(span.clone());
                 let pre_dispatch = run_pre_tool_use(
                     self,
                     fired_hook_ids,
@@ -2076,7 +2081,8 @@ impl SessionExecutor {
                     &call,
                 )
                 .instrument(span.clone())
-                .await?;
+                .await
+                .inspect_err(|_| outcome.record("error"))?;
                 track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
                 self.record_hook_dispatch(events, &pre_dispatch);
                 for message in apply_hook_side_effects(state, &pre_dispatch) {
@@ -2099,7 +2105,7 @@ impl SessionExecutor {
                 );
 
                 if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
-                    span.record("outcome", "blocked");
+                    outcome.record("blocked");
                     span.record("is_error", true);
                     span.in_scope(|| {
                         info!(
@@ -2164,6 +2170,7 @@ impl SessionExecutor {
                     context,
                     tool_event_drain,
                     span,
+                    outcome,
                 });
             }
 
@@ -2205,6 +2212,13 @@ impl SessionExecutor {
                     .instrument(p.span.clone())
                 }))
                 .await;
+            // Record execution outcomes up front, so a post-hook error that
+            // aborts Phase C cannot leave executed calls without one.
+            for (prep, execution) in prepared.iter_mut().zip(&executions) {
+                prep.span.record("is_error", execution.is_err());
+                prep.outcome
+                    .record(if execution.is_ok() { "ok" } else { "error" });
+            }
 
             // Phase C: post-hook + state mutation (sequential, original order).
             for (prep, execution) in prepared.into_iter().zip(executions) {
@@ -2213,6 +2227,7 @@ impl SessionExecutor {
                     context,
                     tool_event_drain,
                     span,
+                    outcome: _,
                 } = prep;
                 drop(context);
                 for payload in tool_event_drain
@@ -2226,8 +2241,6 @@ impl SessionExecutor {
                 let (mut content, error) = match execution {
                     Ok((result, follow_up)) => {
                         follow_ups.extend(follow_up);
-                        span.record("outcome", "ok");
-                        span.record("is_error", false);
                         span.in_scope(|| {
                             debug!(
                                 session_id = %self.session_id,
@@ -2240,8 +2253,6 @@ impl SessionExecutor {
                         (result, None)
                     }
                     Err(error) => {
-                        span.record("outcome", "error");
-                        span.record("is_error", true);
                         span.in_scope(|| {
                             warn!(
                                 session_id = %self.session_id,
@@ -4067,6 +4078,9 @@ struct PreparedToolCall {
     tool_event_drain: ToolEventDrain,
     /// The call's `tool_call` span, carried from pre-hooks to post-hooks.
     span: tracing::Span,
+    /// Records the span's `outcome` once; `aborted` if the call is dropped
+    /// before running (e.g. the pre-batch checkpoint fails).
+    outcome: crate::span_outcome::SpanOutcome,
 }
 
 /// Per-turn totals recorded on the `turn` span exactly once, when dropped:

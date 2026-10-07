@@ -950,9 +950,13 @@ impl RuntimeSubagentControl {
             outcome = Empty,
         );
         subagent_span.follows_from(tracing::Span::current());
+        // Moved into the task: closing or shutting down the subagent aborts
+        // the task, and dropping the guard records `outcome = "aborted"`.
+        let span_outcome = crate::span_outcome::SpanOutcome::new(subagent_span.clone());
         // Spawn and registration share the lock so closure always owns the task.
         let join_handle = tokio::spawn(
             async move {
+                let mut span_outcome = span_outcome;
                 controller
                     .run_turn_task(
                         task_agent_id,
@@ -964,6 +968,7 @@ impl RuntimeSubagentControl {
                         task_cancel,
                         session,
                         current_turn_for_task,
+                        &mut span_outcome,
                     )
                     .await;
                 guard.disarm();
@@ -1004,6 +1009,7 @@ impl RuntimeSubagentControl {
         cancel: CancellationToken,
         session: SessionExecutor,
         current_turn: Arc<std::sync::Mutex<Option<TurnId>>>,
+        span_outcome: &mut crate::span_outcome::SpanOutcome,
     ) {
         let mut next_input = message;
         let mut resubmissions = 0u32;
@@ -1113,9 +1119,9 @@ impl RuntimeSubagentControl {
             };
         };
 
-        // Runs inside the `subagent` span (see `start_turn`). Token usage is
-        // recorded only on the child's `turn` spans, never here.
-        tracing::Span::current().record("outcome", subagent_state_label(outcome.state));
+        // Token usage is recorded only on the child's `turn` spans, never on
+        // `subagent`.
+        span_outcome.record(subagent_state_label(outcome.state));
         self.finish_turn(agent_id, generation, outcome).await;
     }
 

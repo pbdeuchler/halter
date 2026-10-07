@@ -29,6 +29,7 @@ mod session_driver;
 #[cfg(test)]
 mod session_driver_tests;
 mod session_lease;
+mod span_outcome;
 mod subagent_session;
 mod subagents;
 #[cfg(test)]
