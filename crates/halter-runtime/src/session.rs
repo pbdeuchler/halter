@@ -1345,20 +1345,20 @@ impl SessionExecutor {
         live: &LiveTurnStream,
         turn_span: &tracing::Span,
     ) -> anyhow::Result<TurnCommit> {
-        let mut usage = Usage::default();
-        let result = self
-            .run_turn_inner(
-                stored,
-                turn,
-                start_head,
-                turn_cancel,
-                live,
-                turn_span,
-                &mut usage,
-            )
-            .await;
-        record_turn_usage(turn_span, &usage);
-        result
+        let mut totals = TurnSpanTotals::new(turn_span.clone());
+        self.run_turn_inner(
+            stored,
+            turn,
+            start_head,
+            turn_cancel,
+            live,
+            turn_span,
+            &mut totals.usage,
+            &mut totals.provider_iterations,
+        )
+        .await
+        // `totals` drops here (or while unwinding a panic, or when the task
+        // is aborted) and records the totals on the span exactly once.
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1371,12 +1371,12 @@ impl SessionExecutor {
         live: &LiveTurnStream,
         turn_span: &tracing::Span,
         turn_usage: &mut Usage,
+        provider_iterations: &mut u32,
     ) -> anyhow::Result<TurnCommit> {
         let snapshot = self.services.resources.snapshot();
         let mut expected_head = start_head;
         let mut state = stored.state;
         let mut events = Vec::new();
-        let mut provider_iterations = 0u32;
         let mut fired_hook_ids = state
             .fired_hook_ids
             .iter()
@@ -1600,8 +1600,8 @@ impl SessionExecutor {
             if turn_cancel.is_cancelled() {
                 return Err(ProviderError::cancelled().into());
             }
-            ensure_provider_iteration_allowed(stored.blueprint.max_turns, provider_iterations)?;
-            provider_iterations = provider_iterations.saturating_add(1);
+            ensure_provider_iteration_allowed(stored.blueprint.max_turns, *provider_iterations)?;
+            *provider_iterations = provider_iterations.saturating_add(1);
             self.services
                 .context
                 .check_cap(state.token_ledger.effective_tokens())?;
@@ -1618,12 +1618,14 @@ impl SessionExecutor {
                 turn.subagent_model.as_ref(),
             );
             let model = self.services.models.model(&selected_models.default_model)?;
-            // Last write wins: the span reports the model of the latest
-            // provider request in this turn.
-            turn_span.record("provider", tracing::field::display(&model.provider));
-            turn_span.record("model", tracing::field::display(&model.model));
-            turn_span.record("model_id", tracing::field::display(&model.id));
-            turn_span.record("provider_iterations", provider_iterations);
+            // The model comes from the blueprint and turn overrides, which
+            // are fixed for the turn, so record it once. Re-recording a span
+            // field makes the compact formatter repeat it on every line.
+            if *provider_iterations == 1 {
+                turn_span.record("provider", tracing::field::display(&model.provider));
+                turn_span.record("model", tracing::field::display(&model.model));
+                turn_span.record("model_id", tracing::field::display(&model.id));
+            }
             let subagent_model = self
                 .services
                 .models
@@ -1637,7 +1639,7 @@ impl SessionExecutor {
             // and first-step only — the default's own output carries the
             // influence forward through the rest of the turn.
             let mut request_messages = plan.messages.clone();
-            if provider_iterations == 1
+            if *provider_iterations == 1
                 && let Some(judge) = self
                     .services
                     .models
@@ -4067,16 +4069,41 @@ struct PreparedToolCall {
     span: tracing::Span,
 }
 
-/// Records the turn's accumulated token usage on its `turn` span. Token
-/// counts live only on `turn` so span-derived metrics never double count.
-fn record_turn_usage(span: &tracing::Span, usage: &Usage) {
-    span.record("input_tokens", usage.input_tokens);
-    span.record("output_tokens", usage.output_tokens);
-    span.record("cache_read_input_tokens", usage.cache_read_input_tokens);
-    span.record(
-        "cache_creation_input_tokens",
-        usage.cache_creation_input_tokens,
-    );
+/// Per-turn totals recorded on the `turn` span exactly once, when dropped:
+/// after the turn returns or fails, while a panic unwinds, or when the turn
+/// task is aborted. Token counts live only on `turn` so span-derived metrics
+/// never double count; each field is recorded once because the compact
+/// formatter repeats re-recorded fields.
+struct TurnSpanTotals {
+    span: tracing::Span,
+    usage: Usage,
+    provider_iterations: u32,
+}
+
+impl TurnSpanTotals {
+    fn new(span: tracing::Span) -> Self {
+        Self {
+            span,
+            usage: Usage::default(),
+            provider_iterations: 0,
+        }
+    }
+}
+
+impl Drop for TurnSpanTotals {
+    fn drop(&mut self) {
+        let usage = &self.usage;
+        self.span.record("input_tokens", usage.input_tokens);
+        self.span.record("output_tokens", usage.output_tokens);
+        self.span
+            .record("cache_read_input_tokens", usage.cache_read_input_tokens);
+        self.span.record(
+            "cache_creation_input_tokens",
+            usage.cache_creation_input_tokens,
+        );
+        self.span
+            .record("provider_iterations", self.provider_iterations);
+    }
 }
 
 /// Partition `tool_calls` into concurrency-compatible batches per the
@@ -13121,6 +13148,51 @@ mod tests {
                     .all(|value| !value.contains("hello from tool")),
                 "{span:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_output_repeats_no_turn_span_fields_across_iterations() {
+        let buffer = crate::telemetry_capture::BufferWriter::default();
+        let _guard = tracing::subscriber::set_default(
+            crate::telemetry_capture::compact_subscriber(buffer.clone()),
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(ToolLoopProvider), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        session
+            .submit_turn(Turn::user("write a note"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let output = buffer.contents();
+        // The second provider iteration's completion line carries the turn
+        // span's fields; fields recorded after creation must appear once.
+        let line = output
+            .lines()
+            .find(|line| line.contains("turn completed without tool calls"))
+            .unwrap_or_else(|| panic!("completion line in: {output}"));
+        for field in [" model_id=", " provider=", " model="] {
+            assert_eq!(line.matches(field).count(), 1, "{field} in {line}");
+        }
+        for line in output.lines() {
+            for field in [
+                " model_id=",
+                " provider_iterations=",
+                " outcome=",
+                " attempt=",
+            ] {
+                assert!(
+                    line.matches(field).count() <= 1,
+                    "{field} repeated in {line}"
+                );
+            }
         }
     }
 

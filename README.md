@@ -1315,15 +1315,18 @@ stderr: compact by default, JSON when `--output-file` is set.
 
 ### Spans
 
-Span names are the stable contract; identifiers are fields. All spans except
+Span names are the stable contract; identifiers are fields. Each field is
+recorded at most once: the compact formatter repeats a re-recorded field on
+every line, so totals (tokens, `provider_iterations`, `attempt`) are recorded
+when the operation ends. All spans except
 `hook_dispatch` are `info` level, so `RUST_LOG=info` (or
 `halter_runtime=info,halter_providers=info`) enables them.
 
 | Span                  | Target             | Fields at creation                                                        | Fields recorded later                                                                                                                                                                                                     |
 | --------------------- | ------------------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `turn`                | `halter_runtime`   | `session_id`, `turn_id`                                                   | `provider`, `model`, `model_id` (latest provider request), `provider_iterations`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `outcome` (`completed`/`failed`/`cancelled`) |
+| `turn`                | `halter_runtime`   | `session_id`, `turn_id`                                                   | `provider`, `model`, `model_id` (at the first provider request; fixed for the turn), `provider_iterations`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `outcome` (`completed`/`failed`/`cancelled`) |
 | `tool_call`           | `halter_runtime`   | `session_id`, `turn_id`, `tool_name`, `tool_call_id`                      | `outcome` (`ok`/`error`/`blocked`), `is_error`                                                                                                                                                                            |
-| `provider_request`    | `halter_providers` | `provider`, `provider_kind`, `model`, `model_id`, `session_id`, `turn_id` | `attempt`, `outcome` (`completed`/`error`/`cancelled`), `error_kind`                                                                                                                                                      |
+| `provider_request`    | `halter_providers` | `provider`, `provider_kind`, `model`, `model_id`, `session_id`, `turn_id` | `attempt` (final attempt number), `outcome` (`completed`/`error`/`cancelled`), `error_kind`                                                                                                                                                      |
 | `provider_compaction` | `halter_providers` | `provider`, `provider_kind`, `model`, `model_id`, `session_id`            | `attempt`, `outcome`, `error_kind`                                                                                                                                                                                        |
 | `subagent`            | `halter_runtime`   | `agent_id`, `session_id`, `parent_session_id`, `agent_type`, `generation` | `outcome` (`completed`/`failed`/`cancelled`/...)                                                                                                                                                                          |
 | `hook_dispatch`       | `halter_runtime`   | `event` (debug level)                                                     | `matched_handlers`                                                                                                                                                                                                        |

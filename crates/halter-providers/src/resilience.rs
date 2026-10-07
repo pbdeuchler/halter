@@ -155,16 +155,21 @@ where
             outcome = Empty,
             error_kind = Empty,
         );
+        let attempts = AttemptCount::new(span.clone());
 
         tokio::spawn(async move {
             let cancel = task_cancel;
             let mut tx = tx;
             let mut gate = RetryGate::new(policy.request_retry);
             let mut commit_dedup = CommitDedup::default();
+            // Move the whole guard into the task (not just the field the
+            // loop assigns) so it drops when the request ends;
+            // declared after `tx` so it records before the stream closes.
+            let mut attempts = attempts;
 
             loop {
                 let attempt_id = gate.next_attempt_id();
-                tracing::Span::current().record("attempt", attempt_id);
+                attempts.latest = attempt_id;
                 let attempt_cancel = cancel.child_token();
                 // Every exit from this attempt (retry, terminal error, return)
                 // releases the attempt's upstream reader.
@@ -405,8 +410,9 @@ where
             outcome = Empty,
             error_kind = Empty,
         );
+        let mut attempts = AttemptCount::new(span.clone());
         let result = self
-            .compact_with_retries(request, cancel)
+            .compact_with_retries(request, cancel, &mut attempts.latest)
             .instrument(span.clone())
             .await;
         match &result {
@@ -428,11 +434,12 @@ impl<P: Provider + 'static> ResilientProvider<P> {
         &self,
         request: ProviderCompactionRequest,
         cancel: CancellationToken,
+        latest_attempt: &mut u32,
     ) -> anyhow::Result<ProviderCompactionResponse> {
         let mut gate = RetryGate::new(self.policy.request_retry);
         loop {
             let attempt_id = gate.next_attempt_id();
-            tracing::Span::current().record("attempt", attempt_id);
+            *latest_attempt = attempt_id;
             let attempt = select! {
                 biased;
                 _ = cancel.cancelled() => return Err(anyhow::Error::new(ProviderError::cancelled())),
@@ -517,21 +524,24 @@ async fn forward(
     cancel: &CancellationToken,
     item: Result<StreamEvent, ProviderError>,
 ) -> bool {
-    // Every terminal provider error reaches the consumer through here.
-    if let Err(error) = &item {
-        if error.is_cancelled() {
-            record_request_outcome("cancelled", None);
-        } else {
-            record_request_outcome("error", Some(error));
-        }
-    }
+    // Every terminal provider error reaches the consumer through here. Each
+    // branch records the outcome at most once: re-recorded span fields are
+    // repeated by the compact formatter.
+    let terminal_error = item.as_ref().err().cloned();
     select! {
         biased;
         _ = cancel.cancelled() => {
             send_cancelled(tx).await;
             false
         }
-        result = tx.send(item) => result.is_ok(),
+        result = tx.send(item) => {
+            match &terminal_error {
+                Some(error) if error.is_cancelled() => record_request_outcome("cancelled", None),
+                Some(error) => record_request_outcome("error", Some(error)),
+                None => {}
+            }
+            result.is_ok()
+        }
     }
 }
 
@@ -542,6 +552,29 @@ async fn forward(
 async fn send_cancelled(tx: &mut mpsc::Sender<Result<StreamEvent, ProviderError>>) {
     record_request_outcome("cancelled", None);
     let _ = tx.send(Err(ProviderError::cancelled())).await;
+}
+
+/// Records the final attempt number on a request span once, when dropped
+/// (request finished, failed, or its worker was dropped). Recording at the
+/// start of every attempt would make the compact formatter repeat `attempt`
+/// on every line.
+struct AttemptCount {
+    span: tracing::Span,
+    latest: u32,
+}
+
+impl AttemptCount {
+    fn new(span: tracing::Span) -> Self {
+        Self { span, latest: 0 }
+    }
+}
+
+impl Drop for AttemptCount {
+    fn drop(&mut self) {
+        if self.latest > 0 {
+            self.span.record("attempt", self.latest);
+        }
+    }
 }
 
 /// Record the terminal outcome on the `provider_request` span. Only called
@@ -880,6 +913,37 @@ mod tests {
         assert_eq!(retries[0].field("provider_kind"), Some("test"));
         assert!(retries[0].field("error_kind").is_some());
         assert_eq!(retries[0].scope.first().copied(), Some("provider_request"));
+    }
+
+    #[tokio::test]
+    async fn compact_output_does_not_repeat_attempt() {
+        let buffer = crate::telemetry_capture::BufferWriter::default();
+        let _guard = tracing::subscriber::set_default(
+            crate::telemetry_capture::compact_subscriber(buffer.clone()),
+        );
+        let provider = ScriptedProvider::new(vec![
+            vec![Err(transient_error("rate limited"))],
+            vec![Err(transient_error("rate limited"))],
+            success_events("msg_retry", "done"),
+        ]);
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        let mut stream = resilient
+            .stream(sample_request(), CancellationToken::new())
+            .await
+            .expect("stream");
+        while stream.next().await.is_some() {}
+
+        let output = buffer.contents();
+        let retries = output
+            .lines()
+            .filter(|line| line.contains("retrying provider request"))
+            .collect::<Vec<_>>();
+        assert_eq!(retries.len(), 2, "{output}");
+        for line in retries {
+            assert!(line.contains("provider_request"), "{line}");
+            assert_eq!(line.matches(" attempt=").count(), 1, "{line}");
+        }
     }
 
     #[tokio::test]

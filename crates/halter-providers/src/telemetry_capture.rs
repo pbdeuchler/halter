@@ -179,3 +179,50 @@ impl Capture {
             .collect()
     }
 }
+
+/// In-memory `MakeWriter` for asserting on formatted log output.
+#[derive(Clone, Default)]
+pub(crate) struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+impl BufferWriter {
+    pub(crate) fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().expect("buffer").clone()).expect("utf-8")
+    }
+}
+
+impl std::io::Write for BufferWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A subscriber with the same compact formatter `halter::telemetry` installs
+/// (`fmt::layer().with_target(true).compact()`; ANSI off for matching),
+/// limited to halter targets at `info`. `halter-providers` cannot depend
+/// on `halter`, so the layer is rebuilt here.
+pub(crate) fn compact_subscriber(writer: BufferWriter) -> impl Subscriber + Send + Sync + 'static {
+    use tracing_subscriber::Layer as _;
+    keep_interest_shared();
+    let filter = tracing_subscriber::filter::Targets::new().with_target("halter", Level::INFO);
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_target(true)
+            .compact()
+            .with_filter(filter),
+    )
+}
