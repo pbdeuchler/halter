@@ -86,6 +86,37 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-features --all-targets
 
+  # Kani proofs for small pure cores (token ledger arithmetic, UTF-8
+  # truncation). CBMC has no memory limit of its own, so proofs run under
+  # scripts/kani-guarded.sh: one that strays into heap-heavy code is killed
+  # at the ceiling instead of exhausting the runner.
+  kani:
+    runs-on: ubuntu-latest
+    env:
+      KANI_VERSION: 0.68.0
+      KANI_MAX_RSS_MB: 8192
+      KANI_TIMEOUT_S: 900
+      PLAYWRIGHT_DRIVER_VERSION: 1.59.1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - id: kani-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-${{ runner.os }}-${{ env.KANI_VERSION }}
+      - if: steps.kani-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+      - run: ../../scripts/kani-guarded.sh --lib
+        working-directory: crates/halter-protocol
+      - run: ../../scripts/kani-guarded.sh --lib
+        working-directory: crates/halter-tools
+
   audit:
     runs-on: ubuntu-latest
     steps:
