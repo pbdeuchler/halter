@@ -203,6 +203,25 @@ impl Hooks {
         }
 
         matched_handlers.sort_by(|left, right| left.priority.cmp(&right.priority));
+        // Matcher values are tool names, notification types, or sources —
+        // never the payload, which is not logged.
+        let event = request.event_name.canonical_name();
+        let matcher = request.matcher_value.as_deref();
+        if matched_handlers.is_empty() {
+            tracing::trace!(event, matcher, matched_handlers = 0usize, "hooks.matched");
+        } else {
+            let handler_ids = matched_handlers
+                .iter()
+                .map(|handler| handler.handler_id.as_str())
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                event,
+                matcher,
+                matched_handlers = matched_handlers.len(),
+                handler_ids = ?handler_ids,
+                "hooks.matched"
+            );
+        }
         let previews = matched_handlers
             .iter()
             .map(|handler| build_preview_run(handler))
