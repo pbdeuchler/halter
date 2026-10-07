@@ -33,6 +33,8 @@ mod responses_transport;
 mod retry;
 mod secret;
 #[cfg(test)]
+mod telemetry_capture;
+#[cfg(test)]
 pub(crate) mod test_http;
 mod unsupported;
 
