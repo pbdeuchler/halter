@@ -1644,6 +1644,7 @@ mod tests {
         let control = RuntimeSubagentControl::new(services);
         let parent = parent_context();
 
+        // Stands in for the spawning `tool_call` span.
         let status = control
             .spawn(
                 &parent,
@@ -1655,6 +1656,7 @@ mod tests {
                 },
                 CancellationToken::new(),
             )
+            .instrument(tracing::info_span!("spawner"))
             .await
             .expect("spawn");
         let waited = control
@@ -1676,6 +1678,7 @@ mod tests {
         assert_eq!(subagents.len(), 1, "{subagents:?}");
         let subagent = &subagents[0];
         assert_eq!(subagent.parent, None);
+        assert_eq!(capture.follows_from("subagent"), vec!["spawner"]);
         assert_eq!(
             subagent.field("agent_id"),
             Some(status.agent_id.to_string().as_str())

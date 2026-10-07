@@ -19,6 +19,8 @@ pub(crate) struct Capture {
     events: Arc<Mutex<Vec<CapturedEvent>>>,
     /// `(span name, field name)` for every `Span::record` call.
     records: Arc<Mutex<Vec<(&'static str, String)>>>,
+    /// `(span name, followed span name)` for every `follows_from` link.
+    follows: Arc<Mutex<Vec<(&'static str, &'static str)>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +133,15 @@ where
         }
     }
 
+    fn on_follows_from(&self, span: &Id, follows: &Id, ctx: Context<'_, S>) {
+        if let (Some(span), Some(follows)) = (ctx.span(span), ctx.span(follows)) {
+            self.follows
+                .lock()
+                .expect("follows")
+                .push((span.name(), follows.name()));
+        }
+    }
+
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
@@ -174,6 +185,17 @@ impl Capture {
             .iter()
             .filter(|span| span.name == name)
             .cloned()
+            .collect()
+    }
+
+    /// Names of the spans that spans named `span` follow from.
+    pub(crate) fn follows_from(&self, span: &str) -> Vec<&'static str> {
+        self.follows
+            .lock()
+            .expect("follows")
+            .iter()
+            .filter(|(name, _)| *name == span)
+            .map(|(_, follows)| *follows)
             .collect()
     }
 
