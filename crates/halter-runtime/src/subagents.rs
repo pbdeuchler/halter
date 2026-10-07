@@ -17,7 +17,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::field::Empty;
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::session::create_session_seeded;
 use crate::session_lease::OutOfTurn;
@@ -931,23 +932,44 @@ impl RuntimeSubagentControl {
                 agent_id.0
             );
         }
+        // Subagents outlive the parent turn and tool call, and the tracing
+        // registry keeps a parent span open until all of its children close,
+        // so a child relationship would stretch the parent's `turn` and
+        // `tool_call` durations. The `subagent` span is therefore a root,
+        // linked to its causal span with `follows_from` (an OTel span link)
+        // and correlated through `parent_session_id`. The subagent's own
+        // `turn` spans nest under it.
+        let subagent_span = info_span!(
+            parent: None,
+            "subagent",
+            agent_id = %agent_id,
+            session_id = %session_id,
+            parent_session_id = parent_session_id.as_ref().map(tracing::field::display),
+            agent_type = agent_type.as_ref().map(tracing::field::display),
+            generation,
+            outcome = Empty,
+        );
+        subagent_span.follows_from(tracing::Span::current());
         // Spawn and registration share the lock so closure always owns the task.
-        let join_handle = tokio::spawn(async move {
-            controller
-                .run_turn_task(
-                    task_agent_id,
-                    task_session_id,
-                    parent_session_id,
-                    agent_type.clone(),
-                    generation,
-                    task_message,
-                    task_cancel,
-                    session,
-                    current_turn_for_task,
-                )
-                .await;
-            guard.disarm();
-        });
+        let join_handle = tokio::spawn(
+            async move {
+                controller
+                    .run_turn_task(
+                        task_agent_id,
+                        task_session_id,
+                        parent_session_id,
+                        agent_type.clone(),
+                        generation,
+                        task_message,
+                        task_cancel,
+                        session,
+                        current_turn_for_task,
+                    )
+                    .await;
+                guard.disarm();
+            }
+            .instrument(subagent_span),
+        );
 
         registry
             .entries
@@ -963,9 +985,10 @@ impl RuntimeSubagentControl {
         info!(
             agent_id = %status.agent_id,
             session_id = %status.session_id,
-            task = %status.task,
             "started subagent turn"
         );
+        // The task is model-authored prompt text; keep it at trace.
+        tracing::trace!(agent_id = %status.agent_id, task = %status.task, "subagent task");
         Ok(status)
     }
 
@@ -1090,6 +1113,9 @@ impl RuntimeSubagentControl {
             };
         };
 
+        // Runs inside the `subagent` span (see `start_turn`). Token usage is
+        // recorded only on the child's `turn` spans, never here.
+        tracing::Span::current().record("outcome", subagent_state_label(outcome.state));
         self.finish_turn(agent_id, generation, outcome).await;
     }
 
@@ -1514,6 +1540,17 @@ fn load_target_statuses(
         .collect()
 }
 
+/// Span label for a subagent state; matches the protocol's snake_case names.
+fn subagent_state_label(state: SubagentState) -> &'static str {
+    match state {
+        SubagentState::Running => "running",
+        SubagentState::Completed => "completed",
+        SubagentState::Failed => "failed",
+        SubagentState::Cancelled => "cancelled",
+        SubagentState::Closed => "closed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -1590,6 +1627,72 @@ mod tests {
             &requests[0].messages[1],
             Message::User(user) if user.plain_text() == "delegate this"
         ));
+    }
+
+    #[tokio::test]
+    async fn subagent_span_is_linked_root_with_outcome() {
+        let capture = crate::telemetry_capture::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let provider_requests = Arc::new(Mutex::new(Vec::<ProviderRequest>::new()));
+        let services = test_services(Arc::new(RecordingProvider::new(provider_requests)));
+        let control = RuntimeSubagentControl::new(services);
+        let parent = parent_context();
+
+        let status = control
+            .spawn(
+                &parent,
+                SpawnSubagentRequest {
+                    message: "delegate this".to_owned(),
+                    agent_type: None,
+                    fork_context: true,
+                    model: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("spawn");
+        let waited = control
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![status.agent_id.clone()],
+                    timeout_ms: Some(5_000),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("wait");
+        assert_eq!(
+            waited.status.expect("status").state,
+            SubagentState::Completed
+        );
+
+        let subagents = capture.spans_named("subagent");
+        assert_eq!(subagents.len(), 1, "{subagents:?}");
+        let subagent = &subagents[0];
+        assert_eq!(subagent.parent, None);
+        assert_eq!(
+            subagent.field("agent_id"),
+            Some(status.agent_id.to_string().as_str())
+        );
+        assert_eq!(
+            subagent.field("session_id"),
+            Some(status.session_id.to_string().as_str())
+        );
+        assert_eq!(
+            subagent.field("parent_session_id"),
+            Some(parent.blueprint.session_id.to_string().as_str())
+        );
+        assert_eq!(subagent.field("outcome"), Some("completed"));
+        // Token usage lives only on `turn` spans.
+        assert!(subagent.field("input_tokens").is_none());
+
+        let child_turn = capture
+            .spans_named("turn")
+            .into_iter()
+            .find(|turn| turn.field("session_id") == Some(status.session_id.to_string().as_str()))
+            .expect("child turn span");
+        assert_eq!(child_turn.parent, Some("subagent"));
+        assert!(child_turn.field("input_tokens").is_some());
     }
 
     #[tokio::test]

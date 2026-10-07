@@ -31,6 +31,8 @@ mod session_driver_tests;
 mod session_lease;
 mod subagent_session;
 mod subagents;
+#[cfg(test)]
+mod telemetry_capture;
 mod temporary_session;
 mod trace_export;
 mod trace_format;

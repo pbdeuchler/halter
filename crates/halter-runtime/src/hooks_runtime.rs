@@ -28,7 +28,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{Instrument, warn};
 
 /// Maximum bytes accumulated from an HTTP hook response body. Exceeding this
 /// cap aborts the stream and returns `HookError::ResponseTooLarge`.
@@ -464,8 +464,27 @@ async fn execute_hooks(
     request: HookDispatchRequest,
     cancel: &CancellationToken,
 ) -> anyhow::Result<ExecutedHookDispatch> {
+    // Debug-level, so it costs nothing at default filters; it gives the
+    // `hooks.matched` / `hooks.decision` events their dispatch context.
+    let span = tracing::debug_span!(
+        "hook_dispatch",
+        event = request.event_name.canonical_name(),
+        matched_handlers = tracing::field::Empty,
+    );
+    execute_hooks_inner(sess, request, cancel, &span)
+        .instrument(span.clone())
+        .await
+}
+
+async fn execute_hooks_inner(
+    sess: &SessionExecutor,
+    request: HookDispatchRequest,
+    cancel: &CancellationToken,
+    span: &tracing::Span,
+) -> anyhow::Result<ExecutedHookDispatch> {
     let hooks = sess.services().resources.hooks();
     let prepared = Hooks::prepare_many([hooks.as_ref(), sess.session_hooks().as_ref()], request);
+    span.record("matched_handlers", prepared.matched_handlers().len());
     let prepared_previews = prepared.preview_runs().to_vec();
     let mut preview_runs = Vec::new();
     let matched_handlers = prepared.matched_handlers().to_vec();
