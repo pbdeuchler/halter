@@ -833,9 +833,11 @@ impl SessionExecutor {
         // The body waits for registration so its deregister cannot run first
         // and leave a finished turn in the registry.
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
-        // The `turn` span is a child of the current span (the session driver
-        // for root sessions, `subagent` for subagent turns) and travels into
-        // the spawned task through `.instrument`. Provider, model, token
+        // The `turn` span is a child of whatever span is current: none for
+        // root sessions (the session driver task has no span, so their turns
+        // are root spans), `subagent` for subagent turns, and the parent
+        // `turn` for model-judge panel turns. It travels into the spawned
+        // task through `.instrument`. Provider, model, token
         // usage, and outcome are recorded once known.
         let turn_span = info_span!(
             "turn",
