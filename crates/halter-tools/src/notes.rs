@@ -937,3 +937,27 @@ mod tests {
         assert_eq!(std::fs::read_to_string(secret).unwrap(), "do not touch");
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::recovery_preview;
+
+    const MAX_LEN: usize = 6;
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn recovery_preview_is_a_maximal_prefix_within_limit() {
+        let bytes: [u8; MAX_LEN] = kani::any();
+        let len: usize = kani::any_where(|len| *len <= MAX_LEN);
+        let Ok(text) = std::str::from_utf8(&bytes[..len]) else {
+            return;
+        };
+        let limit: usize = kani::any();
+
+        let preview = recovery_preview(text, limit);
+
+        assert!(text.starts_with(preview));
+        assert!(preview.len() <= limit);
+        assert!(text.len().min(limit) - preview.len() < 4);
+    }
+}

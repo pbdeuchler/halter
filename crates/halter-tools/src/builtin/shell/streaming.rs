@@ -273,3 +273,36 @@ mod tests {
         assert!(notice.contains(&OUTPUT_CAP_BYTES.to_string()));
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::truncate_to_char_boundary;
+
+    const MAX_LEN: usize = 6;
+
+    /// For every valid UTF-8 string up to `MAX_LEN` bytes and every cap, the
+    /// truncation never panics, returns a prefix within the cap, and drops
+    /// at most the bytes of the one character straddling the cap.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn truncate_to_char_boundary_is_a_maximal_prefix_within_cap() {
+        let bytes: [u8; MAX_LEN] = kani::any();
+        let len: usize = kani::any_where(|len| *len <= MAX_LEN);
+        let Ok(value) = std::str::from_utf8(&bytes[..len]) else {
+            return;
+        };
+        let cap: usize = kani::any_where(|cap| *cap <= MAX_LEN + 1);
+
+        let result = truncate_to_char_boundary(value, cap);
+
+        assert!(value.starts_with(result));
+        assert!(result.len() <= cap);
+        // Non-vacuity: the multibyte back-off path is actually explored.
+        kani::cover!(value.len() > cap && result.len() < cap);
+        if value.len() > cap {
+            assert!(cap - result.len() < 4);
+        } else {
+            assert_eq!(result.len(), value.len());
+        }
+    }
+}

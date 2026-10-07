@@ -8,7 +8,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AssistantPart, Message, PromptSegment, StopReason, ToolResult, ToolSpec, UserPart};
+use crate::{
+    AssistantPart, Message, PromptSegment, StopReason, ToolResult, ToolSpec, Usage, UserPart,
+};
 
 const CURRENT_ACCOUNTING_VERSION: u8 = 1;
 const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
@@ -125,18 +127,22 @@ impl TokenLedger {
     /// every other message adds its heuristic estimate.
     pub fn record(&mut self, message: &Message) {
         match authoritative_context_tokens(message) {
-            Some(tokens) => {
-                self.authoritative_tokens = tokens;
-                self.inferred_tokens = 0;
-                self.request_tokens_at_last_anchor = self.request_tokens;
-                self.accounting_version = CURRENT_ACCOUNTING_VERSION;
-            }
-            None => {
-                self.inferred_tokens = self
-                    .inferred_tokens
-                    .saturating_add(estimate_message_tokens(message));
-            }
+            Some(tokens) => self.anchor(tokens),
+            None => self.add_inferred(estimate_message_tokens(message)),
         }
+    }
+
+    /// Replace the anchor with a provider-reported context size.
+    fn anchor(&mut self, tokens: u64) {
+        self.authoritative_tokens = tokens;
+        self.inferred_tokens = 0;
+        self.request_tokens_at_last_anchor = self.request_tokens;
+        self.accounting_version = CURRENT_ACCOUNTING_VERSION;
+    }
+
+    /// Add a heuristic estimate for content the provider has not reported on.
+    fn add_inferred(&mut self, tokens: u64) {
+        self.inferred_tokens = self.inferred_tokens.saturating_add(tokens);
     }
 
     /// Ledger for a context with no usable provider report: everything is
@@ -158,13 +164,17 @@ fn authoritative_context_tokens(message: &Message) -> Option<u64> {
     let Message::Assistant(assistant) = message else {
         return None;
     };
+    usable_report(assistant.stop_reason, assistant.usage.as_ref())
+}
+
+fn usable_report(stop_reason: Option<StopReason>, usage: Option<&Usage>) -> Option<u64> {
     if matches!(
-        assistant.stop_reason,
+        stop_reason,
         Some(StopReason::Interrupted | StopReason::Error)
     ) {
         return None;
     }
-    let tokens = assistant.usage.as_ref()?.context_tokens();
+    let tokens = usage?.context_tokens();
     (tokens > 0).then_some(tokens)
 }
 
@@ -693,5 +703,118 @@ mod tests {
             estimate_json_tokens(&json!({"b": true, "a": "abcd"})),
             estimate_text_tokens("{\"a\":\"abcd\",\"b\":true}")
         );
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    //! Proofs over the ledger's integer core. They deliberately avoid
+    //! constructing `Message`: its `serde_json::Value` fields pull B-tree drop
+    //! glue into the model, which CBMC cannot bound. `record` is glue over
+    //! `usable_report`, `anchor`, and `add_inferred`, which are proved here.
+    use super::*;
+
+    fn any_ledger() -> TokenLedger {
+        TokenLedger {
+            authoritative_tokens: kani::any(),
+            inferred_tokens: kani::any(),
+            request_tokens: kani::any(),
+            request_tokens_at_last_anchor: kani::any(),
+            accounting_version: CURRENT_ACCOUNTING_VERSION,
+        }
+    }
+
+    fn any_stop_reason() -> Option<StopReason> {
+        match kani::any::<u8>() {
+            0 => None,
+            1 => Some(StopReason::EndTurn),
+            2 => Some(StopReason::ToolUse),
+            3 => Some(StopReason::Interrupted),
+            4 => Some(StopReason::MaxTokens),
+            _ => Some(StopReason::Error),
+        }
+    }
+
+    fn any_usage() -> Usage {
+        Usage {
+            input_tokens: kani::any(),
+            output_tokens: kani::any(),
+            cache_creation_input_tokens: kani::any(),
+            cache_read_input_tokens: kani::any(),
+        }
+    }
+
+    /// A larger request base never shrinks the projection.
+    #[kani::proof]
+    fn projection_is_monotone_in_request_base() {
+        let ledger = any_ledger();
+        let smaller: u64 = kani::any();
+        let larger: u64 = kani::any_where(|larger| *larger >= smaller);
+        assert!(ledger.projected_tokens(smaller) <= ledger.projected_tokens(larger));
+    }
+
+    /// Interrupted or errored turns, and empty reports, never anchor.
+    /// Every other reported context size does.
+    #[kani::proof]
+    fn only_complete_nonzero_reports_are_usable() {
+        let stop_reason = any_stop_reason();
+        let usage = any_usage();
+        let has_usage: bool = kani::any();
+        let report = usable_report(stop_reason, has_usage.then_some(&usage));
+
+        let partial = matches!(
+            stop_reason,
+            Some(StopReason::Interrupted | StopReason::Error)
+        );
+        let expected =
+            (!partial && has_usage && usage.context_tokens() > 0).then(|| usage.context_tokens());
+        assert_eq!(report, expected);
+    }
+
+    /// Anchoring projects the next request at the reported context size, or
+    /// at the request base if the provider reported less than that estimate.
+    #[kani::proof]
+    fn anchor_projects_reported_size() {
+        let mut ledger = any_ledger();
+        let reported: u64 = kani::any();
+        ledger.anchor(reported);
+        assert_eq!(ledger.inferred_tokens, 0);
+        assert_eq!(
+            ledger.effective_tokens(),
+            reported.max(ledger.request_tokens)
+        );
+    }
+
+    /// After anchoring, a changed prompt/tool base moves the projection by
+    /// exactly the delta, with no double counting of the old base.
+    #[kani::proof]
+    fn request_base_change_contributes_only_its_delta() {
+        let mut ledger = any_ledger();
+        let reported: u64 = kani::any_where(|reported| *reported >= ledger.request_tokens);
+        ledger.anchor(reported);
+
+        let new_base: u64 = kani::any();
+        ledger.prepare_request(new_base, &[], &[]);
+
+        if let Some(expected) =
+            (reported - ledger.request_tokens_at_last_anchor).checked_add(new_base)
+        {
+            assert_eq!(ledger.effective_tokens(), expected);
+        }
+    }
+
+    /// Inferred content only ever grows the projection and never moves the
+    /// anchor.
+    #[kani::proof]
+    fn inferred_content_never_moves_anchor_or_shrinks_projection() {
+        let mut ledger = any_ledger();
+        let before = ledger;
+        ledger.add_inferred(kani::any());
+        assert_eq!(ledger.authoritative_tokens, before.authoritative_tokens);
+        assert_eq!(
+            ledger.request_tokens_at_last_anchor,
+            before.request_tokens_at_last_anchor
+        );
+        assert!(ledger.effective_tokens() >= before.effective_tokens());
     }
 }
