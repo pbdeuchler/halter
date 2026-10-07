@@ -2091,13 +2091,12 @@ impl SessionExecutor {
                 if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
                     call.arguments = updated_input;
                 }
+                // Info/debug events inside `tool_call` get the call's ids from
+                // the span, which shares their target and is info level, so a
+                // level filter that enables them enables it too. Repeating the
+                // ids would print them twice.
                 span.in_scope(|| {
-                    info!(
-                        session_id = %self.session_id,
-                        tool_call_id = %call.id,
-                        tool_name = %call.name,
-                        "executing tool call"
-                    );
+                    info!("executing tool call");
                 });
                 self.push_event(
                     events,
@@ -2108,14 +2107,9 @@ impl SessionExecutor {
                     outcome.record("blocked");
                     span.record("is_error", true);
                     span.in_scope(|| {
-                        info!(
-                            session_id = %self.session_id,
-                            tool_call_id = %call.id,
-                            tool_name = %call.name,
-                            "tool call blocked by hook"
-                        );
+                        info!("tool call blocked by hook");
                         // Hook-authored text; kept below info.
-                        debug!(tool_call_id = %call.id, reason = %reason, "tool call block reason");
+                        debug!(reason = %reason, "tool call block reason");
                     });
                     let error = ToolError::new(reason);
                     let outcome = ToolExecutionOutcome {
@@ -2243,9 +2237,6 @@ impl SessionExecutor {
                         follow_ups.extend(follow_up);
                         span.in_scope(|| {
                             debug!(
-                                session_id = %self.session_id,
-                                tool_call_id = %call.id,
-                                tool_name = %call.name,
                                 result_kind = tool_result_kind(&result),
                                 "tool call completed"
                             );
@@ -2254,6 +2245,8 @@ impl SessionExecutor {
                     }
                     Err(error) => {
                         span.in_scope(|| {
+                            // Warn is enabled at the default filter, where the
+                            // info-level span is not, so keep the ids here.
                             warn!(
                                 session_id = %self.session_id,
                                 tool_call_id = %call.id,
@@ -13194,6 +13187,19 @@ mod tests {
             .unwrap_or_else(|| panic!("completion line in: {output}"));
         for field in [" model_id=", " provider=", " model="] {
             assert_eq!(line.matches(field).count(), 1, "{field} in {line}");
+        }
+        let executing = output
+            .lines()
+            .find(|line| line.contains("executing tool call"))
+            .unwrap_or_else(|| panic!("tool call line in: {output}"));
+        // (`session_id`/`turn_id` are on both `turn` and `tool_call` spans on
+        // purpose: OTel attributes are not inherited.)
+        for field in [" tool_name=", " tool_call_id="] {
+            assert_eq!(
+                executing.matches(field).count(),
+                1,
+                "{field} in {executing}"
+            );
         }
         for line in output.lines() {
             for field in [

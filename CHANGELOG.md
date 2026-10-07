@@ -42,6 +42,10 @@ once a `1.0.0` line is cut.
   arguments are logged only at trace.
 - The "started subagent turn" event no longer logs the task text at info; it is
   logged at trace.
+- The "executing tool call", "tool call blocked by hook", and "tool call
+  completed" events no longer repeat `session_id`, `tool_call_id`, and
+  `tool_name`; they come from the enclosing `tool_call` span (under `span` /
+  `spans` in JSON output). "tool call failed" (warn) keeps them.
 
 ## [0.9.0] - 2026-10-01
 
