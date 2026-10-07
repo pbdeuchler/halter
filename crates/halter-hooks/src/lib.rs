@@ -4,6 +4,8 @@
 //! into ordered hook dispatch plans. It also contains the merge rules that turn
 //! multiple hook outputs into one runtime decision.
 // pattern: Functional Core
+// `tracing` events emitted here (`hooks.matched`, `hooks.decision`) are
+// observability-only side effects; no result depends on them.
 
 mod config;
 mod engine;

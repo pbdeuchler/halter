@@ -18,7 +18,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 use crate::header_overrides::HeaderOverrides;
 use crate::http_client::{join_url, provider_http_clients};
@@ -505,51 +505,55 @@ fn stream_response(
     let stream = response.bytes_stream().eventsource();
     let (tx, rx) = mpsc::unbounded_channel();
 
-    tokio::spawn(async move {
-        let mut stream = Box::pin(stream);
-        loop {
-            // Bias cancellation over the byte stream so a dropped consumer
-            // (which fires `CancelOnDrop` upstream) takes precedence over an
-            // already-buffered SSE chunk. Without `biased`, a noisy stream
-            // could starve the cancel arm and leak the spawned task.
-            select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                event = stream.next() => match event {
-                    None => break,
-                    Some(Err(error)) => {
-                        if tx
-                            .send(Err(OpenAIError::StreamError(Box::new(
-                                StreamError::EventStream(error.to_string()),
-                            ))))
-                            .is_err()
-                        {
-                            break;
+    tokio::spawn(
+        async move {
+            let mut stream = Box::pin(stream);
+            loop {
+                // Bias cancellation over the byte stream so a dropped consumer
+                // (which fires `CancelOnDrop` upstream) takes precedence over an
+                // already-buffered SSE chunk. Without `biased`, a noisy stream
+                // could starve the cancel arm and leak the spawned task.
+                select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    event = stream.next() => match event {
+                        None => break,
+                        Some(Err(error)) => {
+                            if tx
+                                .send(Err(OpenAIError::StreamError(Box::new(
+                                    StreamError::EventStream(error.to_string()),
+                                ))))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
-                    }
-                    Some(Ok(event)) => {
-                        if event.data == "[DONE]" {
-                            break;
-                        }
+                        Some(Ok(event)) => {
+                            if event.data == "[DONE]" {
+                                break;
+                            }
 
-                        match decode_stream_event(&event.data, &rate_limits) {
-                            Ok(Some(event)) => {
-                                if tx.send(Ok(event)).is_err() {
-                                    break;
+                            match decode_stream_event(&event.data, &rate_limits) {
+                                Ok(Some(event)) => {
+                                    if tx.send(Ok(event)).is_err() {
+                                        break;
+                                    }
                                 }
-                            }
-                            Ok(None) => {} // non-standard event already handled (e.g. keepalive)
-                            Err(err) => {
-                                if tx.send(Err(err)).is_err() {
-                                    break;
+                                Ok(None) => {} // non-standard event already handled (e.g. keepalive)
+                                Err(err) => {
+                                    if tx.send(Err(err)).is_err() {
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    }
-                },
+                    },
+                }
             }
         }
-    });
+        // Runs inside the caller's `provider_request` span.
+        .in_current_span(),
+    );
 
     Box::pin(UnboundedReceiverStream::new(rx))
 }

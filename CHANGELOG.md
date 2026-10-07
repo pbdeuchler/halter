@@ -8,6 +8,45 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Added
+
+- `telemetry` feature on the `halter` crate with `halter::telemetry`, an
+  opt-in `tracing` subscriber helper: `TelemetryConfig` (`try_init`,
+  `try_init_with(layer)`, and `env_filter()`/`fmt_layer()` for manual
+  composition), `LogFormat`, `compose_directives`, and
+  `NOISY_TARGET_SUPPRESSIONS`. Library crates still never install a
+  subscriber; without the feature, `tracing-subscriber` is not a dependency.
+- `tracing` spans with stable names and identifier fields: `turn`
+  (`session_id`, `turn_id`; records `provider`, `model`, `model_id`,
+  `provider_iterations`, token usage, and `outcome`), `tool_call`
+  (`tool_name`, `tool_call_id`, `outcome`, `is_error`), `provider_request` and
+  `provider_compaction` (`provider`, `provider_kind`, `model`, `model_id`,
+  `attempt`, `outcome`, `error_kind`), `subagent` (`agent_id`, `session_id`,
+  `parent_session_id`, `outcome`; a root span linked with `follows_from`), and
+  the debug-level `hook_dispatch`.
+- `halter-hooks` emits `hooks.matched` (debug) and `hooks.decision` events.
+  Blocks, stops, and deny/ask permission decisions log at info; reasons are
+  only logged at debug.
+- README "Observability" section documenting the subscriber boundary, the span
+  reference, and the logging conventions.
+
+### Changed
+
+- `halter-cli` builds its subscriber with `halter::telemetry`, with the same
+  defaults (`RUST_LOG`, default `warn`, noisy-target suppression, JSON with
+  `--output-file`). Log lines now include span context when spans are enabled
+  (`RUST_LOG=info` or more verbose).
+- `ResilientProvider` log events name the adapter label `provider_kind` instead
+  of `provider`; retry events also carry `error_kind`.
+- Unparseable tool-call argument warnings log `raw_arguments_len`; the raw
+  arguments are logged only at trace.
+- The "started subagent turn" event no longer logs the task text at info; it is
+  logged at trace.
+- The "executing tool call", "tool call blocked by hook", and "tool call
+  completed" events no longer repeat `session_id`, `tool_call_id`, and
+  `tool_name`; they come from the enclosing `tool_call` span (under `span` /
+  `spans` in JSON output). "tool call failed" (warn) keeps them.
+
 ## [0.9.0] - 2026-10-01
 
 Sessions now accept user messages through a durable inbox and return one

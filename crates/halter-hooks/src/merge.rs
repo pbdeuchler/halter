@@ -153,6 +153,8 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
     let mut winning_updated_input: Option<String> = None;
     let mut winning_updated_output: Option<String> = None;
     let mut winning_permission: Option<(PermissionDecision, String, Option<String>)> = None;
+    let mut block_handler: Option<String> = None;
+    let mut stop_handler: Option<String> = None;
 
     for input in &ordered {
         let reason = non_empty(input.output.reason.clone());
@@ -163,6 +165,7 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
                 .clone()
                 .or(reason.clone())
                 .or_else(|| Some(default_stop_reason().to_owned()));
+            stop_handler = Some(input.handler_id.clone());
         }
 
         if matches!(input.output.decision, Some(HookDecision::Block))
@@ -173,6 +176,7 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
                     .clone()
                     .unwrap_or_else(|| default_block_reason().to_owned()),
             );
+            block_handler = Some(input.handler_id.clone());
         }
 
         if let Some(permission_decision) = input
@@ -260,15 +264,101 @@ pub fn merge_outputs(inputs: &[MergeInput]) -> (HookMergedOutcome, Vec<MergeConf
         }
     }
 
-    if let Some((decision, _, reason)) = winning_permission
+    let permission_handler = winning_permission
+        .as_ref()
+        .map(|(_, handler_id, _)| handler_id.clone());
+    if let Some((decision, handler_id, reason)) = winning_permission
         && matches!(decision, PermissionDecision::Deny | PermissionDecision::Ask)
         && merged.block_reason.is_none()
     {
         merged.block_reason =
             Some(reason.unwrap_or_else(|| default_permission_block_reason(decision).to_owned()));
+        block_handler = Some(handler_id);
+    }
+
+    if !inputs.is_empty() {
+        log_decision(
+            &merged,
+            DecisionHandlers {
+                permission: permission_handler.as_deref(),
+                block: block_handler.as_deref(),
+                stop: stop_handler.as_deref(),
+            },
+            conflicts.len(),
+            inputs.len(),
+        );
     }
 
     (merged, conflicts)
+}
+
+struct DecisionHandlers<'a> {
+    permission: Option<&'a str>,
+    block: Option<&'a str>,
+    stop: Option<&'a str>,
+}
+
+/// Emit the merged policy decision. Observability only: the merge result
+/// does not depend on it. Outcomes that change execution (block, stop, deny,
+/// ask) log at info; everything else at debug. Reasons are hook-authored
+/// text and only appear in a separate debug event; rewritten inputs/outputs
+/// and payloads are never logged.
+fn log_decision(
+    merged: &HookMergedOutcome,
+    handlers: DecisionHandlers<'_>,
+    conflicts: usize,
+    handler_count: usize,
+) {
+    let blocked = merged.block_reason.is_some();
+    let stopped = merged.stop_reason.is_some();
+    let permission_decision = merged.permission_decision.map_or("none", permission_label);
+    let input_rewritten = merged.updated_input.is_some();
+    let output_rewritten = merged.updated_output.is_some();
+    let notable = blocked
+        || stopped
+        || matches!(
+            merged.permission_decision,
+            Some(PermissionDecision::Deny | PermissionDecision::Ask)
+        );
+    macro_rules! decision_event {
+        ($level:ident) => {
+            tracing::$level!(
+                permission_decision,
+                permission_handler = handlers.permission,
+                blocked,
+                block_handler = handlers.block,
+                stopped,
+                stop_handler = handlers.stop,
+                input_rewritten,
+                output_rewritten,
+                conflicts,
+                handler_count,
+                "hooks.decision"
+            )
+        };
+    }
+    if notable {
+        decision_event!(info);
+    } else {
+        decision_event!(debug);
+    }
+    if blocked || stopped || merged.permission_decision_reason.is_some() {
+        tracing::debug!(
+            block_reason = merged.block_reason.as_deref(),
+            stop_reason = merged.stop_reason.as_deref(),
+            permission_decision_reason = merged.permission_decision_reason.as_deref(),
+            "hooks.decision_reasons"
+        );
+    }
+}
+
+fn permission_label(decision: PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::Passthrough => "passthrough",
+        PermissionDecision::Allow => "allow",
+        PermissionDecision::Ask => "ask",
+        PermissionDecision::Deny => "deny",
+    }
 }
 
 /// Convert one hook output into summary entries for event reporting.
@@ -841,5 +931,155 @@ mod tests {
         assert_eq!(conflicts[1].field, ConflictField::UpdatedOutput);
         assert_eq!(conflicts[1].winner, "output-winner");
         assert_eq!(conflicts[1].loser, "output-loser");
+    }
+
+    // --- tracing events ---
+
+    mod decision_events {
+        use std::collections::BTreeMap;
+        use std::fmt;
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing::subscriber::Interest;
+        use tracing::{Event, Level, Metadata, Subscriber};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        use super::*;
+
+        #[derive(Debug, Clone)]
+        struct CapturedEvent {
+            level: Level,
+            message: String,
+            fields: BTreeMap<String, String>,
+        }
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<CapturedEvent>>>);
+
+        #[derive(Default)]
+        struct FieldVisitor(BTreeMap<String, String>);
+
+        impl Visit for FieldVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+
+            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+        }
+
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+                Interest::sometimes()
+            }
+
+            fn enabled(&self, _metadata: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+                true
+            }
+
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                let mut fields = visitor.0;
+                let message = fields.remove("message").unwrap_or_default();
+                self.0.lock().expect("events").push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    message,
+                    fields,
+                });
+            }
+        }
+
+        fn decisions(inputs: &[MergeInput]) -> Vec<CapturedEvent> {
+            // With exactly one live dispatcher, tracing-core computes a new
+            // callsite's interest from the registering thread's default
+            // only, so a parallel test thread without a subscriber could
+            // cache `never`. A permanent second dispatcher prevents that.
+            static KEEPALIVE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+            KEEPALIVE.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
+            let capture = Capture::default();
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                merge_outputs(inputs);
+            });
+            let events = capture.0.lock().expect("events").clone();
+            events
+                .into_iter()
+                .filter(|event| event.message == "hooks.decision")
+                .collect()
+        }
+
+        fn permission_input(handler_id: &str, decision: PermissionDecision) -> MergeInput {
+            merge_input(
+                handler_id,
+                priority(HandlerPriorityGroup::PluginFiles, 0, 0, 0, 0),
+                HookOutput {
+                    hook_specific_output: Some(HookSpecificOutput {
+                        permission_decision: Some(decision),
+                        permission_decision_reason: Some("secret reason text".to_owned()),
+                        ..HookSpecificOutput::default()
+                    }),
+                    ..HookOutput::default()
+                },
+            )
+        }
+
+        #[test]
+        fn deny_decision_logs_info_without_reasons() {
+            let events = decisions(&[permission_input("deny-hook", PermissionDecision::Deny)]);
+            assert_eq!(events.len(), 1, "{events:?}");
+            let event = &events[0];
+            assert_eq!(event.level, Level::INFO);
+            assert_eq!(
+                event.fields.get("permission_decision").map(String::as_str),
+                Some("deny")
+            );
+            assert_eq!(
+                event.fields.get("permission_handler").map(String::as_str),
+                Some("deny-hook")
+            );
+            assert_eq!(
+                event.fields.get("blocked").map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(
+                event.fields.get("block_handler").map(String::as_str),
+                Some("deny-hook")
+            );
+            assert!(
+                event.fields.keys().all(|key| !key.contains("reason")),
+                "{event:?}"
+            );
+            assert!(
+                event
+                    .fields
+                    .values()
+                    .all(|value| !value.contains("secret reason text")),
+                "{event:?}"
+            );
+        }
+
+        #[test]
+        fn allow_decision_logs_debug() {
+            let events = decisions(&[permission_input("allow-hook", PermissionDecision::Allow)]);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0].level, Level::DEBUG);
+            assert_eq!(
+                events[0]
+                    .fields
+                    .get("permission_decision")
+                    .map(String::as_str),
+                Some("allow")
+            );
+        }
+
+        #[test]
+        fn empty_inputs_log_nothing() {
+            assert!(decisions(&[]).is_empty());
+        }
     }
 }

@@ -1266,6 +1266,122 @@ The following can all be implemented in custom hooks:
 
 ---
 
+## Observability
+
+Halter's library crates emit [`tracing`](https://docs.rs/tracing) events and
+spans only. None of them installs a subscriber. To get output, either install
+halter's default subscriber through the opt-in `telemetry` feature or bring
+your own.
+
+```toml
+halter = { version = "0.9", features = ["telemetry"] }
+```
+
+```rust
+use halter::telemetry::{LogFormat, TelemetryConfig};
+
+// Reads RUST_LOG (default `warn`), applies the noisy-target suppression,
+// and writes compact lines to stderr.
+TelemetryConfig::new().try_init()?;
+
+// Or JSON, with explicit directives instead of RUST_LOG:
+// TelemetryConfig::new().with_format(LogFormat::Json).with_directives("info").try_init()?;
+```
+
+`TelemetryConfig::try_init_with(layer)` adds one extra layer (for example an
+exporter) to the same stack. The composed `EnvFilter` filters the whole stack
+in that case. If the extra layer needs its own filter, compose the pieces
+yourself. `env_filter()` and `fmt_layer()` build the parts without installing
+anything:
+
+```rust
+use halter::telemetry::TelemetryConfig;
+use halter::telemetry::tracing_subscriber::{self, EnvFilter, Layer, layer::SubscriberExt};
+
+let config = TelemetryConfig::new();
+let exporter = tracing_subscriber::fmt::layer() // stand-in for any extra layer
+    .with_filter(EnvFilter::try_new("halter_runtime=info,halter_providers=info")?);
+let subscriber = tracing_subscriber::registry()
+    .with(exporter)
+    .with(config.fmt_layer().with_filter(config.env_filter()?));
+tracing::subscriber::set_global_default(subscriber)?;
+```
+
+To use your own subscriber, leave the feature off and install it as usual.
+With the feature on, `halter::telemetry::compose_directives` gives you halter's
+suppression list for your own filter.
+
+**CLI.** `halter` uses this helper. It reads `RUST_LOG`, defaults to `warn`,
+and quiets per-token shell parser and HTTP connection-pool targets (`tokenize`,
+`parse`, `hyper`, `reqwest`, `h2`, ...) even under `RUST_LOG=debug`. An explicit
+per-target directive such as `RUST_LOG=hyper=trace` still wins. Logs go to
+stderr: compact by default, JSON when `--output-file` is set.
+
+### Spans
+
+Span names are the stable contract; identifiers are fields. Each field is
+recorded at most once: the compact formatter repeats a re-recorded field on
+every line, so totals (tokens, `provider_iterations`, `attempt`) are recorded
+when the operation ends. All spans except
+`hook_dispatch` are `info` level, so `RUST_LOG=info` (or
+`halter_runtime=info,halter_providers=info`) enables them.
+
+| Span                  | Target             | Fields at creation                                                        | Fields recorded later                                                                                                                                                                                                     |
+| --------------------- | ------------------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `turn`                | `halter_runtime`   | `session_id`, `turn_id`                                                   | `provider`, `model`, `model_id` (at the first provider request; fixed for the turn), `provider_iterations`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `outcome` (`completed`/`failed`/`cancelled`/`aborted`) |
+| `tool_call`           | `halter_runtime`   | `session_id`, `turn_id`, `tool_name`, `tool_call_id`                      | `outcome` (`ok`/`error`/`blocked`/`aborted`), `is_error`                                                                                                                                                                            |
+| `provider_request`    | `halter_providers` | `provider`, `provider_kind`, `model`, `model_id`, `session_id`, `turn_id` | `attempt` (final attempt number), `outcome` (`completed`/`error`/`cancelled`), `error_kind`                                                                                                                                                      |
+| `provider_compaction` | `halter_providers` | `provider`, `provider_kind`, `model`, `model_id`, `session_id`            | `attempt`, `outcome`, `error_kind`                                                                                                                                                                                        |
+| `subagent`            | `halter_runtime`   | `agent_id`, `session_id`, `parent_session_id`, `agent_type`, `generation` | `outcome` (`completed`/`failed`/`cancelled`/`aborted`/...)                                                                                                                                                                          |
+| `hook_dispatch`       | `halter_runtime`   | `event` (debug level)                                                     | `matched_handlers`                                                                                                                                                                                                        |
+
+`aborted` means the operation ended without reporting a result: its task was
+aborted (for example by shutdown or `close_agent`), its future was dropped, or
+it panicked. Runtime spans always close with an `outcome`.
+
+`tool_call` and `provider_request` nest under `turn`. `provider_request` comes
+from `ResilientProvider`, which wraps every built-in provider. Custom `Provider`
+implementations get no provider span unless they add one.
+
+A `subagent` span is a root span. It links to the span that started it with
+`follows_from` (an OpenTelemetry span link) and shares `parent_session_id` for
+correlation. Subagents outlive the tool call that spawns them, and a child span
+would keep the parent `turn` and `tool_call` open. The subagent's own `turn`
+spans nest under `subagent`.
+
+### Conventions
+
+- **Targets** are the default module paths (`halter_runtime::session`, ...).
+  Don't invent custom targets.
+- **Levels:** `error`/`warn` for actionable problems; `info` for lifecycle and
+  policy outcomes; `debug` for details and decisions; `trace` for payloads.
+- **Field names:** `session_id`, `turn_id`, `parent_session_id`, `agent_id`,
+  `tool_name`, `tool_call_id`, `provider` (configured provider name),
+  `provider_kind` (adapter label such as `anthropic`/`openai`/`openrouter`),
+  `model` (upstream model), `model_id` (halter model id), `attempt`, `outcome`,
+  `error_kind`, and the `Usage` token names.
+- Use **structured fields** instead of values interpolated into the message.
+- **Never log secrets, full tool inputs, prompts, or hook payloads at `info` or
+  above.** Never put payloads in span fields: the JSON format repeats span
+  fields on every line.
+- **Async:** instrument futures with `.instrument(span)` or `.in_current_span()`.
+  Never hold an `Entered` guard across `.await`. Tasks that are part of the
+  current operation carry its span. Detached or long-lived tasks use
+  `parent: None` plus `follows_from`.
+- **Token usage is recorded only on `turn`**, so span-derived metrics never
+  double count.
+- **Hooks:** `halter-hooks` emits `hooks.matched` (`debug`) when handlers match
+  and `hooks.decision` after merging. Decisions that block, stop, deny, or ask
+  log at `info`; others at `debug`. Hook-authored reasons appear only in a
+  separate `debug` event, `hooks.decision_reasons`.
+
+`tracing` diagnostics are separate from **session transcript traces**: the
+JSONL files that `TraceRecorder` writes to `traces_dir` and that
+`halter::session::export_session_trace` produces. Transcript traces record
+committed session events. The `telemetry` feature does not read or write them.
+
+---
+
 ## Features
 
 The `halter` crate keeps optional capabilities out of the default build. No feature is enabled by default. Enable the feature at compile time, then make sure the corresponding tool or session backend is enabled by config and policy.
@@ -1280,6 +1396,7 @@ The `halter` crate keeps optional capabilities out of the default build. No feat
 | `profiling`      | Adds the `profile` built-in tool for profiling and instrumentation workflows.                                                            | `inferno`                                                                                                         | Tool name exposed to the model: `profile`.                                                                                                                                        |
 | `full`           | Convenience rollup for the optional built-in tool families.                                                                              | Same extra dependencies as `advanced-tools`, `ast-tools`, `browser-tools`, `image-tools`, `pty`, and `profiling`. | Does not include `sqlite`; enable `sqlite` separately when persistent session storage is needed.                                                                                  |
 | `sqlite`         | Enables SQLite-backed session persistence and the matching config schema.                                                                | `rusqlite`                                                                                                        | Allows `sessions.backend = "sqlite"` and exposes `halter::session::SqliteSessionStore`. The default backend remains memory unless config selects SQLite.                          |
+| `telemetry`      | Adds `halter::telemetry`, the opt-in `tracing` subscriber helper the CLI uses (env filter, noisy-target suppression, compact/JSON output). | `tracing-subscriber`                                                                                              | No subscriber is installed unless `try_init`/`try_init_with` is called. See [Observability](#observability).                                                                      |
 
 ---
 

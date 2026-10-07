@@ -356,6 +356,8 @@ impl<'a> CompactionContext<'a> {
         calls: Vec<ToolCall>,
     ) -> anyhow::Result<Vec<Message>> {
         let before = self.state.messages.len();
+        // Delegates to the turn's tool path, which opens one `tool_call`
+        // span per call; no separate instrumentation is needed here.
         self.session
             .execute_tool_calls(
                 self.blueprint,

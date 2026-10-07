@@ -31,7 +31,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::field::Empty;
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::model_selection::select_models;
 use crate::session_lease::{OutOfTurn, SessionLease};
@@ -832,137 +833,172 @@ impl SessionExecutor {
         // The body waits for registration so its deregister cannot run first
         // and leave a finished turn in the registry.
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
-        let handle = tokio::spawn(async move {
-            if registered_rx.await.is_err() {
-                return;
-            }
-            // The registry's supervisor deregisters only after this actual
-            // executor has settled, including dropping its session lease.
-            let _parent_stream_registration = parent_stream_registration;
+        // The `turn` span is a child of whatever span is current: none for
+        // root sessions (the session driver task has no span, so their turns
+        // are root spans), `subagent` for subagent turns, and the parent
+        // `turn` for model-judge panel turns. It travels into the spawned
+        // task through `.instrument`. Provider, model, token
+        // usage, and outcome are recorded once known.
+        let turn_span = info_span!(
+            "turn",
+            session_id = %self.session_id,
+            turn_id = %turn.id,
+            provider = Empty,
+            model = Empty,
+            model_id = Empty,
+            provider_iterations = Empty,
+            input_tokens = Empty,
+            output_tokens = Empty,
+            cache_read_input_tokens = Empty,
+            cache_creation_input_tokens = Empty,
+            outcome = Empty,
+        );
+        let task_span = turn_span.clone();
+        // Moved into the task, so a task the registry aborts (even before its
+        // first poll) still closes its span with `outcome = "aborted"`.
+        let turn_outcome = crate::span_outcome::SpanOutcome::new(turn_span.clone());
+        let handle = tokio::spawn(
+            async move {
+                if registered_rx.await.is_err() {
+                    return;
+                }
+                // The registry's supervisor deregisters only after this actual
+                // executor has settled, including dropping its session lease.
+                let _parent_stream_registration = parent_stream_registration;
+                let mut turn_outcome = turn_outcome;
 
-            let blueprint = stored.blueprint.clone();
-            // The lease guarantees no turn is running, so an open turn in the
-            // checkpoint is one a crash or abort left behind.
-            let mut start_events = close_interrupted_turn(&mut stored.state)
-                .into_iter()
-                .map(|payload| session.make_event(payload))
-                .collect::<Vec<_>>();
-            start_events.push(session.make_event(SessionEventPayload::TurnStarted {
-                turn_id: turn.id.clone(),
-                default_model: turn.default_model.clone(),
-                subagent_model: turn.subagent_model.clone(),
-            }));
-            stored.state.open_turn = Some(turn.id.clone());
-            let start_head = match session
-                .commit_and_publish(
-                    &blueprint,
-                    None,
-                    Some(stored.head_sequence),
-                    Some(stored.state.clone()),
-                    start_events,
-                    Some(live.as_ref()),
-                )
+                let blueprint = stored.blueprint.clone();
+                // The lease guarantees no turn is running, so an open turn in the
+                // checkpoint is one a crash or abort left behind.
+                let mut start_events = close_interrupted_turn(&mut stored.state)
+                    .into_iter()
+                    .map(|payload| session.make_event(payload))
+                    .collect::<Vec<_>>();
+                start_events.push(session.make_event(SessionEventPayload::TurnStarted {
+                    turn_id: turn.id.clone(),
+                    default_model: turn.default_model.clone(),
+                    subagent_model: turn.subagent_model.clone(),
+                }));
+                stored.state.open_turn = Some(turn.id.clone());
+                let start_head = match session
+                    .commit_and_publish(
+                        &blueprint,
+                        None,
+                        Some(stored.head_sequence),
+                        Some(stored.state.clone()),
+                        start_events,
+                        Some(live.as_ref()),
+                    )
+                    .await
+                {
+                    Ok(committed) => committed
+                        .last()
+                        .map_or(stored.head_sequence, SessionEvent::sequence),
+                    Err(error) => {
+                        error!(
+                            session_id = %session.session_id,
+                            turn_id = %turn.id,
+                            error = %error,
+                            "failed to commit turn start"
+                        );
+                        turn_outcome.record("failed");
+                        live.emit_error(error);
+                        return;
+                    }
+                };
+
+                // A plugin panic must use the same failure finalization as an
+                // ordinary error. Cancel its execution scope so any tool work
+                // holding child tokens also stops, without marking it as a user
+                // interruption.
+                let execution_cancel = task_cancel.child_token();
+                let execution = std::panic::AssertUnwindSafe(session.run_turn(
+                    stored,
+                    turn.clone(),
+                    start_head,
+                    execution_cancel.clone(),
+                    live.as_ref(),
+                    &task_span,
+                ))
+                .catch_unwind()
                 .await
-            {
-                Ok(committed) => committed
-                    .last()
-                    .map_or(stored.head_sequence, SessionEvent::sequence),
-                Err(error) => {
+                .unwrap_or_else(|_| {
+                    execution_cancel.cancel();
+                    Err(anyhow::anyhow!("session execution panicked"))
+                });
+                let outcome = match execution {
+                    Ok(turn_commit) => {
+                        let mut state = turn_commit.state;
+                        state.open_turn = None;
+                        // A turn whose final commit fails is recorded as failed
+                        // below rather than left open in the log.
+                        session
+                            .commit_and_publish(
+                                &blueprint,
+                                Some(turn_commit.snapshot),
+                                Some(turn_commit.expected_head),
+                                Some(state),
+                                turn_commit.events,
+                                Some(live.as_ref()),
+                            )
+                            .await
+                            .map(|_| ())
+                    }
+                    Err(error) => Err(error),
+                };
+                if outcome.is_ok() {
+                    turn_outcome.record("completed");
+                }
+                if let Err(error) = outcome {
+                    let provider_error = error.downcast_ref::<ProviderError>();
+                    let retryable = provider_error
+                        .map(|provider_error| provider_error.retryable())
+                        .unwrap_or(false);
+                    let cancelled = task_cancel_status.is_cancelled()
+                        || provider_error.is_some_and(ProviderError::is_cancelled);
+                    turn_outcome.record(if cancelled { "cancelled" } else { "failed" });
                     error!(
                         session_id = %session.session_id,
                         turn_id = %turn.id,
                         error = %error,
-                        "failed to commit turn start"
+                        retryable,
+                        cancelled,
+                        "turn failed"
                     );
-                    live.emit_error(error);
-                    return;
-                }
-            };
-
-            // A plugin panic must use the same failure finalization as an
-            // ordinary error. Cancel its execution scope so any tool work
-            // holding child tokens also stops, without marking it as a user
-            // interruption.
-            let execution_cancel = task_cancel.child_token();
-            let execution = std::panic::AssertUnwindSafe(session.run_turn(
-                stored,
-                turn.clone(),
-                start_head,
-                execution_cancel.clone(),
-                live.as_ref(),
-            ))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| {
-                execution_cancel.cancel();
-                Err(anyhow::anyhow!("session execution panicked"))
-            });
-            let outcome = match execution {
-                Ok(turn_commit) => {
-                    let mut state = turn_commit.state;
-                    state.open_turn = None;
-                    // A turn whose final commit fails is recorded as failed
-                    // below rather than left open in the log.
-                    session
-                        .commit_and_publish(
-                            &blueprint,
-                            Some(turn_commit.snapshot),
-                            Some(turn_commit.expected_head),
-                            Some(state),
-                            turn_commit.events,
-                            Some(live.as_ref()),
-                        )
+                    let failure_events =
+                        vec![session.make_event(SessionEventPayload::TurnFailed {
+                            turn_id: turn.id.clone(),
+                            error: error.to_string(),
+                            cancelled,
+                            retryable,
+                        })];
+                    if let Err(commit_error) = session
+                        .commit_turn_failure(failure_events, Some(live.as_ref()))
                         .await
-                        .map(|_| ())
+                    {
+                        error!(
+                            session_id = %session.session_id,
+                            turn_id = %turn.id,
+                            error = %commit_error,
+                            "failed to commit failed turn"
+                        );
+                        live.emit_error(commit_error);
+                    }
                 }
-                Err(error) => Err(error),
-            };
-            if let Err(error) = outcome {
-                let provider_error = error.downcast_ref::<ProviderError>();
-                let retryable = provider_error
-                    .map(|provider_error| provider_error.retryable())
-                    .unwrap_or(false);
-                let cancelled = task_cancel_status.is_cancelled()
-                    || provider_error.is_some_and(ProviderError::is_cancelled);
-                error!(
-                    session_id = %session.session_id,
-                    turn_id = %turn.id,
-                    error = %error,
-                    retryable,
-                    cancelled,
-                    "turn failed"
-                );
-                let failure_events = vec![session.make_event(SessionEventPayload::TurnFailed {
-                    turn_id: turn.id.clone(),
-                    error: error.to_string(),
-                    cancelled,
-                    retryable,
-                })];
-                if let Err(commit_error) = session
-                    .commit_turn_failure(failure_events, Some(live.as_ref()))
-                    .await
-                {
+                // Out-of-turn hook dispatches queued behind this turn are not
+                // part of it, so a failure to commit them is logged rather than
+                // surfaced on the turn stream.
+                if let Err(error) = lease.release().await {
                     error!(
                         session_id = %session.session_id,
                         turn_id = %turn.id,
-                        error = %commit_error,
-                        "failed to commit failed turn"
+                        error = %error,
+                        "failed to commit hook dispatches queued behind turn"
                     );
-                    live.emit_error(commit_error);
                 }
             }
-            // Out-of-turn hook dispatches queued behind this turn are not
-            // part of it, so a failure to commit them is logged rather than
-            // surfaced on the turn stream.
-            if let Err(error) = lease.release().await {
-                error!(
-                    session_id = %session.session_id,
-                    turn_id = %turn.id,
-                    error = %error,
-                    "failed to commit hook dispatches queued behind turn"
-                );
-            }
-        });
+            .instrument(turn_span),
+        );
 
         if let Err(register_error) =
             self.services
@@ -1302,6 +1338,8 @@ impl SessionExecutor {
         Ok(())
     }
 
+    /// Run one turn, recording its token usage on `turn_span` whether the
+    /// turn succeeds or fails.
     async fn run_turn(
         &self,
         stored: StoredSession,
@@ -1309,13 +1347,40 @@ impl SessionExecutor {
         start_head: u64,
         turn_cancel: CancellationToken,
         live: &LiveTurnStream,
+        turn_span: &tracing::Span,
+    ) -> anyhow::Result<TurnCommit> {
+        let mut totals = TurnSpanTotals::new(turn_span.clone());
+        self.run_turn_inner(
+            stored,
+            turn,
+            start_head,
+            turn_cancel,
+            live,
+            turn_span,
+            &mut totals.usage,
+            &mut totals.provider_iterations,
+        )
+        .await
+        // `totals` drops here (or while unwinding a panic, or when the task
+        // is aborted) and records the totals on the span exactly once.
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_turn_inner(
+        &self,
+        stored: StoredSession,
+        turn: Turn,
+        start_head: u64,
+        turn_cancel: CancellationToken,
+        live: &LiveTurnStream,
+        turn_span: &tracing::Span,
+        turn_usage: &mut Usage,
+        provider_iterations: &mut u32,
     ) -> anyhow::Result<TurnCommit> {
         let snapshot = self.services.resources.snapshot();
         let mut expected_head = start_head;
         let mut state = stored.state;
         let mut events = Vec::new();
-        let mut turn_usage = Usage::default();
-        let mut provider_iterations = 0u32;
         let mut fired_hook_ids = state
             .fired_hook_ids
             .iter()
@@ -1400,7 +1465,7 @@ impl SessionExecutor {
             );
             events.push(self.make_event(SessionEventPayload::TurnCompleted {
                 turn_id: turn.id,
-                usage: turn_usage,
+                usage: turn_usage.clone(),
             }));
             return Ok(TurnCommit {
                 expected_head,
@@ -1474,7 +1539,7 @@ impl SessionExecutor {
                     &mut fired_hook_ids,
                     hook_ctx,
                     &mut ledger_at_boundary,
-                    &mut turn_usage,
+                    turn_usage,
                     &turn_cancel,
                 )
                 .await
@@ -1539,8 +1604,8 @@ impl SessionExecutor {
             if turn_cancel.is_cancelled() {
                 return Err(ProviderError::cancelled().into());
             }
-            ensure_provider_iteration_allowed(stored.blueprint.max_turns, provider_iterations)?;
-            provider_iterations = provider_iterations.saturating_add(1);
+            ensure_provider_iteration_allowed(stored.blueprint.max_turns, *provider_iterations)?;
+            *provider_iterations = provider_iterations.saturating_add(1);
             self.services
                 .context
                 .check_cap(state.token_ledger.effective_tokens())?;
@@ -1557,6 +1622,14 @@ impl SessionExecutor {
                 turn.subagent_model.as_ref(),
             );
             let model = self.services.models.model(&selected_models.default_model)?;
+            // The model comes from the blueprint and turn overrides, which
+            // are fixed for the turn, so record it once. Re-recording a span
+            // field makes the compact formatter repeat it on every line.
+            if *provider_iterations == 1 {
+                turn_span.record("provider", tracing::field::display(&model.provider));
+                turn_span.record("model", tracing::field::display(&model.model));
+                turn_span.record("model_id", tracing::field::display(&model.id));
+            }
             let subagent_model = self
                 .services
                 .models
@@ -1570,7 +1643,7 @@ impl SessionExecutor {
             // and first-step only — the default's own output carries the
             // influence forward through the rest of the turn.
             let mut request_messages = plan.messages.clone();
-            if provider_iterations == 1
+            if *provider_iterations == 1
                 && let Some(judge) = self
                     .services
                     .models
@@ -1711,7 +1784,7 @@ impl SessionExecutor {
                         &mut fired_hook_ids,
                         hook_ctx,
                         &mut ledger_at_boundary,
-                        &mut turn_usage,
+                        turn_usage,
                         &turn_cancel,
                     )
                     .await;
@@ -1792,7 +1865,7 @@ impl SessionExecutor {
                             &mut fired_hook_ids,
                             hook_ctx,
                             &mut ledger_at_boundary,
-                            &mut turn_usage,
+                            turn_usage,
                             &turn_cancel,
                         )
                         .await;
@@ -1859,7 +1932,7 @@ impl SessionExecutor {
                 );
                 events.push(self.make_event(SessionEventPayload::TurnCompleted {
                     turn_id: turn.id,
-                    usage: turn_usage,
+                    usage: turn_usage.clone(),
                 }));
                 return Ok(TurnCommit {
                     expected_head,
@@ -1984,6 +2057,18 @@ impl SessionExecutor {
             // because each mutates `state` and may change `call.arguments`).
             let mut prepared: Vec<PreparedToolCall> = Vec::with_capacity(batch.len());
             for mut call in batch {
+                // One `tool_call` span per call covers its pre-hooks,
+                // execution, and post-hooks. Arguments are never span fields.
+                let span = info_span!(
+                    "tool_call",
+                    session_id = %self.session_id,
+                    turn_id = %turn_id,
+                    tool_name = %call.name,
+                    tool_call_id = %call.id,
+                    outcome = Empty,
+                    is_error = Empty,
+                );
+                let mut outcome = crate::span_outcome::SpanOutcome::new(span.clone());
                 let pre_dispatch = run_pre_tool_use(
                     self,
                     fired_hook_ids,
@@ -1995,7 +2080,9 @@ impl SessionExecutor {
                     },
                     &call,
                 )
-                .await?;
+                .instrument(span.clone())
+                .await
+                .inspect_err(|_| outcome.record("error"))?;
                 track_fired_hook_ids(fired_hook_ids, &pre_dispatch);
                 self.record_hook_dispatch(events, &pre_dispatch);
                 for message in apply_hook_side_effects(state, &pre_dispatch) {
@@ -2004,18 +2091,26 @@ impl SessionExecutor {
                 if let Some(updated_input) = pre_dispatch.merged.updated_input.clone() {
                     call.arguments = updated_input;
                 }
-                info!(
-                    session_id = %self.session_id,
-                    tool_call_id = %call.id,
-                    tool_name = %call.name,
-                    "executing tool call"
-                );
+                // Info/debug events inside `tool_call` get the call's ids from
+                // the span, which shares their target and is info level, so a
+                // level filter that enables them enables it too. Repeating the
+                // ids would print them twice.
+                span.in_scope(|| {
+                    info!("executing tool call");
+                });
                 self.push_event(
                     events,
                     SessionEventPayload::ToolExecutionStarted { call: call.clone() },
                 );
 
                 if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
+                    outcome.record("blocked");
+                    span.record("is_error", true);
+                    span.in_scope(|| {
+                        info!("tool call blocked by hook");
+                        // Hook-authored text; kept below info.
+                        debug!(reason = %reason, "tool call block reason");
+                    });
                     let error = ToolError::new(reason);
                     let outcome = ToolExecutionOutcome {
                         call: call.clone(),
@@ -2068,6 +2163,8 @@ impl SessionExecutor {
                     call,
                     context,
                     tool_event_drain,
+                    span,
+                    outcome,
                 });
             }
 
@@ -2106,8 +2203,16 @@ impl SessionExecutor {
                             .await
                             .map(|result| (result, None))
                     }
+                    .instrument(p.span.clone())
                 }))
                 .await;
+            // Record execution outcomes up front, so a post-hook error that
+            // aborts Phase C cannot leave executed calls without one.
+            for (prep, execution) in prepared.iter_mut().zip(&executions) {
+                prep.span.record("is_error", execution.is_err());
+                prep.outcome
+                    .record(if execution.is_ok() { "ok" } else { "error" });
+            }
 
             // Phase C: post-hook + state mutation (sequential, original order).
             for (prep, execution) in prepared.into_iter().zip(executions) {
@@ -2115,6 +2220,8 @@ impl SessionExecutor {
                     call,
                     context,
                     tool_event_drain,
+                    span,
+                    outcome: _,
                 } = prep;
                 drop(context);
                 for payload in tool_event_drain
@@ -2128,23 +2235,26 @@ impl SessionExecutor {
                 let (mut content, error) = match execution {
                     Ok((result, follow_up)) => {
                         follow_ups.extend(follow_up);
-                        debug!(
-                            session_id = %self.session_id,
-                            tool_call_id = %call.id,
-                            tool_name = %call.name,
-                            result_kind = tool_result_kind(&result),
-                            "tool call completed"
-                        );
+                        span.in_scope(|| {
+                            debug!(
+                                result_kind = tool_result_kind(&result),
+                                "tool call completed"
+                            );
+                        });
                         (result, None)
                     }
                     Err(error) => {
-                        warn!(
-                            session_id = %self.session_id,
-                            tool_call_id = %call.id,
-                            tool_name = %call.name,
-                            error = %error,
-                            "tool call failed"
-                        );
+                        span.in_scope(|| {
+                            // Warn is enabled at the default filter, where the
+                            // info-level span is not, so keep the ids here.
+                            warn!(
+                                session_id = %self.session_id,
+                                tool_call_id = %call.id,
+                                tool_name = %call.name,
+                                error = %error,
+                                "tool call failed"
+                            );
+                        });
                         (ToolResult::Empty, Some(ToolError::new(error.to_string())))
                     }
                 };
@@ -2161,6 +2271,7 @@ impl SessionExecutor {
                         &call,
                         &content,
                     )
+                    .instrument(span.clone())
                     .await?;
                     track_fired_hook_ids(fired_hook_ids, &post_dispatch);
                     self.record_hook_dispatch(events, &post_dispatch);
@@ -2183,6 +2294,7 @@ impl SessionExecutor {
                         &call,
                         tool_error,
                     )
+                    .instrument(span.clone())
                     .await?;
                     track_fired_hook_ids(fired_hook_ids, &post_dispatch);
                     self.record_hook_dispatch(events, &post_dispatch);
@@ -3203,9 +3315,14 @@ async fn materialize_assistant_message_with_cancel(
                             model = %model.model,
                             tool_call_id = %pending.tool_call_id,
                             block_id = %id,
-                            raw_arguments = %pending.arguments,
+                            raw_arguments_len = pending.arguments.len(),
                             %error,
                             "tool call arguments failed to parse; substituting empty object"
+                        );
+                        tracing::trace!(
+                            tool_call_id = %pending.tool_call_id,
+                            raw_arguments = %pending.arguments,
+                            "unparseable tool call arguments"
                         );
                         serde_json::json!({})
                     }
@@ -3280,9 +3397,14 @@ async fn materialize_assistant_message_with_cancel(
                     model = %model.model,
                     tool_call_id = %pending.tool_call_id,
                     block_id = %block_id,
-                    raw_arguments = %pending.arguments,
+                    raw_arguments_len = pending.arguments.len(),
                     %error,
                     "stream ended with unterminated tool call whose arguments failed to parse; substituting empty object"
+                );
+                tracing::trace!(
+                    tool_call_id = %pending.tool_call_id,
+                    raw_arguments = %pending.arguments,
+                    "unparseable tool call arguments"
                 );
                 serde_json::json!({})
             }
@@ -3947,6 +4069,48 @@ struct PreparedToolCall {
     call: ToolCall,
     context: halter_tools::ToolContext,
     tool_event_drain: ToolEventDrain,
+    /// The call's `tool_call` span, carried from pre-hooks to post-hooks.
+    span: tracing::Span,
+    /// Records the span's `outcome` once; `aborted` if the call is dropped
+    /// before running (e.g. the pre-batch checkpoint fails).
+    outcome: crate::span_outcome::SpanOutcome,
+}
+
+/// Per-turn totals recorded on the `turn` span exactly once, when dropped:
+/// after the turn returns or fails, while a panic unwinds, or when the turn
+/// task is aborted. Token counts live only on `turn` so span-derived metrics
+/// never double count; each field is recorded once because the compact
+/// formatter repeats re-recorded fields.
+struct TurnSpanTotals {
+    span: tracing::Span,
+    usage: Usage,
+    provider_iterations: u32,
+}
+
+impl TurnSpanTotals {
+    fn new(span: tracing::Span) -> Self {
+        Self {
+            span,
+            usage: Usage::default(),
+            provider_iterations: 0,
+        }
+    }
+}
+
+impl Drop for TurnSpanTotals {
+    fn drop(&mut self) {
+        let usage = &self.usage;
+        self.span.record("input_tokens", usage.input_tokens);
+        self.span.record("output_tokens", usage.output_tokens);
+        self.span
+            .record("cache_read_input_tokens", usage.cache_read_input_tokens);
+        self.span.record(
+            "cache_creation_input_tokens",
+            usage.cache_creation_input_tokens,
+        );
+        self.span
+            .record("provider_iterations", self.provider_iterations);
+    }
 }
 
 /// Partition `tool_calls` into concurrency-compatible batches per the
@@ -12108,6 +12272,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_turn_judge_panel_turn_spans_nest_under_the_parent_turn() {
+        let capture = crate::telemetry_capture::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = full_turn_judge_services(
+            temp.path(),
+            Arc::new(RecordingFakeProvider::new(Some("default answer"))),
+            Arc::new(RecordingFakeProvider::new(Some("panel outcome"))),
+            Arc::new(RecordingFakeProvider::new(Some("synthesis verdict"))),
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        session
+            .submit_turn(Turn::user("plan the work"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let turns = capture.spans_named("turn");
+        let parent = turns
+            .iter()
+            .find(|turn| {
+                turn.field("session_id") == Some(session.session_id().to_string().as_str())
+            })
+            .expect("parent turn span");
+        assert_eq!(parent.parent, None);
+        let panel = turns
+            .iter()
+            .find(|turn| turn.field("model_id") == Some("panel-0"))
+            .unwrap_or_else(|| panic!("panel turn span: {turns:?}"));
+        assert_eq!(panel.parent, Some("turn"), "{panel:?}");
+    }
+
+    #[tokio::test]
     async fn subagent_lifecycle_hooks_queue_behind_the_parent_turn() {
         // Both hooks fire while the parent turn is mid-flight: SubagentStart
         // inside the spawn tool call, SubagentStop when the child finishes
@@ -12863,5 +13063,237 @@ mod tests {
             let expected = if live_list { ["live"] } else { ["logged"] };
             assert_eq!(subjects, expected, "{case}");
         }
+    }
+
+    // --- tracing span instrumentation ---
+
+    fn turn_ids(events: &[SessionEvent]) -> (String, Usage) {
+        let turn_id = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnStarted { turn_id, .. } => Some(turn_id.to_string()),
+                _ => None,
+            })
+            .expect("turn started");
+        let usage = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::TurnCompleted { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        (turn_id, usage)
+    }
+
+    #[tokio::test]
+    async fn turn_and_tool_call_spans_record_ids_usage_and_outcome() {
+        let capture = crate::telemetry_capture::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(ToolLoopProvider), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        let events = session
+            .submit_turn(Turn::user("write a note"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+        let (turn_id, usage) = turn_ids(&events);
+        let call = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::ToolExecutionStarted { call } => Some(call.clone()),
+                _ => None,
+            })
+            .expect("tool execution started");
+
+        let turns = capture.spans_named("turn");
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        let turn = &turns[0];
+        assert_eq!(
+            turn.field("session_id"),
+            Some(session.session_id().to_string().as_str())
+        );
+        assert_eq!(turn.field("turn_id"), Some(turn_id.as_str()));
+        assert_eq!(turn.field("provider"), Some("fake"));
+        assert_eq!(turn.field("model"), Some("halter/fake"));
+        assert_eq!(turn.field("model_id"), Some("default"));
+        assert_eq!(turn.field("provider_iterations"), Some("2"));
+        assert_eq!(
+            turn.field("input_tokens"),
+            Some(usage.input_tokens.to_string().as_str())
+        );
+        assert_eq!(
+            turn.field("output_tokens"),
+            Some(usage.output_tokens.to_string().as_str())
+        );
+        assert!(usage.input_tokens > 0);
+        assert_eq!(turn.field("outcome"), Some("completed"));
+
+        let tool_calls = capture.spans_named("tool_call");
+        assert_eq!(tool_calls.len(), 1, "{tool_calls:?}");
+        let tool_call = &tool_calls[0];
+        assert_eq!(tool_call.parent, Some("turn"));
+        assert_eq!(tool_call.field("turn_id"), Some(turn_id.as_str()));
+        assert_eq!(tool_call.field("tool_name"), Some(call.name.0.as_str()));
+        assert_eq!(
+            tool_call.field("tool_call_id"),
+            Some(call.id.to_string().as_str())
+        );
+        assert_eq!(tool_call.field("outcome"), Some("ok"));
+        assert_eq!(tool_call.field("is_error"), Some("false"));
+
+        // Tool arguments never become span fields.
+        for span in turns.iter().chain(&tool_calls) {
+            assert!(
+                span.fields
+                    .values()
+                    .all(|value| !value.contains("hello from tool")),
+                "{span:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_output_repeats_no_turn_span_fields_across_iterations() {
+        let buffer = crate::telemetry_capture::BufferWriter::default();
+        let _guard = tracing::subscriber::set_default(
+            crate::telemetry_capture::compact_subscriber(buffer.clone()),
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(ToolLoopProvider), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        session
+            .submit_turn(Turn::user("write a note"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let output = buffer.contents();
+        // The second provider iteration's completion line carries the turn
+        // span's fields; fields recorded after creation must appear once.
+        let line = output
+            .lines()
+            .find(|line| line.contains("turn completed without tool calls"))
+            .unwrap_or_else(|| panic!("completion line in: {output}"));
+        for field in [" model_id=", " provider=", " model="] {
+            assert_eq!(line.matches(field).count(), 1, "{field} in {line}");
+        }
+        let executing = output
+            .lines()
+            .find(|line| line.contains("executing tool call"))
+            .unwrap_or_else(|| panic!("tool call line in: {output}"));
+        // (`session_id`/`turn_id` are on both `turn` and `tool_call` spans on
+        // purpose: OTel attributes are not inherited.)
+        for field in [" tool_name=", " tool_call_id="] {
+            assert_eq!(
+                executing.matches(field).count(),
+                1,
+                "{field} in {executing}"
+            );
+        }
+        for line in output.lines() {
+            for field in [
+                " model_id=",
+                " provider_iterations=",
+                " outcome=",
+                " attempt=",
+            ] {
+                assert!(
+                    line.matches(field).count() <= 1,
+                    "{field} repeated in {line}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_tool_call_span_records_blocked_outcome() {
+        let capture = crate::telemetry_capture::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(ToolLoopProvider), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        let (hooks_file, warnings) = HooksFile::from_json_bytes(
+            br#"{
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "write",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "echo blocked by hook >&2; exit 2"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parse hooks");
+        assert!(warnings.is_empty());
+        install_file_hooks(&services, temp.path(), hooks_file);
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        session
+            .submit_turn(Turn::user("write a note"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let tool_calls = capture.spans_named("tool_call");
+        assert_eq!(tool_calls.len(), 1, "{tool_calls:?}");
+        assert_eq!(tool_calls[0].field("outcome"), Some("blocked"));
+        assert_eq!(tool_calls[0].field("is_error"), Some("true"));
+
+        let decisions = capture.events_with_message("hooks.decision");
+        let blocked = decisions
+            .iter()
+            .find(|event| event.field("blocked") == Some("true"))
+            .unwrap_or_else(|| panic!("blocked hooks.decision event: {decisions:?}"));
+        assert_eq!(blocked.level, tracing::Level::INFO);
+        assert_eq!(blocked.scope.first().copied(), Some("hook_dispatch"));
+        assert!(blocked.scope.contains(&"tool_call"), "{blocked:?}");
+        assert!(
+            blocked.fields.keys().all(|key| !key.contains("reason")),
+            "{blocked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_span_records_failed_outcome() {
+        let capture = crate::telemetry_capture::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = configured_services(Arc::new(FailingProvider), temp.path());
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+
+        session
+            .submit_turn(Turn::user("will fail"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let turns = capture.spans_named("turn");
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert_eq!(turns[0].field("outcome"), Some("failed"));
+        assert_eq!(turns[0].field("input_tokens"), Some("0"));
+        assert_eq!(turns[0].field("output_tokens"), Some("0"));
     }
 }

@@ -15,7 +15,8 @@ use halter_protocol::{
 };
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::field::Empty;
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::Provider;
 use crate::retry::{RetryGate, RetryPolicy};
@@ -137,15 +138,38 @@ where
         let policy = self.policy;
         let classifier = self.classifier.clone();
         let label = self.label;
+        // One span per logical request, covering setup, streaming, and
+        // retries. Built-in providers all wrap `ResilientProvider`, so this
+        // is the single provider-request instrumentation point. The worker
+        // task carries the span via `.instrument`, so `Span::current()`
+        // inside it (and in the helpers it awaits) is this span.
+        let span = info_span!(
+            "provider_request",
+            provider = %request.model.provider,
+            provider_kind = label,
+            model = %request.model.model,
+            model_id = %request.model.id,
+            session_id = %request.session_id,
+            turn_id = %request.turn_id,
+            attempt = Empty,
+            outcome = Empty,
+            error_kind = Empty,
+        );
+        let attempts = AttemptCount::new(span.clone());
 
         tokio::spawn(async move {
             let cancel = task_cancel;
             let mut tx = tx;
             let mut gate = RetryGate::new(policy.request_retry);
             let mut commit_dedup = CommitDedup::default();
+            // Move the whole guard into the task (not just the field the
+            // loop assigns) so it drops when the request ends;
+            // declared after `tx` so it records before the stream closes.
+            let mut attempts = attempts;
 
             loop {
                 let attempt_id = gate.next_attempt_id();
+                attempts.latest = attempt_id;
                 let attempt_cancel = cancel.child_token();
                 // Every exit from this attempt (retry, terminal error, return)
                 // releases the attempt's upstream reader.
@@ -237,7 +261,7 @@ where
                             );
                             if !committed && error.retryable() {
                                 warn!(
-                                    provider = label,
+                                    provider_kind = label,
                                     attempt = attempt_id,
                                     error = %error,
                                     "retryable pre-commit provider stream timeout"
@@ -266,7 +290,7 @@ where
                             let error = classifier.classify(error);
                             if !committed && error.retryable() {
                                 warn!(
-                                    provider = label,
+                                    provider_kind = label,
                                     attempt = attempt_id,
                                     error = %error,
                                     backoff_hint = ?error.backoff_hint,
@@ -322,7 +346,7 @@ where
                             let error = classifier.classify(error);
                             if !committed && error.retryable() {
                                 warn!(
-                                    provider = label,
+                                    provider_kind = label,
                                     attempt = attempt_id,
                                     error = %error,
                                     backoff_hint = ?error.backoff_hint,
@@ -357,13 +381,15 @@ where
                                     return;
                                 }
                             }
-                            debug!(provider = label, "provider stream completed");
+                            record_request_outcome("completed", None);
+                            debug!(provider_kind = label, "provider stream completed");
                             return;
                         }
                     }
                 }
             }
-        });
+        }
+        .instrument(span));
 
         Ok(CancelOnDrop::new(rx, stream_cancel).boxed())
     }
@@ -373,9 +399,47 @@ where
         request: ProviderCompactionRequest,
         cancel: CancellationToken,
     ) -> anyhow::Result<ProviderCompactionResponse> {
+        let span = info_span!(
+            "provider_compaction",
+            provider = %request.model.provider,
+            provider_kind = self.label,
+            model = %request.model.model,
+            model_id = %request.model.id,
+            session_id = %request.session_id,
+            attempt = Empty,
+            outcome = Empty,
+            error_kind = Empty,
+        );
+        let mut attempts = AttemptCount::new(span.clone());
+        let result = self
+            .compact_with_retries(request, cancel, &mut attempts.latest)
+            .instrument(span.clone())
+            .await;
+        match &result {
+            Ok(_) => span.record("outcome", "completed"),
+            Err(error) => match error.downcast_ref::<ProviderError>() {
+                Some(error) if error.is_cancelled() => span.record("outcome", "cancelled"),
+                Some(error) => span
+                    .record("outcome", "error")
+                    .record("error_kind", tracing::field::debug(&error.kind)),
+                None => span.record("outcome", "error"),
+            },
+        };
+        result
+    }
+}
+
+impl<P: Provider + 'static> ResilientProvider<P> {
+    async fn compact_with_retries(
+        &self,
+        request: ProviderCompactionRequest,
+        cancel: CancellationToken,
+        latest_attempt: &mut u32,
+    ) -> anyhow::Result<ProviderCompactionResponse> {
         let mut gate = RetryGate::new(self.policy.request_retry);
         loop {
             let attempt_id = gate.next_attempt_id();
+            *latest_attempt = attempt_id;
             let attempt = select! {
                 biased;
                 _ = cancel.cancelled() => return Err(anyhow::Error::new(ProviderError::cancelled())),
@@ -405,8 +469,9 @@ where
             match gate.record_failure_and_next_backoff(error.backoff_hint) {
                 Some(delay) => {
                     info!(
-                        provider = self.label,
+                        provider_kind = self.label,
                         attempt = attempt_id,
+                        error_kind = ?error.kind,
                         retry_in_ms = delay.as_millis() as u64,
                         "retrying provider compaction request"
                     );
@@ -419,7 +484,7 @@ where
                 }
                 None => {
                     warn!(
-                        provider = self.label,
+                        provider_kind = self.label,
                         attempt = attempt_id,
                         kind = ?error.kind,
                         "provider compaction retry budget exhausted"
@@ -459,13 +524,24 @@ async fn forward(
     cancel: &CancellationToken,
     item: Result<StreamEvent, ProviderError>,
 ) -> bool {
+    // Every terminal provider error reaches the consumer through here. Each
+    // branch records the outcome at most once: re-recorded span fields are
+    // repeated by the compact formatter.
+    let terminal_error = item.as_ref().err().cloned();
     select! {
         biased;
         _ = cancel.cancelled() => {
             send_cancelled(tx).await;
             false
         }
-        result = tx.send(item) => result.is_ok(),
+        result = tx.send(item) => {
+            match &terminal_error {
+                Some(error) if error.is_cancelled() => record_request_outcome("cancelled", None),
+                Some(error) => record_request_outcome("error", Some(error)),
+                None => {}
+            }
+            result.is_ok()
+        }
     }
 }
 
@@ -474,7 +550,42 @@ async fn forward(
 /// marker and leave the consumer with a silent end-of-stream; it returns as
 /// soon as the consumer drops the receiver.
 async fn send_cancelled(tx: &mut mpsc::Sender<Result<StreamEvent, ProviderError>>) {
+    record_request_outcome("cancelled", None);
     let _ = tx.send(Err(ProviderError::cancelled())).await;
+}
+
+/// Records the final attempt number on a request span once, when dropped
+/// (request finished, failed, or its worker was dropped). Recording at the
+/// start of every attempt would make the compact formatter repeat `attempt`
+/// on every line.
+struct AttemptCount {
+    span: tracing::Span,
+    latest: u32,
+}
+
+impl AttemptCount {
+    fn new(span: tracing::Span) -> Self {
+        Self { span, latest: 0 }
+    }
+}
+
+impl Drop for AttemptCount {
+    fn drop(&mut self) {
+        if self.latest > 0 {
+            self.span.record("attempt", self.latest);
+        }
+    }
+}
+
+/// Record the terminal outcome on the `provider_request` span. Only called
+/// from the instrumented worker task (directly or through `forward`,
+/// `send_cancelled`, and `retry_or_emit`), so `Span::current()` is that span.
+fn record_request_outcome(outcome: &'static str, error: Option<&ProviderError>) {
+    let span = tracing::Span::current();
+    span.record("outcome", outcome);
+    if let Some(error) = error {
+        span.record("error_kind", tracing::field::debug(&error.kind));
+    }
 }
 
 struct RetryContext<'a> {
@@ -497,8 +608,9 @@ async fn retry_or_emit(context: RetryContext<'_>, error: ProviderError) -> bool 
     {
         Some(delay) => {
             info!(
-                provider = context.label,
+                provider_kind = context.label,
                 attempt = context.attempt_id,
+                error_kind = ?error.kind,
                 retry_in_ms = delay.as_millis() as u64,
                 "retrying provider request"
             );
@@ -513,7 +625,7 @@ async fn retry_or_emit(context: RetryContext<'_>, error: ProviderError) -> bool 
         }
         None => {
             warn!(
-                provider = context.label,
+                provider_kind = context.label,
                 attempt = context.attempt_id,
                 kind = ?error.kind,
                 "provider retry budget exhausted"
@@ -758,6 +870,125 @@ mod tests {
             event,
             StreamEvent::TextDelta { delta, .. } if delta == "done"
         )));
+    }
+
+    #[tokio::test]
+    async fn provider_request_span_records_attempt_and_outcome() {
+        let capture = crate::telemetry_capture::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let provider = ScriptedProvider::new(vec![
+            vec![Err(transient_error("rate limited"))],
+            success_events("msg_retry", "done"),
+        ]);
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+        let request = sample_request();
+
+        let mut stream = resilient
+            .stream(request.clone(), CancellationToken::new())
+            .await
+            .expect("stream");
+        while stream.next().await.is_some() {}
+
+        let spans = capture.spans_named("provider_request");
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let span = &spans[0];
+        assert_eq!(span.parent, None);
+        assert_eq!(span.field("provider_kind"), Some("test"));
+        assert_eq!(
+            span.field("provider"),
+            Some(request.model.provider.to_string().as_str())
+        );
+        assert_eq!(span.field("model"), Some(request.model.model.as_str()));
+        assert_eq!(
+            span.field("session_id"),
+            Some(request.session_id.to_string().as_str())
+        );
+        assert_eq!(span.field("attempt"), Some("2"));
+        assert_eq!(span.field("outcome"), Some("completed"));
+        assert_eq!(span.field("error_kind"), None);
+
+        let retries = capture.events_with_message("retrying provider request");
+        assert_eq!(retries.len(), 1, "{retries:?}");
+        assert_eq!(retries[0].level, tracing::Level::INFO);
+        assert_eq!(retries[0].field("provider_kind"), Some("test"));
+        assert!(retries[0].field("error_kind").is_some());
+        assert_eq!(retries[0].scope.first().copied(), Some("provider_request"));
+    }
+
+    #[tokio::test]
+    async fn compact_output_does_not_repeat_attempt() {
+        let buffer = crate::telemetry_capture::BufferWriter::default();
+        let _guard = tracing::subscriber::set_default(
+            crate::telemetry_capture::compact_subscriber(buffer.clone()),
+        );
+        let provider = ScriptedProvider::new(vec![
+            vec![Err(transient_error("rate limited"))],
+            vec![Err(transient_error("rate limited"))],
+            success_events("msg_retry", "done"),
+        ]);
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        let mut stream = resilient
+            .stream(sample_request(), CancellationToken::new())
+            .await
+            .expect("stream");
+        while stream.next().await.is_some() {}
+
+        let output = buffer.contents();
+        let retries = output
+            .lines()
+            .filter(|line| line.contains("retrying provider request"))
+            .collect::<Vec<_>>();
+        assert_eq!(retries.len(), 2, "{output}");
+        for line in retries {
+            assert!(line.contains("provider_request"), "{line}");
+            assert_eq!(line.matches(" attempt=").count(), 1, "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_request_span_records_fatal_error() {
+        let capture = crate::telemetry_capture::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let provider = ScriptedProvider::new(vec![vec![Err(ProviderError::with_kind(
+            "bad request",
+            ProviderErrorKind::Fatal,
+        ))]]);
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        let items = collect_items(resilient, CancellationToken::new()).await;
+        assert_eq!(items.len(), 1);
+
+        let spans = capture.spans_named("provider_request");
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].field("attempt"), Some("1"));
+        assert_eq!(spans[0].field("outcome"), Some("error"));
+        assert_eq!(spans[0].field("error_kind"), Some("Fatal"));
+    }
+
+    #[tokio::test]
+    async fn provider_compaction_span_records_attempt_and_outcome() {
+        let capture = crate::telemetry_capture::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let provider = ScriptedCompactProvider::new(vec![
+            Err(anyhow::Error::new(ProviderError::with_kind(
+                "rate limited",
+                ProviderErrorKind::RateLimited,
+            ))),
+            Ok(compaction_response()),
+        ]);
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        resilient
+            .compact(sample_compaction_request(), CancellationToken::new())
+            .await
+            .expect("compaction succeeds after retry");
+
+        let spans = capture.spans_named("provider_compaction");
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].field("provider_kind"), Some("test"));
+        assert_eq!(spans[0].field("attempt"), Some("2"));
+        assert_eq!(spans[0].field("outcome"), Some("completed"));
     }
 
     #[tokio::test]
