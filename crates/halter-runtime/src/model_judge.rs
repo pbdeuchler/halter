@@ -27,7 +27,7 @@ use halter_providers::{
 };
 use halter_tools::{ToolRuntime, ToolSessionStore};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 use crate::session::create_session_seeded;
 use crate::subagent_session::extract_subagent_output;
@@ -128,17 +128,22 @@ pub(crate) fn run_full_turn_deliberation(
         // `Send` and the panels genuinely run in parallel.
         let mut handles = Vec::with_capacity(plan.panel.len());
         for (panelist, workspace) in plan.panel.iter().zip(workspaces.iter()) {
-            handles.push(tokio::spawn(run_panel_turn(
-                services.clone(),
-                snapshot.clone(),
-                blueprint.clone(),
-                panelist.clone(),
-                workspace.dir(&blueprint),
-                read_only_tools.clone(),
-                fork_messages.clone(),
-                user_text.clone(),
-                cancel.child_token(),
-            )));
+            handles.push(tokio::spawn(
+                run_panel_turn(
+                    services.clone(),
+                    snapshot.clone(),
+                    blueprint.clone(),
+                    panelist.clone(),
+                    workspace.dir(&blueprint),
+                    read_only_tools.clone(),
+                    fork_messages.clone(),
+                    user_text.clone(),
+                    cancel.child_token(),
+                )
+                // Panel turns are awaited within this turn, so their `turn` and
+                // `provider_request` spans nest under it.
+                .in_current_span(),
+            ));
         }
 
         let mut candidates: Vec<Candidate> = Vec::new();

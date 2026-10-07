@@ -12236,6 +12236,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_turn_judge_panel_turn_spans_nest_under_the_parent_turn() {
+        let capture = crate::telemetry_capture::Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.subscriber());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let services = full_turn_judge_services(
+            temp.path(),
+            Arc::new(RecordingFakeProvider::new(Some("default answer"))),
+            Arc::new(RecordingFakeProvider::new(Some("panel outcome"))),
+            Arc::new(RecordingFakeProvider::new(Some("synthesis verdict"))),
+        );
+        let runtime = SessionRuntime::new(services.clone());
+        let session = new_session(&runtime, temp.path()).await;
+        session
+            .submit_turn(Turn::user("plan the work"))
+            .await
+            .expect("submit turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect events");
+
+        let turns = capture.spans_named("turn");
+        let parent = turns
+            .iter()
+            .find(|turn| {
+                turn.field("session_id") == Some(session.session_id().to_string().as_str())
+            })
+            .expect("parent turn span");
+        assert_eq!(parent.parent, None);
+        let panel = turns
+            .iter()
+            .find(|turn| turn.field("model_id") == Some("panel-0"))
+            .unwrap_or_else(|| panic!("panel turn span: {turns:?}"));
+        assert_eq!(panel.parent, Some("turn"), "{panel:?}");
+    }
+
+    #[tokio::test]
     async fn subagent_lifecycle_hooks_queue_behind_the_parent_turn() {
         // Both hooks fire while the parent turn is mid-flight: SubagentStart
         // inside the spawn tool call, SubagentStop when the child finishes
