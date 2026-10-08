@@ -69,6 +69,12 @@
 //! }
 //! ```
 //!
+//! [`TelemetryConfig::try_init_with_otel`] (behind the `otel` feature) does
+//! exactly this for [`otel::OtelLayers`], since those layers specifically
+//! need their own filter independent of `RUST_LOG` — see the `otel` module
+//! docs' "shared-filter pitfall" section for why `try_init_with` alone is
+//! the wrong tool for them.
+//!
 //! `tracing` diagnostics are unrelated to session transcript traces
 //! (`traces_dir`, [`crate::session::export_session_trace`]); this module never
 //! reads or writes transcripts.
@@ -84,6 +90,14 @@ use tracing_subscriber::{
 /// Re-exported so embedders and the CLI name the same `tracing-subscriber`
 /// version that this module's signatures use.
 pub use tracing_subscriber;
+
+/// OTLP trace and metric export, behind the `otel` feature (implies
+/// `telemetry`). See [`otel::OtelConfig`] for the entry point. Nothing in
+/// this module installs global OpenTelemetry state; it only builds
+/// `tracing_subscriber::Layer`s and a shutdown guard that the caller composes
+/// with [`TelemetryConfig::try_init_with`] (or manually).
+#[cfg(feature = "otel")]
+pub mod otel;
 
 /// Directives used when `RUST_LOG` is unset or blank (and no explicit
 /// directives were configured).
@@ -239,6 +253,36 @@ where
         // tracing-subscriber's default `tracing-log` feature it would also
         // install a `log` -> `tracing` bridge (`LogTracer`), which changes
         // which third-party `log` records reach the output.
+        tracing::subscriber::set_global_default(subscriber).context("failed to initialize logging")
+    }
+}
+
+#[cfg(feature = "otel")]
+impl<W> TelemetryConfig<W>
+where
+    W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
+{
+    /// Install the default formatter plus the `otel` feature's trace and
+    /// metrics layers as the global default subscriber, each under its
+    /// *own* per-layer filter instead of the shared [`EnvFilter`]
+    /// [`Self::try_init_with`] would use.
+    ///
+    /// Use this instead of `try_init_with(otel_layers.combined())`: because
+    /// [`crate::telemetry::otel::OtelLayers::trace`]/`::metrics` already
+    /// carry their own per-layer filter (see the `otel` module docs'
+    /// "shared-filter pitfall" section), composing them as *siblings* here
+    /// — rather than nesting them under `try_init_with`'s single shared
+    /// filter — lets OTel see `info`-level halter spans even when the
+    /// console stays at the default `warn` (`RUST_LOG` unset). Fails if a
+    /// global subscriber is already set.
+    pub fn try_init_with_otel(
+        self,
+        otel: crate::telemetry::otel::OtelLayers,
+    ) -> anyhow::Result<()> {
+        let filter = self.env_filter()?;
+        let subscriber = tracing_subscriber::registry()
+            .with(otel.combined())
+            .with(self.fmt_layer().with_filter(filter));
         tracing::subscriber::set_global_default(subscriber).context("failed to initialize logging")
     }
 }

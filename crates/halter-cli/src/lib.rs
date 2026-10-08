@@ -104,10 +104,12 @@ pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let to_file = cli.output_file.is_some();
     let OutputHandles { mut output, trace } = open_output_handles(cli.output_file.as_deref())?;
-    init_logging(trace, to_file)?;
+    let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    let (otel_layer, otel_guard) = maybe_init_otel(otel_endpoint.as_deref())?;
+    init_logging(trace, to_file, otel_layer)?;
     debug!(config_path = %cli.config.display(), command = cli.command.name(), "parsed cli arguments");
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Init => init_config(&cli.config, output.as_mut()).await,
         Commands::Chat => chat(&cli.config, output.as_mut()).await,
         Commands::Run {
@@ -115,8 +117,11 @@ pub async fn run() -> anyhow::Result<()> {
             prompt_file,
             output: run_output,
         } => {
-            let task = read_run_prompt(task, prompt_file).await?;
-            run_once(&cli.config, &task, run_output.mode(), output.as_mut()).await
+            async {
+                let task = read_run_prompt(task, prompt_file).await?;
+                run_once(&cli.config, &task, run_output.mode(), output.as_mut()).await
+            }
+            .await
         }
         Commands::Resources => show_resources(&cli.config, output.as_mut()).await,
         Commands::Validate => validate(&cli.config, output.as_mut()).await,
@@ -129,9 +134,13 @@ pub async fn run() -> anyhow::Result<()> {
             write_output_line(output.as_mut(), export_json_schema()?)?;
             Ok(())
         }
-    }?;
+    };
 
-    output.flush().context("failed to flush output")
+    result?;
+    output.flush().context("failed to flush output")?;
+    // Explicit shutdown (rather than relying only on `OtelGuard`'s `Drop`)
+    // makes the final flush deterministic relative to process exit.
+    shutdown_otel(otel_guard)
 }
 
 async fn init_config(path: &Path, output: &mut dyn Write) -> anyhow::Result<()> {
@@ -464,7 +473,34 @@ fn write_output_line(output: &mut dyn Write, line: impl std::fmt::Display) -> an
     writeln!(output, "{line}").context("failed to write output")
 }
 
-fn init_logging(writer: TraceWriter, json: bool) -> anyhow::Result<()> {
+#[cfg(feature = "otel")]
+fn init_logging(
+    writer: TraceWriter,
+    json: bool,
+    otel: Option<halter::telemetry::otel::OtelLayers>,
+) -> anyhow::Result<()> {
+    let format = if json {
+        LogFormat::Json
+    } else {
+        LogFormat::Compact
+    };
+    let config = TelemetryConfig::new()
+        .with_writer(writer)
+        .with_format(format);
+    match otel {
+        // `try_init_with_otel` composes the console formatter and the OTel
+        // layers as siblings, each under its own per-layer filter, so OTel
+        // sees info-level halter spans even when the console (and
+        // `RUST_LOG`) stays at the default `warn`. Plain `try_init_with`
+        // would nest both under one shared filter and silently export
+        // nothing by default — see `halter::telemetry::otel`'s module docs.
+        Some(layers) => config.try_init_with_otel(layers),
+        None => config.try_init(),
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+fn init_logging(writer: TraceWriter, json: bool, _otel: Option<()>) -> anyhow::Result<()> {
     let format = if json {
         LogFormat::Json
     } else {
@@ -474,6 +510,46 @@ fn init_logging(writer: TraceWriter, json: bool) -> anyhow::Result<()> {
         .with_writer(writer)
         .with_format(format)
         .try_init()
+}
+
+/// Builds the OTLP trace/metric layers and their shutdown guard, but only
+/// when the `otel` feature is compiled in *and* `endpoint` names a non-empty
+/// OTLP endpoint (normally read from `OTEL_EXPORTER_OTLP_ENDPOINT`). Takes
+/// the endpoint as a parameter rather than reading the env var itself so
+/// this is testable without mutating process-wide env state.
+///
+/// The CLI never exports telemetry by default: without `--features otel`,
+/// or with the feature but no endpoint configured, this returns `(None,
+/// None)` and no OTel exporter, provider, or layer is ever constructed.
+#[cfg(feature = "otel")]
+fn maybe_init_otel(
+    endpoint: Option<&str>,
+) -> anyhow::Result<(
+    Option<halter::telemetry::otel::OtelLayers>,
+    Option<halter::telemetry::otel::OtelGuard>,
+)> {
+    match endpoint {
+        Some(endpoint) if !endpoint.is_empty() => {
+            let (layers, guard) = halter::telemetry::otel::OtelConfig::new().build()?;
+            Ok((Some(layers), Some(guard)))
+        }
+        _ => Ok((None, None)),
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+fn maybe_init_otel(_endpoint: Option<&str>) -> anyhow::Result<(Option<()>, Option<()>)> {
+    Ok((None, None))
+}
+
+#[cfg(feature = "otel")]
+fn shutdown_otel(guard: Option<halter::telemetry::otel::OtelGuard>) -> anyhow::Result<()> {
+    guard.map_or(Ok(()), halter::telemetry::otel::OtelGuard::shutdown)
+}
+
+#[cfg(not(feature = "otel"))]
+fn shutdown_otel(_guard: Option<()>) -> anyhow::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -497,6 +573,20 @@ mod tests {
 
         assert_eq!(cli.output_file, Some(PathBuf::from("out.jsonl")));
         assert!(matches!(cli.command, Commands::Run { .. }));
+    }
+
+    /// `maybe_init_otel` must never construct an OTel exporter/provider/layer
+    /// when no endpoint is configured, with or without the `otel` feature.
+    /// Takes the endpoint as a parameter (rather than reading
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` itself) specifically so this doesn't
+    /// need to mutate process-wide env state.
+    #[test]
+    fn maybe_init_otel_is_noop_without_an_endpoint() {
+        for endpoint in [None, Some("")] {
+            let (layer, guard) = maybe_init_otel(endpoint).expect("must not error");
+            assert!(layer.is_none(), "no layer without an endpoint");
+            assert!(guard.is_none(), "no guard without an endpoint");
+        }
     }
 
     #[test]

@@ -1380,6 +1380,156 @@ JSONL files that `TraceRecorder` writes to `traces_dir` and that
 `halter::session::export_session_trace` produces. Transcript traces record
 committed session events. The `telemetry` feature does not read or write them.
 
+### OpenTelemetry
+
+The `otel` feature (implies `telemetry`) adds `halter::telemetry::otel`: an
+OTLP trace and metric exporter built on top of the span contract above. It
+is entirely opt-in — enabling the feature adds no behavior. Nothing is
+exported, and no OTel exporter, provider, or layer is constructed, until the
+embedder calls `OtelConfig::build()` explicitly. `halter::telemetry::otel`
+never calls `opentelemetry::global::set_tracer_provider` (or the meter/
+propagator equivalents): the `Tracer`/`Meter` are threaded directly into the
+returned layers, so no OTel state becomes globally ambient either.
+
+```toml
+halter = { version = "0.9", features = ["otel"] }
+```
+
+```rust,no_run
+use halter::telemetry::TelemetryConfig;
+use halter::telemetry::otel::OtelConfig;
+
+fn main() -> anyhow::Result<()> {
+    let (layers, _otel_guard) = OtelConfig::new().build()?;
+    // `try_init_with_otel` composes the console formatter and the OTel
+    // layers as *siblings*, each with its own per-layer filter — see
+    // "Filtering" below for why this matters.
+    TelemetryConfig::new().try_init_with_otel(layers)?;
+    // ... run the application ...
+    // `_otel_guard` flushes and shuts down the tracer/meter providers when
+    // dropped; call `_otel_guard.shutdown()` explicitly for a deterministic
+    // flush before the process exits.
+    Ok(())
+}
+```
+
+`OtelLayers` holds the trace layer (`tracing-opentelemetry`, wired to an OTLP
+span exporter) and the metrics layer (a custom `tracing_subscriber::Layer`
+that derives OTel instruments from the spans and events above — see the
+table below) as two separate `Layer<Registry>`s, each already carrying its
+own per-layer filter (see "Filtering" below). The `subagent` span's
+`follows_from` link (see the span table) is exported as a real OTel span
+link. Shutdown can never hang forever on either provider, but
+`OtelConfig::with_shutdown_timeout`'s configured bound is only honored
+precisely by the tracer: `opentelemetry_sdk` 0.33's meter provider ignores
+its `timeout` argument and always uses an internal hardcoded ~5s bound
+instead.
+
+**Filtering.** The `turn`/`tool_call`/`provider_request`/`provider_compaction`/
+`subagent` spans this feature exports are all created at `info`. By default
+`halter::telemetry`'s console formatter only shows `warn` and above
+(`RUST_LOG` unset), and `TelemetryConfig::try_init_with` composes the
+console and any extra layer under *one shared* filter — so naively calling
+`TelemetryConfig::new().try_init_with(layers.combined())` with `RUST_LOG`
+unset silently exports **nothing**, because the spans are never created in
+the first place. `OtelConfig::build()` avoids this by giving both OTel
+layers their own per-layer filter (`halter_runtime=info,halter_providers=info`
+by default — see `OtelConfig::with_filter_directives` to override), and
+`TelemetryConfig::try_init_with_otel(layers)` composes them as *siblings* of
+the console formatter instead of nesting them under one shared filter — so
+OTel exports `info`-level halter spans regardless of `RUST_LOG`, while the
+console itself still defaults to `warn`. Use `try_init_with_otel`, not
+`try_init_with(layers.combined())`, unless you've independently confirmed
+your composition keeps the OTel layers' filtering decoupled from the
+console's.
+
+**Transport.** Export uses OTLP over HTTP/protobuf against the workspace's
+existing `reqwest` 0.12 client, not `opentelemetry-otlp`'s bundled
+`reqwest-client` (which pulls `reqwest ^0.13`, a second major version) or
+`grpc-tonic` (which pulls `tonic`). This keeps `cargo tree -e normal
+--features otel` to exactly one extra dependency family
+(`opentelemetry*`, `tracing-opentelemetry`) with a single `reqwest` version;
+no library crate (`halter-runtime`, `halter-providers`, `halter-hooks`,
+`halter-tools`) ever gains an OTel or second-`reqwest` dependency, with or
+without `--all-features`.
+
+**Env vars**, honored by the underlying OTel SDK (not re-implemented here):
+
+| Variable                                | Effect                                                                 |
+| ---------------------------------------- | ----------------------------------------------------------------------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`            | Base OTLP/HTTP endpoint; `/v1/traces` and `/v1/metrics` are appended.  |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `_METRICS_ENDPOINT` | Per-signal endpoint override, used verbatim.     |
+| `OTEL_SERVICE_NAME`                      | `service.name` resource attribute. Defaults to `halter` if unset.     |
+| `OTEL_RESOURCE_ATTRIBUTES`               | Additional `key=value,...` resource attributes.                       |
+| `OTEL_TRACES_SAMPLER` / `_ARG`           | `always_on` / `always_off` / `traceidratio` (+ ratio) / `parentbased_*`. Defaults to `parentbased_always_on`. |
+
+`OtelConfig::with_endpoint`, `with_service_name`, `with_resource_attributes`,
+and `with_sampler` override the corresponding env var when set.
+`OTEL_EXPORTER_OTLP_PROTOCOL` has no effect: this module only ever speaks
+OTLP HTTP/protobuf (see "Transport" above).
+
+**Metrics.** Derived from the span/event contract, not emitted directly by
+library crates, so `halter-runtime`/`halter-providers`/etc. stay free of an
+OTel dependency. Every attribute is low-cardinality: metrics never carry
+`session_id`, `turn_id`, `tool_call_id`, or `agent_id` (spans do carry them —
+see the span table above).
+
+| Metric                             | Kind                  | Unit        | Attributes                                                                 | Source                                            |
+| ----------------------------------- | ---------------------- | ----------- | --------------------------------------------------------------------------- | -------------------------------------------------- |
+| `gen_ai.client.token.usage`         | Counter\<u64\>         | `{token}`   | `gen_ai.system`, `gen_ai.request.model`, `gen_ai.token.type` (`input`/`output`/`cache_read`/`cache_creation`) | `turn` close, one `add()` per non-zero token field |
+| `halter.turn.duration`              | Histogram\<f64\>       | `s`         | `outcome`                                                                  | `turn` close                                      |
+| `halter.tool_call.duration`         | Histogram\<f64\>       | `s`         | `tool_name`, `outcome`                                                     | `tool_call` close                                 |
+| `halter.tool_call.errors`           | Counter\<u64\>         | `{error}`   | `tool_name`, `outcome`                                                     | `tool_call` close, when `outcome != "ok"`         |
+| `gen_ai.client.operation.duration`  | Histogram\<f64\>       | `s`         | `gen_ai.system` (= `provider_kind`), `gen_ai.request.model`, `outcome`, `halter.operation` (`request`/`compaction`) | `provider_request`/`provider_compaction` close |
+| `halter.provider.retries`           | Counter\<u64\>         | `{retry}`   | `provider_kind`, `error_kind`                                              | `ResilientProvider` retry events                  |
+| `halter.provider.rate_limited`      | Counter\<u64\>         | `{retry}`   | `provider_kind`                                                            | retry events where `error_kind` is `RateLimited`  |
+| `halter.subagents.in_flight`        | UpDownCounter\<i64\>   | `{subagent}`| `agent_type`                                                               | `subagent` open (+1) / close (-1)                 |
+
+The `gen_ai.*` names follow OpenTelemetry's GenAI semantic conventions in
+spirit; the installed `opentelemetry-semantic-conventions` crate marks the
+matching constants (`GEN_AI_SYSTEM`, `GEN_AI_REQUEST_MODEL`,
+`GEN_AI_TOKEN_TYPE`) deprecated in favor of newer, still-in-flux names, so
+this module uses the plain string literals directly rather than depending on
+constants that might rename across patch releases.
+
+**Local collector example**, using the OpenTelemetry Collector's debug
+exporter on OTLP/HTTP:
+
+```sh
+cat > /tmp/otel-collector-debug.yaml <<'EOF'
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]
+EOF
+
+docker run --rm -p 4318:4318 \
+  -v /tmp/otel-collector-debug.yaml:/etc/otelcol/config.yaml \
+  otel/opentelemetry-collector:latest
+
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 halter run "..."
+```
+
+The CLI (built with `cargo build --features otel`) only exports when
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set; it never exports by default, even when
+compiled with the feature. The CLI composes its OTel layers with
+`TelemetryConfig::try_init_with_otel` (see "Filtering" above), so this works
+as shown — exporting `info`-level `turn`/`tool_call`/`provider_request`/
+`subagent` spans and metrics — without setting `RUST_LOG`; the console log
+output itself still defaults to `warn` unless you set `RUST_LOG` separately.
+
 ---
 
 ## Features
@@ -1397,6 +1547,7 @@ The `halter` crate keeps optional capabilities out of the default build. No feat
 | `full`           | Convenience rollup for the optional built-in tool families.                                                                              | Same extra dependencies as `advanced-tools`, `ast-tools`, `browser-tools`, `image-tools`, `pty`, and `profiling`. | Does not include `sqlite`; enable `sqlite` separately when persistent session storage is needed.                                                                                  |
 | `sqlite`         | Enables SQLite-backed session persistence and the matching config schema.                                                                | `rusqlite`                                                                                                        | Allows `sessions.backend = "sqlite"` and exposes `halter::session::SqliteSessionStore`. The default backend remains memory unless config selects SQLite.                          |
 | `telemetry`      | Adds `halter::telemetry`, the opt-in `tracing` subscriber helper the CLI uses (env filter, noisy-target suppression, compact/JSON output). | `tracing-subscriber`                                                                                              | No subscriber is installed unless `try_init`/`try_init_with` is called. See [Observability](#observability).                                                                      |
+| `otel`           | Adds `halter::telemetry::otel`: OTLP trace and metric export (builds on `telemetry`).                                                     | `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `opentelemetry-http`, `opentelemetry-semantic-conventions`, `tracing-opentelemetry` | Implies `telemetry`. Nothing is exported, and no OTel exporter/provider/layer is constructed, unless the embedder calls `OtelConfig::build()` explicitly. See [OpenTelemetry](#opentelemetry). |
 
 ---
 

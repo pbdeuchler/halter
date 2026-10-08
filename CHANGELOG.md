@@ -29,6 +29,33 @@ once a `1.0.0` line is cut.
   only logged at debug.
 - README "Observability" section documenting the subscriber boundary, the span
   reference, and the logging conventions.
+- `otel` feature on the `halter` crate (implies `telemetry`) with
+  `halter::telemetry::otel`: an OTLP trace and metric exporter built on OTLP
+  HTTP/protobuf via the workspace's existing `reqwest` client (no `tonic`,
+  no second `reqwest` major version). `OtelConfig` builds `tracing_subscriber`
+  layers (trace via `tracing-opentelemetry`, including the `subagent`
+  `follows_from` link exported as a real OTel span link; metrics via a custom
+  layer that derives instruments from the span/event contract so library
+  crates stay free of an OTel dependency), each layer already carrying its
+  own per-layer filter so OTel exports `info`-level halter spans regardless
+  of `RUST_LOG`, plus an `OtelGuard` that flushes and shuts down both
+  providers within a bounded timeout (precisely honored for the tracer;
+  `opentelemetry_sdk` 0.33's meter provider uses its own internal ~5s bound
+  instead). `TelemetryConfig::try_init_with_otel` composes the console
+  formatter and the OTel layers as siblings so both keep their own filter —
+  use it instead of `try_init_with(layers.combined())`, which nests
+  everything under one shared filter and would otherwise silently export
+  nothing with `RUST_LOG` unset. Honors the standard `OTEL_*` env vars
+  (endpoint, service name, resource attributes, sampler) with builder
+  overrides for each. Opt-in only: enabling the feature adds no behavior, and
+  no OTel exporter, provider, or global state is installed unless the
+  embedder explicitly calls `OtelConfig::build()`. Metrics: GenAI token
+  usage, turn/tool-call/provider-request durations, tool-call and provider
+  retry/rate-limit counters, and a subagent concurrency gauge, all with
+  low-cardinality attributes only (never `session_id`, `turn_id`,
+  `tool_call_id`, or `agent_id`). `halter-cli` adds a matching `otel` feature
+  that forwards to `halter/otel` and only activates export when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
 ### Changed
 
