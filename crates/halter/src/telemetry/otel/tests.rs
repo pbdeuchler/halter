@@ -84,6 +84,63 @@ impl Harness {
             .get_finished_metrics()
             .expect("metrics")
     }
+
+    /// Builds the OTel trace+metrics layers, each wrapped with its own
+    /// per-layer filter (mirroring `OtelConfig::build`'s real wrapping: see
+    /// [`super::DEFAULT_FILTER_DIRECTIVES`]), alongside a stand-in
+    /// "console" layer filtered at `warn` (mirroring `TelemetryConfig`'s
+    /// default when `RUST_LOG` is unset). Composes all three as *siblings*
+    /// — mirroring [`crate::telemetry::TelemetryConfig::try_init_with_otel`]
+    /// — and runs `f` under that subscriber as the thread-local default.
+    fn run_with_sibling_filters<R>(&self, f: impl FnOnce() -> R) -> R {
+        use tracing_subscriber::{EnvFilter, Layer as _};
+
+        let tracer = self.tracer_provider.tracer("halter-test");
+        let meter = self.meter_provider.meter("halter-test");
+        let otel_layers = super::OtelLayers {
+            trace: tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(EnvFilter::new(super::DEFAULT_FILTER_DIRECTIVES))
+                .boxed(),
+            metrics: OtelMetricsLayer::new(&meter)
+                .with_filter(EnvFilter::new(super::DEFAULT_FILTER_DIRECTIVES))
+                .boxed(),
+        };
+        // Mirrors `TelemetryConfig::try_init_with_otel`'s exact composition
+        // (`registry().with(otel.combined()).with(fmt_layer.with_filter(..))`)
+        // byte-for-byte, just swapping `set_global_default` for a scoped
+        // `with_default` so tests don't pollute the process-wide default.
+        let subscriber = tracing_subscriber::registry()
+            .with(otel_layers.combined())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(EnvFilter::new("warn")),
+            );
+        tracing::subscriber::with_default(subscriber, f)
+    }
+
+    /// Builds the same OTel layers, but composed under **one shared**
+    /// top-level filter positioned above them — mirroring
+    /// [`crate::telemetry::TelemetryConfig::try_init_with`]'s documented
+    /// behavior with `RUST_LOG` unset (so the shared filter defaults to
+    /// `warn`), rather than the per-layer-filtered sibling composition
+    /// above.
+    fn run_with_shared_filter<R>(&self, f: impl FnOnce() -> R) -> R {
+        use tracing_subscriber::{EnvFilter, Layer as _};
+
+        let tracer = self.tracer_provider.tracer("halter-test");
+        let meter = self.meter_provider.meter("halter-test");
+        let otel_combined = tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .and_then(OtelMetricsLayer::new(&meter))
+            .boxed();
+        let subscriber = tracing_subscriber::registry()
+            .with(otel_combined)
+            .with(EnvFilter::new("warn"))
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink));
+        tracing::subscriber::with_default(subscriber, f)
+    }
 }
 
 fn span_named<'a>(spans: &'a [SpanData], name: &str) -> &'a SpanData {
@@ -569,4 +626,59 @@ fn collect_attribute_keys(data: &AggregatedMetrics, keys: &mut BTreeSet<String>)
         AggregatedMetrics::F64(MetricData::Histogram(hist)) => from_hist(hist, keys),
         _ => {}
     }
+}
+
+/// Regression test for the "shared `EnvFilter` hides `info`-level spans"
+/// pitfall (see this module's docs). Composes the OTel layers as *siblings*
+/// of a `warn`-level stand-in console layer, each with its own per-layer
+/// filter — exactly the shape [`crate::telemetry::TelemetryConfig::try_init_with_otel`]
+/// builds — and confirms spans and metrics still export even though the
+/// simulated console (and `RUST_LOG`) stays at the default `warn`.
+#[test]
+fn otel_sibling_filters_export_despite_warn_level_console_layer() {
+    let harness = Harness::new();
+    harness.run_with_sibling_filters(emit_turn_and_tool_call);
+    harness.flush();
+
+    let spans = harness.finished_spans();
+    assert!(
+        !spans.is_empty(),
+        "turn/tool_call spans must still export when the OTel layers carry their own \
+         per-layer filter, even though the simulated console filter is warn"
+    );
+    span_named(&spans, "turn");
+    span_named(&spans, "tool_call");
+
+    let metrics = harness.finished_metrics();
+    assert!(
+        metrics
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .any(|m| m.name() == "halter.turn.duration"),
+        "the turn duration metric must still be recorded"
+    );
+}
+
+/// Companion negative test: reproduces
+/// [`crate::telemetry::TelemetryConfig::try_init_with`]'s exact layering —
+/// one shared top-level filter positioned *above* the OTel layer, as
+/// opposed to the per-layer-filtered sibling composition above — with
+/// `RUST_LOG` unset (so the shared filter defaults to `warn`), and confirms
+/// nothing is exported. This locks in the documented trade-off: naively
+/// composing via `try_init_with(layers.combined())` without raising the
+/// shared filter's directives silently exports nothing, which is exactly
+/// why `try_init_with_otel` (sibling per-layer filters) is the recommended
+/// integration path instead.
+#[test]
+fn shared_top_level_warn_filter_suppresses_otel_without_raising_directives() {
+    let harness = Harness::new();
+    harness.run_with_shared_filter(emit_turn_and_tool_call);
+    harness.flush();
+
+    let spans = harness.finished_spans();
+    assert!(
+        spans.is_empty(),
+        "a shared top-level warn filter must suppress info-level halter spans, got: {spans:?}"
+    );
 }
