@@ -806,3 +806,33 @@ async fn concurrent_sensitive_checks_are_safe() {
         assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
     }
 }
+
+/// Bounded exhaustive check of URL host extraction: every authority of up to
+/// six bytes drawn from the bytes the parser branches on. Any extracted host
+/// must be non-empty and free of userinfo, path, query, and fragment
+/// delimiters. Enumeration is used instead of a Kani proof because symbolic
+/// execution of std's substring search exhausts memory at even four bytes.
+#[test]
+fn extracted_host_never_contains_url_delimiters_exhaustive() {
+    const ALPHABET: &[u8] = b":/@[]?#a1";
+    const MAX_AUTHORITY_LEN: usize = 6;
+
+    let mut authority = String::with_capacity(MAX_AUTHORITY_LEN);
+    for len in 0..=MAX_AUTHORITY_LEN {
+        for mut code in 0..ALPHABET.len().pow(len as u32) {
+            authority.clear();
+            for _ in 0..len {
+                authority.push(char::from(ALPHABET[code % ALPHABET.len()]));
+                code /= ALPHABET.len();
+            }
+            let url = format!("h://{authority}");
+            if let Some((host, _port)) = super::extract_host_and_port(&url) {
+                assert!(!host.is_empty(), "empty host for {url:?}");
+                assert!(
+                    !host.contains(['/', '?', '#', '@']),
+                    "host {host:?} contains a delimiter for {url:?}"
+                );
+            }
+        }
+    }
+}

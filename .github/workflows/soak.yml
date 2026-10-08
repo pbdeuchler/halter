@@ -1,0 +1,28 @@
+name: soak
+
+# Long runs of the randomized session-driver tests. Every PR already runs 128
+# cases through the normal suite; this samples far more interleavings. A
+# failure prints the shrunk operation sequence in the log.
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: Generated cases to run
+        default: "5000"
+
+jobs:
+  session-driver-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PLAYWRIGHT_DRIVER_VERSION: 1.59.1
+      PROPTEST_CASES: ${{ inputs.cases || '5000' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: >-
+          cargo test -p halter-runtime --lib
+          session_driver_model_tests::session_driver_model -- --exact

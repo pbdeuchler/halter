@@ -22,3 +22,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

@@ -933,6 +933,84 @@ mod tests {
         assert_eq!(conflicts[1].loser, "output-loser");
     }
 
+    /// Exhaustive over three hooks: every `continue` value, basic decision,
+    /// permission decision, and priority arrangement (135^3 merges). No hook
+    /// can weaken another's verdict: the merged permission is the strongest
+    /// returned, any block, deny, or ask blocks, and any stop request stops.
+    #[test]
+    fn restrictive_hook_verdicts_always_survive_merge_exhaustive() {
+        const CONTINUES: [Option<bool>; 3] = [None, Some(true), Some(false)];
+        const DECISIONS: [Option<HookDecision>; 3] =
+            [None, Some(HookDecision::Approve), Some(HookDecision::Block)];
+        const PERMISSIONS: [Option<PermissionDecision>; 5] = [
+            None,
+            Some(PermissionDecision::Passthrough),
+            Some(PermissionDecision::Allow),
+            Some(PermissionDecision::Ask),
+            Some(PermissionDecision::Deny),
+        ];
+        const HOOKS: usize = 3;
+        const STATES: usize = CONTINUES.len() * DECISIONS.len() * PERMISSIONS.len() * HOOKS;
+
+        let input = |handler: usize, mut state: usize| {
+            let continue_execution = CONTINUES[state % CONTINUES.len()];
+            state /= CONTINUES.len();
+            let decision = DECISIONS[state % DECISIONS.len()];
+            state /= DECISIONS.len();
+            let permission_decision = PERMISSIONS[state % PERMISSIONS.len()];
+            state /= PERMISSIONS.len();
+            merge_input(
+                &format!("h{handler}"),
+                priority(HandlerPriorityGroup::PluginFiles, 0, 0, 0, state),
+                HookOutput {
+                    continue_execution,
+                    decision,
+                    hook_specific_output: permission_decision.map(|permission_decision| {
+                        HookSpecificOutput {
+                            permission_decision: Some(permission_decision),
+                            ..HookSpecificOutput::default()
+                        }
+                    }),
+                    ..HookOutput::default()
+                },
+            )
+        };
+
+        for code in 0..STATES.pow(HOOKS as u32) {
+            let inputs = [
+                input(0, code % STATES),
+                input(1, code / STATES % STATES),
+                input(2, code / STATES / STATES),
+            ];
+            let (merged, _conflicts) = merge_outputs(&inputs);
+
+            let strongest = inputs
+                .iter()
+                .filter_map(|input| {
+                    input
+                        .output
+                        .hook_specific_output
+                        .as_ref()?
+                        .permission_decision
+                })
+                .max();
+            assert_eq!(merged.permission_decision, strongest, "{inputs:?}");
+
+            let blocks = matches!(
+                strongest,
+                Some(PermissionDecision::Deny | PermissionDecision::Ask)
+            ) || inputs
+                .iter()
+                .any(|input| matches!(input.output.decision, Some(HookDecision::Block)));
+            assert_eq!(merged.block_reason.is_some(), blocks, "{inputs:?}");
+
+            let stops = inputs
+                .iter()
+                .any(|input| matches!(input.output.continue_execution, Some(false)));
+            assert_eq!(merged.stop_reason.is_some(), stops, "{inputs:?}");
+        }
+    }
+
     // --- tracing events ---
 
     mod decision_events {

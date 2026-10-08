@@ -27,6 +27,8 @@ mod provider_default;
 mod session;
 mod session_driver;
 #[cfg(test)]
+mod session_driver_model_tests;
+#[cfg(test)]
 mod session_driver_tests;
 mod session_lease;
 mod span_outcome;
