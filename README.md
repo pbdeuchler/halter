@@ -1401,7 +1401,10 @@ use halter::telemetry::otel::OtelConfig;
 
 fn main() -> anyhow::Result<()> {
     let (layers, _otel_guard) = OtelConfig::new().build()?;
-    TelemetryConfig::new().try_init_with(layers.combined())?;
+    // `try_init_with_otel` composes the console formatter and the OTel
+    // layers as *siblings*, each with its own per-layer filter — see
+    // "Filtering" below for why this matters.
+    TelemetryConfig::new().try_init_with_otel(layers)?;
     // ... run the application ...
     // `_otel_guard` flushes and shuts down the tracer/meter providers when
     // dropped; call `_otel_guard.shutdown()` explicitly for a deterministic
@@ -1413,11 +1416,32 @@ fn main() -> anyhow::Result<()> {
 `OtelLayers` holds the trace layer (`tracing-opentelemetry`, wired to an OTLP
 span exporter) and the metrics layer (a custom `tracing_subscriber::Layer`
 that derives OTel instruments from the spans and events above — see the
-table below) as two separate `Layer<Registry>`s; `.combined()` composes them
-for a single `try_init_with` call, or use each field with its own
-`.with_filter(...)` and compose manually, same as any other extra layer. The
-`subagent` span's `follows_from` link (see the span table) is exported as a
-real OTel span link.
+table below) as two separate `Layer<Registry>`s, each already carrying its
+own per-layer filter (see "Filtering" below). The `subagent` span's
+`follows_from` link (see the span table) is exported as a real OTel span
+link. Shutdown can never hang forever on either provider, but
+`OtelConfig::with_shutdown_timeout`'s configured bound is only honored
+precisely by the tracer: `opentelemetry_sdk` 0.33's meter provider ignores
+its `timeout` argument and always uses an internal hardcoded ~5s bound
+instead.
+
+**Filtering.** The `turn`/`tool_call`/`provider_request`/`provider_compaction`/
+`subagent` spans this feature exports are all created at `info`. By default
+`halter::telemetry`'s console formatter only shows `warn` and above
+(`RUST_LOG` unset), and `TelemetryConfig::try_init_with` composes the
+console and any extra layer under *one shared* filter — so naively calling
+`TelemetryConfig::new().try_init_with(layers.combined())` with `RUST_LOG`
+unset silently exports **nothing**, because the spans are never created in
+the first place. `OtelConfig::build()` avoids this by giving both OTel
+layers their own per-layer filter (`halter_runtime=info,halter_providers=info`
+by default — see `OtelConfig::with_filter_directives` to override), and
+`TelemetryConfig::try_init_with_otel(layers)` composes them as *siblings* of
+the console formatter instead of nesting them under one shared filter — so
+OTel exports `info`-level halter spans regardless of `RUST_LOG`, while the
+console itself still defaults to `warn`. Use `try_init_with_otel`, not
+`try_init_with(layers.combined())`, unless you've independently confirmed
+your composition keeps the OTel layers' filtering decoupled from the
+console's.
 
 **Transport.** Export uses OTLP over HTTP/protobuf against the workspace's
 existing `reqwest` 0.12 client, not `opentelemetry-otlp`'s bundled
@@ -1500,7 +1524,11 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 halter run "..."
 
 The CLI (built with `cargo build --features otel`) only exports when
 `OTEL_EXPORTER_OTLP_ENDPOINT` is set; it never exports by default, even when
-compiled with the feature.
+compiled with the feature. The CLI composes its OTel layers with
+`TelemetryConfig::try_init_with_otel` (see "Filtering" above), so this works
+as shown — exporting `info`-level `turn`/`tool_call`/`provider_request`/
+`subagent` spans and metrics — without setting `RUST_LOG`; the console log
+output itself still defaults to `warn` unless you set `RUST_LOG` separately.
 
 ---
 

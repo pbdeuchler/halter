@@ -3,9 +3,40 @@
 //! [`OtelConfig::build`] builds a [`tracing_opentelemetry`] span layer and a
 //! custom metrics layer ([`crate::telemetry::otel::metrics`], not public)
 //! that derives OTel instruments from the span/event contract documented in
-//! `README.md`. Both are plain `tracing_subscriber::Layer<Registry>`s, so
-//! they compose with [`crate::telemetry::TelemetryConfig::try_init_with`] or
-//! manual composition exactly like any other extra layer.
+//! `README.md`. Both are plain `tracing_subscriber::Layer<Registry>`s,
+//! already wrapped in their own per-layer [`EnvFilter`] (see
+//! [`DEFAULT_FILTER_DIRECTIVES`] / [`OtelConfig::with_filter_directives`]) so
+//! they see `info`-level halter spans *independently* of whatever filter
+//! governs the rest of the subscriber stack.
+//!
+//! # The shared-filter pitfall
+//!
+//! [`crate::telemetry::TelemetryConfig::try_init_with`] composes its
+//! formatter and the `extra` layer under *one shared* top-level
+//! [`EnvFilter`] (defaulting to `warn`). Because `tracing-subscriber`'s
+//! layer composition is a logical AND — the whole stack's `enabled()` must
+//! agree before a span is even created — that shared filter gates the OTel
+//! layers too, *regardless* of their own per-layer filter: a per-layer
+//! filter can only make a layer *more* permissive than its siblings when
+//! every level-filtering layer in the stack uses the per-layer filtering
+//! API (`.with_filter(...)`), not when one of them is a bare top-level
+//! layer like `try_init_with`'s shared filter. Concretely: calling
+//! `TelemetryConfig::new().try_init_with(layers.combined())` with
+//! `RUST_LOG` unset (so the shared filter defaults to `warn`) silently
+//! exports **nothing**, because the `info_span!`-level `turn`/`tool_call`/
+//! `provider_request`/`subagent` spans are never created in the first
+//! place.
+//!
+//! Use [`crate::telemetry::TelemetryConfig::try_init_with_otel`] instead:
+//! it composes the formatter and the OTel layers as siblings, each with its
+//! *own* per-layer filter, so OTel sees `info`-level halter spans
+//! regardless of the console's `RUST_LOG`. If you still want to use
+//! `try_init_with` (for example because you are composing more than one
+//! extra layer yourself), raise the shared filter's directives to include
+//! at least [`DEFAULT_FILTER_DIRECTIVES`] (e.g.
+//! `TelemetryConfig::new().with_directives(halter::telemetry::otel::DEFAULT_FILTER_DIRECTIVES)`),
+//! or build your own manual per-layer-filter composition (see the
+//! `telemetry` module docs' "Adding layers" section).
 //!
 //! # No implicit global state
 //!
@@ -15,7 +46,7 @@
 //! built from the two SDK providers are threaded directly into the returned
 //! layers; nothing OTel-related becomes globally ambient. A global `tracing`
 //! subscriber is only installed if the embedder goes on to call
-//! [`crate::telemetry::TelemetryConfig::try_init_with`] (or
+//! [`crate::telemetry::TelemetryConfig::try_init_with_otel`] (or
 //! `tracing::subscriber::set_global_default` themselves).
 //!
 //! ```rust,no_run
@@ -24,7 +55,11 @@
 //!
 //! fn main() -> anyhow::Result<()> {
 //!     let (layers, _guard) = OtelConfig::new().build()?;
-//!     TelemetryConfig::new().try_init_with(layers.combined())?;
+//!     // Each of `layers.trace`/`layers.metrics` already carries its own
+//!     // per-layer filter, independent of the console's `RUST_LOG` — this
+//!     // exports `info`-level halter spans even when the console (and
+//!     // `RUST_LOG`) stays at the default `warn`.
+//!     TelemetryConfig::new().try_init_with_otel(layers)?;
 //!     // ... run the application ...
 //!     Ok(())
 //! }
@@ -47,7 +82,10 @@
 //! `_TRACES_`/`_METRICS_` signal-specific variants). Builder overrides
 //! ([`OtelConfig::with_endpoint`], [`OtelConfig::with_service_name`],
 //! [`OtelConfig::with_resource_attributes`], [`OtelConfig::with_sampler`])
-//! take priority over all of these.
+//! take priority over all of these. The *span-visibility* filter
+//! ([`DEFAULT_FILTER_DIRECTIVES`]) is separate from `RUST_LOG`; override it
+//! with [`OtelConfig::with_filter_directives`] if you need a different
+//! target/level set exported.
 
 mod http_client;
 mod metrics;
@@ -64,8 +102,8 @@ use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig, WithHtt
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::{BatchSpanProcessor, Sampler, SdkTracerProvider};
-use tracing_subscriber::Registry;
 use tracing_subscriber::layer::Layer;
+use tracing_subscriber::{EnvFilter, Registry};
 
 use self::http_client::ReqwestOtlpClient;
 use self::metrics::OtelMetricsLayer;
@@ -76,7 +114,24 @@ use self::metrics::OtelMetricsLayer;
 const DEFAULT_SERVICE_NAME: &str = "halter";
 
 /// Default bound on [`OtelGuard::shutdown`] / its `Drop` impl, per provider.
+///
+/// Honored by the tracer provider's shutdown. **Not** currently honored by
+/// `opentelemetry_sdk` 0.33's `SdkMeterProvider::shutdown_with_timeout` for
+/// the metrics side, which ignores its `timeout` argument and always uses
+/// an internal hardcoded ~5s bound (`PeriodicReader`'s shutdown message has
+/// a literal `// TODO: Make this timeout configurable.`). Shutdown still
+/// cannot hang forever either way; a configured timeout shorter than 5s
+/// just won't shorten the metrics-provider wait. See [`OtelGuard::shutdown`].
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Directives applied to both OTel layers' own per-layer [`EnvFilter`] by
+/// default: `info`-level for the two targets the exported span contract
+/// actually uses (`halter_runtime`: `turn`/`tool_call`/`subagent`;
+/// `halter_providers`: `provider_request`/`provider_compaction`). This is
+/// deliberately independent of `RUST_LOG`/[`crate::telemetry::compose_directives`]:
+/// it exists so OTel keeps exporting even when the console stays at the
+/// default `warn`. Override with [`OtelConfig::with_filter_directives`].
+pub const DEFAULT_FILTER_DIRECTIVES: &str = "halter_runtime=info,halter_providers=info";
 
 /// A boxed `Layer<Registry>`, used so [`OtelLayers`] can hand back
 /// trait objects without naming `tracing_opentelemetry`'s or this crate's
@@ -86,8 +141,8 @@ type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 /// Builder for the OTLP trace and metric pipelines.
 ///
 /// Building does not install anything; call [`OtelConfig::build`] to get the
-/// layers and a shutdown [`OtelGuard`], then compose the layers with
-/// [`crate::telemetry::TelemetryConfig::try_init_with`] or manually.
+/// layers and a shutdown [`OtelGuard`], then install them with
+/// [`crate::telemetry::TelemetryConfig::try_init_with_otel`] or manually.
 #[derive(Debug, Default)]
 pub struct OtelConfig {
     endpoint: Option<String>,
@@ -95,6 +150,7 @@ pub struct OtelConfig {
     resource_attributes: Vec<(String, String)>,
     sampler: Option<Sampler>,
     shutdown_timeout: Duration,
+    filter_directives: Option<String>,
 }
 
 impl OtelConfig {
@@ -108,6 +164,7 @@ impl OtelConfig {
             resource_attributes: Vec::new(),
             sampler: None,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            filter_directives: None,
         }
     }
 
@@ -150,9 +207,18 @@ impl OtelConfig {
     }
 
     /// Bound how long [`OtelGuard::shutdown`] (and its `Drop` impl) may block
-    /// flushing each provider. Default: 3 seconds.
+    /// flushing each provider. Default: 3 seconds. See [`DEFAULT_SHUTDOWN_TIMEOUT`]
+    /// for a caveat: the SDK's metrics provider does not currently honor this.
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// Override the per-layer filter directives applied to both OTel
+    /// layers (default: [`DEFAULT_FILTER_DIRECTIVES`]). Independent of
+    /// `RUST_LOG` and of whatever filter governs the console formatter.
+    pub fn with_filter_directives(mut self, directives: impl Into<String>) -> Self {
+        self.filter_directives = Some(directives.into());
         self
     }
 
@@ -161,10 +227,20 @@ impl OtelConfig {
     /// Returns the composable layers plus a guard that must be held (and
     /// ideally [`OtelGuard::shutdown`] called explicitly) for as long as
     /// telemetry should keep exporting; dropping it flushes and shuts down
-    /// both providers, bounded by the configured shutdown timeout.
+    /// both providers, bounded by the configured shutdown timeout. Both
+    /// returned layers already carry their own per-layer filter (see the
+    /// module docs' "shared-filter pitfall" section) — compose them with
+    /// [`crate::telemetry::TelemetryConfig::try_init_with_otel`].
     pub fn build(self) -> anyhow::Result<(OtelLayers, OtelGuard)> {
         let resource = self.build_resource();
         let http_client = Arc::new(ReqwestOtlpClient::default());
+        let directives = self
+            .filter_directives
+            .as_deref()
+            .unwrap_or(DEFAULT_FILTER_DIRECTIVES);
+        let trace_filter =
+            EnvFilter::try_new(directives).context("invalid otel filter directives")?;
+        let metrics_filter = trace_filter.clone();
 
         let span_exporter = {
             let mut builder = SpanExporter::builder()
@@ -187,7 +263,14 @@ impl OtelConfig {
         }
         let tracer_provider = tracer_provider_builder.build();
         let tracer = tracer_provider.tracer("halter");
-        let trace_layer: BoxedLayer = tracing_opentelemetry::layer().with_tracer(tracer).boxed();
+        // `.with_filter(...)` makes this a per-layer-filtered layer: its
+        // effective level is independent of whatever filter the rest of
+        // the subscriber stack uses, which is exactly what avoids the
+        // shared-filter pitfall described in the module docs.
+        let trace_layer: BoxedLayer = tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(trace_filter)
+            .boxed();
 
         let metric_exporter = {
             let mut builder = MetricExporter::builder()
@@ -207,7 +290,9 @@ impl OtelConfig {
             .with_resource(resource)
             .build();
         let meter = meter_provider.meter("halter");
-        let metrics_layer: BoxedLayer = OtelMetricsLayer::new(&meter).boxed();
+        let metrics_layer: BoxedLayer = OtelMetricsLayer::new(&meter)
+            .with_filter(metrics_filter)
+            .boxed();
 
         let layers = OtelLayers {
             trace: trace_layer,
@@ -272,21 +357,27 @@ fn signal_endpoint(base: &str, path: &str) -> String {
 
 /// The two layers built by [`OtelConfig::build`]: traces
 /// ([`tracing_opentelemetry`]) and metrics (this module's custom layer).
-/// Both are plain `Layer<Registry>`s; use [`Self::combined`] to pass both to
-/// a single [`crate::telemetry::TelemetryConfig::try_init_with`] call, or
-/// `.with_filter(...)` each individually before composing them yourself.
+/// Each already carries its own per-layer filter (see the module docs'
+/// "shared-filter pitfall" section), independent of whatever filter the
+/// rest of the subscriber stack uses. Install both with
+/// [`crate::telemetry::TelemetryConfig::try_init_with_otel`], or use
+/// [`Self::combined`] (or the individual fields) in your own manual
+/// composition.
 pub struct OtelLayers {
-    /// `tracing-opentelemetry`'s span layer, wired to an OTLP span exporter.
+    /// `tracing-opentelemetry`'s span layer, wired to an OTLP span exporter
+    /// and already filtered to [`DEFAULT_FILTER_DIRECTIVES`] (or the
+    /// override passed to [`OtelConfig::with_filter_directives`]).
     pub trace: BoxedLayer,
-    /// The custom metrics-deriving layer, wired to an OTLP metric exporter.
+    /// The custom metrics-deriving layer, wired to an OTLP metric exporter,
+    /// with the same per-layer filter as [`Self::trace`].
     pub metrics: BoxedLayer,
 }
 
 impl OtelLayers {
-    /// Compose both layers into one, for a single
-    /// [`crate::telemetry::TelemetryConfig::try_init_with`] call. Both
-    /// layers still see every event; use the individual fields with their
-    /// own `.with_filter(...)` if they need different filters.
+    /// Compose both layers into one. Each retains its own per-layer filter,
+    /// so the result behaves correctly whether it's passed to
+    /// [`crate::telemetry::TelemetryConfig::try_init_with_otel`] or added
+    /// to your own `tracing_subscriber::registry()` stack directly.
     pub fn combined(self) -> BoxedLayer {
         self.trace.and_then(self.metrics).boxed()
     }
@@ -297,9 +388,11 @@ impl OtelLayers {
 /// Dropping the guard (or calling [`Self::shutdown`] explicitly, which is
 /// recommended for deterministic flush ordering relative to process exit)
 /// flushes and shuts down both providers. Shutdown errors are logged (via
-/// `tracing::warn!`, a no-op if nothing is listening) rather than panicking,
-/// and are bounded by the configured shutdown timeout so a stuck exporter
-/// can never hang the process.
+/// `tracing::warn!`, a no-op if nothing is listening) rather than panicking.
+/// Shutdown can never hang forever on either provider, but the configured
+/// timeout is only honored precisely for the *tracer*: `opentelemetry_sdk`
+/// 0.33's meter provider ignores its `timeout` argument and always uses an
+/// internal hardcoded ~5s bound instead (see [`DEFAULT_SHUTDOWN_TIMEOUT`]).
 pub struct OtelGuard {
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,

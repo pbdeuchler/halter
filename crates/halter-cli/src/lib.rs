@@ -473,7 +473,12 @@ fn write_output_line(output: &mut dyn Write, line: impl std::fmt::Display) -> an
     writeln!(output, "{line}").context("failed to write output")
 }
 
-fn init_logging(writer: TraceWriter, json: bool, extra: Option<BoxedLayer>) -> anyhow::Result<()> {
+#[cfg(feature = "otel")]
+fn init_logging(
+    writer: TraceWriter,
+    json: bool,
+    otel: Option<halter::telemetry::otel::OtelLayers>,
+) -> anyhow::Result<()> {
     let format = if json {
         LogFormat::Json
     } else {
@@ -482,23 +487,33 @@ fn init_logging(writer: TraceWriter, json: bool, extra: Option<BoxedLayer>) -> a
     let config = TelemetryConfig::new()
         .with_writer(writer)
         .with_format(format);
-    match extra {
-        Some(layer) => config.try_init_with(layer),
+    match otel {
+        // `try_init_with_otel` composes the console formatter and the OTel
+        // layers as siblings, each under its own per-layer filter, so OTel
+        // sees info-level halter spans even when the console (and
+        // `RUST_LOG`) stays at the default `warn`. Plain `try_init_with`
+        // would nest both under one shared filter and silently export
+        // nothing by default — see `halter::telemetry::otel`'s module docs.
+        Some(layers) => config.try_init_with_otel(layers),
         None => config.try_init(),
     }
 }
 
-/// A boxed `Layer<Registry>`, so the otel-vs-not-otel branches below share
-/// one return type regardless of whether the `otel` feature is compiled in.
-type BoxedLayer = Box<
-    dyn halter::telemetry::tracing_subscriber::Layer<
-            halter::telemetry::tracing_subscriber::Registry,
-        > + Send
-        + Sync,
->;
+#[cfg(not(feature = "otel"))]
+fn init_logging(writer: TraceWriter, json: bool, _otel: Option<()>) -> anyhow::Result<()> {
+    let format = if json {
+        LogFormat::Json
+    } else {
+        LogFormat::Compact
+    };
+    TelemetryConfig::new()
+        .with_writer(writer)
+        .with_format(format)
+        .try_init()
+}
 
-/// Builds the OTLP trace/metric layer and its shutdown guard, but only when
-/// the `otel` feature is compiled in *and* `endpoint` names a non-empty
+/// Builds the OTLP trace/metric layers and their shutdown guard, but only
+/// when the `otel` feature is compiled in *and* `endpoint` names a non-empty
 /// OTLP endpoint (normally read from `OTEL_EXPORTER_OTLP_ENDPOINT`). Takes
 /// the endpoint as a parameter rather than reading the env var itself so
 /// this is testable without mutating process-wide env state.
@@ -510,20 +525,20 @@ type BoxedLayer = Box<
 fn maybe_init_otel(
     endpoint: Option<&str>,
 ) -> anyhow::Result<(
-    Option<BoxedLayer>,
+    Option<halter::telemetry::otel::OtelLayers>,
     Option<halter::telemetry::otel::OtelGuard>,
 )> {
     match endpoint {
         Some(endpoint) if !endpoint.is_empty() => {
             let (layers, guard) = halter::telemetry::otel::OtelConfig::new().build()?;
-            Ok((Some(layers.combined()), Some(guard)))
+            Ok((Some(layers), Some(guard)))
         }
         _ => Ok((None, None)),
     }
 }
 
 #[cfg(not(feature = "otel"))]
-fn maybe_init_otel(_endpoint: Option<&str>) -> anyhow::Result<(Option<BoxedLayer>, Option<()>)> {
+fn maybe_init_otel(_endpoint: Option<&str>) -> anyhow::Result<(Option<()>, Option<()>)> {
     Ok((None, None))
 }
 
