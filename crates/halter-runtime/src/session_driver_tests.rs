@@ -1259,6 +1259,123 @@ struct FailingCompaction {
     started: Arc<Notify>,
 }
 
+#[tokio::test]
+async fn admitted_input_crossing_threshold_compacts_before_the_next_provider_request() {
+    use halter_hooks::{
+        Hook, HookEventName, HookResponse, RegisteredHookPriority, RegisteredHooks,
+    };
+
+    struct Checkpoint;
+    #[async_trait]
+    impl crate::CompactionStrategy for Checkpoint {
+        async fn compact(
+            &self,
+            context: crate::CompactionContext<'_>,
+        ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+            Ok(Some(crate::CompactionEffects {
+                messages: vec![Message::user("checkpoint of admitted input")],
+                compacted_context: Default::default(),
+                result: halter_protocol::CompactionResult {
+                    compacted_count: context.state().messages.len(),
+                    summary: "checkpointed".into(),
+                },
+                usage: Default::default(),
+            }))
+        }
+    }
+
+    struct RecordingProvider(std::sync::Mutex<Vec<ProviderRequest>>);
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            cancel: CancellationToken,
+        ) -> anyhow::Result<stream::BoxStream<'static, Result<StreamEvent, ProviderError>>>
+        {
+            self.0.lock().unwrap().push(request.clone());
+            FakeProvider::default().stream(request, cancel).await
+        }
+    }
+
+    // Exercise admission after the opening boundary and after the final
+    // response's boundary. Both must budget the new input before inference.
+    for event_name in [HookEventName::UserPromptSubmit, HookEventName::Stop] {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let first = Arc::new(AtomicBool::new(true));
+        let mut hooks = RegisteredHooks::default();
+        let gate_entered = entered.clone();
+        let gate_release = release.clone();
+        hooks.register(
+            halter_protocol::PluginId::from("admission-boundary"),
+            RegisteredHookPriority::AfterPlugins,
+            Hook::callback(event_name, move |_| {
+                let first = first.clone();
+                let entered = gate_entered.clone();
+                let release = gate_release.clone();
+                async move {
+                    if first.swap(false, Ordering::SeqCst) {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    HookResponse::passthrough()
+                }
+            }),
+        );
+        let provider = Arc::new(RecordingProvider(Default::default()));
+        let mut runtime_services = services(provider.clone());
+        let configured = Arc::get_mut(&mut runtime_services).unwrap();
+        configured.registered_hooks = Arc::new(hooks);
+        configured.context = crate::ContextSettings {
+            compaction_threshold: 10_000,
+            max_tokens: Some(15_000),
+        };
+        configured.compaction = Arc::new(Checkpoint);
+        let runtime = SessionRuntime::new(runtime_services);
+        let (session, mut events) = runtime
+            .create_session(SessionInit::default())
+            .await
+            .unwrap();
+        session.submit(Message::user("start")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("hook reached");
+        let accepted = session
+            .submit(Message::user("x".repeat(80_000)))
+            .await
+            .unwrap();
+        release.notify_one();
+        let seen = until_finished(&session, &mut events).await;
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnFailed { .. })),
+            "{event_name:?}: compaction must precede cap enforcement"
+        );
+        let log = session.replay().await.unwrap();
+        let position = |predicate: &dyn Fn(&SessionEventPayload) -> bool| {
+            log.iter()
+                .position(|event| predicate(&event.payload))
+                .unwrap()
+        };
+        let delivered = position(
+            &|payload| matches!(payload, SessionEventPayload::MessageItem { message: Message::User(user) } if user.id == accepted.message_id),
+        );
+        let compacted =
+            position(&|payload| matches!(payload, SessionEventPayload::ContextCompacted { .. }));
+        assert!(
+            delivered < compacted,
+            "{event_name:?}: the checkpoint must include admitted input (delivery {delivered}, compaction {compacted})"
+        );
+        assert!(provider.0.lock().unwrap().iter().any(|request| request.messages.iter().any(|message| matches!(message, Message::User(user) if user.plain_text() == "checkpoint of admitted input"))), "{event_name:?}: the next inference must see the checkpoint");
+        session.shutdown(None).await.unwrap();
+    }
+}
+
 #[async_trait]
 impl crate::CompactionStrategy for FailingCompaction {
     async fn compact(
