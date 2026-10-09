@@ -29,12 +29,14 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use halter_protocol::fold::{covered_state_matches, fold_events};
 use halter_protocol::{
-    BlockId, Message, MessageId, PendingEvent, ProviderCapabilities, ProviderError,
-    ProviderRequest, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload,
-    SessionId, SessionState, SessionStatus, StreamEvent,
+    AgentId, BlockId, CloseSubagentRequest, Message, MessageId, PendingEvent, ProviderCapabilities,
+    ProviderError, ProviderRequest, ResourceSnapshot, SessionBlueprint, SessionEvent,
+    SessionEventPayload, SessionId, SessionState, SessionStatus, SpawnSubagentRequest, StreamEvent,
+    SubagentState,
 };
 use halter_providers::{FakeProvider, Provider};
 use halter_session::{InMemorySessionStore, SessionStore, SqliteSessionStore, StoredSession};
+use halter_tools::SubagentParentContext;
 use proptest::prelude::*;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -85,6 +87,13 @@ enum Op {
     /// Abandon the process without cleanup and resume in a fresh runtime
     /// over the same durable store.
     Crash,
+    /// Drop the last handle without shutting down. The session must stay
+    /// open while it owns running subagents and close once it owns none.
+    Release,
+    /// Spawn a subagent owned by the session.
+    SpawnSubagent,
+    /// Close one of the subagents spawned so far.
+    CloseSubagent(usize),
     Script(ProviderStep),
     Fault(StoreFault),
 }
@@ -102,6 +111,9 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => Just(Op::WaitIdle),
         1 => Just(Op::Reopen),
         1 => Just(Op::Crash),
+        1 => Just(Op::Release),
+        2 => Just(Op::SpawnSubagent),
+        1 => (0usize..4).prop_map(Op::CloseSubagent),
         3 => prop_oneof![
             Just(ProviderStep::Complete),
             Just(ProviderStep::FailCreate),
@@ -216,11 +228,13 @@ impl Durable {
 
 /// One process's view of the durable store, with switchable commit
 /// failures. A failed commit is rejected before reaching the inner store, so
-/// it is never durable. Once `dead`, the process has crashed and none of its
-/// writes land.
+/// it is never durable. Once `alive` is cleared, the process has crashed and
+/// none of its writes land. Writes hold `alive` shared for their whole
+/// duration, so a crash is atomic: each write lands before it or not at all,
+/// and none trails into the next process.
 struct FaultyStore {
     inner: Arc<dyn SessionStore>,
-    dead: AtomicBool,
+    alive: tokio::sync::RwLock<bool>,
     fail_admission: AtomicBool,
     fail_terminal: AtomicBool,
     fail_next_turn_start: AtomicBool,
@@ -231,7 +245,7 @@ impl FaultyStore {
     fn over(inner: Arc<dyn SessionStore>) -> Self {
         Self {
             inner,
-            dead: AtomicBool::default(),
+            alive: tokio::sync::RwLock::new(true),
             fail_admission: AtomicBool::default(),
             fail_terminal: AtomicBool::default(),
             fail_next_turn_start: AtomicBool::default(),
@@ -254,7 +268,8 @@ impl FaultyStore {
 #[async_trait]
 impl SessionStore for FaultyStore {
     async fn create_session(&self, session: StoredSession) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.dead.load(Ordering::SeqCst), "process crashed");
+        let alive = self.alive.read().await;
+        anyhow::ensure!(*alive, "process crashed");
         self.inner.create_session(session).await
     }
 
@@ -273,7 +288,8 @@ impl SessionStore for FaultyStore {
         let has = |matches: fn(&SessionEventPayload) -> bool| {
             events.iter().any(|event| matches(&event.payload))
         };
-        anyhow::ensure!(!self.dead.load(Ordering::SeqCst), "process crashed");
+        let alive = self.alive.read().await;
+        anyhow::ensure!(*alive, "process crashed");
         if self.fail_next_commit.swap(false, Ordering::SeqCst) {
             anyhow::bail!("injected commit failure");
         }
@@ -350,6 +366,11 @@ enum Outcome {
     Interrupt(Result<(), ErrorKind>),
     Compact(Result<(), ErrorKind>),
     Shutdown(Result<(), ErrorKind>),
+    Spawn(Result<AgentId, String>),
+    CloseSubagent {
+        target: AgentId,
+        result: Result<(), String>,
+    },
     /// The call did not settle within `CALL_TIMEOUT`.
     Hung(&'static str),
 }
@@ -381,9 +402,31 @@ struct Run {
     log: Vec<SessionEvent>,
     stored_state: SessionState,
     provider_requests: Vec<Vec<String>>,
+    /// Incarnations whose process crashed or was abandoned; their
+    /// uncommitted writes are legitimately lost.
+    crashed_incarnations: BTreeSet<usize>,
+    /// Each recorded subagent's own session log.
+    child_logs: BTreeMap<AgentId, Vec<SessionEvent>>,
+    /// Resumes that failed, with their errors, by incarnation.
+    resume_failures: Vec<(usize, String)>,
 }
 
 type Drain = JoinHandle<(Vec<SessionEvent>, Option<String>)>;
+
+/// A released incarnation: its status (observing it does not keep the
+/// session open) and the subagents it owned while running at release.
+struct Released {
+    status: tokio::sync::watch::Receiver<SessionStatus>,
+    running: BTreeSet<AgentId>,
+}
+
+fn subagent_states(log: &[SessionEvent]) -> BTreeMap<AgentId, SubagentState> {
+    fold_events(SessionState::default(), log)
+        .subagents
+        .into_iter()
+        .map(|(agent, record)| (agent, record.status.state))
+        .collect()
+}
 
 fn drain(mut events: SessionEventStream) -> Drain {
     tokio::spawn(async move {
@@ -414,6 +457,9 @@ struct Harness {
     /// Runtimes of crashed processes, kept alive so their tasks can only
     /// fail against the dead store rather than vanish mid-await.
     crashed: Vec<SessionRuntime>,
+    /// Set when the current incarnation's last handle was dropped without
+    /// shutdown.
+    released: Option<Released>,
     run: Run,
 }
 
@@ -460,6 +506,7 @@ impl Harness {
                 .collect(),
             pending: Vec::new(),
             crashed: Vec::new(),
+            released: None,
             run: Run::default(),
         }
     }
@@ -544,6 +591,42 @@ impl Harness {
             Op::Shutdown => self.spawn_call("shutdown", |handle| async move {
                 Outcome::Shutdown(handle.shutdown(None).await.map_err(|e| (&e).into()))
             }),
+            Op::SpawnSubagent => self.spawn_subagent().await,
+            Op::CloseSubagent(index) => self.close_subagent(index),
+            Op::Release => {
+                self.barrier().await;
+                // Dropping the handle of a session that already closed is
+                // not a release; there is nothing left to own.
+                if let Some(handle) = self.handle.take()
+                    && handle.status() != SessionStatus::Closed
+                {
+                    // Children the model already closed may still read as
+                    // running: their records can be queued behind a turn.
+                    let closed: BTreeSet<AgentId> = self
+                        .run
+                        .calls
+                        .iter()
+                        .filter_map(|call| match &call.outcome {
+                            Outcome::CloseSubagent { target, .. } => Some(target.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let running = match handle.replay().await {
+                        Ok(log) => subagent_states(&log)
+                            .into_iter()
+                            .filter(|(agent, state)| {
+                                *state == SubagentState::Running && !closed.contains(agent)
+                            })
+                            .map(|(agent, _)| agent)
+                            .collect(),
+                        Err(_) => BTreeSet::new(),
+                    };
+                    self.released = Some(Released {
+                        status: handle.subscribe_status(),
+                        running,
+                    });
+                }
+            }
             Op::Yield(times) => {
                 for _ in 0..times {
                     tokio::task::yield_now().await;
@@ -556,6 +639,189 @@ impl Harness {
             Op::Script(step) => self.provider.script.lock().unwrap().push_back(step),
             Op::Fault(fault) => self.store.apply(fault),
         }
+    }
+
+    /// Spawn the way the subagent tool does: inside the parent's lifetime.
+    /// The tool spawns during a turn, which shutdown cancels and awaits
+    /// before closing children, so a spawn never outlives its parent. The
+    /// harness reproduces that fence by spawning only into an open session
+    /// with no other call in flight, and awaiting the spawn before the next
+    /// operation. `SubagentControl::spawn` itself does not check that the
+    /// parent is open; see `spawn_into_closed_parent_is_accepted`.
+    async fn spawn_subagent(&mut self) {
+        self.barrier().await;
+        if self
+            .handle
+            .as_ref()
+            .is_none_or(|handle| handle.status() == SessionStatus::Closed)
+        {
+            return;
+        }
+        let control = self.runtime.subagent_control();
+        let sessions = self.services.sessions.clone();
+        let id = self.id.clone();
+        self.spawn_call("spawn subagent", |_handle| async move {
+            let spawned = async {
+                let stored = sessions
+                    .load_session(&id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("parent session is missing"))?;
+                let parent = SubagentParentContext {
+                    model: stored.blueprint.default_model.clone(),
+                    subagent_model: stored.blueprint.subagent_model.clone(),
+                    blueprint: stored.blueprint,
+                    state: stored.state,
+                    snapshot: stored.snapshot,
+                };
+                let request = SpawnSubagentRequest {
+                    message: "delegated task".into(),
+                    agent_type: None,
+                    fork_context: false,
+                    model: None,
+                };
+                control
+                    .spawn(&parent, request, CancellationToken::new())
+                    .await
+            };
+            Outcome::Spawn(
+                spawned
+                    .await
+                    .map(|status| status.agent_id)
+                    .map_err(|e| format!("{e:#}")),
+            )
+        });
+        self.barrier().await;
+    }
+
+    fn spawned_subagents(&self) -> Vec<AgentId> {
+        self.run
+            .calls
+            .iter()
+            .filter_map(|call| match &call.outcome {
+                Outcome::Spawn(Ok(agent)) => Some(agent.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn close_subagent(&mut self, index: usize) {
+        let spawned = self.spawned_subagents();
+        let Some(target) = spawned.get(index % spawned.len().max(1)).cloned() else {
+            return;
+        };
+        let control = self.runtime.subagent_control();
+        self.spawn_call("close subagent", |_handle| async move {
+            let request = CloseSubagentRequest {
+                target: target.clone(),
+                timeout_ms: None,
+            };
+            let result = control
+                .close(request)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"));
+            Outcome::CloseSubagent { target, result }
+        });
+    }
+
+    /// Whether the session owns work that must finish before it releases:
+    /// a foreground turn or compaction, a running subagent, or a job.
+    fn owns_running_work(&self, status: &tokio::sync::watch::Receiver<SessionStatus>) -> bool {
+        *status.borrow() == SessionStatus::Running
+            || self.runtime.subagents.has_running_subagents(&self.id)
+            || self.services.tool_sessions.has_running_jobs(&self.id)
+    }
+
+    /// Settle a released incarnation. It must close by itself once it owns
+    /// no running work, never while it does, and refuse a second open
+    /// meanwhile. If owned work stalls on a hung provider, closing the
+    /// subagents must let it close, unless a foreground turn is the one
+    /// stalled: with no handle left nothing can interrupt it, so the process
+    /// is abandoned like a crash.
+    async fn settle_release(&mut self, released: Released) {
+        let Released { status, running } = released;
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
+        let drained = match tokio::time::timeout(IDLE_TIMEOUT, &mut stream).await {
+            // A session that failed (its stream ends with the error) closes
+            // its children by design; the release rules apply only to a
+            // session that closed because it was released.
+            Ok(Ok((events, None))) => {
+                if self.runtime.subagents.has_running_subagents(&self.id)
+                    || self.services.tool_sessions.has_running_jobs(&self.id)
+                {
+                    self.run
+                        .failures
+                        .push("released session closed while owning running work".into());
+                }
+                // Nobody closed these children, so each must have finished
+                // on its own before the session closed. Closing the session
+                // then records every child as closed, finished or not; a
+                // release that closes a child still running cuts it short.
+                if let Ok(log) = self.services.sessions.replay(&self.id).await {
+                    for agent in &running {
+                        let finished = log.iter().any(|event| {
+                            matches!(&event.payload,
+                            SessionEventPayload::SubagentUpdated { record }
+                                if &record.status.agent_id == agent
+                                    && matches!(
+                                        record.status.state,
+                                        SubagentState::Completed | SubagentState::Failed
+                                    ))
+                        });
+                        if !finished {
+                            self.run
+                                .failures
+                                .push(format!("release closed running subagent {agent}"));
+                        }
+                    }
+                }
+                Ok((events, None))
+            }
+            Ok(drained) => drained,
+            Err(_) => {
+                if !self.owns_running_work(&status) {
+                    self.run
+                        .failures
+                        .push("released session stayed open without owned work".into());
+                }
+                match self.runtime.resume_session(&self.id).await {
+                    Err(SessionError::AlreadyOpen(_)) => {}
+                    other => self.run.failures.push(format!(
+                        "open released session was reopened: {:?}",
+                        other.map(|_| ())
+                    )),
+                }
+                let control = self.runtime.subagent_control();
+                for target in self.spawned_subagents() {
+                    let request = CloseSubagentRequest {
+                        target,
+                        timeout_ms: None,
+                    };
+                    let _ = tokio::time::timeout(CALL_TIMEOUT, control.close(request)).await;
+                }
+                match tokio::time::timeout(CALL_TIMEOUT, &mut stream).await {
+                    Ok(drained) => drained,
+                    Err(_) if *status.borrow() == SessionStatus::Running => {
+                        stream.abort();
+                        self.abandon_process().await;
+                        return;
+                    }
+                    Err(_) => {
+                        self.run.failures.push(
+                            "released session did not close after its subagents closed".into(),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        let (events, stream_error) = drained.expect("stream task");
+        self.run.incarnations.push(Incarnation {
+            events,
+            stream_error,
+        });
     }
 
     async fn wait_idle(&mut self) {
@@ -592,6 +858,9 @@ impl Harness {
     /// Close the current incarnation and record its stream.
     async fn close(&mut self) {
         self.barrier().await;
+        if let Some(released) = self.released.take() {
+            self.settle_release(released).await;
+        }
         if let Some(handle) = self.handle.take() {
             let shutdown = tokio::time::timeout(CALL_TIMEOUT, handle.shutdown(None)).await;
             if shutdown.is_err() {
@@ -623,35 +892,75 @@ impl Harness {
     /// Kill the process: nothing it does from here on is durable. In-flight
     /// calls finish against the dead store and are still checked.
     async fn crash(&mut self) {
-        self.store.dead.store(true, Ordering::SeqCst);
         self.barrier().await;
         self.handle = None;
+        self.released = None;
         if let Some(stream) = self.stream.take() {
             stream.abort();
         }
+        self.abandon_process().await;
+        self.resume().await;
+    }
+
+    /// Replace the process: the old one's writes stop landing and a fresh
+    /// runtime takes over the same durable store.
+    async fn abandon_process(&mut self) {
+        self.run.crashed_incarnations.insert(self.incarnation);
+        *self.store.alive.write().await = false;
         let (runtime, services, store) = Self::process(&self.provider, self.durable.open());
         self.crashed
             .push(std::mem::replace(&mut self.runtime, runtime));
         self.services = services;
         self.store = store;
-        self.resume().await;
     }
 
     async fn resume(&mut self) {
         self.incarnation += 1;
         match tokio::time::timeout(CALL_TIMEOUT, self.runtime.resume_session(&self.id)).await {
             Ok(Ok((handle, events))) => {
+                // A fresh driver owns no live children: a crash killed them
+                // and a reopen follows a shutdown that closed them. Records
+                // left running must have been recovered, not adopted.
+                if self.runtime.subagents.has_running_subagents(&self.id) {
+                    self.run
+                        .failures
+                        .push("resumed session reports subagents it does not run".into());
+                }
                 self.handle = Some(handle);
                 self.stream = Some(drain(events));
             }
             // A fault may fail the resume; later ops no-op until a retry.
-            Ok(Err(_)) => {}
+            Ok(Err(error)) => self
+                .run
+                .resume_failures
+                .push((self.incarnation, format!("{error:#}"))),
             Err(_) => self.run.failures.push("resume hung".into()),
         }
     }
 
     async fn finish(mut self) -> Run {
         self.close().await;
+        // The last incarnation may not have ended cleanly: its process
+        // crashed or was abandoned, its resume failed, or the session failed
+        // (its stream ended with an error). Durable state is repaired on the
+        // next resume, not at the failure, so resume once and shut down
+        // cleanly before checking. A clean final shutdown is checked as-is.
+        let failed = self
+            .run
+            .incarnations
+            .last()
+            .is_some_and(|incarnation| incarnation.stream_error.is_some());
+        let unrecovered = failed
+            || self.run.crashed_incarnations.contains(&self.incarnation)
+            || self
+                .run
+                .resume_failures
+                .last()
+                .is_some_and(|(incarnation, _)| *incarnation == self.incarnation);
+        if unrecovered {
+            self.resume().await;
+            self.close().await;
+        }
         let report = self.runtime.shutdown(Duration::from_secs(5)).await;
         if report.timed_out {
             self.run.failures.push("runtime shutdown timed out".into());
@@ -670,6 +979,15 @@ impl Harness {
         crate::session::hydrate_stored_session(self.services.sessions.as_ref(), &mut stored)
             .await
             .unwrap();
+        for (agent, record) in &stored.state.subagents {
+            let log = self
+                .services
+                .sessions
+                .replay(&record.status.session_id)
+                .await
+                .unwrap_or_default();
+            self.run.child_logs.insert(agent.clone(), log);
+        }
         self.run.stored_state = stored.state;
         self.run.provider_requests = std::mem::take(&mut *self.provider.requests.lock().unwrap());
         self.run
@@ -754,6 +1072,54 @@ fn input_histories(log: &[SessionEvent]) -> HashMap<MessageId, InputHistory> {
         }
     }
     histories
+}
+
+/// Subagent records, checked by replaying the parent's log with the fold:
+///
+/// - A terminal record never returns to `Running`. The model never sends a
+///   subagent more input, so a regression is a stale write winning.
+/// - After the final clean shutdown (with a recovery pass first if the last
+///   incarnation crashed or failed), no record is left `Running`: shutdown
+///   closes owned subagents, and resume cancels those a crash or failure
+///   orphaned.
+/// - Every successful spawn is recorded in the parent's log, unless its
+///   process crashed first: a spawn during a turn queues the record behind
+///   the turn's write lease, and a crash loses it with the turn.
+fn check_subagents(run: &Run) {
+    let mut state = SessionState::default();
+    let mut terminal: BTreeSet<AgentId> = BTreeSet::new();
+    for event in &run.log {
+        halter_protocol::fold::apply_event(&mut state, &event.payload);
+        if let SessionEventPayload::SubagentUpdated { record } = &event.payload {
+            let agent = &record.status.agent_id;
+            let held = state.subagents[agent].status.state;
+            assert!(
+                !(terminal.contains(agent) && held == SubagentState::Running),
+                "subagent {agent} returned to running at {}",
+                event.sequence()
+            );
+            if held.is_terminal() {
+                terminal.insert(agent.clone());
+            }
+        }
+    }
+    for (agent, record) in &state.subagents {
+        assert!(
+            record.status.state.is_terminal(),
+            "subagent {agent} left {:?} after shutdown",
+            record.status.state
+        );
+    }
+    for call in &run.calls {
+        if let Outcome::Spawn(Ok(agent)) = &call.outcome
+            && !run.crashed_incarnations.contains(&call.incarnation)
+        {
+            assert!(
+                state.subagents.contains_key(agent),
+                "spawned subagent {agent} is missing from the parent log"
+            );
+        }
+    }
 }
 
 fn halter_protocol_compaction_marker() -> &'static str {
@@ -953,7 +1319,10 @@ fn check(run: &Run) {
                 Outcome::Interrupt(result) | Outcome::Compact(result) => {
                     result.as_ref().err() == Some(&ErrorKind::Closed)
                 }
-                Outcome::Shutdown(_) | Outcome::Hung(_) => true,
+                Outcome::Shutdown(_)
+                | Outcome::Spawn(_)
+                | Outcome::CloseSubagent { .. }
+                | Outcome::Hung(_) => true,
             };
             assert!(
                 closed,
@@ -1007,6 +1376,7 @@ fn check(run: &Run) {
     }
 
     check_scheduling(log);
+    check_subagents(run);
 
     // A compaction prompt belongs only to its own request, as the final
     // message. Anywhere earlier, a stale prompt leaked into the transcript.
@@ -1097,9 +1467,21 @@ fn check(run: &Run) {
     }
 }
 
+/// Seed for the generated cases. The normal suite replays one fixed case set
+/// so CI is reproducible; a soak (`PROPTEST_CASES` set) samples fresh cases.
+fn case_seed() -> proptest::test_runner::RngSeed {
+    use proptest::test_runner::RngSeed;
+    if std::env::var_os("PROPTEST_CASES").is_some() {
+        RngSeed::Random
+    } else {
+        RngSeed::Fixed(0x6861_6c74_6572)
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 128,
+        rng_seed: case_seed(),
         ..ProptestConfig::default()
     })]
 
@@ -1114,6 +1496,7 @@ proptest! {
     // the nightly soak raises `PROPTEST_CASES` for both backends.
     #![proptest_config(ProptestConfig {
         cases: 32,
+        rng_seed: case_seed(),
         ..ProptestConfig::default()
     })]
 
@@ -1162,6 +1545,31 @@ fn pinned_scenarios() {
             Crash,
             WaitIdle,
         ],
+        // A child that finishes before release must not hold the session
+        // open, and release must not cut a running child short.
+        &[SpawnSubagent, Script(Complete), Release],
+        // A child stalled on its provider holds a released session open
+        // until it is closed.
+        &[Script(HangMidStream), SpawnSubagent, Release],
+        // A crash orphans a running child; resume must record it cancelled
+        // rather than adopt it as still running.
+        &[Script(HangCreate), SpawnSubagent, Crash],
+        // Shutdown closes a running child before the session closes.
+        &[Script(HangCreate), SpawnSubagent, Shutdown],
+        // A child closed while a parent turn holds the lease queues its
+        // record; the turn's next commit fails. The record must survive.
+        &[
+            Script(HangMidStream),
+            SpawnSubagent,
+            Script(HangMidStream),
+            Submit(0),
+            Yield(4),
+            CloseSubagent(0),
+            Barrier,
+            Fault(NextCommit),
+            Interrupt,
+            Barrier,
+        ],
     ];
     for ops in scenarios {
         for backend in [Backend::Memory, Backend::Sqlite] {
@@ -1197,6 +1605,16 @@ fn generator_coverage() {
                 _ => name,
             };
             seen.insert(name);
+            if let SessionEventPayload::SubagentUpdated { record } = &event.payload {
+                let cause = record
+                    .status
+                    .error
+                    .as_deref()
+                    .map_or(String::new(), |error| {
+                        format!(" ({})", error.split(':').next().unwrap_or(error))
+                    });
+                seen.insert(format!("subagent {:?}{cause}", record.status.state));
+            }
         }
         for call in &run.calls {
             let name = match &call.outcome {
@@ -1207,6 +1625,11 @@ fn generator_coverage() {
                 Outcome::Interrupt(r) => format!("call interrupt {r:?}"),
                 Outcome::Compact(r) => format!("call compact {r:?}"),
                 Outcome::Shutdown(r) => format!("call shutdown {r:?}"),
+                Outcome::Spawn(r) => format!("call spawn {}", if r.is_ok() { "ok" } else { "err" }),
+                Outcome::CloseSubagent { result: r, .. } => format!(
+                    "call close subagent {}",
+                    if r.is_ok() { "ok" } else { "err" }
+                ),
                 Outcome::Hung(l) => format!("call hung {l}"),
             };
             seen.insert(name);
@@ -1237,4 +1660,72 @@ fn generator_coverage() {
     for (name, count) in counts {
         println!("{count:>4}/{runs} {name}");
     }
+}
+
+/// Documents current behaviour rather than a requirement: the public
+/// `SubagentControl::spawn` does not check that the parent session is open.
+/// A spawn into a session that already shut down succeeds, and its records
+/// are appended to the closed session's log after `SessionShutdownComplete`.
+/// The subagent tool never does this, because it spawns inside a turn that
+/// shutdown awaits. If spawn starts refusing closed parents, update this.
+#[test]
+fn spawn_into_closed_parent_is_accepted() {
+    let run = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let workspace = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let harness = Harness::new(
+                workspace.path(),
+                Durable::new(Backend::Memory, storage.path()),
+            )
+            .await;
+            harness
+                .handle
+                .as_ref()
+                .unwrap()
+                .shutdown(None)
+                .await
+                .unwrap();
+            let control = harness.runtime.subagent_control();
+            let stored = harness
+                .services
+                .sessions
+                .load_session(&harness.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let parent = SubagentParentContext {
+                model: stored.blueprint.default_model.clone(),
+                subagent_model: stored.blueprint.subagent_model.clone(),
+                blueprint: stored.blueprint,
+                state: stored.state,
+                snapshot: stored.snapshot,
+            };
+            let request = SpawnSubagentRequest {
+                message: "after shutdown".into(),
+                agent_type: None,
+                fork_context: false,
+                model: None,
+            };
+            let spawned = control
+                .spawn(&parent, request, CancellationToken::new())
+                .await;
+            assert!(spawned.is_ok(), "spawn into a closed parent is accepted");
+            harness.finish().await
+        });
+    let closed_at = run
+        .log
+        .iter()
+        .position(|event| matches!(event.payload, SessionEventPayload::SessionShutdownComplete))
+        .expect("parent shut down");
+    assert!(
+        run.log[closed_at..]
+            .iter()
+            .any(|event| matches!(event.payload, SessionEventPayload::SubagentUpdated { .. })),
+        "the child is recorded in the closed parent's log"
+    );
 }
