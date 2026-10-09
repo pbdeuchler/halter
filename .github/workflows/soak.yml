@@ -1,8 +1,9 @@
 name: soak
 
-# Long runs of the randomized session-driver tests. Every PR already runs 128
-# cases through the normal suite; this samples far more interleavings. A
-# failure prints the shrunk operation sequence in the log.
+# Long runs of the randomized session-driver tests, against both the in-memory
+# and SQLite stores. Every PR already runs 128 and 32 cases respectively
+# through the normal suite; this samples far more interleavings. A failure
+# prints the shrunk operation sequence in the log.
 on:
   schedule:
     - cron: "17 9 * * *"
@@ -23,6 +24,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Matches both the in-memory and SQLite model tests.
       - run: >-
           cargo test -p halter-runtime --lib
-          session_driver_model_tests::session_driver_model -- --exact
+          session_driver_model_tests::session_driver_model
