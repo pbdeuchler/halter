@@ -700,6 +700,9 @@ pub(crate) struct AnthropicStreamDecoder {
     message_id: Option<MessageId>,
     stop_reason: StopReason,
     usage: Usage,
+    // Keep the raw counter so partial cumulative updates can be normalized
+    // again without subtracting cache traffic from a saturated total.
+    uncached_input_tokens: u64,
     blocks: BTreeMap<usize, AnthropicStreamBlock>,
 }
 
@@ -725,6 +728,7 @@ impl AnthropicStreamDecoder {
             message_id: None,
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
+            uncached_input_tokens: 0,
             blocks: BTreeMap::new(),
         }
     }
@@ -774,7 +778,12 @@ impl AnthropicStreamDecoder {
             .map(|id| MessageId::from(id.to_owned()))
             .unwrap_or_default();
         self.message_id = Some(message_id.clone());
-        self.usage = decode_usage(event.pointer("/message").unwrap_or(event));
+        let message = event.pointer("/message").unwrap_or(event);
+        self.uncached_input_tokens = message
+            .pointer("/usage/input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        self.usage = decode_usage(message);
         vec![StreamEvent::MessageStart { id: message_id }]
     }
 
@@ -950,6 +959,25 @@ impl AnthropicStreamDecoder {
             self.stop_reason = decode_stop_reason_value(stop_reason);
         }
         if let Some(usage) = event.get("usage") {
+            // Delta usage is cumulative, and may finalize input/cache counts
+            // as well as output. Missing fields retain the start/last report;
+            // present fields replace it, including explicit zeroes.
+            self.uncached_input_tokens = usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.uncached_input_tokens);
+            self.usage.cache_creation_input_tokens = usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.usage.cache_creation_input_tokens);
+            self.usage.cache_read_input_tokens = usage
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.usage.cache_read_input_tokens);
+            self.usage.input_tokens = self
+                .uncached_input_tokens
+                .saturating_add(self.usage.cache_creation_input_tokens)
+                .saturating_add(self.usage.cache_read_input_tokens);
             self.usage.output_tokens = usage
                 .get("output_tokens")
                 .and_then(Value::as_u64)
@@ -1451,6 +1479,92 @@ mod tests {
             event,
             StreamEvent::MessageEnd { stop_reason, .. } if *stop_reason == StopReason::ToolUse
         )));
+    }
+
+    #[test]
+    fn stream_decoder_merges_cumulative_input_and_cache_usage_from_deltas() {
+        let cases = [
+            (
+                "final input and cache counts replace provisional counts",
+                json!({"input_tokens": 10, "cache_creation_input_tokens": 20, "cache_read_input_tokens": 30}),
+                vec![
+                    json!({"input_tokens": 100, "cache_creation_input_tokens": 200, "cache_read_input_tokens": 80_000, "output_tokens": 500}),
+                ],
+                Usage {
+                    input_tokens: 80_300,
+                    output_tokens: 500,
+                    cache_creation_input_tokens: 200,
+                    cache_read_input_tokens: 80_000,
+                },
+            ),
+            (
+                "output-only deltas retain input counters",
+                json!({"input_tokens": 10, "cache_creation_input_tokens": 20, "cache_read_input_tokens": 80_000}),
+                vec![json!({"output_tokens": 500}), json!({"output_tokens": 600})],
+                Usage {
+                    input_tokens: 80_030,
+                    output_tokens: 600,
+                    cache_creation_input_tokens: 20,
+                    cache_read_input_tokens: 80_000,
+                },
+            ),
+            (
+                "partial and repeated deltas do not double count cache tokens",
+                json!({"input_tokens": 10, "cache_creation_input_tokens": 20, "cache_read_input_tokens": 30}),
+                vec![
+                    json!({"cache_read_input_tokens": 80_000}),
+                    json!({"cache_read_input_tokens": 80_000}),
+                    json!({"input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 600}),
+                ],
+                Usage {
+                    input_tokens: 80_000,
+                    output_tokens: 600,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 80_000,
+                },
+            ),
+            (
+                "raw input survives saturation when cache counters change",
+                json!({"input_tokens": u64::MAX, "cache_read_input_tokens": 20}),
+                vec![json!({"cache_read_input_tokens": 0, "output_tokens": 600})],
+                Usage {
+                    input_tokens: u64::MAX,
+                    output_tokens: 600,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+            ),
+        ];
+        for (name, initial, updates, expected) in cases {
+            let mut decoder = AnthropicStreamDecoder::new(&sample_request(Vec::new()));
+            decoder.decode(&json!({"type": "message_start", "message": {"id": "msg_test", "usage": initial}})).expect(name);
+            for usage in updates {
+                let events = decoder
+                    .decode(&json!({"type": "message_delta", "usage": usage}))
+                    .expect(name);
+                assert!(
+                    matches!(events.as_slice(), [StreamEvent::UsageUpdate { .. }]),
+                    "{name}"
+                );
+            }
+            assert_eq!(decoder.usage, expected, "{name}");
+            let mut ledger = halter_protocol::TokenLedger::default();
+            let message = halter_protocol::AssistantMessage {
+                id: MessageId::new(),
+                created_at: chrono::Utc::now(),
+                parts: vec![AssistantPart::Text {
+                    text: "done".to_owned(),
+                }],
+                usage: Some(decoder.usage),
+                stop_reason: Some(StopReason::EndTurn),
+                replay_meta: Default::default(),
+            };
+            ledger.record(&Message::Assistant(message));
+            assert!(
+                ledger.effective_tokens() >= 80_000,
+                "{name}: compaction must see the full context"
+            );
+        }
     }
 
     /// In-band `error` events must carry the shared retryability
