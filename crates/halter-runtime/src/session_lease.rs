@@ -223,11 +223,17 @@ impl SessionLease {
         }
     }
 
+    /// Release the lease, committing the writes queued behind it. Release
+    /// runs in its own task: if the caller is cancelled mid-release (a turn
+    /// task aborted while it releases), the release still finishes rather
+    /// than leaving the lease held forever or dropping queued writes.
     pub(crate) async fn release(mut self) -> anyhow::Result<()> {
-        match self.session.take() {
-            Some(session) => session.release_lease().await,
-            None => Ok(()),
-        }
+        let Some(session) = self.session.take() else {
+            return Ok(());
+        };
+        tokio::spawn(async move { session.release_lease().await })
+            .await
+            .unwrap_or_else(|error| Err(anyhow::Error::new(error)))
     }
 }
 
@@ -579,5 +585,39 @@ mod tests {
             leases.take_subagent_records(&session).await,
             [record(1, Running), record(1, Completed)]
         );
+    }
+
+    /// Cancelling a task while it releases its lease must not leak the
+    /// lease. A subagent turn aborted mid-release used to leave its session
+    /// locked, so the subagent's close, and every parent shutdown waiting on
+    /// that close, hung forever.
+    #[tokio::test]
+    async fn cancelled_release_still_frees_the_lease() {
+        let services = crate::session_driver_tests::services(Arc::new(
+            halter_providers::FakeProvider::default(),
+        ));
+        let runtime = crate::SessionRuntime::new(services.clone());
+        let (handle, _events) = runtime
+            .create_session(crate::SessionInit::default())
+            .await
+            .unwrap();
+        let executor = SessionExecutor::new(services.clone(), handle.id().clone()).unwrap();
+
+        let lease = executor.acquire_lease().await;
+        // Hold the queue lock so the release stalls partway, then cancel it.
+        let blocked = services.session_leases.writes.lock().await;
+        let releasing = tokio::spawn(lease.release());
+        tokio::task::yield_now().await;
+        releasing.abort();
+        let _ = releasing.await;
+        drop(blocked);
+
+        tokio::time::timeout(Duration::from_secs(1), executor.acquire_lease())
+            .await
+            .expect("a cancelled release still frees the lease")
+            .release()
+            .await
+            .unwrap();
+        handle.shutdown(None).await.unwrap();
     }
 }

@@ -253,6 +253,18 @@ impl FaultyStore {
         }
     }
 
+    /// Storage recovers: every injected fault is lifted.
+    fn clear_faults(&self) {
+        for fault in [
+            &self.fail_admission,
+            &self.fail_terminal,
+            &self.fail_next_turn_start,
+            &self.fail_next_commit,
+        ] {
+            fault.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn apply(&self, fault: StoreFault) {
         match fault {
             StoreFault::Admission(on) => self.fail_admission.store(on, Ordering::SeqCst),
@@ -409,6 +421,9 @@ struct Run {
     child_logs: BTreeMap<AgentId, Vec<SessionEvent>>,
     /// Resumes that failed, with their errors, by incarnation.
     resume_failures: Vec<(usize, String)>,
+    /// Spawns that outlived their parent's close; see
+    /// `Harness::close_spawn_into_closed_parent`.
+    spawns_into_closed_parent: usize,
 }
 
 type Drain = JoinHandle<(Vec<SessionEvent>, Option<String>)>;
@@ -691,6 +706,40 @@ impl Harness {
             )
         });
         self.barrier().await;
+        self.close_spawn_into_closed_parent().await;
+    }
+
+    /// Known gap: `SubagentControl::spawn` does not refuse a parent that
+    /// has closed (see `spawn_into_closed_parent_is_accepted`). The harness
+    /// spawns only into an open session, but a session that fails
+    /// asynchronously can finish closing while the spawn is in flight; the
+    /// child then outlives its parent's cleanup. The subagent tool cannot do
+    /// this, since it spawns inside a turn the session awaits before cleanup,
+    /// so the harness closes such a child, as the parent's cleanup would
+    /// have, and counts the occurrence. Remove this once spawn refuses closed
+    /// parents.
+    async fn close_spawn_into_closed_parent(&mut self) {
+        let Some(Call {
+            outcome: Outcome::Spawn(Ok(agent)),
+            ..
+        }) = self.run.calls.last()
+        else {
+            return;
+        };
+        if self
+            .handle
+            .as_ref()
+            .is_none_or(|handle| handle.status() != SessionStatus::Closed)
+        {
+            return;
+        }
+        let request = CloseSubagentRequest {
+            target: agent.clone(),
+            timeout_ms: None,
+        };
+        let control = self.runtime.subagent_control();
+        let _ = tokio::time::timeout(CALL_TIMEOUT, control.close(request)).await;
+        self.run.spawns_into_closed_parent += 1;
     }
 
     fn spawned_subagents(&self) -> Vec<AgentId> {
@@ -943,8 +992,9 @@ impl Harness {
         // The last incarnation may not have ended cleanly: its process
         // crashed or was abandoned, its resume failed, or the session failed
         // (its stream ended with an error). Durable state is repaired on the
-        // next resume, not at the failure, so resume once and shut down
-        // cleanly before checking. A clean final shutdown is checked as-is.
+        // next resume once storage works again, not at the failure, so lift
+        // the faults, resume once, and shut down cleanly before checking. A
+        // clean final shutdown is checked as-is.
         let failed = self
             .run
             .incarnations
@@ -958,6 +1008,9 @@ impl Harness {
                 .last()
                 .is_some_and(|(incarnation, _)| *incarnation == self.incarnation);
         if unrecovered {
+            // Repair needs working storage; a fault left on would fail the
+            // recovering resume itself.
+            self.store.clear_faults();
             self.resume().await;
             self.close().await;
         }
@@ -1570,6 +1623,27 @@ fn pinned_scenarios() {
             Interrupt,
             Barrier,
         ],
+        // Closing children while their failing turns release their leases.
+        // An aborted release leaked the lease, hanging the close and every
+        // shutdown behind it. It reproduces only intermittently (about one
+        // run in ten before the fix); the deterministic check is
+        // `cancelled_release_still_frees_the_lease`.
+        &[
+            Script(Complete),
+            SpawnSubagent,
+            SpawnSubagent,
+            Fault(Terminal(true)),
+            SpawnSubagent,
+            SpawnSubagent,
+            SpawnSubagent,
+            CloseSubagent(2),
+            CloseSubagent(3),
+            Shutdown,
+            Interrupt,
+            Shutdown,
+            Shutdown,
+            CloseSubagent(0),
+        ],
     ];
     for ops in scenarios {
         for backend in [Backend::Memory, Backend::Sqlite] {
@@ -1633,6 +1707,9 @@ fn generator_coverage() {
                 Outcome::Hung(l) => format!("call hung {l}"),
             };
             seen.insert(name);
+        }
+        if run.spawns_into_closed_parent > 0 {
+            seen.insert("spawn into closed parent (known gap)".into());
         }
         if run.incarnations.len() > 1 {
             seen.insert("reopened".into());
