@@ -12,7 +12,9 @@ use crate::{
     AssistantPart, Message, PromptSegment, StopReason, ToolResult, ToolSpec, Usage, UserPart,
 };
 
-const CURRENT_ACCOUNTING_VERSION: u8 = 1;
+// Version 2 rejects output-only reports as context anchors. Rebuild persisted
+// ledgers from the transcript once so an old, undersized anchor cannot survive.
+const CURRENT_ACCOUNTING_VERSION: u8 = 2;
 const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const PROMPT_SEGMENT_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_SPEC_OVERHEAD_TOKENS: u64 = 8;
@@ -122,7 +124,7 @@ impl TokenLedger {
     }
 
     /// Account for one message appended to the transcript. A completed
-    /// assistant response carrying a non-zero usage report replaces the
+    /// assistant response carrying a non-zero input usage report replaces the
     /// anchor (its `context_tokens` already include the response itself);
     /// every other message adds its heuristic estimate.
     pub fn record(&mut self, message: &Message) {
@@ -174,8 +176,10 @@ fn usable_report(stop_reason: Option<StopReason>, usage: Option<&Usage>) -> Opti
     ) {
         return None;
     }
-    let tokens = usage?.context_tokens();
-    (tokens > 0).then_some(tokens)
+    let usage = usage?;
+    // Output alone does not report how much history the provider read.
+    // Anchoring on it would erase the accumulated transcript estimate.
+    (usage.input_tokens > 0).then(|| usage.context_tokens())
 }
 
 /// A pluggable token-budget estimator. Implementors may swap in a
@@ -436,6 +440,10 @@ mod tests {
                 message: assistant("empty", Some(StopReason::EndTurn), reported(0, 0)),
             },
             Case {
+                name: "output-only usage cannot describe the input context",
+                message: assistant("done", Some(StopReason::EndTurn), reported(0, 50)),
+            },
+            Case {
                 name: "no usage",
                 message: assistant("none", Some(StopReason::EndTurn), None),
             },
@@ -562,6 +570,33 @@ mod tests {
         assert_eq!(ledger.authoritative_tokens, 0);
         assert_eq!(ledger.inferred_tokens, estimate_messages_tokens(&messages));
         assert_eq!(ledger.accounting_version, CURRENT_ACCOUNTING_VERSION);
+    }
+
+    #[test]
+    fn output_only_anchor_from_previous_accounting_is_rebuilt_on_resume() {
+        let messages = vec![
+            Message::user("x".repeat(80_000)),
+            assistant("done", Some(StopReason::EndTurn), reported(0, 50)),
+        ];
+        let mut ledger: TokenLedger = serde_json::from_value(json!({
+            "authoritative_tokens": 50,
+            "inferred_tokens": 0,
+            "request_tokens": 250,
+            "request_tokens_at_last_anchor": 250,
+            "accounting_version": 1
+        }))
+        .expect("previous accounting ledger");
+
+        assert!(ledger.needs_request_preparation(250));
+        ledger.prepare_request(250, &[], &messages);
+
+        assert_eq!(ledger.authoritative_tokens, 0);
+        assert_eq!(
+            ledger.effective_tokens(),
+            250 + estimate_messages_tokens(&messages)
+        );
+        assert!(ledger.effective_tokens() > 20_000);
+        assert!(!ledger.needs_request_preparation(250));
     }
 
     #[test]
@@ -767,7 +802,7 @@ mod kani_proofs {
             Some(StopReason::Interrupted | StopReason::Error)
         );
         let expected =
-            (!partial && has_usage && usage.context_tokens() > 0).then(|| usage.context_tokens());
+            (!partial && has_usage && usage.input_tokens > 0).then(|| usage.context_tokens());
         assert_eq!(report, expected);
     }
 
