@@ -74,6 +74,14 @@ once a `1.0.0` line is cut.
   `tool_name`; they come from the enclosing `tool_call` span (under `span` /
   `spans` in JSON output). "tool call failed" (warn) keeps them.
 
+### Fixed
+
+- `grep` with `max_columns` no longer takes time quadratic in line length when
+  it measures or truncates a match. Grapheme lookup re-segmented the line from
+  its first byte on every step, so one matching multi-megabyte line (one-line
+  JSON, minified JS) could pin a blocking thread for hours. Truncation is now
+  a single linear pass.
+
 ## [0.9.0] - 2026-10-01
 
 Sessions now accept user messages through a durable inbox and return one
