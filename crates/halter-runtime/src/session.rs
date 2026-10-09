@@ -1493,8 +1493,9 @@ impl SessionExecutor {
         // CleanWindow prepares the window before delivering fresh input so
         // rollover cannot erase it. Prefix compaction includes fresh input in
         // its token budget. Both internal and driven executions use this path.
-        let mut primary_pending =
+        let clean_window =
             self.services.compaction.window_policy() == crate::WindowPolicy::CleanWindow;
+        let mut primary_pending = clean_window;
         if !primary_pending {
             let user_message = Message::User(turn.user_message.clone());
             state.append(user_message.clone());
@@ -1578,14 +1579,44 @@ impl SessionExecutor {
                 )
                 .await?;
             }
-            self.deliver_pending_input(
-                &mut state,
-                &mut events,
-                &mut fired_hook_ids,
-                hook_ctx,
-                &turn_cancel,
-            )
-            .await?;
+            let delivered = self
+                .deliver_pending_input(
+                    &mut state,
+                    &mut events,
+                    &mut fired_hook_ids,
+                    hook_ctx,
+                    &turn_cancel,
+                )
+                .await?;
+            // Compact policies include freshly delivered input in the budget.
+            // Admission happens after the opening boundary, so give compaction
+            // another chance before enforcing the cap or sending that input.
+            // CleanWindow instead prepares its window before input delivery.
+            if delivered && !clean_window {
+                let boundary_result = self
+                    .context_boundary(
+                        &stored.blueprint,
+                        snapshot.clone(),
+                        &mut state,
+                        &mut events,
+                        &mut fired_hook_ids,
+                        hook_ctx,
+                        &mut ledger_at_boundary,
+                        turn_usage,
+                        &turn_cancel,
+                    )
+                    .await;
+                self.flush_turn_progress(
+                    &stored.blueprint,
+                    snapshot.clone(),
+                    &mut expected_head,
+                    &mut state,
+                    &mut events,
+                    live,
+                )
+                .await?;
+                boundary_result?;
+            }
             self.prepare_token_ledger(
                 &stored.blueprint,
                 snapshot.as_ref(),
@@ -1919,7 +1950,7 @@ impl SessionExecutor {
                     return Err(ProviderError::cancelled().into());
                 }
                 if delivered {
-                    skip_context_boundary = true;
+                    skip_context_boundary = clean_window;
                     continue;
                 }
 
