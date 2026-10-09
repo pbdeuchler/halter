@@ -81,6 +81,13 @@ once a `1.0.0` line is cut.
   its first byte on every step, so one matching multi-megabyte line (one-line
   JSON, minified JS) could pin a blocking thread for hours. Truncation is now
   a single linear pass.
+- A subagent status update (`SubagentUpdated`) is no longer lost when the
+  parent-session commit carrying it fails. A record queued behind a running
+  turn was dropped with that turn's failed commit, and records committed at
+  lease release or with no writer were dropped on failure too, leaving the
+  parent's log and checkpoint showing a closed or completed subagent as
+  running (and, after resume, as interrupted). Failed records are now
+  redelivered, in order, ahead of the session's next write.
 
 ## [0.9.0] - 2026-10-01
 

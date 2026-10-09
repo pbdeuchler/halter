@@ -2792,19 +2792,19 @@ impl SessionExecutor {
         // Queued behind this turn by its subagents. Taken here, not at
         // release, so a spawn's record commits with the tool result that
         // hands the model its agent id.
-        for record in self
+        let records = self
             .services
             .session_leases
             .take_subagent_records(&self.session_id)
-            .await
-        {
-            self.record_subagent(state, events, record);
+            .await;
+        for record in &records {
+            self.record_subagent(state, events, record.clone());
         }
         if events.is_empty() {
             return Ok(());
         }
 
-        let committed = self
+        let committed = match self
             .commit_and_publish(
                 blueprint,
                 Some(snapshot),
@@ -2813,7 +2813,19 @@ impl SessionExecutor {
                 events.clone(),
                 Some(live),
             )
-            .await?;
+            .await
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                // The failed turn's state is discarded; hand the records back
+                // so the lease's next commit or its release delivers them.
+                self.services
+                    .session_leases
+                    .requeue_subagent_records(&self.session_id, records)
+                    .await;
+                return Err(error);
+            }
+        };
         events.clear();
         if let Some(last) = committed.last() {
             *expected_head = last.sequence();

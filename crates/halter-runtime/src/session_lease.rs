@@ -8,7 +8,14 @@
 // committed when the lease is released. With no lease held they commit
 // immediately, under the same lock, so a writer cannot start mid-commit.
 // Subagent records touch no transcript, so the holder also takes them at each
-// of its own commits (`take_subagent_records`) rather than at release. Later
+// of its own commits (`take_subagent_records`) rather than at release.
+//
+// A subagent record whose commit fails is not dropped: it waits as
+// undelivered and goes out ahead of every newer write for its session, seeded
+// into the next lease or committed with the next immediate dispatch. Records
+// carry generations, so a late delivery cannot override a newer generation,
+// and delivering in order keeps it from overwriting a newer record of the
+// same generation (`Running` then `Completed` share one). Later
 // dispatches read the `once` hook ids of queued ones (`queued_hook_ids`),
 // since the checkpoint has not caught up with them.
 
@@ -26,8 +33,38 @@ use crate::session::SessionExecutor;
 #[derive(Default)]
 /// Per-session write leases plus the writes queued behind them.
 pub struct SessionLeases {
-    held: Mutex<HashMap<SessionId, Vec<OutOfTurn>>>,
+    writes: Mutex<Writes>,
     released: Notify,
+}
+
+#[derive(Default)]
+struct Writes {
+    /// Sessions with a lease holder, and the writes queued behind it.
+    held: HashMap<SessionId, Vec<OutOfTurn>>,
+    /// Subagent records whose commit failed, oldest first.
+    undelivered: HashMap<SessionId, Vec<SubagentRecord>>,
+}
+
+impl Writes {
+    /// Hold `records` for redelivery ahead of anything already waiting.
+    fn hold_undelivered(&mut self, session_id: &SessionId, mut records: Vec<SubagentRecord>) {
+        if records.is_empty() {
+            return;
+        }
+        let waiting = self.undelivered.entry(session_id.clone()).or_default();
+        records.append(waiting);
+        *waiting = records;
+    }
+}
+
+fn subagent_records(writes: &[OutOfTurn]) -> Vec<SubagentRecord> {
+    writes
+        .iter()
+        .filter_map(|write| match write {
+            OutOfTurn::Subagent(record) => Some(record.clone()),
+            OutOfTurn::Hooks(_) => None,
+        })
+        .collect()
 }
 
 /// A write that originated outside the session's writer.
@@ -44,10 +81,16 @@ impl SessionLeases {
         loop {
             // Created before the check so a release in between still wakes us.
             let released = self.released.notified();
-            if let Entry::Vacant(slot) = self.held.lock().await.entry(session_id.clone()) {
-                slot.insert(Vec::new());
-                return;
+            let mut writes = self.writes.lock().await;
+            let undelivered = writes.undelivered.remove(session_id).unwrap_or_default();
+            match writes.held.entry(session_id.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(undelivered.into_iter().map(OutOfTurn::Subagent).collect());
+                    return;
+                }
+                Entry::Occupied(_) => writes.hold_undelivered(session_id, undelivered),
             }
+            drop(writes);
             released.await;
         }
     }
@@ -62,12 +105,19 @@ impl SessionLeases {
         F: FnOnce(Vec<OutOfTurn>) -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
     {
-        let mut held = self.held.lock().await;
-        let outcome = match held.remove(session_id) {
-            Some(queued) if !queued.is_empty() => commit(queued).await,
+        let mut writes = self.writes.lock().await;
+        let outcome = match writes.held.remove(session_id) {
+            Some(queued) if !queued.is_empty() => {
+                let records = subagent_records(&queued);
+                let outcome = commit(queued).await;
+                if outcome.is_err() {
+                    writes.hold_undelivered(session_id, records);
+                }
+                outcome
+            }
             _ => Ok(()),
         };
-        drop(held);
+        drop(writes);
         self.released.notify_waiters();
         outcome
     }
@@ -78,8 +128,8 @@ impl SessionLeases {
         &self,
         session_id: &SessionId,
     ) -> Vec<SubagentRecord> {
-        let mut held = self.held.lock().await;
-        let Some(queued) = held.get_mut(session_id) else {
+        let mut writes = self.writes.lock().await;
+        let Some(queued) = writes.held.get_mut(session_id) else {
             return Vec::new();
         };
         queued
@@ -91,11 +141,29 @@ impl SessionLeases {
             .collect()
     }
 
+    /// Return records taken by [`Self::take_subagent_records`] whose commit
+    /// failed, ahead of anything queued since, so they are not lost.
+    pub(crate) async fn requeue_subagent_records(
+        &self,
+        session_id: &SessionId,
+        records: Vec<SubagentRecord>,
+    ) {
+        let mut writes = self.writes.lock().await;
+        match writes.held.get_mut(session_id) {
+            Some(queued) => {
+                queued.splice(0..0, records.into_iter().map(OutOfTurn::Subagent));
+            }
+            None => writes.hold_undelivered(session_id, records),
+        }
+    }
+
     /// The `once` hook ids fired by hook dispatches queued behind the lease,
     /// which the checkpoint does not hold yet.
     pub(crate) async fn queued_hook_ids(&self, session_id: &SessionId) -> BTreeSet<String> {
-        let held = self.held.lock().await;
-        held.get(session_id)
+        let writes = self.writes.lock().await;
+        writes
+            .held
+            .get(session_id)
             .into_iter()
             .flatten()
             .filter_map(|write| match write {
@@ -107,8 +175,8 @@ impl SessionLeases {
             .collect()
     }
 
-    /// Queue `dispatch` behind the lease holder, or commit it now when the
-    /// session has no writer.
+    /// Queue `dispatch` behind the lease holder, or commit it now (after any
+    /// undelivered subagent records) when the session has no writer.
     pub(crate) async fn dispatch<F, Fut>(
         &self,
         session_id: &SessionId,
@@ -119,14 +187,25 @@ impl SessionLeases {
         F: FnOnce(Vec<OutOfTurn>) -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
     {
-        let mut held = self.held.lock().await;
-        match held.get_mut(session_id) {
-            Some(queued) => {
-                queued.push(dispatch);
-                Ok(())
-            }
-            None => commit(vec![dispatch]).await,
+        let mut writes = self.writes.lock().await;
+        if let Some(queued) = writes.held.get_mut(session_id) {
+            queued.push(dispatch);
+            return Ok(());
         }
+        let mut batch = writes
+            .undelivered
+            .remove(session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(OutOfTurn::Subagent)
+            .collect::<Vec<_>>();
+        batch.push(dispatch);
+        let records = subagent_records(&batch);
+        let outcome = commit(batch).await;
+        if outcome.is_err() {
+            writes.hold_undelivered(session_id, records);
+        }
+        outcome
     }
 }
 
@@ -397,5 +476,108 @@ mod tests {
                 .expect("release");
             assert_eq!(committed.load(Ordering::SeqCst), left, "{case}");
         }
+    }
+
+    fn record(generation: u64, state: halter_protocol::SubagentState) -> SubagentRecord {
+        SubagentRecord {
+            status: halter_protocol::SubagentStatus {
+                agent_id: halter_protocol::AgentId::from("child"),
+                session_id: SessionId::from("child-session"),
+                agent_type: None,
+                task: "task".to_owned(),
+                state,
+                last_message: None,
+                usage: None,
+                error: None,
+            },
+            generation,
+        }
+    }
+
+    /// Commits that fail with `fail`, else record the subagent records they carry.
+    fn capture(
+        delivered: Arc<std::sync::Mutex<Vec<SubagentRecord>>>,
+        fail: bool,
+    ) -> impl FnOnce(Vec<OutOfTurn>) -> std::future::Ready<anyhow::Result<()>> {
+        move |writes| {
+            if fail {
+                return std::future::ready(Err(anyhow::anyhow!("commit unavailable")));
+            }
+            delivered.lock().unwrap().extend(subagent_records(&writes));
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// A subagent record whose commit fails is redelivered ahead of newer
+    /// writes, on every path that can lose it: release, an immediate
+    /// dispatch, and a holder's own failed commit.
+    #[tokio::test]
+    async fn failed_subagent_records_are_redelivered_in_order() {
+        use halter_protocol::SubagentState::{Completed, Running};
+
+        // Release fails: the next lease is seeded with the record.
+        let leases = SessionLeases::default();
+        let session = SessionId::new();
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        leases.acquire(&session).await;
+        let running = OutOfTurn::Subagent(record(1, Running));
+        leases
+            .dispatch(&session, running, capture(delivered.clone(), false))
+            .await
+            .unwrap();
+        assert!(
+            leases
+                .release(&session, capture(delivered.clone(), true))
+                .await
+                .is_err()
+        );
+        leases.acquire(&session).await;
+        assert_eq!(
+            leases.take_subagent_records(&session).await,
+            [record(1, Running)],
+            "failed release seeds the next lease"
+        );
+
+        // An immediate dispatch fails: the next one delivers both, in order.
+        let leases = SessionLeases::default();
+        let failed = leases
+            .dispatch(
+                &session,
+                OutOfTurn::Subagent(record(1, Running)),
+                capture(delivered.clone(), true),
+            )
+            .await;
+        assert!(failed.is_err());
+        leases
+            .dispatch(
+                &session,
+                OutOfTurn::Subagent(record(1, Completed)),
+                capture(delivered.clone(), false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            [record(1, Running), record(1, Completed)],
+            "older record first, so the same-generation update wins"
+        );
+
+        // A holder's commit fails: requeued records precede newer queued ones.
+        let leases = SessionLeases::default();
+        leases.acquire(&session).await;
+        let taken = vec![record(1, Running)];
+        leases
+            .dispatch(
+                &session,
+                OutOfTurn::Subagent(record(1, Completed)),
+                capture(delivered.clone(), false),
+            )
+            .await
+            .unwrap();
+        leases.requeue_subagent_records(&session, taken).await;
+        assert_eq!(
+            leases.take_subagent_records(&session).await,
+            [record(1, Running), record(1, Completed)]
+        );
     }
 }
