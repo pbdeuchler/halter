@@ -231,6 +231,18 @@ impl Provider for AnthropicMessagesProvider {
                 )));
             }
         };
+        debug!(
+            session_id = %request.session_id,
+            turn_id = %request.turn_id,
+            model = %request.model.model,
+            prefix_cache_key = %request.prompt.prefix_cache_key,
+            tools_hash = %crate::codec_common::request_section_hash(&body["tools"]),
+            system_hash = %crate::codec_common::request_section_hash(&body["system"]),
+            thinking_hash = %crate::codec_common::request_section_hash(&body["thinking"]),
+            output_config_hash = %crate::codec_common::request_section_hash(&body["output_config"]),
+            message_prefix_hashes = ?anthropic_codec::message_prefix_hashes(&body),
+            "encoded anthropic request prefix"
+        );
         // Adaptive thinking includes interleaved thinking without the legacy beta.
         let enable_interleaved_thinking =
             body["thinking"]["type"] == "enabled" && !request.tools.is_empty();

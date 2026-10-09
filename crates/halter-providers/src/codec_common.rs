@@ -11,6 +11,11 @@ use sha2::{Digest, Sha256};
 /// call ids, Responses item ids, etc.). Consolidated to `64`.
 pub(crate) const PROVIDER_ID_MAX_LEN: usize = 64;
 
+/// Fingerprint an encoded request section without logging prompt contents.
+pub(crate) fn request_section_hash(value: &serde_json::Value) -> String {
+    format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
+}
+
 pub(crate) fn collect_system_text(request: &ProviderRequest) -> Option<String> {
     let mut sections = Vec::new();
     let rendered_prefix = request.prompt.rendered_prefix.trim();

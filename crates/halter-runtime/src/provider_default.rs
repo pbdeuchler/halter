@@ -177,6 +177,13 @@ mod tests {
                 preserved_first: Some("latest"),
             },
             Case {
+                name: "inline keeps an entire single user turn even when it is large",
+                strategy: ProviderCompactionStrategy::Inline,
+                messages: vec![user("only user"), assistant(&"x".repeat(80_000))],
+                eligible: 0,
+                preserved_first: Some("only user"),
+            },
+            Case {
                 name: "inline without a user compacts everything",
                 strategy: ProviderCompactionStrategy::Inline,
                 messages: vec![assistant("only")],
