@@ -10,10 +10,17 @@
 // blocked, tokio advances the clock, so a deadlock surfaces as a call timeout
 // within milliseconds of wall time.
 //
+// Each run uses one durable backend. With the in-memory store a turn usually
+// finishes before the next operation, so those runs mostly exercise delivery.
+// SQLite commits run on blocking threads, so interrupts, shutdowns, and crashes
+// land mid-turn far more often; those runs mostly exercise cancellation and
+// recovery against real persistence. The two are complementary.
+//
 // `PROPTEST_CASES=2000 cargo test -p halter-runtime session_driver_model`
-// runs a longer soak.
+// runs a longer soak of both.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,7 +34,7 @@ use halter_protocol::{
     SessionId, SessionState, SessionStatus, StreamEvent,
 };
 use halter_providers::{FakeProvider, Provider};
-use halter_session::{InMemorySessionStore, SessionStore, StoredSession};
+use halter_session::{InMemorySessionStore, SessionStore, SqliteSessionStore, StoredSession};
 use proptest::prelude::*;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -175,13 +182,44 @@ impl Provider for ScriptedProvider {
     }
 }
 
-/// One process's view of a shared in-memory store, with switchable commit
+/// Durable storage that outlives any one process.
+#[derive(Debug, Clone, Copy)]
+enum Backend {
+    Memory,
+    Sqlite,
+}
+
+/// Opens each process's handle on the durable store: memory processes share
+/// one in-process store, SQLite processes open the same database file.
+enum Durable {
+    Memory(InMemorySessionStore),
+    Sqlite(PathBuf),
+}
+
+impl Durable {
+    fn new(backend: Backend, dir: &Path) -> Self {
+        match backend {
+            Backend::Memory => Self::Memory(InMemorySessionStore::default()),
+            Backend::Sqlite => Self::Sqlite(dir.join("sessions.db")),
+        }
+    }
+
+    fn open(&self) -> Arc<dyn SessionStore> {
+        match self {
+            Self::Memory(store) => Arc::new(store.clone()),
+            Self::Sqlite(path) => {
+                Arc::new(SqliteSessionStore::open(path).expect("open sqlite store"))
+            }
+        }
+    }
+}
+
+/// One process's view of the durable store, with switchable commit
 /// failures. A failed commit is rejected before reaching the inner store, so
 /// it is never durable. Once `dead`, the process has crashed and none of its
 /// writes land.
-#[derive(Default)]
 struct FaultyStore {
-    inner: InMemorySessionStore,
+    inner: Arc<dyn SessionStore>,
     dead: AtomicBool,
     fail_admission: AtomicBool,
     fail_terminal: AtomicBool,
@@ -190,10 +228,14 @@ struct FaultyStore {
 }
 
 impl FaultyStore {
-    fn over(inner: InMemorySessionStore) -> Self {
+    fn over(inner: Arc<dyn SessionStore>) -> Self {
         Self {
             inner,
-            ..Self::default()
+            dead: AtomicBool::default(),
+            fail_admission: AtomicBool::default(),
+            fail_terminal: AtomicBool::default(),
+            fail_next_turn_start: AtomicBool::default(),
+            fail_next_commit: AtomicBool::default(),
         }
     }
 
@@ -360,6 +402,7 @@ struct Harness {
     runtime: SessionRuntime,
     services: Arc<crate::RuntimeServices>,
     provider: Arc<ScriptedProvider>,
+    durable: Durable,
     store: Arc<FaultyStore>,
     id: SessionId,
     handle: Option<SessionHandle>,
@@ -378,7 +421,7 @@ impl Harness {
     /// A fresh process: its own services, leases, and store view.
     fn process(
         provider: &Arc<ScriptedProvider>,
-        durable: InMemorySessionStore,
+        durable: Arc<dyn SessionStore>,
     ) -> (
         SessionRuntime,
         Arc<crate::RuntimeServices>,
@@ -391,9 +434,9 @@ impl Harness {
         (SessionRuntime::new(services.clone()), services, store)
     }
 
-    async fn new(working_dir: &std::path::Path) -> Self {
+    async fn new(working_dir: &Path, durable: Durable) -> Self {
         let provider = Arc::new(ScriptedProvider::default());
-        let (runtime, services, store) = Self::process(&provider, InMemorySessionStore::default());
+        let (runtime, services, store) = Self::process(&provider, durable.open());
         let (handle, events) = runtime
             .create_session(SessionInit {
                 working_dir: working_dir.into(),
@@ -405,6 +448,7 @@ impl Harness {
             runtime,
             services,
             provider,
+            durable,
             store,
             id: handle.id().clone(),
             handle: Some(handle),
@@ -531,8 +575,15 @@ impl Harness {
             }
         })
         .await;
+        // A liveness snapshot is sound only if no client call can add input
+        // while it is taken: with none in flight, and the session idle both
+        // before and after the replay, the log is the idle driver's inbox.
+        let quiescent = |pending: &[JoinHandle<Call>]| pending.iter().all(JoinHandle::is_finished);
         if settled == Ok(SessionStatus::Idle)
+            && quiescent(&self.pending)
             && let Ok(log) = handle.replay().await
+            && quiescent(&self.pending)
+            && handle.status() == SessionStatus::Idle
         {
             self.run.idle_logs.push(log);
         }
@@ -578,8 +629,7 @@ impl Harness {
         if let Some(stream) = self.stream.take() {
             stream.abort();
         }
-        let durable = self.store.inner.clone();
-        let (runtime, services, store) = Self::process(&self.provider, durable);
+        let (runtime, services, store) = Self::process(&self.provider, self.durable.open());
         self.crashed
             .push(std::mem::replace(&mut self.runtime, runtime));
         self.services = services;
@@ -633,15 +683,17 @@ fn message_id(message: &Message) -> MessageId {
     user.id.clone()
 }
 
-fn execute(ops: &[Op]) -> Run {
+fn execute(ops: &[Op], backend: Backend) -> Run {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
         .build()
         .unwrap();
-    let temp = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
     runtime.block_on(async {
-        let mut harness = Harness::new(temp.path()).await;
+        let durable = Durable::new(backend, storage.path());
+        let mut harness = Harness::new(workspace.path(), durable).await;
         for &op in ops {
             harness.apply(op).await;
             tokio::task::yield_now().await;
@@ -1053,7 +1105,21 @@ proptest! {
 
     #[test]
     fn session_driver_model(ops in prop::collection::vec(op_strategy(), 1..40)) {
-        check(&execute(&ops));
+        check(&execute(&ops, Backend::Memory));
+    }
+}
+
+proptest! {
+    // Each SQLite case does real file I/O, so it samples fewer cases per run;
+    // the nightly soak raises `PROPTEST_CASES` for both backends.
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn session_driver_model_sqlite(ops in prop::collection::vec(op_strategy(), 1..40)) {
+        check(&execute(&ops, Backend::Sqlite));
     }
 }
 
@@ -1098,7 +1164,9 @@ fn pinned_scenarios() {
         ],
     ];
     for ops in scenarios {
-        check(&execute(ops));
+        for backend in [Backend::Memory, Backend::Sqlite] {
+            check(&execute(ops, backend));
+        }
     }
 }
 
@@ -1116,7 +1184,7 @@ fn generator_coverage() {
     let runs = 200;
     for _ in 0..runs {
         let ops = strategy.new_tree(&mut runner).unwrap().current();
-        let run = execute(&ops);
+        let run = execute(&ops, Backend::Memory);
         let mut seen = BTreeSet::new();
         for event in &run.log {
             let name = format!("{:?}", event.payload);
