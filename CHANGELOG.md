@@ -88,6 +88,12 @@ once a `1.0.0` line is cut.
   parent's log and checkpoint showing a closed or completed subagent as
   running (and, after resume, as interrupted). Failed records are now
   redelivered, in order, ahead of the session's next write.
+- A session write lease is no longer leaked when the task releasing it is
+  cancelled mid-release. A subagent turn aborted while releasing its lease
+  left the subagent's session locked, so closing that subagent, and any
+  parent shutdown waiting on the close, hung indefinitely (runtime shutdown
+  with a deadline timed out too). Lease release now runs to completion in
+  its own task.
 
 ## [0.9.0] - 2026-10-01
 
