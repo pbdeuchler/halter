@@ -209,7 +209,7 @@ async fn action_click(context: &ToolContext, input: &Value) -> anyhow::Result<Va
     let session_handle = context.tool_sessions.browser_session(&context.session_id);
     let mut guard = session_handle.lock().await;
     let session = require_open_session(&mut guard)?;
-    let locator = session.page().locator(&target.selector_string()).await;
+    let locator = session.page().locator(target.selector_string());
     locator
         .click(None)
         .await
@@ -224,7 +224,7 @@ async fn action_type(context: &ToolContext, input: &Value) -> anyhow::Result<Val
     let session_handle = context.tool_sessions.browser_session(&context.session_id);
     let mut guard = session_handle.lock().await;
     let session = require_open_session(&mut guard)?;
-    let locator = session.page().locator(&target.selector_string()).await;
+    let locator = session.page().locator(target.selector_string());
     locator
         .fill(&text, None)
         .await
@@ -281,7 +281,7 @@ async fn action_press(context: &ToolContext, input: &Value) -> anyhow::Result<Va
     let mut guard = session_handle.lock().await;
     let session = require_open_session(&mut guard)?;
     // Page-level keypress: target the body so something always has focus.
-    let locator = session.page().locator("body").await;
+    let locator = session.page().locator("body");
     locator
         .press(&key, None)
         .await

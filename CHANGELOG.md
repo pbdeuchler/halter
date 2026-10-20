@@ -75,6 +75,10 @@ once a `1.0.0` line is cut.
   `spans` in JSON output). "tool call failed" (warn) keeps them.
 - The minimum supported `tokio` is now 1.54. Streaming shell pipes register
   with `AsyncFd::register`, which replaces the deprecated `AsyncFd::new`.
+- `playwright-rs` (behind `browser-tools`) is upgraded from 0.12.0 to 0.20.1,
+  which bundles Playwright driver 1.64. This drops the `zip` 8 build
+  dependency affected by RUSTSEC-2026-0367, RUSTSEC-2026-0368, and
+  RUSTSEC-2026-0369. Builds no longer need `PLAYWRIGHT_DRIVER_VERSION`.
 
 ### Fixed
 

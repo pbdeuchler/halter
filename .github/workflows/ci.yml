@@ -15,11 +15,6 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
-    # playwright-rs 0.12.x fails to emit its required compile-time version
-    # when its build-time driver download is unavailable. Keep compilation
-    # deterministic; browser installation remains a runtime concern.
-    env:
-      PLAYWRIGHT_DRIVER_VERSION: 1.59.1
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -40,8 +35,6 @@ jobs:
   # and test it explicitly.
   default-features:
     runs-on: ubuntu-latest
-    env:
-      PLAYWRIGHT_DRIVER_VERSION: 1.59.1
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -60,8 +53,6 @@ jobs:
   # Keep the toolchain version in sync with `rust-version` in Cargo.toml.
   msrv:
     runs-on: ubuntu-latest
-    env:
-      PLAYWRIGHT_DRIVER_VERSION: 1.59.1
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.88
@@ -78,8 +69,6 @@ jobs:
   # Compiles the `#[cfg(windows)]` branches natively (check only, no tests).
   windows:
     runs-on: windows-latest
-    env:
-      PLAYWRIGHT_DRIVER_VERSION: 1.59.1
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -96,7 +85,6 @@ jobs:
       KANI_VERSION: 0.68.0
       KANI_MAX_RSS_MB: 8192
       KANI_TIMEOUT_S: 900
-      PLAYWRIGHT_DRIVER_VERSION: 1.59.1
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
