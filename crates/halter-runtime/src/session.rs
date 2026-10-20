@@ -2396,6 +2396,8 @@ impl SessionExecutor {
             stop_reason = ?materialized.message.stop_reason,
             input_tokens = materialized.usage.input_tokens,
             output_tokens = materialized.usage.output_tokens,
+            cache_creation_input_tokens = materialized.usage.cache_creation_input_tokens,
+            cache_read_input_tokens = materialized.usage.cache_read_input_tokens,
             "materialized assistant message"
         );
 
@@ -2566,6 +2568,21 @@ impl SessionExecutor {
         } else {
             settings.compaction_due(state.token_ledger.effective_tokens())
         };
+        debug!(
+            session_id = %blueprint.session_id,
+            context_window = state.context_window,
+            effective_tokens = state.token_ledger.effective_tokens(),
+            authoritative_tokens = state.token_ledger.authoritative_tokens,
+            inferred_tokens = state.token_ledger.inferred_tokens,
+            request_tokens = state.token_ledger.request_tokens,
+            compaction_threshold = settings.compaction_threshold,
+            max_tokens = ?settings.max_tokens,
+            message_count = state.messages.len(),
+            clean_window,
+            requested,
+            due,
+            "evaluated context boundary"
+        );
         if due {
             self.run_automatic_compaction(
                 blueprint,

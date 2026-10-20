@@ -73,6 +73,37 @@ pub(crate) fn encode_stream_request(
     )
 }
 
+/// Checkpoints of the encoded conversation at 1, 2, 4, ... messages, plus
+/// its end. Comparing matching counts detects changes to retained history
+/// without logging contents or a hash per message in a long session.
+/// Moving cache breakpoints are excluded; tool arguments remain untouched.
+pub(crate) fn message_prefix_hashes(body: &Value) -> Vec<(usize, String)> {
+    use sha2::{Digest, Sha256};
+
+    let Some(messages) = body["messages"].as_array() else {
+        return Vec::new();
+    };
+    let mut hasher = Sha256::new();
+    let mut hashes = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let mut message = message.clone();
+        if let Some(content) = message["content"].as_array_mut() {
+            for block in content {
+                if let Some(block) = block.as_object_mut() {
+                    block.remove("cache_control");
+                }
+            }
+        }
+        hasher.update(message.to_string().as_bytes());
+        hasher.update(b"\n");
+        let count = index + 1;
+        if count.is_power_of_two() || count == messages.len() {
+            hashes.push((count, format!("{:x}", hasher.clone().finalize())));
+        }
+    }
+    hashes
+}
+
 fn encode_request_with_options(
     request: &ProviderRequest,
     temperature: Option<f32>,
@@ -1101,6 +1132,61 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn message_prefix_fingerprints_distinguish_history_edits_from_cache_marker_moves() {
+        let messages: Vec<Value> = (0..65)
+            .map(|index| {
+                json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": format!("message {index}")}]
+                })
+            })
+            .collect();
+        let extended = json!({"messages": messages});
+        let extended_hashes = message_prefix_hashes(&extended);
+
+        // Each shorter request puts its marker at a different place. Its
+        // retained content checkpoints must agree with the extended request.
+        for length in 1..=65 {
+            let mut earlier = json!({"messages": &messages[..length]});
+            earlier["messages"][length - 1]["content"][0]["cache_control"] =
+                json!({"type": "ephemeral"});
+            for (count, hash) in message_prefix_hashes(&earlier) {
+                if let Some((_, extended_hash)) = extended_hashes
+                    .iter()
+                    .find(|(checkpoint, _)| *checkpoint == count)
+                {
+                    assert_eq!(&hash, extended_hash, "retained prefix of {count} messages");
+                }
+            }
+        }
+        assert_eq!(
+            extended_hashes
+                .iter()
+                .map(|(count, _)| *count)
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 8, 16, 32, 64, 65]
+        );
+
+        let mut changed = extended.clone();
+        changed["messages"][0]["content"][0]["text"] = json!("rewritten first message");
+        for ((_, original), (_, rewritten)) in
+            extended_hashes.iter().zip(message_prefix_hashes(&changed))
+        {
+            assert_ne!(original, &rewritten);
+        }
+
+        // A similarly named field inside actual tool arguments is content,
+        // not breakpoint metadata, and must affect the fingerprints.
+        let tool = json!({"messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_test", "name": "echo", "input": {"cache_control": "first"}}]}]});
+        let mut changed_tool = tool.clone();
+        changed_tool["messages"][0]["content"][0]["input"]["cache_control"] = json!("second");
+        assert_ne!(
+            message_prefix_hashes(&tool),
+            message_prefix_hashes(&changed_tool)
+        );
+    }
 
     #[test]
     fn adaptive_reasoning_efforts_preserve_disable_and_provider_extremes() {
