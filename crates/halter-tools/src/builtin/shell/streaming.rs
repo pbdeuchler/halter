@@ -192,7 +192,10 @@ fn truncate_to_char_boundary(value: &str, cap: usize) -> &str {
 #[cfg(unix)]
 fn register_nonblocking_pipe(reader: fs::File) -> io::Result<tokio::io::unix::AsyncFd<fs::File>> {
     set_nonblocking(&reader)?;
-    tokio::io::unix::AsyncFd::new(reader)
+    // SAFETY: `reader` is an owned `File`, so its descriptor is open and stays
+    // the same until the `AsyncFd` drops or returns it. Nothing else can close
+    // or replace the descriptor while the `AsyncFd` owns the `File`.
+    unsafe { tokio::io::unix::AsyncFd::register(reader) }.map_err(io::Error::from)
 }
 
 #[cfg(unix)]
