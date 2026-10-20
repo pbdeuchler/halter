@@ -73,6 +73,8 @@ once a `1.0.0` line is cut.
   completed" events no longer repeat `session_id`, `tool_call_id`, and
   `tool_name`; they come from the enclosing `tool_call` span (under `span` /
   `spans` in JSON output). "tool call failed" (warn) keeps them.
+- The minimum supported `tokio` is now 1.54. Streaming shell pipes register
+  with `AsyncFd::register`, which replaces the deprecated `AsyncFd::new`.
 
 ### Fixed
 
