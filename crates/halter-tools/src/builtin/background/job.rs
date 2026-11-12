@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex as AsyncMutex, watch};
@@ -82,7 +81,7 @@ fn signal_owned(owned: &OwnedProcessIds, signal: i32) {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum JobStatus {
     Running,
@@ -93,6 +92,80 @@ enum JobStatus {
     Failed {
         error: String,
     },
+}
+
+impl std::fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => f.write_str("running"),
+            Self::Exited {
+                exit_code: Some(code),
+                ..
+            } => write!(f, "exited with code {code}"),
+            Self::Exited {
+                signal: Some(signal),
+                ..
+            } => write!(f, "killed by signal {signal}"),
+            Self::Exited { .. } => f.write_str("exited"),
+            Self::Failed { error } => write!(f, "failed: {error}"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+/// A background job as `spawn`, `list` and `kill` report it.
+pub struct JobSummary {
+    id: String,
+    command: String,
+    cwd: std::path::PathBuf,
+    pid: u32,
+    started_at_ms: u128,
+    status: JobStatus,
+}
+
+impl JobSummary {
+    /// A header line, then the command verbatim after `$ `.
+    pub(super) fn render(&self) -> String {
+        format!(
+            "{} ({}, pid {}, cwd {})\n$ {}",
+            self.id,
+            self.status,
+            self.pid,
+            self.cwd.display(),
+            self.command
+        )
+    }
+}
+
+#[derive(Debug, Serialize)]
+/// A window of a background job's combined output.
+pub struct JobOutput {
+    id: String,
+    output: String,
+    start_cursor: u64,
+    next_cursor: u64,
+    truncated: bool,
+    status: JobStatus,
+}
+
+impl JobOutput {
+    /// A header line, then the output verbatim.
+    pub(super) fn render(&self) -> String {
+        let discarded = if self.truncated {
+            "; earlier output was discarded"
+        } else {
+            ""
+        };
+        format!(
+            "[{}: {}; bytes {}-{}{discarded}; pass cursor={} for newer output]\n{}",
+            self.id,
+            self.status,
+            self.start_cursor,
+            self.next_cursor,
+            self.next_cursor,
+            self.output
+        )
+    }
 }
 
 struct OutputBuffer {
@@ -253,15 +326,22 @@ impl BackgroundJob {
         }))
     }
 
-    pub(super) fn summary(&self) -> Value {
-        json!({"id": self.id, "command": self.command, "cwd": self.cwd, "pid": self.pid, "started_at_ms": self.started_at_ms, "status": self.status.borrow().clone()})
+    pub(super) fn summary(&self) -> JobSummary {
+        JobSummary {
+            id: self.id.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            pid: self.pid,
+            started_at_ms: self.started_at_ms,
+            status: self.status.borrow().clone(),
+        }
     }
 
     pub(super) fn is_finished(&self) -> bool {
         !matches!(*self.status.borrow(), JobStatus::Running)
     }
 
-    pub(super) fn output(&self, cursor: u64) -> anyhow::Result<Value> {
+    pub(super) fn output(&self, cursor: u64) -> anyhow::Result<JobOutput> {
         let buffer = self.output.lock();
         anyhow::ensure!(
             cursor <= buffer.end,
@@ -275,9 +355,14 @@ impl BackgroundJob {
             .skip((start - oldest) as usize)
             .copied()
             .collect();
-        Ok(
-            json!({"id": self.id, "output": String::from_utf8_lossy(&bytes), "start_cursor": start, "next_cursor": buffer.end, "truncated": cursor < oldest, "status": self.status.borrow().clone()}),
-        )
+        Ok(JobOutput {
+            id: self.id.clone(),
+            output: String::from_utf8_lossy(&bytes).into_owned(),
+            start_cursor: start,
+            next_cursor: buffer.end,
+            truncated: cursor < oldest,
+            status: self.status.borrow().clone(),
+        })
     }
 
     pub(super) fn request_stop(&self) {

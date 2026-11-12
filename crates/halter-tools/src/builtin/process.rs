@@ -1,10 +1,11 @@
 // pattern: Imperative Shell
 
 use async_trait::async_trait;
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, ToolOutput, TypedTool};
 
 use super::common::{ToolScope, ensure_not_cancelled, optional_u64, required_string};
 
@@ -245,7 +246,7 @@ mod platform {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 /// Per-process result returned by [`kill_tree`].
 pub struct KillTreeEntry {
     pub pid: i32,
@@ -302,8 +303,10 @@ pub fn list_descendants(pid: i32) -> Vec<i32> {
 pub struct ProcessTool;
 
 #[async_trait]
-impl Tool for ProcessTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for ProcessTool {
+    type Output = ProcessOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("process"),
             description: "Inspect or terminate a process tree".to_owned(),
@@ -327,7 +330,7 @@ impl Tool for ProcessTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<ProcessOutput> {
         let _scope = ToolScope::new(&context, "process");
         ensure_not_cancelled(&context.cancel)?;
         let action = required_string(&input, "action")?;
@@ -336,41 +339,80 @@ impl Tool for ProcessTool {
         let pid = i32::try_from(pid)
             .map_err(|_| anyhow::anyhow!("failed to execute process tool: pid is out of range"))?;
 
-        let value = match action {
+        Ok(match action {
             "kill_tree" => {
                 context.policy.check_process_signal(pid).await?;
                 let signal = optional_u64(&input, "signal")?.unwrap_or(9);
                 let signal = i32::try_from(signal).map_err(|_| {
                     anyhow::anyhow!("failed to execute process tool: signal is out of range")
                 })?;
-                let report = kill_tree(pid, signal);
-                let killed_count =
-                    u64::try_from(report.iter().filter(|entry| entry.killed).count())
-                        .unwrap_or(u64::MAX);
-                let per_pid: Vec<Value> = report
-                    .iter()
-                    .map(|entry| {
-                        json!({
-                            "pid": entry.pid,
-                            "killed": entry.killed,
-                        })
-                    })
-                    .collect();
-                json!({
-                    "pid": pid,
-                    "signal": signal,
-                    "killed": killed_count,
-                    "per_pid": per_pid,
-                })
+                let per_pid = kill_tree(pid, signal);
+                ProcessOutput::Killed {
+                    pid,
+                    signal,
+                    killed: per_pid.iter().filter(|entry| entry.killed).count(),
+                    per_pid,
+                }
             }
-            "list_descendants" => json!({
-                "pid": pid,
-                "descendants": list_descendants(pid),
-            }),
+            "list_descendants" => ProcessOutput::Descendants {
+                pid,
+                descendants: list_descendants(pid),
+            },
             _ => anyhow::bail!("failed to execute process tool: unknown action '{action}'"),
-        };
+        })
+    }
+}
 
-        Ok(ToolResult::Json { value })
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+/// Result of a `process` call.
+pub enum ProcessOutput {
+    Killed {
+        pid: i32,
+        signal: i32,
+        killed: usize,
+        per_pid: Vec<KillTreeEntry>,
+    },
+    Descendants {
+        pid: i32,
+        descendants: Vec<i32>,
+    },
+}
+
+impl ToolOutput for ProcessOutput {
+    fn to_model_string(&self) -> String {
+        let pids = |pids: &mut dyn Iterator<Item = i32>| {
+            pids.map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match self {
+            Self::Killed {
+                pid,
+                signal,
+                killed,
+                per_pid,
+            } => {
+                let total = per_pid.len();
+                let refused = per_pid.iter().filter(|entry| !entry.killed);
+                let refused = pids(&mut refused.map(|entry| entry.pid));
+                let text = format!(
+                    "Sent signal {signal} to {killed} of {total} processes in the tree of pid {pid}"
+                );
+                if refused.is_empty() {
+                    text
+                } else {
+                    format!("{text}\nnot signalled: {refused}")
+                }
+            }
+            Self::Descendants { pid, descendants } if descendants.is_empty() => {
+                format!("pid {pid} has no descendants")
+            }
+            Self::Descendants { pid, descendants } => format!(
+                "Descendants of pid {pid}: {}",
+                pids(&mut descendants.iter().copied())
+            ),
+        }
     }
 }
 
@@ -387,6 +429,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::Tool;
 
     fn tool_context(root: &std::path::Path, allowed_shell_commands: Vec<String>) -> ToolContext {
         ToolContext {
@@ -428,5 +471,45 @@ mod tests {
             error.to_string().contains("outside the session"),
             "expected ProcessOutsideTree, got: {error}"
         );
+    }
+
+    #[test]
+    fn process_output_renders_a_sentence_and_keeps_the_json_shape() {
+        let entry = |pid, killed| KillTreeEntry { pid, killed };
+        let killed = ProcessOutput::Killed {
+            pid: 7,
+            signal: 9,
+            killed: 1,
+            per_pid: vec![entry(8, false), entry(7, true)],
+        };
+        let listed = |descendants| ProcessOutput::Descendants {
+            pid: 7,
+            descendants,
+        };
+        for (output, text, value) in [
+            (
+                killed,
+                "Sent signal 9 to 1 of 2 processes in the tree of pid 7\nnot signalled: 8",
+                json!({
+                    "pid": 7,
+                    "signal": 9,
+                    "killed": 1,
+                    "per_pid": [{ "pid": 8, "killed": false }, { "pid": 7, "killed": true }],
+                }),
+            ),
+            (
+                listed(vec![8, 9]),
+                "Descendants of pid 7: 8, 9",
+                json!({ "pid": 7, "descendants": [8, 9] }),
+            ),
+            (
+                listed(Vec::new()),
+                "pid 7 has no descendants",
+                json!({ "pid": 7, "descendants": [] }),
+            ),
+        ] {
+            assert_eq!(output.to_model_string(), text);
+            assert_eq!(serde_json::to_value(&output).expect("serialize"), value);
+        }
     }
 }

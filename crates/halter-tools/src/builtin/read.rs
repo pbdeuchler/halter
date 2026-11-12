@@ -1,15 +1,17 @@
 // pattern: Imperative Shell
 
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, ToolOutput, TypedTool};
 
 use super::common::{
     ToolScope, ensure_not_cancelled, optional_bool, optional_u64, required_string, resolve_path,
@@ -34,19 +36,21 @@ struct ReadWindow {
 }
 
 #[async_trait]
-impl Tool for ReadTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for ReadTool {
+    type Output = ReadOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("read"),
             description: format!(
                 "Read a UTF-8 text file, up to {MAX_READ_LIMIT} lines per call. `path` may \
                  be absolute or relative to the working directory. Page through larger files \
-                 with `offset` (1-based start line) and `limit`; the response includes \
-                 `total_lines`, so a returned count below it means the file continues past \
-                 the window. Returns the raw file text plus its sha256. When reviewing or \
-                 debugging code, set `line_numbers = true` to receive a `lines` array with \
-                 per-line `{{\"line_number\", \"line\"}}` entries instead of using shell \
-                 commands such as `nl`, `sed -n`, `awk`, or `wc -l`."
+                 with `offset` (1-based start line) and `limit`. Returns the raw file text \
+                 under a one-line header giving the lines returned, the file's total line \
+                 count, and its sha256; a window that ends below the total means the file \
+                 continues. When reviewing or debugging code, set `line_numbers = true` to \
+                 prefix each line with its number instead of using shell commands such as \
+                 `nl`, `sed -n`, `awk`, or `wc -l`."
             ),
             input_schema: json!({
                 "type": "object",
@@ -67,7 +71,7 @@ impl Tool for ReadTool {
                     "line_numbers": {
                         "type": "boolean",
                         "default": false,
-                        "description": "When true, return a structured `lines` array of `{\"line_number\": 1, \"line\": \"...\"}` objects in addition to the legacy `content` string."
+                        "description": "When true, prefix each returned line with its 1-based line number and a tab."
                     }
                 },
                 "required": ["path"],
@@ -78,7 +82,7 @@ impl Tool for ReadTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Self::Output> {
         let _scope = ToolScope::new(&context, "read");
         ensure_not_cancelled(&context.cancel)?;
         let path = resolve_path(&context.working_dir, required_string(&input, "path")?);
@@ -134,28 +138,66 @@ impl Tool for ReadTool {
         })
         .await??;
 
-        let mut result = serde_json::Map::new();
-        result.insert("path".to_owned(), json!(canonical_path));
-        result.insert("content".to_owned(), json!(read_window.content));
-        result.insert("sha256".to_owned(), json!(read_window.sha256));
-        result.insert("total_lines".to_owned(), json!(read_window.total_lines));
-        if line_numbers {
-            let lines: Vec<Value> = read_window
-                .lines
-                .into_iter()
-                .map(|(line_number, line)| {
-                    json!({
-                        "line_number": line_number,
-                        "line": line,
-                    })
-                })
-                .collect();
-            result.insert("lines".to_owned(), json!(lines));
-        }
-
-        Ok(ToolResult::Json {
-            value: Value::Object(result),
+        Ok(ReadOutput {
+            path: canonical_path,
+            content: read_window.content,
+            sha256: read_window.sha256,
+            total_lines: read_window.total_lines,
+            lines: line_numbers.then(|| {
+                read_window
+                    .lines
+                    .into_iter()
+                    .map(|(line_number, line)| NumberedLine { line_number, line })
+                    .collect()
+            }),
+            first_line: offset.max(1),
         })
+    }
+}
+
+#[derive(Debug, Serialize)]
+/// Result of a `read` call.
+pub struct ReadOutput {
+    path: PathBuf,
+    content: String,
+    sha256: String,
+    total_lines: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lines: Option<Vec<NumberedLine>>,
+    #[serde(skip)]
+    first_line: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct NumberedLine {
+    line_number: u64,
+    line: String,
+}
+
+impl ToolOutput for ReadOutput {
+    /// A one-line header, then the window verbatim. The header keeps the
+    /// sha256 because `edit` accepts it as `expected_sha256`.
+    fn to_model_string(&self) -> String {
+        let count = self.content.lines().count() as u64;
+        let window = match count {
+            0 => format!("no lines at offset {}", self.first_line),
+            _ => format!("lines {}-{}", self.first_line, self.first_line + count - 1),
+        };
+        let header = format!(
+            "[{}: {window}; {} lines total; sha256={}]\n",
+            self.path.display(),
+            self.total_lines,
+            self.sha256
+        );
+        if self.lines.is_none() {
+            return header + &self.content;
+        }
+        self.content
+            .split_inclusive('\n')
+            .zip(self.first_line..)
+            .fold(header, |text, (line, number)| {
+                text + &number.to_string() + "\t" + line
+            })
     }
 }
 
@@ -250,6 +292,8 @@ mod tests {
     };
 
     use super::*;
+    use crate::Tool;
+    use halter_protocol::ToolResult;
 
     #[test]
     fn reads_requested_line_window() {
@@ -318,7 +362,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResult::Rendered { value, .. } = ReadTool
             .execute(
                 tool_context(temp.path(), 4),
                 json!({
@@ -342,7 +386,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\nc\nd\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResult::Rendered { value, .. } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -373,7 +417,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\nc\nd\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResult::Rendered { value, .. } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -399,7 +443,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\nc\nd\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResult::Rendered { value, .. } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -425,7 +469,7 @@ mod tests {
             .collect::<String>();
         std::fs::write(temp.path().join("note.txt"), text).expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResult::Rendered { value, .. } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -460,7 +504,7 @@ mod tests {
             .collect::<String>();
         std::fs::write(temp.path().join("note.txt"), text).expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResult::Rendered { value, .. } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -485,7 +529,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "a\nb\nc\n").expect("write");
 
-        let ToolResult::Json { value: enabled } = ReadTool
+        let ToolResult::Rendered { value: enabled, .. } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -499,7 +543,9 @@ mod tests {
             panic!("expected json result");
         };
 
-        let ToolResult::Json { value: disabled } = ReadTool
+        let ToolResult::Rendered {
+            value: disabled, ..
+        } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({ "path": "note.txt" }),
@@ -518,7 +564,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResult::Rendered { value, .. } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -543,7 +589,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("note.txt"), "1\n2\n3\n4\n5\n").expect("write");
 
-        let ToolResult::Json { value } = ReadTool
+        let ToolResult::Rendered { value, .. } = ReadTool
             .execute(
                 tool_context(temp.path(), usize::MAX),
                 json!({
@@ -758,6 +804,39 @@ mod tests {
             error
                 .to_string()
                 .contains("invalid tool input: field 'limit' must be between 1 and 500")
+        );
+    }
+
+    #[test]
+    fn read_output_renders_text_verbatim_under_a_header() {
+        let output = |content: &str, lines, first_line| ReadOutput {
+            path: PathBuf::from("/w/a.rs"),
+            content: content.to_owned(),
+            sha256: "abc".to_owned(),
+            total_lines: 9,
+            lines,
+            first_line,
+        };
+        let text = "let s = \"é\";\n\tx\n";
+        for (output, expected) in [
+            (
+                output(text, None, 3),
+                "[/w/a.rs: lines 3-4; 9 lines total; sha256=abc]\nlet s = \"é\";\n\tx\n",
+            ),
+            (
+                output(text, Some(Vec::new()), 3),
+                "[/w/a.rs: lines 3-4; 9 lines total; sha256=abc]\n3\tlet s = \"é\";\n4\t\tx\n",
+            ),
+            (
+                output("", None, 10),
+                "[/w/a.rs: no lines at offset 10; 9 lines total; sha256=abc]\n",
+            ),
+        ] {
+            assert_eq!(output.to_model_string(), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(output("a\n", None, 1)).expect("serialize"),
+            json!({ "path": "/w/a.rs", "content": "a\n", "sha256": "abc", "total_lines": 9 })
         );
     }
 }

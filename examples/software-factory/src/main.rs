@@ -28,7 +28,7 @@ use halter_protocol::{
     ReasoningEffort, SessionEventPayload, ToolCapabilities, ToolConcurrency, ToolName, ToolResult,
     ToolSpec, Volatility,
 };
-use halter_tools::{Tool, ToolContext};
+use halter_tools::{Report, Tool, ToolContext, TypedTool};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1120,6 +1120,7 @@ fn default_factory_config() -> HarnessConfig {
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
+            ..ToolsConfig::default()
         },
         policy: PolicyConfig {
             allowed_write_roots: vec![PathBuf::from("./"), PathBuf::from("/tmp/halter")],
@@ -1281,8 +1282,10 @@ impl GitHubIssueTool {
 }
 
 #[async_trait]
-impl Tool for GitHubIssueTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for GitHubIssueTool {
+    type Output = Report;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("github_issue"),
             description: "Fetch full text for an open GitHub issue in the current factory corpus. Returns cached issue text when available.".to_owned(),
@@ -1308,15 +1311,13 @@ impl Tool for GitHubIssueTool {
         }
     }
 
-    async fn execute(&self, _context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, _context: ToolContext, input: Value) -> anyhow::Result<Report> {
         let number = parse_issue_number_input(&input).map_err(anyhow::Error::msg)?;
         let (issue, source) = self.cached_or_fetch(number).await?;
-        Ok(ToolResult::Json {
-            value: json!({
-                "source": source,
-                "issue": issue,
-            }),
-        })
+        Ok(Report(json!({
+            "source": source,
+            "issue": issue,
+        })))
     }
 }
 
@@ -1332,8 +1333,10 @@ impl RankResponsesTool {
 }
 
 #[async_trait]
-impl Tool for RankResponsesTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for RankResponsesTool {
+    type Output = Report;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from(RANK_RESPONSES_TOOL),
             description: "Submit a stack ranking of the anonymized panel responses. Provide every anonymous model_id together with its rank, where rank 1 is the best response.".to_owned(),
@@ -1365,7 +1368,7 @@ impl Tool for RankResponsesTool {
         }
     }
 
-    async fn execute(&self, _context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, _context: ToolContext, input: Value) -> anyhow::Result<Report> {
         let model_names = self.model_names.read().await;
         let rankings = deanonymized_rankings(&input, &model_names).map_err(anyhow::Error::msg)?;
         let ranking_log = rankings
@@ -1383,12 +1386,10 @@ impl Tool for RankResponsesTool {
             count = rankings.len(),
             "recorded panel response ranking"
         );
-        Ok(ToolResult::Json {
-            value: json!({
-                "recorded": true,
-                "ranked_panel_responses": rankings.len(),
-            }),
-        })
+        Ok(Report(json!({
+            "recorded": true,
+            "ranked_panel_responses": rankings.len(),
+        })))
     }
 }
 
@@ -1819,15 +1820,12 @@ fn tool_result_kind(result: &ToolResult) -> &'static str {
         ToolResult::Empty => "empty",
         ToolResult::Text { .. } => "text",
         ToolResult::Json { .. } => "json",
+        ToolResult::Rendered { .. } => "rendered",
     }
 }
 
 fn tool_result_size(result: &ToolResult) -> usize {
-    match result {
-        ToolResult::Empty => 0,
-        ToolResult::Text { text } => text.len(),
-        ToolResult::Json { value } => value.to_string().len(),
-    }
+    result.to_model_string().len()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

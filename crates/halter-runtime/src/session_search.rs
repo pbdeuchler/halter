@@ -2,11 +2,11 @@
 // pattern: Imperative Shell
 
 use async_trait::async_trait;
-use halter_protocol::{Message, SessionId, ToolConcurrency, ToolResult, ToolSpec};
+use halter_protocol::{Message, SessionId, ToolConcurrency, ToolSpec};
 use halter_session::{SessionHistory, SessionStore};
 use halter_tools::{
-    LineRange, RECOVERY_RESPONSE_BYTES, RECOVERY_RESULT_LIMIT, Tool, ToolContext, recovery_lines,
-    recovery_preview as preview,
+    LineRange, RECOVERY_RESPONSE_BYTES, RECOVERY_RESULT_LIMIT, Report, ToolContext, TypedTool,
+    recovery_lines, recovery_preview as preview,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -221,8 +221,10 @@ fn bounded_rows(rows: impl Iterator<Item = Value>) -> anyhow::Result<Value> {
 pub(crate) struct SessionSearchTool<S: SessionSearchBackend>(pub Arc<S>);
 
 #[async_trait]
-impl<S: SessionSearchBackend> Tool for SessionSearchTool<S> {
-    fn spec(&self) -> ToolSpec {
+impl<S: SessionSearchBackend> TypedTool for SessionSearchTool<S> {
+    type Output = Report;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: "session_search".into(),
             description: self.0.description().to_owned(),
@@ -236,14 +238,10 @@ impl<S: SessionSearchBackend> Tool for SessionSearchTool<S> {
             provider_aliases: Default::default(),
         }
     }
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Report> {
         anyhow::ensure!(!context.cancel.is_cancelled(), "session search cancelled");
-        Ok(ToolResult::Json {
-            value: self
-                .0
-                .execute(&context.session_id, serde_json::from_value(input)?)
-                .await?,
-        })
+        let request = serde_json::from_value(input)?;
+        Ok(Report(self.0.execute(&context.session_id, request).await?))
     }
 }
 

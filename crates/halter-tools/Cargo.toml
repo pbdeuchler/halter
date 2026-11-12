@@ -60,6 +60,9 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Tests run with insertion-ordered JSON maps, the order a host enabling this
+# feature gets, so rendering that leans on sorted maps fails here.
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

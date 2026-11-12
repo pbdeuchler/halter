@@ -36,6 +36,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::model_selection::select_models;
 use crate::session_lease::{OutOfTurn, SessionLease};
+use crate::tool_output::{bound_error, bound_result, transcript_content};
 use crate::turn_registry::TurnRegistry;
 use crate::{
     CompactionBoundary, CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager,
@@ -94,6 +95,8 @@ pub struct RuntimeServices {
     pub subagent_event_forwarding: SubagentEventForwarding,
     pub subagent_event_forwarding_cap: u64,
     pub shell_timeout_secs: u64,
+    /// Bound on the text one tool result puts in the context.
+    pub tool_output: crate::ToolOutputSettings,
     /// Optional sink that mirrors every committed `SessionEvent` into a
     /// per-session JSONL trace file. Disabled (`None`) when
     /// `runtime.traces_dir` is not configured.
@@ -2142,13 +2145,16 @@ impl SessionExecutor {
                         // Hook-authored text; kept below info.
                         debug!(reason = %reason, "tool call block reason");
                     });
-                    let error = ToolError::new(reason);
+                    let id = MessageId::new();
+                    let output = &self.services.tool_output;
+                    let error =
+                        bound_error(output, &self.session_id, &id, ToolError::new(reason)).await;
                     let outcome = ToolExecutionOutcome {
                         call: call.clone(),
                         result: Err(error.clone()),
                     };
                     let message = Message::Tool(ToolResultMessage {
-                        id: MessageId::new(),
+                        id,
                         call_id: call.id.clone(),
                         content: ToolResult::Empty,
                         error: Some(error),
@@ -2333,12 +2339,29 @@ impl SessionExecutor {
                         self.push_event(events, SessionEventPayload::MessageItem { message });
                     }
                 }
+                // Every executed call's result is committed here, whatever
+                // produced it: bounded once, so the log holds exactly what the
+                // model saw. The completion event keeps the whole result; the
+                // transcript keeps only its model text.
+                let id = MessageId::new();
+                let output = &self.services.tool_output;
+                let (result, content, error) = match error {
+                    None => {
+                        let result = bound_result(output, &self.session_id, &id, content).await;
+                        let content = transcript_content(&result);
+                        (Ok(result), content, None)
+                    }
+                    Some(error) => {
+                        let error = bound_error(output, &self.session_id, &id, error).await;
+                        (Err(error.clone()), content, Some(error))
+                    }
+                };
                 let outcome = ToolExecutionOutcome {
                     call: call.clone(),
-                    result: error.clone().map_or_else(|| Ok(content.clone()), Err),
+                    result,
                 };
                 let message = Message::Tool(ToolResultMessage {
-                    id: MessageId::new(),
+                    id,
                     call_id: call.id.clone(),
                     content,
                     error,
@@ -3030,9 +3053,9 @@ impl SessionExecutor {
                 outcome:
                     ToolExecutionOutcome {
                         call,
-                        result: Ok(ToolResult::Json { value }),
+                        result: Ok(result),
                     },
-            } if call.name.0 == crate::model_summary::TODO_TOOL_NAME => Some(value),
+            } if call.name.0 == crate::model_summary::TODO_TOOL_NAME => result.structured(),
             _ => None,
         });
         self.services
@@ -3606,6 +3629,7 @@ fn tool_result_kind(result: &ToolResult) -> &'static str {
         ToolResult::Empty => "empty",
         ToolResult::Text { .. } => "text",
         ToolResult::Json { .. } => "json",
+        ToolResult::Rendered { .. } => "rendered",
     }
 }
 
@@ -4322,6 +4346,7 @@ impl Default for RuntimeServices {
             subagent_event_forwarding: SubagentEventForwarding::Off,
             subagent_event_forwarding_cap: 100_000,
             shell_timeout_secs: 30,
+            tool_output: crate::ToolOutputSettings::default(),
             trace_recorder: None,
         }
     }
@@ -5777,6 +5802,7 @@ mod tests {
         let recorder =
             Arc::new(crate::TraceRecorder::open(temp.path().to_path_buf()).expect("recorder"));
         let services = RuntimeServices {
+            tool_output: crate::ToolOutputSettings::default(),
             trace_recorder: Some(recorder.clone()),
             ..RuntimeServices::default()
         };
@@ -9528,7 +9554,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(windows["items"].as_array().unwrap().len(), 2);
-                assert!(replay.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionCompleted { outcome } if outcome.call.name.0 == "session_search" && matches!(&outcome.result, Ok(ToolResult::Json { value }) if value["items"].as_array().unwrap().len() == 2))));
+                assert!(replay.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionCompleted { outcome } if outcome.call.name.0 == "session_search" && matches!(&outcome.result, Ok(result) if result.structured().is_some_and(|value| value["items"].as_array().unwrap().len() == 2)))));
                 let resumed = runtime.resume(session.session_id()).await.unwrap().unwrap();
                 assert!(
                     search
@@ -10448,6 +10474,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_output_budget_applies_inside_a_subagent_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services =
+            test_support::configured_services(Arc::new(SubagentFirehoseProvider), temp.path());
+        let unique = Arc::get_mut(&mut services).expect("unique services");
+        unique.tool_output = crate::ToolOutputSettings {
+            max_bytes: 64,
+            spill_dir: temp.path().join("spill"),
+        };
+        halter_tools::register_builtin_tools(&unique.tools, &["read".to_owned()]);
+        std::fs::write(temp.path().join("big.txt"), "line\n".repeat(100)).expect("write file");
+        let runtime = SessionRuntime::new(services.clone());
+        install_subagent_tools(&runtime, &services);
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+        session
+            .submit_turn(Turn::user("child reads a big file"))
+            .await
+            .expect("turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("events");
+
+        let tool_texts = |log: Vec<SessionEvent>| {
+            let texts = log.into_iter().filter_map(|event| match event.payload {
+                SessionEventPayload::MessageItem {
+                    message: Message::Tool(tool),
+                } => Some(tool.to_model_string().into_owned()),
+                _ => None,
+            });
+            texts.collect::<Vec<_>>()
+        };
+        let parent = services.sessions.replay(session.session_id()).await;
+        let child = parent
+            .expect("replay")
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::ToolExecutionCompleted { outcome }
+                    if outcome.call.name.0 == "spawn_agent" =>
+                {
+                    let status = outcome.result.as_ref().ok()?.structured()?;
+                    status["session_id"].as_str().map(SessionId::from)
+                }
+                _ => None,
+            });
+        let child = child.expect("child session");
+        let child_log = services
+            .sessions
+            .replay(&child)
+            .await
+            .expect("replay child");
+        let [read] = &tool_texts(child_log)[..] else {
+            panic!("expected one tool result in the child");
+        };
+        let spill = temp.path().join("spill").join(&child.0);
+        let marker = format!("bytes elided here; full output: {}", spill.display());
+        assert!(read.len() < 400 && read.contains(&marker), "{read}");
+    }
+
+    #[tokio::test]
     async fn traces_record_subagent_events_when_forwarding_is_off() {
         let temp = tempfile::tempdir().expect("tempdir");
         let traces_dir = temp.path().join("traces");
@@ -10965,6 +11056,11 @@ mod tests {
                 if latest_user_text.contains("grandchild") {
                     return Ok(text_stream(vec!["grandchild done"]));
                 }
+                if latest_user_text.contains("read a big file")
+                    && !matches!(request.messages.last(), Some(Message::Tool(_)))
+                {
+                    return Ok(tool_call_stream("read", json!({ "path": "big.txt" })));
+                }
                 if latest_user_text.contains("many child events") {
                     return Ok(text_stream(vec![
                         "child ", "done ", "with ", "many ", "events",
@@ -10987,6 +11083,8 @@ mod tests {
                 "spawn grandchild"
             } else if latest_user_text.contains("many child events") {
                 "many child events"
+            } else if latest_user_text.contains("big file") {
+                "read a big file"
             } else {
                 "child task"
             };
@@ -11008,15 +11106,15 @@ mod tests {
             .unwrap_or_default()
     }
 
+    // These read tool results as the model does: `spawn_agent` answers
+    // `agent <id>: running`, `wait_agent` a finished status or `timed out`.
     fn latest_spawn_agent_id(messages: &[Message]) -> Option<String> {
         messages.iter().rev().find_map(|message| match message {
-            Message::Tool(tool) => match &tool.content {
-                ToolResult::Json { value } => value
-                    .get("agent_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned),
-                ToolResult::Empty | ToolResult::Text { .. } => None,
-            },
+            Message::Tool(tool) => tool
+                .to_model_string()
+                .strip_prefix("agent ")?
+                .strip_suffix(": running")
+                .map(ToOwned::to_owned),
             Message::System(_) | Message::User(_) | Message::Assistant(_) => None,
         })
     }
@@ -11026,7 +11124,10 @@ mod tests {
             matches!(
                 message,
                 Message::Tool(tool)
-                    if matches!(&tool.content, ToolResult::Json { value } if value.get("timed_out").is_some())
+                    if tool.to_model_string().lines().next().is_some_and(|header| {
+                        header == "timed out"
+                            || header.starts_with("agent ") && !header.ends_with(": running")
+                    })
             )
         })
     }

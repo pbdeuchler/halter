@@ -7,18 +7,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use halter_protocol::{
-    SessionId, ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec,
-};
+use halter_protocol::{SessionId, ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::{CanonicalPath, Tool, ToolContext};
+use crate::{CanonicalPath, ToolContext, ToolOutput, TypedTool};
 
 use super::common::{
     ToolScope, ensure_not_cancelled, optional_u64, parse_env_map, required_string, resolve_path,
 };
-use job::BackgroundJob;
+use job::{BackgroundJob, JobOutput, JobSummary};
 
 /// Retained stdout and stderr bytes per job. Output cursors count original
 /// bytes, including bytes already discarded from this bounded buffer.
@@ -58,7 +57,7 @@ impl BackgroundRegistry {
         command: &str,
         cwd: CanonicalPath,
         env: Option<HashMap<String, String>>,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<JobSummary> {
         let mut state = self.state.lock().await;
         ensure_not_cancelled(&context.cancel)?;
         anyhow::ensure!(
@@ -93,14 +92,14 @@ impl BackgroundRegistry {
             .ok_or_else(|| anyhow::anyhow!("failed to execute background tool: unknown job '{id}'"))
     }
 
-    async fn list(&self) -> Value {
+    async fn list(&self) -> Vec<JobSummary> {
         let state = self.state.lock().await;
         let mut jobs: Vec<_> = state.jobs.values().collect();
         jobs.sort_by(|left, right| left.id.cmp(&right.id));
-        json!({"jobs": jobs.into_iter().map(|job| job.summary()).collect::<Vec<_>>()})
+        jobs.into_iter().map(|job| job.summary()).collect()
     }
 
-    async fn prune(&self) -> Value {
+    async fn prune(&self) -> BackgroundOutput {
         let mut state = self.state.lock().await;
         let mut pruned = Vec::new();
         state.jobs.retain(|id, job| {
@@ -112,7 +111,10 @@ impl BackgroundRegistry {
             }
         });
         pruned.sort();
-        json!({"pruned": pruned, "remaining": state.jobs.len()})
+        BackgroundOutput::Pruned {
+            pruned,
+            remaining: state.jobs.len(),
+        }
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
@@ -158,8 +160,10 @@ impl BackgroundRegistry {
 pub struct BackgroundTool;
 
 #[async_trait]
-impl Tool for BackgroundTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for BackgroundTool {
+    type Output = BackgroundOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("background"),
             description: "Spawn, list, read output from, stop, or prune finished managed background commands. Prune removes finished job records and retained output; running jobs are preserved. Jobs survive interruption of agent execution and are terminated when the session closes. Commands use an independent shell with explicit cwd/env; persistent shell state is not inherited. Output is bounded and cursors count bytes of combined stdout/stderr.".to_owned(),
@@ -181,14 +185,14 @@ impl Tool for BackgroundTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<BackgroundOutput> {
         let _scope = ToolScope::new(&context, "background");
         ensure_not_cancelled(&context.cancel)?;
         let action = required_string(&input, "action")?;
         let registry = context
             .tool_sessions
             .background_session(&context.session_id);
-        let value = match action {
+        Ok(match action {
             "spawn" => {
                 let command = required_string(&input, "command")?;
                 anyhow::ensure!(
@@ -216,13 +220,15 @@ impl Tool for BackgroundTool {
                         );
                     }
                 }
-                registry.spawn(&context, command, cwd, env).await?
+                BackgroundOutput::Job(registry.spawn(&context, command, cwd, env).await?)
             }
-            "list" => registry.list().await,
+            "list" => BackgroundOutput::Jobs {
+                jobs: registry.list().await,
+            },
             "prune" => registry.prune().await,
             "output" => {
                 let job = registry.get(required_string(&input, "id")?).await?;
-                job.output(optional_u64(&input, "cursor")?.unwrap_or(0))?
+                BackgroundOutput::Output(job.output(optional_u64(&input, "cursor")?.unwrap_or(0))?)
             }
             "kill" => {
                 let job = registry.get(required_string(&input, "id")?).await?;
@@ -230,11 +236,46 @@ impl Tool for BackgroundTool {
                 // There is no arbitrary-PID signalling API here.
                 job.request_stop();
                 job.wait().await?;
-                job.summary()
+                BackgroundOutput::Job(job.summary())
             }
             _ => anyhow::bail!("failed to execute background tool: unknown action '{action}'"),
-        };
-        Ok(ToolResult::Json { value })
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+/// Result of a `background` call.
+pub enum BackgroundOutput {
+    Job(JobSummary),
+    Jobs {
+        jobs: Vec<JobSummary>,
+    },
+    Pruned {
+        pruned: Vec<String>,
+        remaining: usize,
+    },
+    Output(JobOutput),
+}
+
+impl ToolOutput for BackgroundOutput {
+    fn to_model_string(&self) -> String {
+        match self {
+            Self::Job(job) => job.render(),
+            Self::Jobs { jobs } if jobs.is_empty() => "No background jobs".to_owned(),
+            Self::Jobs { jobs } => {
+                let jobs = jobs.iter().map(JobSummary::render).collect::<Vec<_>>();
+                jobs.join("\n\n")
+            }
+            Self::Pruned { pruned, remaining } => format!(
+                "Pruned {} finished jobs; {remaining} remain\n{}",
+                pruned.len(),
+                pruned.join("\n")
+            )
+            .trim_end()
+            .to_owned(),
+            Self::Output(output) => output.render(),
+        }
     }
 }
 

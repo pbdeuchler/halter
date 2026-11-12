@@ -230,6 +230,37 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+A `ToolResult::Json` reaches the model as compact JSON, so any text inside it
+is escaped. When a tool returns text the model should read as written,
+implement `halter_tools::TypedTool` instead: its `Output` serializes to the
+structured value and renders its own model text.
+
+```rust
+use halter_tools::ToolOutput;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct BashOutput {
+    exit_code: i32,
+    output: String,
+}
+
+impl ToolOutput for BashOutput {
+    fn to_model_string(&self) -> String {
+        match self.exit_code {
+            0 => self.output.clone(),
+            code => format!("{}\n[exit code {code}]", self.output),
+        }
+    }
+}
+```
+
+Whatever a tool returns, the runtime bounds the text that enters the context
+at `[tools] max_output_bytes` (default 50 KiB). A larger result keeps its
+head and tail, and the marker line between them names the file holding the
+full output. A tool still limits what it holds in memory: the built-in shell
+captures at most 1 MiB of a command's output.
+
 ### Provide your own session store
 
 ```rust
@@ -546,6 +577,11 @@ enabled = [
   "send_input",
   "close_agent",
 ]
+# Largest tool result, in bytes of model-visible text, committed whole. Larger
+# results keep their head and tail; the full text is written under output_dir.
+# 0 disables the bound.
+max_output_bytes = 51200
+# output_dir = "/tmp/halter/tool-output" # default: under the system temp dir
 
 [context]
 # Thresholds are optional. Unset, compaction_threshold is

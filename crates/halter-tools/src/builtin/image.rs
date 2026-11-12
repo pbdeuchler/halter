@@ -6,17 +6,18 @@ use std::path::Path;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat as ImageCrateFormat, io::Reader as ImageReader};
 use serde_json::{Value, json};
 
-use crate::{CanonicalPath, Tool, ToolContext};
+use crate::{CanonicalPath, ToolContext, TypedTool};
 
 use super::common::{
-    ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string, resolve_path,
+    Report, ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string,
+    resolve_path,
 };
 
 #[derive(Debug)]
@@ -24,8 +25,10 @@ use super::common::{
 pub struct ImageTool;
 
 #[async_trait]
-impl Tool for ImageTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for ImageTool {
+    type Output = Report;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("image"),
             description: "Inspect, resize, or convert raster image files".to_owned(),
@@ -57,7 +60,7 @@ impl Tool for ImageTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Report> {
         let _scope = ToolScope::new(&context, "image");
         ensure_not_cancelled(&context.cancel)?;
         let action = required_string(&input, "action")?.to_owned();
@@ -160,7 +163,7 @@ impl Tool for ImageTool {
         })
         .await??;
 
-        Ok(ToolResult::Json { value: result })
+        Ok(Report(result))
     }
 }
 
