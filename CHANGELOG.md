@@ -129,6 +129,18 @@ once a `1.0.0` line is cut.
 
 ### Fixed
 
+- A long reply no longer fails the turn because of how many text deltas the
+  provider split it into. Past 8,192 deltas (about 120 kB of text at
+  Anthropic's chunk size) the turn failed with `provider stream text exceeded
+  event cap`, discarding the reply and its usage. Deltas beyond the budget are
+  now coalesced into the preceding `DeltaItem`, so the events stay bounded and
+  still concatenate to the full text; the 4 MiB output cap is the only fatal
+  bound. Provider metadata has its own budget of 1,024 events, so neither it
+  nor text can crowd the other out.
+- The core prompt no longer tells the model that dedicated tools "aren't gated
+  by the shell allowlist", which was false for hosts that register their own
+  unrestricted shell tool. It now gives the reason that holds everywhere:
+  structured, bounded output that costs less context.
 - `grep` with `max_columns` no longer takes time quadratic in line length when
   it measures or truncates a match. Grapheme lookup re-segmented the line from
   its first byte on every step, so one matching multi-megabyte line (one-line

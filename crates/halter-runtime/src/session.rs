@@ -52,6 +52,7 @@ pub type SessionEventStream = BoxStream<'static, anyhow::Result<SessionEvent>>;
 
 const PROVIDER_STREAM_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_STREAM_EVENT_CAP: usize = 8_192;
+const PROVIDER_STREAM_METADATA_EVENT_CAP: usize = 1_024;
 const TOOL_RUNTIME_EVENT_CAP: usize = 4_096;
 const TOOL_RUNTIME_EVENT_BYTES_CAP: usize = 1024 * 1024;
 /// `PreCompact`/`PostCompact` matcher value for ledger-triggered passes;
@@ -3297,6 +3298,7 @@ async fn materialize_assistant_message_with_cancel(
     let mut parts = Vec::new();
     let mut text_buffer = String::new();
     let mut delta_events = Vec::new();
+    let mut metadata_events = 0usize;
     let mut accumulated_output_bytes = 0usize;
     let mut thinking_block: Option<PendingThinkingBlock> = None;
     let mut tool_call_blocks: std::collections::BTreeMap<BlockId, PendingToolCallBlock> =
@@ -3326,15 +3328,21 @@ async fn materialize_assistant_message_with_cancel(
                     &delta,
                     &mut accumulated_output_bytes,
                 )?;
-                if delta_events.len() >= PROVIDER_STREAM_EVENT_CAP {
-                    anyhow::bail!(
-                        "provider stream text exceeded event cap: {} events",
-                        PROVIDER_STREAM_EVENT_CAP
-                    );
+                // How finely a provider chunks its stream must not fail the
+                // turn; the byte cap above is the only fatal bound. Past the
+                // event budget, deltas coalesce into the preceding one, so
+                // the events stay bounded, in order, and sum to the full text.
+                let text_events = delta_events.len() - metadata_events;
+                match delta_events.last_mut() {
+                    Some(SessionEventPayload::DeltaItem { delta: last })
+                        if text_events >= PROVIDER_STREAM_EVENT_CAP =>
+                    {
+                        last.text.push_str(&delta);
+                    }
+                    _ => delta_events.push(SessionEventPayload::DeltaItem {
+                        delta: halter_protocol::DeltaItem { text: delta },
+                    }),
                 }
-                delta_events.push(SessionEventPayload::DeltaItem {
-                    delta: halter_protocol::DeltaItem { text: delta },
-                });
             }
             Ok(StreamEvent::TextEnd { .. }) => {
                 flush_text_buffer(&mut parts, &mut text_buffer);
@@ -3434,8 +3442,9 @@ async fn materialize_assistant_message_with_cancel(
             }
             Ok(StreamEvent::ProviderMetadata { metadata }) => {
                 // Non-essential annotation: drop rather than fail the turn once
-                // the event budget is spoken for by actual model output.
-                if delta_events.len() < PROVIDER_STREAM_EVENT_CAP {
+                // its own budget is spent. Text deltas are counted separately.
+                if metadata_events < PROVIDER_STREAM_METADATA_EVENT_CAP {
+                    metadata_events += 1;
                     delta_events.push(SessionEventPayload::ProviderMetadata { metadata });
                 }
             }
@@ -6084,7 +6093,7 @@ mod tests {
     #[tokio::test]
     async fn materialize_drops_provider_metadata_beyond_the_event_cap() {
         let model = resolved_test_model("default", "fake", "halter/fake");
-        let events = (0..PROVIDER_STREAM_EVENT_CAP + 10).map(|index| {
+        let events = (0..PROVIDER_STREAM_METADATA_EVENT_CAP + 10).map(|index| {
             Ok(StreamEvent::ProviderMetadata {
                 metadata: format!(r#"{{"seq":{index}}}"#),
             })
@@ -6095,32 +6104,131 @@ mod tests {
         let materialized = super::materialize_assistant_message(stream, &model)
             .await
             .expect("metadata flood must not fail the turn");
+        assert_eq!(
+            materialized.events.len(),
+            PROVIDER_STREAM_METADATA_EVENT_CAP
+        );
+    }
+
+    fn delta_item_text(events: &[SessionEventPayload]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEventPayload::DeltaItem { delta } => Some(delta.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The number of chunks a provider splits its reply into is not a limit:
+    /// deltas past the event budget coalesce instead of failing the turn.
+    #[tokio::test]
+    async fn materialize_coalesces_text_deltas_beyond_the_event_cap() {
+        let model = resolved_test_model("default", "fake", "halter/fake");
+        let block_id = BlockId::new();
+        let deltas: Vec<String> = (0..20_000).map(|index| format!("w{index} ")).collect();
+        let expected = deltas.concat();
+        let events = deltas.into_iter().map(|delta| {
+            Ok(StreamEvent::TextDelta {
+                id: block_id.clone(),
+                delta,
+            })
+        });
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> =
+            stream::iter(events.collect::<Vec<_>>()).boxed();
+
+        let materialized = super::materialize_assistant_message(stream, &model)
+            .await
+            .expect("delta count must not fail the turn");
+        assert_eq!(
+            materialized.message.parts,
+            vec![AssistantPart::Text {
+                text: expected.clone()
+            }]
+        );
+        assert_eq!(delta_item_text(&materialized.events), expected);
         assert_eq!(materialized.events.len(), PROVIDER_STREAM_EVENT_CAP);
     }
 
+    /// Text and metadata have separate budgets: neither starves the other,
+    /// and interleaving them cannot grow the events without bound.
+    #[tokio::test]
+    async fn materialize_keeps_text_whole_through_a_metadata_flood() {
+        let model = resolved_test_model("default", "fake", "halter/fake");
+        let block_id = BlockId::new();
+        let deltas: Vec<String> = (0..20_000).map(|index| format!("w{index} ")).collect();
+        let expected = deltas.concat();
+        let events = deltas.into_iter().enumerate().flat_map(|(index, delta)| {
+            [
+                Ok(StreamEvent::ProviderMetadata {
+                    metadata: format!(r#"{{"seq":{index}}}"#),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    id: block_id.clone(),
+                    delta,
+                }),
+            ]
+        });
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> =
+            stream::iter(events.collect::<Vec<_>>()).boxed();
+
+        let materialized = super::materialize_assistant_message(stream, &model)
+            .await
+            .expect("metadata flood with long text must not fail the turn");
+        assert_eq!(
+            materialized.message.parts,
+            vec![AssistantPart::Text {
+                text: expected.clone()
+            }]
+        );
+        assert_eq!(delta_item_text(&materialized.events), expected);
+        let metadata_events = materialized
+            .events
+            .iter()
+            .filter(|event| matches!(event, SessionEventPayload::ProviderMetadata { .. }))
+            .count();
+        assert_eq!(metadata_events, PROVIDER_STREAM_METADATA_EVENT_CAP);
+        assert_eq!(
+            materialized.events.len(),
+            PROVIDER_STREAM_EVENT_CAP + PROVIDER_STREAM_METADATA_EVENT_CAP
+        );
+    }
+
+    /// The byte cap is the one fatal bound on model output, however the
+    /// provider chunks it: one oversized delta or many small ones.
     #[tokio::test]
     async fn materialize_rejects_oversized_provider_text() {
         let model = resolved_test_model("default", "fake", "halter/fake");
-        let block_id = BlockId::new();
-        let oversized = "x".repeat(PROVIDER_STREAM_OUTPUT_CAP_BYTES + 1);
-        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> = stream::iter(vec![
-            Ok(StreamEvent::MessageStart {
-                id: halter_protocol::MessageId::new(),
-            }),
-            Ok(StreamEvent::TextStart {
-                id: block_id.clone(),
-            }),
-            Ok(StreamEvent::TextDelta {
-                id: block_id,
-                delta: oversized,
-            }),
-        ])
-        .boxed();
+        let chunk = "x".repeat(64);
+        let cases = [
+            (
+                "one delta",
+                vec!["x".repeat(PROVIDER_STREAM_OUTPUT_CAP_BYTES + 1)],
+            ),
+            (
+                "many deltas",
+                vec![chunk.clone(); PROVIDER_STREAM_OUTPUT_CAP_BYTES / chunk.len() + 1],
+            ),
+        ];
+        for (name, deltas) in cases {
+            let block_id = BlockId::new();
+            let events = deltas.into_iter().map(|delta| {
+                Ok(StreamEvent::TextDelta {
+                    id: block_id.clone(),
+                    delta,
+                })
+            });
+            let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> =
+                stream::iter(events.collect::<Vec<_>>()).boxed();
 
-        let error = super::materialize_assistant_message(stream, &model)
-            .await
-            .expect_err("oversized provider text should fail");
-        assert!(error.to_string().contains("exceeded output cap"));
+            let error = super::materialize_assistant_message(stream, &model)
+                .await
+                .expect_err("oversized provider text should fail");
+            assert!(
+                error.to_string().contains("exceeded output cap"),
+                "{name}: {error}"
+            );
+        }
     }
 
     #[test]
