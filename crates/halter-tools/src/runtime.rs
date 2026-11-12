@@ -10,6 +10,7 @@ use halter_protocol::{
     SessionBlueprint, SessionId, SessionState, SpawnSubagentRequest, SubagentStatus, ToolResult,
     ToolSpec, WaitSubagentRequest, WaitSubagentResponse,
 };
+use serde::Serialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -133,6 +134,48 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     /// Execute the tool with validated runtime context and raw JSON input.
     async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult>;
+}
+
+/// A tool's typed output. Its `Serialize` form is the structured value hosts
+/// and UIs read; `to_model_string` is what the model reads.
+pub trait ToolOutput: Serialize {
+    /// Render for a model reader: text verbatim rather than JSON-escaped, and
+    /// only the fields the model can act on.
+    fn to_model_string(&self) -> String;
+
+    /// Erase into the structured value and model text a [`Tool`] returns.
+    fn to_tool_result(&self) -> serde_json::Result<ToolResult> {
+        Ok(ToolResult::Rendered {
+            value: serde_json::to_value(self)?,
+            model_text: self.to_model_string(),
+            elision: None,
+        })
+    }
+}
+
+#[async_trait]
+/// A tool whose output type renders itself for the model. Every `TypedTool`
+/// is a [`Tool`]; implement [`Tool`] directly only when the output cannot be
+/// typed, as with a passthrough to an external tool server.
+pub trait TypedTool: Send + Sync {
+    /// Serialized as the result's structured value and rendered as its
+    /// model text.
+    type Output: ToolOutput + Send;
+    /// Provider-visible tool specification, returned by [`Tool::spec`].
+    fn describe(&self) -> ToolSpec;
+    /// Execute the tool with validated runtime context and raw JSON input.
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Self::Output>;
+}
+
+#[async_trait]
+impl<T: TypedTool> Tool for T {
+    fn spec(&self) -> ToolSpec {
+        self.describe()
+    }
+
+    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+        Ok(self.run(context, input).await?.to_tool_result()?)
+    }
 }
 
 #[derive(Default)]

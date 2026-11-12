@@ -344,6 +344,7 @@ fn panel_services(
         subagent_event_forwarding: SubagentEventForwarding::Off,
         subagent_event_forwarding_cap: parent.subagent_event_forwarding_cap,
         shell_timeout_secs: parent.shell_timeout_secs,
+        tool_output: parent.tool_output.clone(),
         trace_recorder: parent.trace_recorder.clone(),
     })
 }

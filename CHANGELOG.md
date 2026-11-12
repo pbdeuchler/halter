@@ -56,8 +56,55 @@ once a `1.0.0` line is cut.
   `tool_call_id`, or `agent_id`). `halter-cli` adds a matching `otel` feature
   that forwards to `halter/otel` and only activates export when
   `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
-
-### Changed
+- Typed tool output. `halter_tools::ToolOutput` (`Serialize` plus
+  `to_model_string`) separates the structured value hosts read from the text
+  the model reads, and `halter_tools::TypedTool` (`type Output: ToolOutput`,
+  `describe`, `run`) is a `Tool` through a blanket impl. `ToolResult` gains
+  `Rendered { value, model_text, elision }`, with
+  `ToolResult::to_model_string`, `ToolResult::structured`, and
+  `ToolResultMessage::to_model_string`.
+- Tool output budget. `[tools] max_output_bytes` (default `51200`; `0`
+  disables) bounds the model text of every tool result before it is
+  committed. A larger result keeps its head and tail around one marker line,
+  and its full output is written to
+  `<tools.output_dir>/<session id>/<tool message id>.txt` (default directory:
+  `halter/tool-output` under the system temporary directory), readable by
+  its owner only; a `ToolResult::Json` is written pretty-printed so it can be
+  searched by line. The marker names the file and says to `grep` it or `read`
+  it with `offset` and `limit`. The `ToolExecutionCompleted` event records
+  `elision.original_bytes` and `elision.spill_path`; the structured `value`
+  is not cut. Oversized tool error messages, including a pre-tool hook's
+  block reason, are bounded the same way. `RuntimeServices` gains
+  `tool_output: ToolOutputSettings`. Building a runtime warns when the output
+  directory is outside the allowed read roots.
+- **Breaking:** `ToolResult` has a fourth variant, `Rendered`. Hosts that
+  match on it exhaustively must add an arm; `to_model_string()` and
+  `structured()` cover the common cases without a match. Session logs written
+  by earlier versions load unchanged.
+- **Breaking:** a rendered result is stored once. `ToolExecutionCompleted`
+  carries the whole `Rendered` result; the transcript `ToolResultMessage`
+  carries `Text` holding its model text. A host that read a structured value
+  from a transcript tool message must read it from the completion event.
+- **Breaking:** `ToolsConfig` gains `max_output_bytes` and `output_dir`, and
+  `RuntimeServices` gains `tool_output`; struct literals need the new fields
+  or `..Default::default()`.
+- Every in-tree tool returns `ToolResult::Rendered` instead of
+  `ToolResult::Json`. `value` keeps the previous JSON shape, so
+  `result.structured()` reads it as before, but the serialized `kind` is
+  `"rendered"`, which is what hooks see in `tool_response`. The model now
+  reads rendered text instead of escaped JSON: `read` returns the file text
+  under a one-line header, `grep` and `glob` one hit per line, `write` and
+  `edit` a one-line confirmation, `shell` its output followed by a status
+  line only when the exit was not a plain `0`, and `wait_agent` the child's
+  final message under a one-line status header. The `read` tool with
+  `line_numbers = true` shows `N<tab>line` text; the `lines` array is still
+  in `value`. A truncated `grep` names the `offset` that continues it, also
+  as `next_offset` in `value`. `notes`, `session_search`, `browser`, and
+  `image` render `key: value` lines in key order through `halter_tools::Report`.
+- Every provider codec, the session-history search text, and the token ledger
+  render tool results through `ToolResult::to_model_string`. The ledger now
+  counts a tool result's error text, which it previously skipped; its
+  accounting version is 3, so persisted ledgers are rebuilt once.
 
 - `halter-cli` builds its subscriber with `halter::telemetry`, with the same
   defaults (`RUST_LOG`, default `warn`, noisy-target suppression, JSON with

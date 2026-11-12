@@ -5,12 +5,15 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 use halter_protocol::{
-    CloseSubagentRequest, ResourceSnapshot, SendSubagentInputRequest, SpawnSubagentRequest,
-    ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec, WaitSubagentRequest,
+    CloseSubagentRequest, CloseSubagentResponse, ResourceSnapshot, SendSubagentInputRequest,
+    SpawnSubagentRequest, SubagentState, SubagentStatus, ToolCapabilities, ToolConcurrency,
+    ToolName, ToolSpec, WaitSubagentRequest, WaitSubagentResponse,
 };
 use serde_json::{Value, json};
 
-use crate::{SubagentControl, Tool, ToolContext, ToolRuntime, ToolRuntimeEvent};
+use crate::{
+    SubagentControl, Tool, ToolContext, ToolOutput, ToolRuntime, ToolRuntimeEvent, TypedTool,
+};
 
 const DEFAULT_MODEL_ALIAS: &str = "default";
 const SUBAGENT_MODEL_ALIAS: &str = "subagent";
@@ -150,8 +153,10 @@ impl SpawnAgentTool {
 }
 
 #[async_trait]
-impl Tool for SpawnAgentTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for SpawnAgentTool {
+    type Output = SubagentStatus;
+
+    fn describe(&self) -> ToolSpec {
         subagent_spec(
             "spawn_agent",
             "Spawn a child session to work on a delegated task. Omit agent_type to use the default child session. Omit model to use the configured subagent model. If you set model, use a registered model id; default, subagent, and auto_resolve resolve relative to the parent session.",
@@ -166,7 +171,7 @@ impl Tool for SpawnAgentTool {
         )
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<SubagentStatus> {
         emit_started(&context, "spawn_agent");
         let parent = context
             .subagent_parent
@@ -180,10 +185,7 @@ impl Tool for SpawnAgentTool {
             .spawn(parent, request, context.cancel.clone())
             .await?;
         emit_completed(&context, "spawn_agent");
-        Ok(ToolResult::Json {
-            value: serde_json::to_value(status)
-                .context("failed to execute spawn_agent tool: invalid status payload")?,
-        })
+        Ok(status)
     }
 }
 
@@ -217,8 +219,10 @@ impl SendInputTool {
 }
 
 #[async_trait]
-impl Tool for SendInputTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for SendInputTool {
+    type Output = SubagentStatus;
+
+    fn describe(&self) -> ToolSpec {
         subagent_spec(
             "send_input",
             "Send a follow-up task to an existing child session after it reaches a terminal state (completed, failed, or cancelled). Closed children no longer accept input. Use wait_agent to wait for completion, or close_agent to stop a running agent.",
@@ -235,16 +239,13 @@ impl Tool for SendInputTool {
         )
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<SubagentStatus> {
         emit_started(&context, "send_input");
         let request: SendSubagentInputRequest = serde_json::from_value(input)
             .context("failed to execute send_input tool: invalid input")?;
         let status = self.control.send_input(request).await?;
         emit_completed(&context, "send_input");
-        Ok(ToolResult::Json {
-            value: serde_json::to_value(status)
-                .context("failed to execute send_input tool: invalid status payload")?,
-        })
+        Ok(status)
     }
 }
 
@@ -260,8 +261,10 @@ impl WaitAgentTool {
 }
 
 #[async_trait]
-impl Tool for WaitAgentTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for WaitAgentTool {
+    type Output = WaitSubagentResponse;
+
+    fn describe(&self) -> ToolSpec {
         subagent_spec(
             "wait_agent",
             "Wait for one of the target child sessions to reach a terminal state (completed, failed, cancelled, or closed). Returns the status of the agent that finished. If timeout_ms expires before any target finishes, returns timed_out: true and target_statuses with the current state of each requested agent.",
@@ -281,16 +284,17 @@ impl Tool for WaitAgentTool {
         )
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(
+        &self,
+        context: ToolContext,
+        input: Value,
+    ) -> anyhow::Result<WaitSubagentResponse> {
         emit_started(&context, "wait_agent");
         let request: WaitSubagentRequest = serde_json::from_value(input)
             .context("failed to execute wait_agent tool: invalid input")?;
         let response = self.control.wait(request, context.cancel.clone()).await?;
         emit_completed(&context, "wait_agent");
-        Ok(ToolResult::Json {
-            value: serde_json::to_value(response)
-                .context("failed to execute wait_agent tool: invalid response payload")?,
-        })
+        Ok(response)
     }
 }
 
@@ -306,8 +310,10 @@ impl CloseAgentTool {
 }
 
 #[async_trait]
-impl Tool for CloseAgentTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for CloseAgentTool {
+    type Output = CloseSubagentResponse;
+
+    fn describe(&self) -> ToolSpec {
         subagent_spec(
             "close_agent",
             "Close an existing child session, stopping any in-progress work. Use this to cancel a running agent or clean up a finished one. Omit timeout_ms to wait for cleanup without a deadline; setting it bounds the wait and requests forced cleanup on timeout. The closed agent will no longer accept send_input calls.",
@@ -331,16 +337,63 @@ impl Tool for CloseAgentTool {
         )
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(
+        &self,
+        context: ToolContext,
+        input: Value,
+    ) -> anyhow::Result<CloseSubagentResponse> {
         emit_started(&context, "close_agent");
         let request: CloseSubagentRequest = serde_json::from_value(input)
             .context("failed to execute close_agent tool: invalid input")?;
         let response = self.control.close(request).await?;
         emit_completed(&context, "close_agent");
-        Ok(ToolResult::Json {
-            value: serde_json::to_value(response)
-                .context("failed to execute close_agent tool: invalid response payload")?,
-        })
+        Ok(response)
+    }
+}
+
+/// One line naming the agent and its state, plus its error if it has one.
+fn status_header(status: &SubagentStatus) -> String {
+    let state = match status.state {
+        SubagentState::Running => "running",
+        SubagentState::Completed => "completed",
+        SubagentState::Failed => "failed",
+        SubagentState::Cancelled => "cancelled",
+        SubagentState::Closed => "closed",
+    };
+    let error = status.error.iter().map(|error| format!("\nerror: {error}"));
+    format!(
+        "agent {}: {state}{}",
+        status.agent_id,
+        error.collect::<String>()
+    )
+}
+
+impl ToolOutput for SubagentStatus {
+    /// The status header, then the child's last message as it wrote it.
+    fn to_model_string(&self) -> String {
+        let message = self.last_message.iter();
+        status_header(self)
+            + &message
+                .map(|text| format!("\n\n{text}"))
+                .collect::<String>()
+    }
+}
+
+impl ToolOutput for WaitSubagentResponse {
+    /// The finished agent's status and final message, or on a timeout the
+    /// current state of every target.
+    fn to_model_string(&self) -> String {
+        let Some(status) = &self.status else {
+            let targets = self.target_statuses.iter().map(status_header);
+            return format!("timed out\n{}", targets.collect::<Vec<_>>().join("\n"));
+        };
+        status.to_model_string()
+    }
+}
+
+impl ToolOutput for CloseSubagentResponse {
+    fn to_model_string(&self) -> String {
+        format!("closed {}", status_header(&self.previous_status))
     }
 }
 
@@ -501,9 +554,9 @@ mod tests {
                 shell_timeout_secs: 30,
                 subagent_parent: None,
             };
-            let ToolResult::Json { value } = tool.execute(context, input).await.unwrap() else {
-                panic!("expected close response");
-            };
+            let result = tool.execute(context, input).await.unwrap();
+            assert_eq!(result.to_model_string(), "closed agent agent-1: completed");
+            let value = result.structured().expect("structured");
             assert_eq!(value["previous_status"]["agent_id"], "agent-1");
             assert_eq!(
                 *control.close_requests.lock().unwrap(),
@@ -574,9 +627,7 @@ mod tests {
             .await
             .expect("spawn succeeds");
 
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result");
-        };
+        let value = result.structured().expect("structured");
         assert_eq!(value["agent_id"], "agent-1");
         let requests = control.requests.lock().expect("requests");
         assert_eq!(requests.len(), 1);
@@ -584,6 +635,57 @@ mod tests {
         assert_eq!(requests[0].agent_type, Some(AgentName::from("helper")));
         assert!(!requests[0].fork_context);
         assert_eq!(requests[0].model, Some(ModelId::from("default")));
+    }
+
+    #[test]
+    fn wait_renders_the_final_message_as_text_under_a_status_header() {
+        let status = |state, last_message: Option<&str>, error: Option<&str>| SubagentStatus {
+            agent_id: AgentId::from("agent-1"),
+            session_id: SessionId::from("session-1"),
+            agent_type: None,
+            task: "delegate this".to_owned(),
+            state,
+            last_message: last_message.map(str::to_owned),
+            usage: None,
+            error: error.map(str::to_owned),
+        };
+        let finished = status(
+            SubagentState::Completed,
+            Some("line \"one\"\nline two"),
+            None,
+        );
+        let failed = status(SubagentState::Failed, None, Some("provider gave up"));
+        let wait = |status: Option<SubagentStatus>, target_statuses| WaitSubagentResponse {
+            timed_out: status.is_none(),
+            status,
+            target_statuses,
+        };
+        let cases = [
+            (
+                wait(Some(finished.clone()), Vec::new()),
+                "agent agent-1: completed\n\nline \"one\"\nline two",
+            ),
+            (
+                wait(Some(failed.clone()), Vec::new()),
+                "agent agent-1: failed\nerror: provider gave up",
+            ),
+            (
+                wait(
+                    None,
+                    vec![status(SubagentState::Running, Some("stale"), None), failed],
+                ),
+                "timed out\nagent agent-1: running\nagent agent-1: failed\nerror: provider gave up",
+            ),
+        ];
+
+        for (response, text) in cases {
+            let result = response.to_tool_result().expect("serializes");
+            assert_eq!(result.to_model_string(), text);
+            assert_eq!(
+                result.structured(),
+                Some(&serde_json::to_value(&response).expect("json"))
+            );
+        }
     }
 
     #[test]

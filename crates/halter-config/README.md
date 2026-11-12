@@ -478,6 +478,19 @@ Behavior:
 
 Feature-gated tools must still be compiled in via Cargo features, even if named here.
 
+`ToolsConfig` also bounds what one tool result may put in the context:
+
+```toml
+[tools]
+max_output_bytes = 51200                  # default; 0 disables the bound
+output_dir = "/var/tmp/halter/tool-output" # default: halter/tool-output under the system temp dir
+```
+
+- a result whose model-visible text is larger than `max_output_bytes` keeps its head and tail around one marker line
+- the full text is written to `<output_dir>/<session id>/<tool message id>.txt`, readable by its owner only, and the marker names that file
+- the runtime never deletes these files; the default location leaves them to the operating system
+- `output_dir` must be under a root the read tools may reach (the temporary directory is one by default) for the model to open the file
+
 For the full tool catalog, see `../halter-tools/README.md`.
 
 ---

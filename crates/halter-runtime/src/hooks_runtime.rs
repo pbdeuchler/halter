@@ -920,6 +920,7 @@ async fn run_agent(
         subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
         subagent_event_forwarding_cap: sess.services().subagent_event_forwarding_cap,
         shell_timeout_secs: sess.services().shell_timeout_secs,
+        tool_output: sess.services().tool_output.clone(),
         trace_recorder: sess.services().trace_recorder.clone(),
     });
     let model = resolve_agent_model(sess, config.model.as_deref())?;

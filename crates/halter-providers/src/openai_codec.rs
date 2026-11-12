@@ -18,7 +18,7 @@ use tracing::warn;
 use crate::codec_common::{
     assistant_text, bounded_provider_id, bounded_provider_id_with_prefix, canonical_tool_name,
     collect_system_text, data_url, document_filename, has_user_media, tool_name_for_provider,
-    tool_result_text, user_text,
+    user_text,
 };
 
 // Alias the consolidated PROVIDER_ID_MAX_LEN from codec_common (finding L14).
@@ -1180,7 +1180,7 @@ fn encode_responses_tool_output(message: &halter_protocol::ToolResultMessage) ->
         "type": "function_call_output",
         "id": responses_function_call_output_item_id(&message.call_id),
         "call_id": message.call_id,
-        "output": tool_result_text(&message.content, &message.error),
+        "output": message.to_model_string(),
     })
 }
 
@@ -1344,7 +1344,7 @@ fn encode_chat_messages(request: &ProviderRequest) -> anyhow::Result<Vec<Value>>
             Message::Tool(tool) => messages.push(json!({
                 "role": "tool",
                 "tool_call_id": tool.call_id,
-                "content": tool_result_text(&tool.content, &tool.error),
+                "content": tool.to_model_string(),
             })),
         }
     }

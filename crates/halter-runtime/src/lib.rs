@@ -37,6 +37,7 @@ mod subagents;
 #[cfg(test)]
 mod telemetry_capture;
 mod temporary_session;
+mod tool_output;
 mod trace_export;
 mod trace_format;
 mod trace_recorder;
@@ -76,6 +77,7 @@ pub use session::{
 };
 pub use session_driver::{SessionError, SessionHandle, Submission};
 pub use session_lease::SessionLeases;
+pub use tool_output::ToolOutputSettings;
 pub use trace_export::export_session_trace;
 pub use trace_recorder::TraceRecorder;
 pub use turn_registry::{ShutdownReport, TurnRegistry, TurnRegistryError};

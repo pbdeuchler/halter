@@ -166,10 +166,14 @@ mod tests {
             .await
             .expect("read file");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
-            panic!("expected json result");
+        let halter_protocol::ToolResult::Rendered {
+            value, model_text, ..
+        } = result
+        else {
+            panic!("expected rendered result");
         };
         assert_eq!(value["content"], "hello");
+        assert!(model_text.ends_with("]\nhello"), "{model_text}");
     }
 
     #[test]
@@ -246,7 +250,7 @@ mod tests {
             .await
             .expect("glob should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResult::Rendered { value, .. } = result else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");
@@ -280,7 +284,7 @@ mod tests {
             .await
             .expect("grep should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResult::Rendered { value, .. } = result else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");
@@ -305,7 +309,7 @@ mod tests {
             .await
             .expect("grep should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResult::Rendered { value, .. } = result else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");
@@ -340,7 +344,7 @@ mod tests {
             .await
             .expect("grep should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResult::Rendered { value, .. } = result else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");
@@ -368,7 +372,7 @@ mod tests {
             .await
             .expect("grep should succeed");
 
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResult::Rendered { value, .. } = result else {
             panic!("expected json result");
         };
         let matches = value["matches"].as_array().expect("matches array");

@@ -6,7 +6,7 @@ use std::{cmp::Reverse, collections::HashMap, sync::LazyLock, time::Instant};
 #[cfg(feature = "profiling")]
 use async_trait::async_trait;
 #[cfg(feature = "profiling")]
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
 #[cfg(any(test, feature = "profiling"))]
 use parking_lot::Mutex;
 #[cfg(feature = "profiling")]
@@ -15,7 +15,7 @@ use serde_json::json;
 use smallvec::SmallVec;
 
 #[cfg(feature = "profiling")]
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, TypedTool};
 
 #[cfg(any(test, feature = "profiling"))]
 const MAX_SAMPLES: usize = 10_000;
@@ -124,13 +124,25 @@ pub(crate) fn profile_flat_region(region: &'static str, session_id: &str) -> Fla
 }
 
 #[cfg(any(test, feature = "profiling"))]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WorkProfile {
     pub folded: String,
     pub summary: String,
     pub svg: Option<String>,
     pub total_ms: f64,
     pub sample_count: u32,
+}
+
+#[cfg(any(test, feature = "profiling"))]
+impl crate::ToolOutput for WorkProfile {
+    /// The summary table and the folded stacks. The flamegraph SVG stays in
+    /// the structured value: a model cannot read it.
+    fn to_model_string(&self) -> String {
+        format!(
+            "{}\n\nFolded stacks (microseconds):\n{}",
+            self.summary, self.folded
+        )
+    }
 }
 
 #[must_use]
@@ -163,8 +175,10 @@ pub struct ProfilingTool;
 
 #[cfg(feature = "profiling")]
 #[async_trait]
-impl Tool for ProfilingTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for ProfilingTool {
+    type Output = WorkProfile;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("profile"),
             description: "Inspect the always-on tool execution profiler".to_owned(),
@@ -180,25 +194,19 @@ impl Tool for ProfilingTool {
         }
     }
 
-    async fn execute(
+    async fn run(
         &self,
         context: ToolContext,
         input: serde_json::Value,
-    ) -> anyhow::Result<ToolResult> {
+    ) -> anyhow::Result<WorkProfile> {
         let last_seconds = input
             .get("last_seconds")
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(30.0);
-        let profile = get_work_profile_for_session(last_seconds, Some(&context.session_id.0));
-        Ok(ToolResult::Json {
-            value: json!({
-                "folded": profile.folded,
-                "summary": profile.summary,
-                "svg": profile.svg,
-                "total_ms": profile.total_ms,
-                "sample_count": profile.sample_count,
-            }),
-        })
+        Ok(get_work_profile_for_session(
+            last_seconds,
+            Some(&context.session_id.0),
+        ))
     }
 }
 
@@ -304,5 +312,27 @@ mod tests {
         let profile = get_work_profile_for_session(10.0, Some("session-a"));
         assert!(profile.folded.contains("alpha"));
         assert!(!profile.folded.contains("beta"));
+    }
+
+    #[test]
+    fn work_profile_renders_summary_and_stacks_but_not_the_svg() {
+        use crate::ToolOutput;
+
+        let profile = WorkProfile {
+            folded: "a;b 5".to_owned(),
+            summary: "top \"a\"".to_owned(),
+            svg: Some("<svg/>".to_owned()),
+            total_ms: 1.0,
+            sample_count: 1,
+        };
+
+        assert_eq!(
+            profile.to_model_string(),
+            "top \"a\"\n\nFolded stacks (microseconds):\na;b 5"
+        );
+        assert_eq!(
+            serde_json::to_value(&profile).expect("serialize")["svg"],
+            "<svg/>"
+        );
     }
 }

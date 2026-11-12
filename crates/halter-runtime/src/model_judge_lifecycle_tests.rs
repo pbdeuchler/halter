@@ -60,7 +60,7 @@ impl Tool for CaptureTool {
 
     async fn execute(&self, mut context: ToolContext, _input: Value) -> anyhow::Result<ToolResult> {
         let pid = if self.background {
-            let ToolResult::Json { value } = BackgroundTool
+            let ToolResult::Rendered { value, .. } = BackgroundTool
                 .execute(
                     context.clone(),
                     json!({"action": "spawn", "command": "sleep 30"}),

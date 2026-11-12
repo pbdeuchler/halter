@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobSet};
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
 use ignore::WalkBuilder;
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, ToolOutput, TypedTool};
 
 use super::common::{ToolScope, ensure_not_cancelled, optional_string};
 
@@ -27,8 +28,10 @@ pub(super) struct FileCandidate {
 }
 
 #[async_trait]
-impl Tool for AstGrepTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for AstGrepTool {
+    type Output = AstGrepOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("ast_grep"),
             description: "Search or rewrite source files with structural AST patterns".to_owned(),
@@ -73,22 +76,24 @@ impl Tool for AstGrepTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<AstGrepOutput> {
         let _scope = ToolScope::new(&context, "ast_grep");
         ensure_not_cancelled(&context.cancel)?;
         let action = optional_string(&input, "action")
             .ok_or_else(|| anyhow::anyhow!("invalid tool input: missing string field 'action'"))?;
 
-        let value = match action {
+        Ok(match action {
             "find" => {
                 let config = find::FindConfig::parse(&input)?;
                 let working_dir = context.working_dir.clone();
                 let path_locks = context.path_locks.clone();
                 let cancel = context.cancel.clone();
-                tokio::task::spawn_blocking(move || {
-                    find::run(config, working_dir, path_locks, cancel)
-                })
-                .await??
+                AstGrepOutput::Find(
+                    tokio::task::spawn_blocking(move || {
+                        find::run(config, working_dir, path_locks, cancel)
+                    })
+                    .await??,
+                )
             }
             "replace" => {
                 let config = replace::ReplaceConfig::parse(&input)?;
@@ -101,15 +106,32 @@ impl Tool for AstGrepTool {
                 let path_locks = context.path_locks.clone();
                 let cancel = context.cancel.clone();
                 let policy = context.policy.clone();
-                tokio::task::spawn_blocking(move || {
-                    replace::run(config, candidates, path_locks, cancel, policy)
-                })
-                .await??
+                AstGrepOutput::Replace(
+                    tokio::task::spawn_blocking(move || {
+                        replace::run(config, candidates, path_locks, cancel, policy)
+                    })
+                    .await??,
+                )
             }
             other => anyhow::bail!("failed to execute ast_grep tool: unknown action '{other}'"),
-        };
+        })
+    }
+}
 
-        Ok(ToolResult::Json { value })
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+/// Result of an `ast_grep` call.
+pub enum AstGrepOutput {
+    Find(find::FindOutput),
+    Replace(replace::ReplaceOutput),
+}
+
+impl ToolOutput for AstGrepOutput {
+    fn to_model_string(&self) -> String {
+        match self {
+            Self::Find(output) => output.render(),
+            Self::Replace(output) => output.render(),
+        }
     }
 }
 

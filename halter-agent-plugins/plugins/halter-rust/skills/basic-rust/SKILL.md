@@ -260,7 +260,7 @@ Builder rules:
 
 ## Custom tools
 
-Implement `halter_tools::Tool`. Keep the provider-visible schema strict, decode JSON into a typed input struct, enforce policy through `ToolContext`, and return `ToolResult::Json` when callers need structured data.
+Implement `halter_tools::TypedTool` (every `TypedTool` is a `halter_tools::Tool`). Keep the provider-visible schema strict, decode JSON into a typed input struct, enforce policy through `ToolContext`, and return an output type that implements `halter_tools::ToolOutput`: its `Serialize` form is the structured value callers read and `to_model_string` is the text the model reads. Implement `Tool` directly and return `ToolResult::Json` only when the output cannot be typed; the model then reads compact JSON. The runtime bounds every result at `[tools] max_output_bytes`.
 
 Tool spec choices matter:
 

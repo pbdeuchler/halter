@@ -2,8 +2,8 @@
 
 use base64::Engine;
 use halter_protocol::{
-    AssistantMessage, AssistantPart, Message, ProviderKind, ProviderRequest, ToolCallId, ToolError,
-    ToolName, ToolResult, ToolSpec, UserMessage, UserPart,
+    AssistantMessage, AssistantPart, Message, ProviderKind, ProviderRequest, ToolCallId, ToolName,
+    ToolSpec, UserMessage, UserPart,
 };
 use sha2::{Digest, Sha256};
 
@@ -103,24 +103,6 @@ pub(crate) fn canonical_tool_name(
         .find(|spec| spec.name.0 == provided_name)
         .map(|spec| spec.name.clone())
         .unwrap_or_else(|| ToolName::from(provided_name.to_owned()))
-}
-
-pub(crate) fn tool_result_text(result: &ToolResult, error: &Option<ToolError>) -> String {
-    match (result, error) {
-        (_, Some(error)) if matches!(result, ToolResult::Empty) => error.message.clone(),
-        (ToolResult::Text { text }, Some(error)) => {
-            format!("{text}\n\nerror: {}", error.message)
-        }
-        (ToolResult::Json { value }, Some(error)) => serde_json::json!({
-            "result": value,
-            "error": error.message,
-        })
-        .to_string(),
-        (ToolResult::Empty, None) => String::new(),
-        (ToolResult::Text { text }, None) => text.clone(),
-        (ToolResult::Json { value }, None) => value.to_string(),
-        (ToolResult::Empty, Some(error)) => error.message.clone(),
-    }
 }
 
 pub(crate) fn normalized_tool_call_id(call_id: &ToolCallId) -> String {

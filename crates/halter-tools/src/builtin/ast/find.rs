@@ -1,10 +1,11 @@
 // pattern: Functional Core
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use ast_grep_core::{MatchStrictness, matcher::Pattern, tree_sitter::LanguageExt};
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::PathLockMap;
@@ -68,7 +69,7 @@ impl FindConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Serialize)]
 struct FindMatch {
     path: String,
     text: String,
@@ -78,7 +79,55 @@ struct FindMatch {
     start_column: u64,
     end_line: u64,
     end_column: u64,
-    meta_variables: Option<HashMap<String, String>>,
+    meta_variables: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+/// Result of an `ast_grep` find.
+pub struct FindOutput {
+    matches: Vec<FindMatch>,
+    total_matches: u64,
+    files_searched: usize,
+    files_with_matches: usize,
+    limit_reached: bool,
+    parse_errors: Option<Vec<String>>,
+    /// The `offset` that continues a search that reached its limit.
+    next_offset: u64,
+}
+
+impl FindOutput {
+    /// Each matched source line as `path:line:text`, matches separated by
+    /// `--`, meta-variables as `  $NAME = <JSON string>` under their match.
+    pub(super) fn render(&self) -> String {
+        let matches = self.matches.iter().map(|matched| {
+            let lines = (matched.start_line..).zip(matched.text.lines());
+            let lines = lines.map(|(number, line)| format!("{}:{number}:{line}\n", matched.path));
+            let variables = matched.meta_variables.iter().flatten();
+            let variables =
+                variables.map(|(name, value)| format!("  ${name} = {}\n", Value::from(&**value)));
+            lines.chain(variables).collect::<String>()
+        });
+        let mut text = matches.collect::<Vec<_>>().join("--\n");
+        if text.is_empty() {
+            text += "No matches\n";
+        }
+        if self.limit_reached {
+            text += &format!(
+                "[showing {} of {} matches; continue with offset={}]\n",
+                self.matches.len(),
+                self.total_matches,
+                self.next_offset
+            );
+        }
+        text + &render_parse_errors(self.parse_errors.as_deref())
+    }
+}
+
+/// Files the search could not parse, one per line under a heading.
+pub(super) fn render_parse_errors(errors: Option<&[String]>) -> String {
+    errors.map_or_else(String::new, |errors| {
+        format!("parse errors:\n{}\n", errors.join("\n"))
+    })
 }
 
 pub(super) fn run(
@@ -86,7 +135,7 @@ pub(super) fn run(
     working_dir: std::path::PathBuf,
     path_locks: Arc<PathLockMap>,
     cancel: CancellationToken,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<FindOutput> {
     let candidates = collect_candidates(
         &working_dir,
         config.path.as_deref(),
@@ -152,7 +201,8 @@ pub(super) fn run(
                     end_column: one_based(end.column(matched.get_node())),
                     meta_variables: config
                         .include_meta
-                        .then(|| HashMap::<String, String>::from(matched.get_env().clone())),
+                        .then(|| HashMap::<String, String>::from(matched.get_env().clone()))
+                        .map(BTreeMap::from_iter),
                 });
                 files_with_matches.insert(candidate.display_path.clone());
             }
@@ -171,30 +221,21 @@ pub(super) fn run(
     let offset = usize::try_from(config.offset).unwrap_or(usize::MAX);
     let limit = usize::try_from(config.limit).unwrap_or(usize::MAX);
     let limit_reached = matches.len() > offset.saturating_add(limit);
-    let visible = matches
+    let matches = matches
         .into_iter()
         .skip(offset)
         .take(limit)
         .collect::<Vec<_>>();
 
-    Ok(json!({
-        "matches": visible.iter().map(|matched| json!({
-            "path": matched.path,
-            "text": matched.text,
-            "byte_start": matched.byte_start,
-            "byte_end": matched.byte_end,
-            "start_line": matched.start_line,
-            "start_column": matched.start_column,
-            "end_line": matched.end_line,
-            "end_column": matched.end_column,
-            "meta_variables": matched.meta_variables,
-        })).collect::<Vec<_>>(),
-        "total_matches": total_matches,
-        "files_searched": candidates.len(),
-        "files_with_matches": files_with_matches.len(),
-        "limit_reached": limit_reached,
-        "parse_errors": (!parse_errors.is_empty()).then_some(parse_errors),
-    }))
+    Ok(FindOutput {
+        next_offset: config.offset.saturating_add(matches.len() as u64),
+        matches,
+        total_matches,
+        files_searched: candidates.len(),
+        files_with_matches: files_with_matches.len(),
+        limit_reached,
+        parse_errors: (!parse_errors.is_empty()).then_some(parse_errors),
+    })
 }
 
 /// Converts an `ast-grep` zero-based line/column index to the one-based
@@ -256,8 +297,33 @@ mod tests {
         )
         .expect("find should succeed");
 
+        assert_eq!(
+            value.render(),
+            "main.rs:1:fn alpha() {}\n  $NAME = \"alpha\"\n--\n\
+             main.rs:2:fn beta() {}\n  $NAME = \"beta\"\n"
+        );
+        let value = serde_json::to_value(value).expect("serialize");
         assert_eq!(value["total_matches"], 2);
         assert_eq!(value["files_with_matches"], 1);
         assert_eq!(value["matches"][0]["meta_variables"]["NAME"], "alpha");
+    }
+
+    #[test]
+    fn a_limited_or_empty_find_says_so() {
+        let output = FindOutput {
+            matches: Vec::new(),
+            total_matches: 7,
+            files_searched: 2,
+            files_with_matches: 1,
+            limit_reached: true,
+            parse_errors: Some(vec!["bad.rs: unparsable".to_owned()]),
+            next_offset: 5,
+        };
+
+        assert_eq!(
+            output.render(),
+            "No matches\n[showing 0 of 7 matches; continue with offset=5]\n\
+             parse errors:\nbad.rs: unparsable\n"
+        );
     }
 }
