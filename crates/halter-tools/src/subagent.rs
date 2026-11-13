@@ -267,7 +267,7 @@ impl TypedTool for WaitAgentTool {
     fn describe(&self) -> ToolSpec {
         subagent_spec(
             "wait_agent",
-            "Wait for one of the target child sessions to reach a terminal state (completed, failed, cancelled, or closed). Returns the status of the agent that finished. If timeout_ms expires before any target finishes, returns timed_out: true and target_statuses with the current state of each requested agent.",
+            "Wait for one of the target child sessions to reach a terminal state (completed, failed, cancelled, or closed). Returns a status line for the agent that finished, `agent <id>: <state>`, followed by its final message. If timeout_ms expires before any target finishes, returns `timed out` followed by one status line for each requested agent.",
             json!({
                 "type": "object",
                 "properties": {
@@ -721,8 +721,9 @@ mod tests {
         assert!(send_input.contains("close_agent"));
 
         let wait_agent = WaitAgentTool::new(control.clone()).spec().description;
-        assert!(wait_agent.contains("target_statuses"));
-        assert!(wait_agent.contains("timed_out: true"));
+        assert!(wait_agent.contains("`agent <id>: <state>`"));
+        assert!(wait_agent.contains("`timed out` followed by one status line"));
+        assert!(!wait_agent.contains("target_statuses") && !wait_agent.contains("timed_out"));
 
         let close_agent = CloseAgentTool::new(control).spec().description;
         assert!(close_agent.contains("stopping any in-progress work"));

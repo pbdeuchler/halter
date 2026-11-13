@@ -10642,7 +10642,7 @@ mod tests {
             panic!("expected one tool result in the child");
         };
         let spill = temp.path().join("spill").join(&child.0);
-        let marker = format!("bytes elided here; full output: {}", spill.display());
+        let marker = format!("result elided here; full output: {}", spill.display());
         assert!(read.len() < 400 && read.contains(&marker), "{read}");
     }
 

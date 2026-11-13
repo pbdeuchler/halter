@@ -180,8 +180,9 @@ mod tests {
 
     #[test]
     fn report_renders_sorted_fields_as_lines_without_escaping() {
-        // Inserted out of key order at both levels: with serde_json's
-        // `preserve_order` an unsorted rendering would follow insertion.
+        // Built out of key order at both levels. This pins the layout; the
+        // explicit sorts only show under serde_json's `preserve_order`,
+        // which no build of this workspace enables.
         let nested = Map::from_iter([("z".to_owned(), json!(1)), ("a".to_owned(), json!(null))]);
         let report = Report(Value::Object(Map::from_iter([
             ("output".to_owned(), json!("é line1\nline2")),

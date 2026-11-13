@@ -293,14 +293,7 @@ impl HalterBuilder {
         }
 
         let policy = policy_from_config(&config.policy);
-        let tool_output = ToolOutputSettings {
-            max_bytes: config.tools.max_output_bytes,
-            spill_dir: config
-                .tools
-                .output_dir
-                .as_deref()
-                .map_or_else(|| ToolOutputSettings::default().spill_dir, expand_path),
-        };
+        let tool_output = tool_output_settings(&config.tools)?;
         if tool_output.max_bytes > 0
             && !spill_dir_is_readable(&tool_output.spill_dir, &policy.allowed_read_roots)
         {
@@ -1174,6 +1167,21 @@ where
     resolve_provider_runtime_config(provider, config.provider_config(provider), lookup_env)
 }
 
+/// The output budget from configuration. A relative `output_dir` is made
+/// absolute here: the marker's path is read back relative to the session's
+/// working directory, not the one this process writes from.
+fn tool_output_settings(config: &halter_config::ToolsConfig) -> anyhow::Result<ToolOutputSettings> {
+    let spill_dir = match &config.output_dir {
+        Some(dir) => std::path::absolute(expand_path(dir))
+            .context("failed to build halter runtime: invalid tools.output_dir")?,
+        None => ToolOutputSettings::default().spill_dir,
+    };
+    Ok(ToolOutputSettings {
+        max_bytes: config.max_output_bytes,
+        spill_dir,
+    })
+}
+
 /// Whether the `read` and `grep` tools can reach files under `spill_dir`,
 /// compared both as configured and with symlinks resolved. The directory
 /// may not exist yet, so its nearest existing ancestor is what is resolved.
@@ -1428,6 +1436,34 @@ mod tests {
             1,
             "configured write roots should be added to read roots once"
         );
+    }
+
+    #[test]
+    fn tool_output_dir_is_absolute_whatever_the_configured_form() {
+        let cwd = std::env::current_dir().expect("cwd");
+        for (configured, expected) in [
+            (Some("spill/out"), Some(cwd.join("spill/out"))),
+            (Some("/var/out"), Some(PathBuf::from("/var/out"))),
+            (None, Some(ToolOutputSettings::default().spill_dir)),
+            (Some(""), None),
+        ] {
+            let config = halter_config::ToolsConfig {
+                max_output_bytes: 7,
+                output_dir: configured.map(PathBuf::from),
+                ..Default::default()
+            };
+            let settings = tool_output_settings(&config);
+            let spill_dir = settings
+                .as_ref()
+                .ok()
+                .map(|settings| settings.spill_dir.clone());
+            assert_eq!(spill_dir, expected, "{configured:?}");
+            assert!(
+                spill_dir.is_none_or(|dir| dir.is_absolute()),
+                "{configured:?}"
+            );
+            assert!(settings.is_err() || settings.is_ok_and(|settings| settings.max_bytes == 7));
+        }
     }
 
     #[test]

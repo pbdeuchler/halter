@@ -578,10 +578,12 @@ enabled = [
   "close_agent",
 ]
 # Largest tool result, in bytes of model-visible text, committed whole. Larger
-# results keep their head and tail; the full text is written under output_dir.
-# 0 disables the bound.
+# results keep their head and tail; the full text is written to
+# <output_dir>/<sanitized session id>/<message id>.txt. 0 disables the bound.
 max_output_bytes = 51200
-# output_dir = "/tmp/halter/tool-output" # default: under the system temp dir
+# Default: halter-<user>/tool-output under the system temp dir, which the read
+# tools reach by default. Anywhere else must be under [policy] allowed_read_roots.
+# output_dir = "/tmp/halter-me/tool-output"
 
 [context]
 # Thresholds are optional. Unset, compaction_threshold is
