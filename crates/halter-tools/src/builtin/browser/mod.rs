@@ -16,14 +16,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, TypedTool};
 
 use super::common::{
-    ToolScope, ensure_not_cancelled, optional_bool, optional_string, required_string, resolve_path,
+    Report, ToolScope, ensure_not_cancelled, optional_bool, optional_string, required_string,
+    resolve_path,
 };
 
 pub mod browserbase;
@@ -41,8 +42,10 @@ const SNAPSHOT_TRUNCATE_THRESHOLD: usize = 8_000;
 pub struct BrowserTool;
 
 #[async_trait]
-impl Tool for BrowserTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for BrowserTool {
+    type Output = Report;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("browser"),
             description: include_str!("description.txt").trim().to_owned(),
@@ -60,7 +63,7 @@ impl Tool for BrowserTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Report> {
         let _scope = ToolScope::new(&context, "browser");
         ensure_not_cancelled(&context.cancel)?;
         let action = required_string(&input, "action")?.to_owned();
@@ -92,7 +95,7 @@ impl Tool for BrowserTool {
             .run_until_cancelled(dispatch)
             .await
             .ok_or_else(|| anyhow::anyhow!("failed to execute tool: cancelled"))??;
-        Ok(ToolResult::Json { value })
+        Ok(Report(value))
     }
 }
 

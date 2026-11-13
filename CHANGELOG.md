@@ -56,9 +56,69 @@ once a `1.0.0` line is cut.
   `tool_call_id`, or `agent_id`). `halter-cli` adds a matching `otel` feature
   that forwards to `halter/otel` and only activates export when
   `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+- Typed tool output. `halter_tools::ToolOutput` (`Serialize` plus
+  `to_model_string`) separates the structured value hosts read from the text
+  the model reads, and `halter_tools::TypedTool` (`type Output: ToolOutput`,
+  `describe`, `run`) is a `Tool` through a blanket impl. `ToolResult` gains
+  `Rendered { value, model_text, elision }`, with
+  `ToolResult::to_model_string`, `ToolResult::structured`, and
+  `ToolResultMessage::to_model_string`.
+- Tool output budget. `[tools] max_output_bytes` (default `51200`; `0`
+  disables) bounds the model text of every tool result before it is
+  committed. A larger result keeps its head and tail around one marker line,
+  unless the marker would cost as much as the cut saves, in which case the
+  result is committed whole. The full output is written to
+  `<tools.output_dir>/<sanitized session id>/<message id>.txt`, where the
+  session id has every character outside `[A-Za-z0-9_-]` replaced by `_` and
+  the message id is that of the tool result message. The default directory
+  is `halter-<user>/tool-output` under the system temporary directory
+  (`<user>` from `USER`; `halter/tool-output` when it is unset); a relative
+  `output_dir` is resolved against the process working directory when the
+  runtime is built. Files are readable by their owner only. A
+  `ToolResult::Json` is written pretty-printed so it can be searched by
+  line. The marker states how much of the result was cut, names the file,
+  and says to `grep` it or `read` it with `offset` and `limit`; its sizes
+  describe the result, not the file. The `ToolExecutionCompleted` event records
+  `elision.original_bytes` and `elision.spill_path`; the structured `value`
+  is not cut. Oversized tool error messages, including a pre-tool hook's
+  block reason, are bounded the same way. `RuntimeServices` gains
+  `tool_output: ToolOutputSettings`. Building a runtime warns when the output
+  directory is outside the allowed read roots.
 
 ### Changed
 
+- **Breaking:** `ToolResult` has a fourth variant, `Rendered`. Hosts that
+  match on it exhaustively must add an arm; `to_model_string()` and
+  `structured()` cover the common cases without a match. Session logs written
+  by earlier versions load unchanged.
+- **Breaking:** the transcript no longer holds a tool's structured value.
+  `ToolExecutionCompleted` carries the whole `Rendered` result: `value`,
+  `model_text`, and `elision`. The transcript `ToolResultMessage` carries
+  `Text` holding the same model text and nothing else, so the model text is
+  stored in both places and the structured value only in the event. A host
+  that read a structured value from a transcript tool message must read it
+  from the completion event.
+- **Breaking:** `ToolsConfig` gains `max_output_bytes` and `output_dir`, and
+  `RuntimeServices` gains `tool_output`; struct literals need the new fields
+  or `..Default::default()`.
+- Every in-tree tool returns `ToolResult::Rendered` instead of
+  `ToolResult::Json`. `value` keeps the previous JSON shape, so
+  `result.structured()` reads it as before, but the serialized `kind` is
+  `"rendered"`, which is what hooks see in `tool_response`. The model now
+  reads rendered text instead of escaped JSON: `read` returns the file text
+  under a one-line header, `grep` and `glob` one hit per line, `write` and
+  `edit` a one-line confirmation, `shell` its output followed by a status
+  line only when the exit was not a plain `0`, and `wait_agent` the child's
+  final message under a one-line status header. The `read` tool with
+  `line_numbers = true` shows `N<tab>line` text; the `lines` array is still
+  in `value`. A truncated `grep` names the `offset` that continues it, also
+  as `next_offset` in `value`; in `count` and `files_with_matches` modes,
+  which do not page, it says to raise `max_matches` instead. `notes`, `session_search`, `browser`, and
+  `image` render `key: value` lines in key order through `halter_tools::Report`.
+- Every provider codec, the session-history search text, and the token ledger
+  render tool results through `ToolResult::to_model_string`. The ledger now
+  counts a tool result's error text, which it previously skipped; its
+  accounting version is 3, so persisted ledgers are rebuilt once.
 - `halter-cli` builds its subscriber with `halter::telemetry`, with the same
   defaults (`RUST_LOG`, default `warn`, noisy-target suppression, JSON with
   `--output-file`). Log lines now include span context when spans are enabled
@@ -82,6 +142,21 @@ once a `1.0.0` line is cut.
 
 ### Fixed
 
+- A long reply no longer fails the turn because of how many text deltas the
+  provider split it into. Past 8,192 deltas (about 120 kB of text at
+  Anthropic's chunk size) the turn failed with `provider stream text exceeded
+  event cap`, discarding the reply and its usage. Deltas beyond the budget are
+  now coalesced into the preceding text `DeltaItem`, so the events still
+  concatenate to the full text and the 4 MiB output cap is the only fatal
+  bound. Provider metadata has its own budget of 1,024 events, so neither it
+  nor text can crowd the other out. A turn's stream therefore yields at most
+  8,192 text events plus 1,024 metadata events, plus up to 1,024 further text
+  events where a metadata event separates a coalesced delta from the text
+  event before it.
+- The core prompt no longer tells the model that dedicated tools "aren't gated
+  by the shell allowlist", which was false for hosts that register their own
+  unrestricted shell tool. It now gives the reason that holds everywhere:
+  structured, bounded output that costs less context.
 - `grep` with `max_columns` no longer takes time quadratic in line length when
   it measures or truncates a match. Grapheme lookup re-segmented the line from
   its first byte on every step, so one matching multi-megabyte line (one-line

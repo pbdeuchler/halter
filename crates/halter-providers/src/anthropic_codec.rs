@@ -10,9 +10,7 @@ use halter_protocol::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::codec_common::{
-    canonical_tool_name, normalized_tool_call_id, tool_name_for_provider, tool_result_text,
-};
+use crate::codec_common::{canonical_tool_name, normalized_tool_call_id, tool_name_for_provider};
 
 const CACHE_CONTROL_EPHEMERAL: &str = "ephemeral";
 const COMPACTED_CONTEXT_TYPE: &str = "halter_compacted_context";
@@ -576,7 +574,7 @@ fn encode_tool_result(message: &ToolResultMessage) -> Value {
     json!({
         "type": "tool_result",
         "tool_use_id": normalized_tool_call_id(&message.call_id),
-        "content": tool_result_text(&message.content, &message.error),
+        "content": message.to_model_string(),
         "is_error": message.error.is_some(),
     })
 }
@@ -1125,11 +1123,7 @@ fn render_compaction_message(message: &Message) -> String {
                 .join("\n");
             format!("assistant:\n{parts}")
         }
-        Message::Tool(tool) => format!(
-            "tool_result {}:\n{}",
-            tool.call_id,
-            tool_result_text(&tool.content, &tool.error)
-        ),
+        Message::Tool(tool) => format!("tool_result {}:\n{}", tool.call_id, tool.to_model_string()),
     }
 }
 

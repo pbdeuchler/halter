@@ -6,10 +6,11 @@ pub mod streaming;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, ToolOutput, TypedTool};
 
 use self::session::{ShellRunOptions, run_persistent_shell};
 use super::common::{
@@ -21,8 +22,10 @@ use super::common::{
 pub struct ShellTool;
 
 #[async_trait]
-impl Tool for ShellTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for ShellTool {
+    type Output = ShellOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("shell"),
             description: "Run a command in a persistent shell session: the working directory, \
@@ -53,7 +56,7 @@ impl Tool for ShellTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Self::Output> {
         let _scope = ToolScope::new(&context, "shell");
         ensure_not_cancelled(&context.cancel)?;
         let timeout = optional_u64(&input, "timeout_ms")?
@@ -80,15 +83,55 @@ impl Tool for ShellTool {
         )
         .await?;
 
-        Ok(ToolResult::Json {
-            value: json!({
-                "exit_code": result.exit_code,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "timed_out": result.timed_out,
-                "cancelled": result.cancelled,
-            }),
+        Ok(ShellOutput {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            timed_out: result.timed_out,
+            cancelled: result.cancelled,
         })
+    }
+}
+
+#[derive(Debug, Serialize)]
+/// Result of a `shell` call.
+pub struct ShellOutput {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+    cancelled: bool,
+}
+
+impl ToolOutput for ShellOutput {
+    /// Stdout verbatim, stderr under a `[stderr]` line, then a status trailer
+    /// only when the command did not simply exit 0.
+    fn to_model_string(&self) -> String {
+        let status = match (self.timed_out, self.cancelled, self.exit_code) {
+            (true, _, _) => "[timed out]".to_owned(),
+            (_, true, _) => "[cancelled]".to_owned(),
+            (_, _, Some(0)) => String::new(),
+            (_, _, Some(code)) => format!("[exit code {code}]"),
+            (_, _, None) => "[no exit code]".to_owned(),
+        };
+        let stderr = match self.stderr.as_str() {
+            "" => String::new(),
+            stderr => format!("[stderr]\n{stderr}"),
+        };
+        let text = [self.stdout.as_str(), &stderr, &status]
+            .into_iter()
+            .filter(|section| !section.is_empty())
+            .fold(String::new(), |mut text, section| {
+                if !(text.is_empty() || text.ends_with('\n')) {
+                    text.push('\n');
+                }
+                text + section
+            });
+        if text.is_empty() {
+            "[no output]".to_owned()
+        } else {
+            text
+        }
     }
 }
 
@@ -96,6 +139,7 @@ impl Tool for ShellTool {
 mod tests {
     use std::sync::Arc;
 
+    use crate::Tool;
     use halter_protocol::ToolResult;
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
@@ -131,7 +175,7 @@ mod tests {
 
     fn json_value(result: ToolResult) -> Value {
         match result {
-            ToolResult::Json { value } => value,
+            ToolResult::Rendered { value, .. } => value,
             other => panic!("expected json result, got {other:?}"),
         }
     }
@@ -251,5 +295,42 @@ mod tests {
             .shutdown_session(&context.session_id)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn shell_output_renders_streams_verbatim_with_an_informative_trailer() {
+        let output = |exit_code, stdout: &str, stderr: &str, timed_out, cancelled| ShellOutput {
+            exit_code,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+            timed_out,
+            cancelled,
+        };
+        for (output, expected) in [
+            (output(Some(0), "a \"b\"\n", "", false, false), "a \"b\"\n"),
+            (
+                output(Some(2), "out", "warn: é\n", false, false),
+                "out\n[stderr]\nwarn: é\n[exit code 2]",
+            ),
+            (output(Some(0), "", "", false, false), "[no output]"),
+            (
+                output(None, "partial\n", "", true, false),
+                "partial\n[timed out]",
+            ),
+            (output(None, "", "", false, true), "[cancelled]"),
+            (output(None, "", "", false, false), "[no exit code]"),
+        ] {
+            assert_eq!(output.to_model_string(), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(output(Some(0), "o", "e", false, false)).expect("serialize"),
+            json!({
+                "exit_code": 0,
+                "stdout": "o",
+                "stderr": "e",
+                "timed_out": false,
+                "cancelled": false,
+            })
+        );
     }
 }

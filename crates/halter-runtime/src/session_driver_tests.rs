@@ -393,7 +393,7 @@ async fn running_background_job_retains_released_session_until_its_exit() {
         shell_timeout_secs: 30,
         subagent_parent: None,
     };
-    let halter_protocol::ToolResult::Json { value: job } = BackgroundTool
+    let halter_protocol::ToolResult::Rendered { value: job, .. } = BackgroundTool
         .execute(
             context.clone(),
             serde_json::json!({"action": "spawn", "command": "sleep 30"}),

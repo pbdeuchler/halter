@@ -50,7 +50,7 @@ impl Tool for CaptureAgentTool {
 
     async fn execute(&self, context: ToolContext, _input: Value) -> anyhow::Result<ToolResult> {
         let _dropped = SignalDrop(self.dropped.lock().unwrap().take());
-        let ToolResult::Json { value } = BackgroundTool
+        let ToolResult::Rendered { value, .. } = BackgroundTool
             .execute(
                 context.clone(),
                 json!({"action": "spawn", "command": "sleep 3600"}),

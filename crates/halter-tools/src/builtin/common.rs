@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::ToolOutput;
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -119,4 +121,108 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 #[must_use]
 pub fn hash_text(text: &str) -> String {
     hash_bytes(text.as_bytes())
+}
+
+/// Typed output for the tools whose result is open-ended (a browser `eval`
+/// returns whatever the page did). The value is the report; the model reads
+/// its fields as `key: value` lines.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct Report(pub Value);
+
+impl ToolOutput for Report {
+    /// Fields in key order, whatever order the map holds them in. Strings
+    /// are verbatim, never JSON-escaped; multi-line ones come last, each
+    /// under its own `key:` line. Null fields are dropped. Nested values are
+    /// compact JSON with sorted keys.
+    fn to_model_string(&self) -> String {
+        let inline = |value: &Value| match value {
+            Value::String(text) => text.clone(),
+            other => sorted(other).to_string(),
+        };
+        let Value::Object(fields) = &self.0 else {
+            return inline(&self.0);
+        };
+        let mut fields = fields.iter().collect::<Vec<_>>();
+        fields.retain(|(_, value)| !value.is_null());
+        let is_block = |value: &Value| value.as_str().is_some_and(|text| text.contains('\n'));
+        fields.sort_by_key(|(key, value)| (is_block(value), *key));
+        let line = |(key, value): &(&String, &Value)| {
+            let separator = if is_block(value) { ":\n" } else { ": " };
+            format!("{key}{separator}{}", inline(value))
+        };
+        fields.iter().map(line).collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// `value` with every object rebuilt in key order, so its JSON text does not
+/// depend on whether `serde_json` preserves insertion order.
+fn sorted(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => items.iter().map(sorted).collect(),
+        Value::Object(fields) => {
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_by_key(|(key, _)| *key);
+            let fields = fields
+                .into_iter()
+                .map(|(key, value)| (key.clone(), sorted(value)));
+            Value::Object(fields.collect())
+        }
+        other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Map, json};
+
+    use super::*;
+
+    #[test]
+    fn report_renders_sorted_fields_as_lines_without_escaping() {
+        // Built out of key order at both levels. This pins the layout; the
+        // explicit sorts only show under serde_json's `preserve_order`,
+        // which no build of this workspace enables.
+        let nested = Map::from_iter([("z".to_owned(), json!(1)), ("a".to_owned(), json!(null))]);
+        let report = Report(Value::Object(Map::from_iter([
+            ("output".to_owned(), json!("é line1\nline2")),
+            ("status".to_owned(), json!("running")),
+            ("note".to_owned(), json!(null)),
+            ("jobs".to_owned(), json!([nested, "b \"q\""])),
+            ("command".to_owned(), json!("echo \"hi\"")),
+        ])));
+
+        assert_eq!(
+            report.to_model_string(),
+            "command: echo \"hi\"\njobs: [{\"a\":null,\"z\":1},\"b \\\"q\\\"\"]\n\
+             status: running\noutput:\né line1\nline2"
+        );
+        assert_eq!(
+            Report(json!("plain \"text\"")).to_model_string(),
+            "plain \"text\""
+        );
+        assert_eq!(
+            Report(json!([{"b": 1, "a": 2}])).to_model_string(),
+            "[{\"a\":2,\"b\":1}]"
+        );
+        assert_eq!(serde_json::to_value(&report).expect("serialize"), report.0);
+    }
+
+    #[test]
+    fn output_that_cannot_serialize_is_an_error() {
+        #[derive(Serialize)]
+        struct Unkeyed(std::collections::HashMap<(u8, u8), u8>);
+        impl ToolOutput for Unkeyed {
+            fn to_model_string(&self) -> String {
+                "text".to_owned()
+            }
+        }
+
+        let error = Unkeyed([((1, 2), 3)].into()).to_tool_result();
+        let error = error.expect_err("a tuple is not a JSON object key");
+        assert!(
+            error.to_string().contains("key must be a string"),
+            "{error}"
+        );
+    }
 }

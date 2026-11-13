@@ -28,14 +28,14 @@ use halter_runtime::{
     CleanWindow, CompactionStrategy, ContextSettings, DefaultContextManager,
     DefaultPromptAssembler, EventBus, ModelSummary, ProviderDefault, ResourceHandle,
     RuntimeServices, SKILL_TOOL_NAME, SessionError, SessionEventStream, SessionHandle, SessionInit,
-    SessionRuntime, StoreSearch, TraceRecorder, WindowPolicy,
+    SessionRuntime, StoreSearch, ToolOutputSettings, TraceRecorder, WindowPolicy,
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
     DefaultToolPolicy, LoopbackAllow, PathLockMap, PolicySettings, ShellMode, Tool, ToolRuntime,
     ToolSessionStore, register_builtin_tools, register_subagent_tools,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{CompiledResources, LoadedPlugin, LoadedSkill, ResourceCompiler};
 
@@ -292,7 +292,18 @@ impl HalterBuilder {
             tools.register(tool);
         }
 
-        let policy = Arc::new(DefaultToolPolicy::new(policy_from_config(&config.policy)));
+        let policy = policy_from_config(&config.policy);
+        let tool_output = tool_output_settings(&config.tools)?;
+        if tool_output.max_bytes > 0
+            && !spill_dir_is_readable(&tool_output.spill_dir, &policy.allowed_read_roots)
+        {
+            warn!(
+                spill_dir = %tool_output.spill_dir.display(),
+                "tool output directory is outside the allowed read roots: \
+                 the model cannot read back output elided from its context"
+            );
+        }
+        let policy = Arc::new(DefaultToolPolicy::new(policy));
         let trace_recorder = config
             .runtime
             .traces_dir
@@ -320,6 +331,7 @@ impl HalterBuilder {
             subagent_event_forwarding: config.runtime.subagent_event_forwarding,
             subagent_event_forwarding_cap: config.runtime.subagent_event_forwarding_cap,
             shell_timeout_secs: config.policy.shell.timeout_secs,
+            tool_output,
             trace_recorder,
         });
         let runtime = SessionRuntime::new(services.clone());
@@ -1155,6 +1167,37 @@ where
     resolve_provider_runtime_config(provider, config.provider_config(provider), lookup_env)
 }
 
+/// The output budget from configuration. A relative `output_dir` is made
+/// absolute here: the marker's path is read back relative to the session's
+/// working directory, not the one this process writes from.
+fn tool_output_settings(config: &halter_config::ToolsConfig) -> anyhow::Result<ToolOutputSettings> {
+    let spill_dir = match &config.output_dir {
+        Some(dir) => std::path::absolute(expand_path(dir))
+            .context("failed to build halter runtime: invalid tools.output_dir")?,
+        None => ToolOutputSettings::default().spill_dir,
+    };
+    Ok(ToolOutputSettings {
+        max_bytes: config.max_output_bytes,
+        spill_dir,
+    })
+}
+
+/// Whether the `read` and `grep` tools can reach files under `spill_dir`,
+/// compared both as configured and with symlinks resolved. The directory
+/// may not exist yet, so its nearest existing ancestor is what is resolved.
+fn spill_dir_is_readable(spill_dir: &Path, read_roots: &[PathBuf]) -> bool {
+    let resolved = spill_dir.ancestors().find_map(|dir| {
+        let rest = spill_dir.strip_prefix(dir).ok()?;
+        Some(dir.canonicalize().ok()?.join(rest))
+    });
+    read_roots.iter().any(|root| {
+        spill_dir.starts_with(root)
+            || root
+                .canonicalize()
+                .is_ok_and(|root| resolved.as_deref().is_some_and(|dir| dir.starts_with(root)))
+    })
+}
+
 /// Every `PolicySettings` field comes from configuration now; `defaults`
 /// supplies the fallbacks for the fields whose "unset" form means "keep the
 /// built-in value".
@@ -1393,6 +1436,64 @@ mod tests {
             1,
             "configured write roots should be added to read roots once"
         );
+    }
+
+    #[test]
+    fn tool_output_dir_is_absolute_whatever_the_configured_form() {
+        let cwd = std::env::current_dir().expect("cwd");
+        for (configured, expected) in [
+            (Some("spill/out"), Some(cwd.join("spill/out"))),
+            (Some("/var/out"), Some(PathBuf::from("/var/out"))),
+            (None, Some(ToolOutputSettings::default().spill_dir)),
+            (Some(""), None),
+        ] {
+            let config = halter_config::ToolsConfig {
+                max_output_bytes: 7,
+                output_dir: configured.map(PathBuf::from),
+                ..Default::default()
+            };
+            let settings = tool_output_settings(&config);
+            let spill_dir = settings
+                .as_ref()
+                .ok()
+                .map(|settings| settings.spill_dir.clone());
+            assert_eq!(spill_dir, expected, "{configured:?}");
+            assert!(
+                spill_dir.is_none_or(|dir| dir.is_absolute()),
+                "{configured:?}"
+            );
+            assert!(settings.is_err() || settings.is_ok_and(|settings| settings.max_bytes == 7));
+        }
+    }
+
+    #[test]
+    fn spill_dir_is_readable_only_under_a_read_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        let resolved = root.canonicalize().expect("canonical root");
+        let missing = PathBuf::from("/nonexistent-root");
+
+        for (spill_dir, roots, readable) in [
+            (root.join("not/yet/made"), vec![root.clone()], true),
+            (
+                root.join("spill"),
+                vec![missing.clone(), resolved.clone()],
+                true,
+            ),
+            (resolved.join("spill"), vec![root.clone()], true),
+            (missing.join("spill"), vec![missing.clone()], true),
+            (temp.path().join("beside"), vec![root.clone()], false),
+            (PathBuf::from("relative/spill"), vec![root.clone()], false),
+            (root.join("spill"), Vec::new(), false),
+        ] {
+            assert_eq!(
+                spill_dir_is_readable(&spill_dir, &roots),
+                readable,
+                "{} under {roots:?}",
+                spill_dir.display()
+            );
+        }
     }
 
     #[test]

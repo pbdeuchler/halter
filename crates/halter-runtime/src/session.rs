@@ -36,6 +36,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::model_selection::select_models;
 use crate::session_lease::{OutOfTurn, SessionLease};
+use crate::tool_output::{bound_error, bound_result, transcript_content};
 use crate::turn_registry::TurnRegistry;
 use crate::{
     CompactionBoundary, CompactionContext, CompactionStrategy, CompactionTrigger, ContextManager,
@@ -51,6 +52,7 @@ pub type SessionEventStream = BoxStream<'static, anyhow::Result<SessionEvent>>;
 
 const PROVIDER_STREAM_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_STREAM_EVENT_CAP: usize = 8_192;
+const PROVIDER_STREAM_METADATA_EVENT_CAP: usize = 1_024;
 const TOOL_RUNTIME_EVENT_CAP: usize = 4_096;
 const TOOL_RUNTIME_EVENT_BYTES_CAP: usize = 1024 * 1024;
 /// `PreCompact`/`PostCompact` matcher value for ledger-triggered passes;
@@ -94,6 +96,8 @@ pub struct RuntimeServices {
     pub subagent_event_forwarding: SubagentEventForwarding,
     pub subagent_event_forwarding_cap: u64,
     pub shell_timeout_secs: u64,
+    /// Bound on the text one tool result puts in the context.
+    pub tool_output: crate::ToolOutputSettings,
     /// Optional sink that mirrors every committed `SessionEvent` into a
     /// per-session JSONL trace file. Disabled (`None`) when
     /// `runtime.traces_dir` is not configured.
@@ -2142,13 +2146,16 @@ impl SessionExecutor {
                         // Hook-authored text; kept below info.
                         debug!(reason = %reason, "tool call block reason");
                     });
-                    let error = ToolError::new(reason);
+                    let id = MessageId::new();
+                    let output = &self.services.tool_output;
+                    let error =
+                        bound_error(output, &self.session_id, &id, ToolError::new(reason)).await;
                     let outcome = ToolExecutionOutcome {
                         call: call.clone(),
                         result: Err(error.clone()),
                     };
                     let message = Message::Tool(ToolResultMessage {
-                        id: MessageId::new(),
+                        id,
                         call_id: call.id.clone(),
                         content: ToolResult::Empty,
                         error: Some(error),
@@ -2333,12 +2340,29 @@ impl SessionExecutor {
                         self.push_event(events, SessionEventPayload::MessageItem { message });
                     }
                 }
+                // Every executed call's result is committed here, whatever
+                // produced it: bounded once, so the log holds exactly what the
+                // model saw. The completion event keeps the whole result; the
+                // transcript keeps only its model text.
+                let id = MessageId::new();
+                let output = &self.services.tool_output;
+                let (result, content, error) = match error {
+                    None => {
+                        let result = bound_result(output, &self.session_id, &id, content).await;
+                        let content = transcript_content(&result);
+                        (Ok(result), content, None)
+                    }
+                    Some(error) => {
+                        let error = bound_error(output, &self.session_id, &id, error).await;
+                        (Err(error.clone()), content, Some(error))
+                    }
+                };
                 let outcome = ToolExecutionOutcome {
                     call: call.clone(),
-                    result: error.clone().map_or_else(|| Ok(content.clone()), Err),
+                    result,
                 };
                 let message = Message::Tool(ToolResultMessage {
-                    id: MessageId::new(),
+                    id,
                     call_id: call.id.clone(),
                     content,
                     error,
@@ -3030,9 +3054,9 @@ impl SessionExecutor {
                 outcome:
                     ToolExecutionOutcome {
                         call,
-                        result: Ok(ToolResult::Json { value }),
+                        result: Ok(result),
                     },
-            } if call.name.0 == crate::model_summary::TODO_TOOL_NAME => Some(value),
+            } if call.name.0 == crate::model_summary::TODO_TOOL_NAME => result.structured(),
             _ => None,
         });
         self.services
@@ -3274,6 +3298,7 @@ async fn materialize_assistant_message_with_cancel(
     let mut parts = Vec::new();
     let mut text_buffer = String::new();
     let mut delta_events = Vec::new();
+    let mut metadata_events = 0usize;
     let mut accumulated_output_bytes = 0usize;
     let mut thinking_block: Option<PendingThinkingBlock> = None;
     let mut tool_call_blocks: std::collections::BTreeMap<BlockId, PendingToolCallBlock> =
@@ -3303,15 +3328,21 @@ async fn materialize_assistant_message_with_cancel(
                     &delta,
                     &mut accumulated_output_bytes,
                 )?;
-                if delta_events.len() >= PROVIDER_STREAM_EVENT_CAP {
-                    anyhow::bail!(
-                        "provider stream text exceeded event cap: {} events",
-                        PROVIDER_STREAM_EVENT_CAP
-                    );
+                // How finely a provider chunks its stream must not fail the
+                // turn; the byte cap above is the only fatal bound. Past the
+                // event budget, deltas coalesce into the preceding one, so
+                // the events stay bounded, in order, and sum to the full text.
+                let text_events = delta_events.len() - metadata_events;
+                match delta_events.last_mut() {
+                    Some(SessionEventPayload::DeltaItem { delta: last })
+                        if text_events >= PROVIDER_STREAM_EVENT_CAP =>
+                    {
+                        last.text.push_str(&delta);
+                    }
+                    _ => delta_events.push(SessionEventPayload::DeltaItem {
+                        delta: halter_protocol::DeltaItem { text: delta },
+                    }),
                 }
-                delta_events.push(SessionEventPayload::DeltaItem {
-                    delta: halter_protocol::DeltaItem { text: delta },
-                });
             }
             Ok(StreamEvent::TextEnd { .. }) => {
                 flush_text_buffer(&mut parts, &mut text_buffer);
@@ -3411,8 +3442,9 @@ async fn materialize_assistant_message_with_cancel(
             }
             Ok(StreamEvent::ProviderMetadata { metadata }) => {
                 // Non-essential annotation: drop rather than fail the turn once
-                // the event budget is spoken for by actual model output.
-                if delta_events.len() < PROVIDER_STREAM_EVENT_CAP {
+                // its own budget is spent. Text deltas are counted separately.
+                if metadata_events < PROVIDER_STREAM_METADATA_EVENT_CAP {
+                    metadata_events += 1;
                     delta_events.push(SessionEventPayload::ProviderMetadata { metadata });
                 }
             }
@@ -3606,6 +3638,7 @@ fn tool_result_kind(result: &ToolResult) -> &'static str {
         ToolResult::Empty => "empty",
         ToolResult::Text { .. } => "text",
         ToolResult::Json { .. } => "json",
+        ToolResult::Rendered { .. } => "rendered",
     }
 }
 
@@ -4322,6 +4355,7 @@ impl Default for RuntimeServices {
             subagent_event_forwarding: SubagentEventForwarding::Off,
             subagent_event_forwarding_cap: 100_000,
             shell_timeout_secs: 30,
+            tool_output: crate::ToolOutputSettings::default(),
             trace_recorder: None,
         }
     }
@@ -5777,6 +5811,7 @@ mod tests {
         let recorder =
             Arc::new(crate::TraceRecorder::open(temp.path().to_path_buf()).expect("recorder"));
         let services = RuntimeServices {
+            tool_output: crate::ToolOutputSettings::default(),
             trace_recorder: Some(recorder.clone()),
             ..RuntimeServices::default()
         };
@@ -6058,7 +6093,7 @@ mod tests {
     #[tokio::test]
     async fn materialize_drops_provider_metadata_beyond_the_event_cap() {
         let model = resolved_test_model("default", "fake", "halter/fake");
-        let events = (0..PROVIDER_STREAM_EVENT_CAP + 10).map(|index| {
+        let events = (0..PROVIDER_STREAM_METADATA_EVENT_CAP + 10).map(|index| {
             Ok(StreamEvent::ProviderMetadata {
                 metadata: format!(r#"{{"seq":{index}}}"#),
             })
@@ -6069,32 +6104,131 @@ mod tests {
         let materialized = super::materialize_assistant_message(stream, &model)
             .await
             .expect("metadata flood must not fail the turn");
+        assert_eq!(
+            materialized.events.len(),
+            PROVIDER_STREAM_METADATA_EVENT_CAP
+        );
+    }
+
+    fn delta_item_text(events: &[SessionEventPayload]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEventPayload::DeltaItem { delta } => Some(delta.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The number of chunks a provider splits its reply into is not a limit:
+    /// deltas past the event budget coalesce instead of failing the turn.
+    #[tokio::test]
+    async fn materialize_coalesces_text_deltas_beyond_the_event_cap() {
+        let model = resolved_test_model("default", "fake", "halter/fake");
+        let block_id = BlockId::new();
+        let deltas: Vec<String> = (0..20_000).map(|index| format!("w{index} ")).collect();
+        let expected = deltas.concat();
+        let events = deltas.into_iter().map(|delta| {
+            Ok(StreamEvent::TextDelta {
+                id: block_id.clone(),
+                delta,
+            })
+        });
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> =
+            stream::iter(events.collect::<Vec<_>>()).boxed();
+
+        let materialized = super::materialize_assistant_message(stream, &model)
+            .await
+            .expect("delta count must not fail the turn");
+        assert_eq!(
+            materialized.message.parts,
+            vec![AssistantPart::Text {
+                text: expected.clone()
+            }]
+        );
+        assert_eq!(delta_item_text(&materialized.events), expected);
         assert_eq!(materialized.events.len(), PROVIDER_STREAM_EVENT_CAP);
     }
 
+    /// Text and metadata have separate budgets: neither starves the other,
+    /// and interleaving them cannot grow the events without bound.
+    #[tokio::test]
+    async fn materialize_keeps_text_whole_through_a_metadata_flood() {
+        let model = resolved_test_model("default", "fake", "halter/fake");
+        let block_id = BlockId::new();
+        let deltas: Vec<String> = (0..20_000).map(|index| format!("w{index} ")).collect();
+        let expected = deltas.concat();
+        let events = deltas.into_iter().enumerate().flat_map(|(index, delta)| {
+            [
+                Ok(StreamEvent::ProviderMetadata {
+                    metadata: format!(r#"{{"seq":{index}}}"#),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    id: block_id.clone(),
+                    delta,
+                }),
+            ]
+        });
+        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> =
+            stream::iter(events.collect::<Vec<_>>()).boxed();
+
+        let materialized = super::materialize_assistant_message(stream, &model)
+            .await
+            .expect("metadata flood with long text must not fail the turn");
+        assert_eq!(
+            materialized.message.parts,
+            vec![AssistantPart::Text {
+                text: expected.clone()
+            }]
+        );
+        assert_eq!(delta_item_text(&materialized.events), expected);
+        let metadata_events = materialized
+            .events
+            .iter()
+            .filter(|event| matches!(event, SessionEventPayload::ProviderMetadata { .. }))
+            .count();
+        assert_eq!(metadata_events, PROVIDER_STREAM_METADATA_EVENT_CAP);
+        assert_eq!(
+            materialized.events.len(),
+            PROVIDER_STREAM_EVENT_CAP + PROVIDER_STREAM_METADATA_EVENT_CAP
+        );
+    }
+
+    /// The byte cap is the one fatal bound on model output, however the
+    /// provider chunks it: one oversized delta or many small ones.
     #[tokio::test]
     async fn materialize_rejects_oversized_provider_text() {
         let model = resolved_test_model("default", "fake", "halter/fake");
-        let block_id = BlockId::new();
-        let oversized = "x".repeat(PROVIDER_STREAM_OUTPUT_CAP_BYTES + 1);
-        let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> = stream::iter(vec![
-            Ok(StreamEvent::MessageStart {
-                id: halter_protocol::MessageId::new(),
-            }),
-            Ok(StreamEvent::TextStart {
-                id: block_id.clone(),
-            }),
-            Ok(StreamEvent::TextDelta {
-                id: block_id,
-                delta: oversized,
-            }),
-        ])
-        .boxed();
+        let chunk = "x".repeat(64);
+        let cases = [
+            (
+                "one delta",
+                vec!["x".repeat(PROVIDER_STREAM_OUTPUT_CAP_BYTES + 1)],
+            ),
+            (
+                "many deltas",
+                vec![chunk.clone(); PROVIDER_STREAM_OUTPUT_CAP_BYTES / chunk.len() + 1],
+            ),
+        ];
+        for (name, deltas) in cases {
+            let block_id = BlockId::new();
+            let events = deltas.into_iter().map(|delta| {
+                Ok(StreamEvent::TextDelta {
+                    id: block_id.clone(),
+                    delta,
+                })
+            });
+            let stream: BoxStream<'static, Result<StreamEvent, ProviderError>> =
+                stream::iter(events.collect::<Vec<_>>()).boxed();
 
-        let error = super::materialize_assistant_message(stream, &model)
-            .await
-            .expect_err("oversized provider text should fail");
-        assert!(error.to_string().contains("exceeded output cap"));
+            let error = super::materialize_assistant_message(stream, &model)
+                .await
+                .expect_err("oversized provider text should fail");
+            assert!(
+                error.to_string().contains("exceeded output cap"),
+                "{name}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -9528,7 +9662,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(windows["items"].as_array().unwrap().len(), 2);
-                assert!(replay.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionCompleted { outcome } if outcome.call.name.0 == "session_search" && matches!(&outcome.result, Ok(ToolResult::Json { value }) if value["items"].as_array().unwrap().len() == 2))));
+                assert!(replay.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionCompleted { outcome } if outcome.call.name.0 == "session_search" && matches!(&outcome.result, Ok(result) if result.structured().is_some_and(|value| value["items"].as_array().unwrap().len() == 2)))));
                 let resumed = runtime.resume(session.session_id()).await.unwrap().unwrap();
                 assert!(
                     search
@@ -10448,6 +10582,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_output_budget_applies_inside_a_subagent_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut services =
+            test_support::configured_services(Arc::new(SubagentFirehoseProvider), temp.path());
+        let unique = Arc::get_mut(&mut services).expect("unique services");
+        unique.tool_output = crate::ToolOutputSettings {
+            max_bytes: 64,
+            spill_dir: temp.path().join("spill"),
+        };
+        halter_tools::register_builtin_tools(&unique.tools, &["read".to_owned()]);
+        std::fs::write(temp.path().join("big.txt"), "line\n".repeat(100)).expect("write file");
+        let runtime = SessionRuntime::new(services.clone());
+        install_subagent_tools(&runtime, &services);
+        let session = runtime
+            .new_session(SessionInit {
+                working_dir: temp.path().to_path_buf(),
+                ..SessionInit::default()
+            })
+            .await
+            .expect("session");
+        session
+            .submit_turn(Turn::user("child reads a big file"))
+            .await
+            .expect("turn")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("events");
+
+        let tool_texts = |log: Vec<SessionEvent>| {
+            let texts = log.into_iter().filter_map(|event| match event.payload {
+                SessionEventPayload::MessageItem {
+                    message: Message::Tool(tool),
+                } => Some(tool.to_model_string().into_owned()),
+                _ => None,
+            });
+            texts.collect::<Vec<_>>()
+        };
+        let parent = services.sessions.replay(session.session_id()).await;
+        let child = parent
+            .expect("replay")
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::ToolExecutionCompleted { outcome }
+                    if outcome.call.name.0 == "spawn_agent" =>
+                {
+                    let status = outcome.result.as_ref().ok()?.structured()?;
+                    status["session_id"].as_str().map(SessionId::from)
+                }
+                _ => None,
+            });
+        let child = child.expect("child session");
+        let child_log = services
+            .sessions
+            .replay(&child)
+            .await
+            .expect("replay child");
+        let [read] = &tool_texts(child_log)[..] else {
+            panic!("expected one tool result in the child");
+        };
+        let spill = temp.path().join("spill").join(&child.0);
+        let marker = format!("result elided here; full output: {}", spill.display());
+        assert!(read.len() < 400 && read.contains(&marker), "{read}");
+    }
+
+    #[tokio::test]
     async fn traces_record_subagent_events_when_forwarding_is_off() {
         let temp = tempfile::tempdir().expect("tempdir");
         let traces_dir = temp.path().join("traces");
@@ -10965,6 +11164,11 @@ mod tests {
                 if latest_user_text.contains("grandchild") {
                     return Ok(text_stream(vec!["grandchild done"]));
                 }
+                if latest_user_text.contains("read a big file")
+                    && !matches!(request.messages.last(), Some(Message::Tool(_)))
+                {
+                    return Ok(tool_call_stream("read", json!({ "path": "big.txt" })));
+                }
                 if latest_user_text.contains("many child events") {
                     return Ok(text_stream(vec![
                         "child ", "done ", "with ", "many ", "events",
@@ -10987,6 +11191,8 @@ mod tests {
                 "spawn grandchild"
             } else if latest_user_text.contains("many child events") {
                 "many child events"
+            } else if latest_user_text.contains("big file") {
+                "read a big file"
             } else {
                 "child task"
             };
@@ -11008,15 +11214,15 @@ mod tests {
             .unwrap_or_default()
     }
 
+    // These read tool results as the model does: `spawn_agent` answers
+    // `agent <id>: running`, `wait_agent` a finished status or `timed out`.
     fn latest_spawn_agent_id(messages: &[Message]) -> Option<String> {
         messages.iter().rev().find_map(|message| match message {
-            Message::Tool(tool) => match &tool.content {
-                ToolResult::Json { value } => value
-                    .get("agent_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned),
-                ToolResult::Empty | ToolResult::Text { .. } => None,
-            },
+            Message::Tool(tool) => tool
+                .to_model_string()
+                .strip_prefix("agent ")?
+                .strip_suffix(": running")
+                .map(ToOwned::to_owned),
             Message::System(_) | Message::User(_) | Message::Assistant(_) => None,
         })
     }
@@ -11026,7 +11232,10 @@ mod tests {
             matches!(
                 message,
                 Message::Tool(tool)
-                    if matches!(&tool.content, ToolResult::Json { value } if value.get("timed_out").is_some())
+                    if tool.to_model_string().lines().next().is_some_and(|header| {
+                        header == "timed out"
+                            || header.starts_with("agent ") && !header.ends_with(": running")
+                    })
             )
         })
     }

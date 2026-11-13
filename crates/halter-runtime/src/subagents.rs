@@ -1801,7 +1801,7 @@ mod tests {
             shell_timeout_secs: 30,
             subagent_parent: None,
         };
-        let halter_protocol::ToolResult::Json { value: job } = halter_tools::BackgroundTool
+        let halter_protocol::ToolResult::Rendered { value: job, .. } = halter_tools::BackgroundTool
             .execute(
                 context.clone(),
                 serde_json::json!({"action": "spawn", "command": "sleep 30"}),
@@ -2453,7 +2453,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let halter_protocol::ToolResult::Json { value } = result else {
+        let halter_protocol::ToolResult::Rendered { value, .. } = result else {
             panic!("shell result");
         };
         assert_eq!(
@@ -3659,6 +3659,7 @@ mod tests {
             subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
             subagent_event_forwarding_cap: 100_000,
             shell_timeout_secs: 30,
+            tool_output: crate::ToolOutputSettings::default(),
             trace_recorder: None,
         })
     }

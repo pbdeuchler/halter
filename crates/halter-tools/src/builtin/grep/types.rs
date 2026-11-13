@@ -12,11 +12,11 @@ use globset::{GlobBuilder, GlobSet};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
-use serde_json::{Value, json};
+use serde::Serialize;
 use smallvec::SmallVec;
 use tokio_util::sync::CancellationToken;
 
-use crate::PathLockMap;
+use crate::{PathLockMap, ToolOutput};
 
 use super::super::common::resolve_path;
 use super::super::text::{truncate_to_width, visible_width};
@@ -58,7 +58,7 @@ pub struct SearchConfig {
     pub output_mode: OutputMode,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ContextLine {
     pub line_number: u64,
     pub line: String,
@@ -94,6 +94,8 @@ struct AggregateResult {
     files_searched: u64,
     files_with_matches: u64,
     total_matches: u64,
+    /// Matches counted towards `max_matches`, after `offset`.
+    collected: u64,
     limit_reached: bool,
 }
 
@@ -270,7 +272,7 @@ pub fn run_basic_search(
     path_locks: Arc<PathLockMap>,
     cancel: CancellationToken,
     config: SearchConfig,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<GrepOutput> {
     execute_search(working_dir, path_locks, cancel, config, false)
 }
 
@@ -280,7 +282,7 @@ pub fn run_advanced_search(
     path_locks: Arc<PathLockMap>,
     cancel: CancellationToken,
     config: SearchConfig,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<GrepOutput> {
     execute_search(working_dir, path_locks, cancel, config, true)
 }
 
@@ -290,7 +292,7 @@ fn execute_search(
     cancel: CancellationToken,
     config: SearchConfig,
     allow_parallel: bool,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<GrepOutput> {
     let search_root = resolve_search_root(&working_dir, &config.path);
     let entries = collect_entries(
         &search_root,
@@ -306,7 +308,7 @@ fn execute_search(
             run_sequential_search(&entries, &matcher, &config, path_locks, cancel)?
         };
 
-    Ok(build_response(result, &config))
+    Ok(GrepOutput::new(result, &config))
 }
 
 fn run_parallel_search(
@@ -413,6 +415,7 @@ fn run_parallel_search(
             files_searched,
             files_with_matches,
             total_matches,
+            collected: total_matches,
             limit_reached: false,
         })
     }
@@ -507,6 +510,7 @@ fn run_sequential_search(
         files_searched,
         files_with_matches,
         total_matches,
+        collected,
         limit_reached,
     })
 }
@@ -874,91 +878,171 @@ fn extract_context_lines(
     (before_lines, after_lines)
 }
 
-fn build_response(result: AggregateResult, config: &SearchConfig) -> Value {
-    match config.output_mode {
-        OutputMode::Content => build_content_response(result, config),
-        OutputMode::Count => build_count_response(result),
-        OutputMode::FilesWithMatches => build_files_with_matches_response(result),
-    }
+#[derive(Debug, Serialize)]
+/// Result of a `grep` call.
+pub struct GrepOutput {
+    matches: Vec<GrepMatch>,
+    /// Matches seen before the search stopped; not the total when
+    /// `truncated`.
+    total_matches: u64,
+    files_searched: u64,
+    files_with_matches: u64,
+    truncated: bool,
+    /// The `offset` that continues a truncated search.
+    next_offset: u64,
+    #[serde(skip)]
+    emitted: u64,
+    #[serde(skip)]
+    mode: OutputMode,
 }
 
-fn build_content_response(result: AggregateResult, config: &SearchConfig) -> Value {
-    // Offset is applied upstream: in the sequential path via
-    // `file_offset` passed into `SearchParams`, and in the parallel path
-    // by the `config.offset == 0` gate at the entry point. The emitted
-    // matches here are already post-offset, so only `max_matches`
-    // bounding is needed at this layer.
-    let mut emitted = 0u64;
-    let mut matches = Vec::new();
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum GrepMatch {
+    Line {
+        path: String,
+        line_number: u64,
+        line: String,
+        context_before: Option<Vec<ContextLine>>,
+        context_after: Option<Vec<ContextLine>>,
+        /// The line was cut at `max_columns`.
+        truncated: bool,
+    },
+    Count {
+        path: String,
+        line_number: u64,
+        line: &'static str,
+        match_count: u64,
+    },
+    File {
+        path: String,
+        line_number: u64,
+        line: &'static str,
+    },
+}
 
-    'files: for file in &result.files {
-        for matched in &file.matches {
-            if emitted >= config.max_matches {
-                break 'files;
-            }
-            matches.push(json!({
-                "path": file.path,
-                "line_number": matched.line_number,
-                "line": matched.line,
-                "context_before": if matched.context_before.is_empty() {
-                    Value::Null
-                } else {
-                    json!(matched.context_before.iter().map(|line| json!({
-                        "line_number": line.line_number,
-                        "line": line.line,
-                    })).collect::<Vec<_>>())
-                },
-                "context_after": if matched.context_after.is_empty() {
-                    Value::Null
-                } else {
-                    json!(matched.context_after.iter().map(|line| json!({
-                        "line_number": line.line_number,
-                        "line": line.line,
-                    })).collect::<Vec<_>>())
-                },
-                "truncated": matched.truncated,
-            }));
-            emitted = emitted.saturating_add(1);
+impl GrepOutput {
+    fn new(result: AggregateResult, config: &SearchConfig) -> Self {
+        // Offset is applied upstream: in the sequential path via
+        // `file_offset` passed into `SearchParams`, and in the parallel path
+        // by the `config.offset == 0` gate at the entry point. The collected
+        // matches here are already post-offset, so only `max_matches`
+        // bounding is needed at this layer.
+        let emitted = result.collected.min(config.max_matches);
+        let context =
+            |lines: SmallVec<[ContextLine; 8]>| (!lines.is_empty()).then(|| lines.into_vec());
+        let matches = match config.output_mode {
+            OutputMode::Content => result
+                .files
+                .into_iter()
+                .flat_map(|file| {
+                    let path = file.path;
+                    file.matches
+                        .into_iter()
+                        .map(move |matched| GrepMatch::Line {
+                            path: path.clone(),
+                            line_number: matched.line_number,
+                            line: matched.line,
+                            context_before: context(matched.context_before),
+                            context_after: context(matched.context_after),
+                            truncated: matched.truncated,
+                        })
+                })
+                .take(usize::try_from(emitted).unwrap_or(usize::MAX))
+                .collect(),
+            OutputMode::Count => result
+                .files
+                .into_iter()
+                .map(|file| GrepMatch::Count {
+                    path: file.path,
+                    line_number: 0,
+                    line: "",
+                    match_count: file.total_matches,
+                })
+                .collect(),
+            OutputMode::FilesWithMatches => result
+                .files
+                .into_iter()
+                .map(|file| GrepMatch::File {
+                    path: file.path,
+                    line_number: 0,
+                    line: "",
+                })
+                .collect(),
+        };
+        let next_offset = config.offset.saturating_add(emitted);
+        Self {
+            matches,
+            total_matches: result.total_matches,
+            files_searched: result.files_searched,
+            files_with_matches: result.files_with_matches,
+            truncated: result.limit_reached
+                || (config.output_mode == OutputMode::Content
+                    && result.total_matches > next_offset),
+            next_offset,
+            emitted,
+            mode: config.output_mode,
         }
     }
-
-    json!({
-        "matches": matches,
-        "total_matches": result.total_matches,
-        "files_searched": result.files_searched,
-        "files_with_matches": result.files_with_matches,
-        "truncated": result.limit_reached
-            || result.total_matches > config.offset.saturating_add(emitted),
-    })
 }
 
-fn build_count_response(result: AggregateResult) -> Value {
-    json!({
-        "matches": result.files.iter().map(|file| json!({
-            "path": file.path,
-            "line_number": 0,
-            "line": "",
-            "match_count": file.total_matches,
-        })).collect::<Vec<_>>(),
-        "total_matches": result.total_matches,
-        "files_searched": result.files_searched,
-        "files_with_matches": result.files_with_matches,
-        "truncated": result.limit_reached,
-    })
-}
-
-fn build_files_with_matches_response(result: AggregateResult) -> Value {
-    json!({
-        "matches": result.files.iter().map(|file| json!({
-            "path": file.path,
-            "line_number": 0,
-            "line": "",
-        })).collect::<Vec<_>>(),
-        "total_matches": result.total_matches,
-        "files_searched": result.files_searched,
-        "files_with_matches": result.files_with_matches,
-        "truncated": result.limit_reached,
-    })
+impl ToolOutput for GrepOutput {
+    /// One hit per line in ripgrep form: `path:line:text` for a match,
+    /// `path-line-text` for context, `path: count` in count mode and a bare
+    /// path in files-with-matches mode.
+    fn to_model_string(&self) -> String {
+        let mut text = String::new();
+        for matched in &self.matches {
+            match matched {
+                GrepMatch::Line {
+                    path,
+                    line_number,
+                    line,
+                    context_before,
+                    context_after,
+                    truncated,
+                } => {
+                    let context = |text: &mut String, lines: &Option<Vec<ContextLine>>| {
+                        for line in lines.iter().flatten() {
+                            *text += &format!("{path}-{}-{}\n", line.line_number, line.line);
+                        }
+                    };
+                    let cut = if *truncated {
+                        " [line cut at max_columns]"
+                    } else {
+                        ""
+                    };
+                    context(&mut text, context_before);
+                    text += &format!("{path}:{line_number}:{line}{cut}\n");
+                    context(&mut text, context_after);
+                }
+                GrepMatch::Count {
+                    path, match_count, ..
+                } => text += &format!("{path}: {match_count}\n"),
+                GrepMatch::File { path, .. } => text += &format!("{path}\n"),
+            }
+        }
+        if text.is_empty() {
+            text += "No matches\n";
+        }
+        // Only content mode pages: the other modes list every file up to
+        // the stopping point again whatever the offset, with counts that
+        // include the skipped matches.
+        if self.truncated {
+            let emitted = self.emitted;
+            text += &match self.mode {
+                OutputMode::Content => format!(
+                    "[truncated after {emitted} matches; more may exist: continue with offset={}]\n",
+                    self.next_offset
+                ),
+                OutputMode::Count | OutputMode::FilesWithMatches => format!(
+                    "[stopped after {emitted} matches; later files were not searched and the last \
+                     count may be short: raise max_matches]\n"
+                ),
+            };
+        }
+        text
+    }
 }
 
 fn sanitize_braces(pattern: &str) -> Cow<'_, str> {
@@ -1173,5 +1257,158 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].line_number, 4);
         assert_eq!(after[0].line, "delta");
+    }
+
+    fn search(dir: &Path, parallel: bool, configure: impl FnOnce(&mut SearchConfig)) -> GrepOutput {
+        let mut config = SearchConfig {
+            pattern: "needle".to_owned(),
+            path: ".".to_owned(),
+            glob: None,
+            type_filter: None,
+            ignore_case: false,
+            multiline: false,
+            context_before: 0,
+            context_after: 0,
+            max_matches: DEFAULT_MAX_MATCHES,
+            offset: 0,
+            max_columns: None,
+            output_mode: OutputMode::Content,
+        };
+        configure(&mut config);
+        execute_search(
+            dir.to_path_buf(),
+            Arc::new(PathLockMap::default()),
+            CancellationToken::new(),
+            config,
+            parallel,
+        )
+        .expect("search")
+    }
+
+    #[test]
+    fn grep_output_renders_one_hit_per_line_in_every_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn f() {\nlet needle = \"é\";\n}\nneedle two\n",
+        )
+        .expect("write");
+
+        let content = search(dir.path(), false, |config| {
+            config.context_before = 1;
+            config.max_columns = Some(12);
+        });
+        assert_eq!(
+            content.to_model_string(),
+            "a.rs-1-fn f() {\na.rs:2:let needle = [line cut at max_columns]\n\
+             a.rs-3-}\na.rs:4:needle two\n"
+        );
+        let value = serde_json::to_value(&content).expect("serialize");
+        assert_eq!(
+            value["matches"][0],
+            serde_json::json!({
+                "path": "a.rs",
+                "line_number": 2,
+                "line": "let needle =",
+                "context_before": [{ "line_number": 1, "line": "fn f() {" }],
+                "context_after": null,
+                "truncated": true,
+            })
+        );
+        assert_eq!(value["truncated"], false);
+
+        let count = search(dir.path(), false, |config| {
+            config.output_mode = OutputMode::Count;
+        });
+        assert_eq!(count.to_model_string(), "a.rs: 2\n");
+        assert_eq!(
+            serde_json::to_value(&count).expect("serialize")["matches"][0],
+            serde_json::json!({ "path": "a.rs", "line_number": 0, "line": "", "match_count": 2 })
+        );
+
+        let files = search(dir.path(), false, |config| {
+            config.output_mode = OutputMode::FilesWithMatches;
+        });
+        assert_eq!(files.to_model_string(), "a.rs\n");
+        assert_eq!(
+            serde_json::to_value(&files).expect("serialize")["matches"][0],
+            serde_json::json!({ "path": "a.rs", "line_number": 0, "line": "" })
+        );
+
+        let none = search(dir.path(), false, |config| {
+            config.pattern = "absent".to_owned();
+        });
+        assert_eq!(none.to_model_string(), "No matches\n");
+    }
+
+    #[test]
+    fn grep_stopped_at_the_limit_names_an_offset_only_in_content_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "needle 1\nneedle 2\n").expect("write");
+        std::fs::write(dir.path().join("b.txt"), "needle 3\n").expect("write");
+        let stopped = "[stopped after 2 matches; later files were not searched and the last \
+                       count may be short: raise max_matches]\n";
+
+        for (mode, expected) in [
+            (
+                OutputMode::Content,
+                "a.txt:1:needle 1\na.txt:2:needle 2\n\
+                 [truncated after 2 matches; more may exist: continue with offset=2]\n"
+                    .to_owned(),
+            ),
+            (OutputMode::Count, format!("a.txt: 2\n{stopped}")),
+            (OutputMode::FilesWithMatches, format!("a.txt\n{stopped}")),
+        ] {
+            let page = search(dir.path(), false, |config| {
+                config.max_matches = 2;
+                config.output_mode = mode;
+            });
+            assert!(page.truncated, "{mode:?}");
+            assert_eq!(page.to_model_string(), expected, "{mode:?}");
+
+            let whole = search(dir.path(), false, |config| config.output_mode = mode);
+            assert!(!whole.to_model_string().contains('['), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn truncated_grep_output_names_the_offset_that_continues_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "needle 1\nneedle 2\nneedle 3\n").expect("write");
+        std::fs::write(dir.path().join("b.txt"), "needle 4\nneedle 5\n").expect("write");
+
+        // Following the trailer's offset reads every match once, whichever
+        // search path produced the first page.
+        for parallel in [false, cfg!(feature = "advanced-tools")] {
+            let mut seen = String::new();
+            let mut offset = 0;
+            for expected in [Some(2), Some(4), None] {
+                let page = search(dir.path(), parallel, |config| {
+                    config.max_matches = 2;
+                    config.offset = offset;
+                });
+                let text = page.to_model_string();
+                let (hits, trailer) = match expected {
+                    Some(next) => {
+                        let trailer = format!(
+                            "[truncated after 2 matches; more may exist: continue with offset={next}]\n"
+                        );
+                        let hits = text
+                            .strip_suffix(&trailer)
+                            .unwrap_or_else(|| panic!("{text}"));
+                        (hits, true)
+                    }
+                    None => (text.as_str(), false),
+                };
+                assert_eq!(page.truncated, trailer, "{text}");
+                seen += hits;
+                offset = page.next_offset;
+            }
+            assert_eq!(
+                seen,
+                "a.txt:1:needle 1\na.txt:2:needle 2\na.txt:3:needle 3\n\
+                 b.txt:1:needle 4\nb.txt:2:needle 5\n"
+            );
+        }
     }
 }

@@ -66,6 +66,9 @@ The runtime asks for a tool by name. This crate decides:
 ### Core runtime abstractions
 
 - `Tool`
+- `TypedTool`
+- `ToolOutput`
+- `Report`
 - `ToolContext`
 - `ToolRuntime`
 - `ToolRuntimeEvent`
@@ -691,17 +694,54 @@ Use `register_subagent_tools(...)` when the runtime has subagent control wired i
 
 ### Add your own tools
 
-Implement `Tool` and register it with the runtime.
-
-Conceptual example:
+Implement `TypedTool` and register it with the runtime. Its `Output` type
+serializes to the structured value hosts read and renders the text the model
+reads, so text reaches the model as written instead of escaped inside JSON.
+Every `TypedTool` is a `Tool`.
 
 ```rust
-use halter_tools::{Tool, ToolContext};
+use async_trait::async_trait;
+use halter_protocol::ToolSpec;
+use halter_tools::{ToolContext, ToolOutput, TypedTool};
+use serde::Serialize;
+use serde_json::Value;
 
-struct MyTool;
+#[derive(Serialize)]
+struct Lookup {
+    key: String,
+    body: String,
+}
 
-// implement Tool for MyTool
+impl ToolOutput for Lookup {
+    fn to_model_string(&self) -> String {
+        format!("[{}]\n{}", self.key, self.body)
+    }
+}
+
+struct LookupTool;
+
+#[async_trait]
+impl TypedTool for LookupTool {
+    type Output = Lookup;
+
+    fn describe(&self) -> ToolSpec {
+        todo!()
+    }
+
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Lookup> {
+        todo!()
+    }
+}
 ```
+
+Implement `Tool` directly only when the output cannot be typed, such as a
+passthrough to an external tool server. A `ToolResult::Json` it returns reaches
+the model as compact JSON.
+
+The runtime bounds every result at `[tools] max_output_bytes` whatever the
+tool returns, so a tool does not need its own truncation to protect the
+context. It may still need one to bound its own memory, as the built-in
+shell does by capturing at most 1 MiB of output.
 
 A well-behaved custom tool should:
 

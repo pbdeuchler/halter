@@ -1,11 +1,14 @@
 // pattern: Imperative Shell
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, ToolOutput, TypedTool};
 
 use super::common::{
     ToolScope, ensure_not_cancelled, hash_text, optional_bool, required_string, resolve_path,
@@ -16,8 +19,10 @@ use super::common::{
 pub struct EditTool;
 
 #[async_trait]
-impl Tool for EditTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for EditTool {
+    type Output = EditOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("edit"),
             description: "Replace an exact string in a UTF-8 file with an atomic write. \
@@ -49,7 +54,7 @@ impl Tool for EditTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Self::Output> {
         let _scope = ToolScope::new(&context, "edit");
         ensure_not_cancelled(&context.cancel)?;
         let path = resolve_path(&context.working_dir, required_string(&input, "path")?);
@@ -122,16 +127,35 @@ impl Tool for EditTool {
         .await??;
 
         let occurrences_in_file = result.0;
-        let replacements_applied = if replace_all { occurrences_in_file } else { 1 };
-        Ok(ToolResult::Json {
-            value: json!({
-                "path": canonical_path,
-                "occurrences_in_file": occurrences_in_file,
-                "replacements_applied": replacements_applied,
-                "file_hash_before": result.1,
-                "file_hash_after": result.2,
-            }),
+        Ok(EditOutput {
+            path: canonical_path,
+            occurrences_in_file,
+            replacements_applied: if replace_all { occurrences_in_file } else { 1 },
+            file_hash_before: result.1,
+            file_hash_after: result.2,
         })
+    }
+}
+
+#[derive(Debug, Serialize)]
+/// Result of an `edit` call.
+pub struct EditOutput {
+    path: PathBuf,
+    occurrences_in_file: usize,
+    replacements_applied: usize,
+    file_hash_before: String,
+    file_hash_after: String,
+}
+
+impl ToolOutput for EditOutput {
+    /// The new hash is the `expected_sha256` for a follow-up edit.
+    fn to_model_string(&self) -> String {
+        format!(
+            "Edited {} ({} replaced); sha256={}",
+            self.path.display(),
+            self.replacements_applied,
+            self.file_hash_after
+        )
     }
 }
 
@@ -145,6 +169,8 @@ mod tests {
     use crate::{DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolPolicy};
 
     use super::*;
+    use crate::Tool;
+    use halter_protocol::ToolResult;
 
     fn tool_context(root: &std::path::Path) -> ToolContext {
         ToolContext {
@@ -171,7 +197,7 @@ mod tests {
         std::fs::write(&path, "hello world").expect("write");
         let expected_sha256 = hash_text("hello world");
 
-        let ToolResult::Json { value } = EditTool
+        let ToolResult::Rendered { value, .. } = EditTool
             .execute(
                 tool_context(temp.path()),
                 json!({
@@ -230,5 +256,31 @@ mod tests {
             .expect_err("stale hash should fail");
 
         assert!(error.to_string().contains("expected_sha256"));
+    }
+
+    #[test]
+    fn edit_output_renders_a_confirmation_with_the_new_hash() {
+        let output = EditOutput {
+            path: PathBuf::from("/w/a \"é\".rs"),
+            occurrences_in_file: 3,
+            replacements_applied: 2,
+            file_hash_before: "old".to_owned(),
+            file_hash_after: "new".to_owned(),
+        };
+
+        assert_eq!(
+            output.to_model_string(),
+            "Edited /w/a \"é\".rs (2 replaced); sha256=new"
+        );
+        assert_eq!(
+            serde_json::to_value(&output).expect("serialize"),
+            json!({
+                "path": "/w/a \"é\".rs",
+                "occurrences_in_file": 3,
+                "replacements_applied": 2,
+                "file_hash_before": "old",
+                "file_hash_after": "new",
+            })
+        );
     }
 }
