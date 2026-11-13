@@ -233,7 +233,10 @@ impl OtelConfig {
     /// [`crate::telemetry::TelemetryConfig::try_init_with_otel`].
     pub fn build(self) -> anyhow::Result<(OtelLayers, OtelGuard)> {
         let resource = self.build_resource();
-        let http_client = Arc::new(ReqwestOtlpClient::default());
+        let http_client = Arc::new(
+            ReqwestOtlpClient::new(reqwest::Client::new())
+                .context("failed to start the OTLP export runtime")?,
+        );
         let directives = self
             .filter_directives
             .as_deref()
@@ -302,6 +305,7 @@ impl OtelConfig {
             tracer_provider,
             meter_provider,
             shutdown_timeout: self.shutdown_timeout,
+            shut_down: false,
         };
         Ok((layers, guard))
     }
@@ -397,6 +401,9 @@ pub struct OtelGuard {
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
     shutdown_timeout: Duration,
+    /// Set by [`Self::shutdown`] so `Drop` doesn't shut the providers down a
+    /// second time (which the SDK reports as "Shutdown already invoked").
+    shut_down: bool,
 }
 
 impl OtelGuard {
@@ -404,7 +411,8 @@ impl OtelGuard {
     /// shutdown timeout. Prefer calling this explicitly over relying on
     /// `Drop` so the flush completes before dependent resources (e.g. output
     /// handles) are torn down.
-    pub fn shutdown(self) -> anyhow::Result<()> {
+    pub fn shutdown(mut self) -> anyhow::Result<()> {
+        self.shut_down = true;
         let trace_result = self
             .tracer_provider
             .shutdown_with_timeout(self.shutdown_timeout);
@@ -419,6 +427,9 @@ impl OtelGuard {
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
+        if self.shut_down {
+            return;
+        }
         if let Err(error) = self
             .tracer_provider
             .shutdown_with_timeout(self.shutdown_timeout)

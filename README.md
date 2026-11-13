@@ -1451,7 +1451,11 @@ existing `reqwest` 0.12 client, not `opentelemetry-otlp`'s bundled
 (`opentelemetry*`, `tracing-opentelemetry`) with a single `reqwest` version;
 no library crate (`halter-runtime`, `halter-providers`, `halter-hooks`,
 `halter-tools`) ever gains an OTel or second-`reqwest` dependency, with or
-without `--all-features`.
+without `--all-features`. The SDK exports from its own background threads,
+so `OtelConfig::build()` also starts one small dedicated Tokio worker
+thread (`halter-otlp-http`) that performs the HTTP requests. Export does not
+depend on, or need, the application's runtime, and keeps working while that
+runtime shuts down.
 
 **Env vars**, honored by the underlying OTel SDK (not re-implemented here):
 

@@ -682,3 +682,95 @@ fn shared_top_level_warn_filter_suppresses_otel_without_raising_directives() {
         "a shared top-level warn filter must suppress info-level halter spans, got: {spans:?}"
     );
 }
+
+/// Minimal OTLP/HTTP sink: accepts connections on a loopback port, records
+/// each request's path and body length, and answers `200 OK`. Every response
+/// closes its connection so one request maps to one accepted connection.
+struct OtlpSink {
+    endpoint: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+}
+
+impl OtlpSink {
+    fn start() -> Self {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sink");
+        let endpoint = format!("http://{}", listener.local_addr().expect("sink addr"));
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let mut content_length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                recorded.lock().expect("sink lock").push((path, body.len()));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\n\
+                      content-length: 0\r\nconnection: close\r\n\r\n",
+                );
+            }
+        });
+        Self { endpoint, requests }
+    }
+
+    fn requests(&self) -> Vec<(String, usize)> {
+        self.requests.lock().expect("sink lock").clone()
+    }
+}
+
+/// Regression test for the shipped OTLP/HTTP path, end to end:
+/// `OtelConfig::build()` (real `ReqwestOtlpClient`, real batch processor and
+/// periodic reader) exporting to a loopback HTTP listener. Deliberately *not*
+/// a `#[tokio::test]`: the SDK exports from its own OS threads with no Tokio
+/// reactor, which is exactly the condition that previously made every export
+/// panic inside `reqwest` while the in-memory tests stayed green.
+#[test]
+fn otlp_http_export_reaches_a_collector_without_an_ambient_tokio_runtime() {
+    let sink = OtlpSink::start();
+    let (layers, guard) = super::OtelConfig::new()
+        .with_endpoint(sink.endpoint.clone())
+        .with_sampler(Sampler::AlwaysOn)
+        .build()
+        .expect("build otel layers");
+    let subscriber = tracing_subscriber::registry().with(layers.combined());
+    tracing::subscriber::with_default(subscriber, emit_turn_and_tool_call);
+
+    guard
+        .shutdown()
+        .expect("shutdown must flush both signals to the collector");
+
+    let requests = sink.requests();
+    for signal in ["/v1/traces", "/v1/metrics"] {
+        assert!(
+            requests
+                .iter()
+                .any(|(path, len)| path == signal && *len > 0),
+            "expected a non-empty POST to {signal}, sink saw {requests:?}"
+        );
+    }
+}
