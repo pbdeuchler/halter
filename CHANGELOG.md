@@ -59,6 +59,11 @@ once a `1.0.0` line is cut.
 
 ### Changed
 
+- **Breaking:** workspace MSRV raised from 1.88 to 1.89. `rusqlite` moves
+  from 0.32 to 0.42, which bundles SQLite 3.54 or later and clears
+  RUSTSEC-2026-0459 (CVE-2026-119375); every `rusqlite` release that does
+  so requires Rust 1.89. Only the `sqlite` feature of `halter-session`
+  links SQLite.
 - `halter-cli` builds its subscriber with `halter::telemetry`, with the same
   defaults (`RUST_LOG`, default `warn`, noisy-target suppression, JSON with
   `--output-file`). Log lines now include span context when spans are enabled
