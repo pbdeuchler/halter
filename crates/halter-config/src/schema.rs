@@ -1337,9 +1337,10 @@ pub struct ToolsConfig {
     #[serde(default = "default_max_output_bytes")]
     pub max_output_bytes: usize,
     /// Directory for the full text of elided results, written as
-    /// `<output_dir>/<session id>/<tool message id>.txt`. Defaults to
-    /// `halter/tool-output` under the system temporary directory, which the
-    /// read tools can reach by default.
+    /// `<output_dir>/<sanitized session id>/<message id>.txt`. Defaults to
+    /// `halter-<user>/tool-output` under the system temporary directory,
+    /// which the read tools can reach by default. A relative path is resolved
+    /// against the process working directory when the runtime is built.
     #[serde(default)]
     pub output_dir: Option<PathBuf>,
 }

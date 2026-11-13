@@ -66,25 +66,38 @@ once a `1.0.0` line is cut.
 - Tool output budget. `[tools] max_output_bytes` (default `51200`; `0`
   disables) bounds the model text of every tool result before it is
   committed. A larger result keeps its head and tail around one marker line,
-  and its full output is written to
-  `<tools.output_dir>/<session id>/<tool message id>.txt` (default directory:
-  `halter/tool-output` under the system temporary directory), readable by
-  its owner only; a `ToolResult::Json` is written pretty-printed so it can be
-  searched by line. The marker names the file and says to `grep` it or `read`
-  it with `offset` and `limit`. The `ToolExecutionCompleted` event records
+  unless the marker would cost as much as the cut saves, in which case the
+  result is committed whole. The full output is written to
+  `<tools.output_dir>/<sanitized session id>/<message id>.txt`, where the
+  session id has every character outside `[A-Za-z0-9_-]` replaced by `_` and
+  the message id is that of the tool result message. The default directory
+  is `halter-<user>/tool-output` under the system temporary directory
+  (`<user>` from `USER`; `halter/tool-output` when it is unset); a relative
+  `output_dir` is resolved against the process working directory when the
+  runtime is built. Files are readable by their owner only. A
+  `ToolResult::Json` is written pretty-printed so it can be searched by
+  line. The marker states how much of the result was cut, names the file,
+  and says to `grep` it or `read` it with `offset` and `limit`; its sizes
+  describe the result, not the file. The `ToolExecutionCompleted` event records
   `elision.original_bytes` and `elision.spill_path`; the structured `value`
   is not cut. Oversized tool error messages, including a pre-tool hook's
   block reason, are bounded the same way. `RuntimeServices` gains
   `tool_output: ToolOutputSettings`. Building a runtime warns when the output
   directory is outside the allowed read roots.
+
+### Changed
+
 - **Breaking:** `ToolResult` has a fourth variant, `Rendered`. Hosts that
   match on it exhaustively must add an arm; `to_model_string()` and
   `structured()` cover the common cases without a match. Session logs written
   by earlier versions load unchanged.
-- **Breaking:** a rendered result is stored once. `ToolExecutionCompleted`
-  carries the whole `Rendered` result; the transcript `ToolResultMessage`
-  carries `Text` holding its model text. A host that read a structured value
-  from a transcript tool message must read it from the completion event.
+- **Breaking:** the transcript no longer holds a tool's structured value.
+  `ToolExecutionCompleted` carries the whole `Rendered` result: `value`,
+  `model_text`, and `elision`. The transcript `ToolResultMessage` carries
+  `Text` holding the same model text and nothing else, so the model text is
+  stored in both places and the structured value only in the event. A host
+  that read a structured value from a transcript tool message must read it
+  from the completion event.
 - **Breaking:** `ToolsConfig` gains `max_output_bytes` and `output_dir`, and
   `RuntimeServices` gains `tool_output`; struct literals need the new fields
   or `..Default::default()`.
@@ -99,13 +112,13 @@ once a `1.0.0` line is cut.
   final message under a one-line status header. The `read` tool with
   `line_numbers = true` shows `N<tab>line` text; the `lines` array is still
   in `value`. A truncated `grep` names the `offset` that continues it, also
-  as `next_offset` in `value`. `notes`, `session_search`, `browser`, and
+  as `next_offset` in `value`; in `count` and `files_with_matches` modes,
+  which do not page, it says to raise `max_matches` instead. `notes`, `session_search`, `browser`, and
   `image` render `key: value` lines in key order through `halter_tools::Report`.
 - Every provider codec, the session-history search text, and the token ledger
   render tool results through `ToolResult::to_model_string`. The ledger now
   counts a tool result's error text, which it previously skipped; its
   accounting version is 3, so persisted ledgers are rebuilt once.
-
 - `halter-cli` builds its subscriber with `halter::telemetry`, with the same
   defaults (`RUST_LOG`, default `warn`, noisy-target suppression, JSON with
   `--output-file`). Log lines now include span context when spans are enabled
@@ -133,10 +146,13 @@ once a `1.0.0` line is cut.
   provider split it into. Past 8,192 deltas (about 120 kB of text at
   Anthropic's chunk size) the turn failed with `provider stream text exceeded
   event cap`, discarding the reply and its usage. Deltas beyond the budget are
-  now coalesced into the preceding `DeltaItem`, so the events stay bounded and
-  still concatenate to the full text; the 4 MiB output cap is the only fatal
+  now coalesced into the preceding text `DeltaItem`, so the events still
+  concatenate to the full text and the 4 MiB output cap is the only fatal
   bound. Provider metadata has its own budget of 1,024 events, so neither it
-  nor text can crowd the other out.
+  nor text can crowd the other out. A turn's stream therefore yields at most
+  8,192 text events plus 1,024 metadata events, plus up to 1,024 further text
+  events where a metadata event separates a coalesced delta from the text
+  event before it.
 - The core prompt no longer tells the model that dedicated tools "aren't gated
   by the shell allowlist", which was false for hosts that register their own
   unrestricted shell tool. It now gives the reason that holds everywhere:

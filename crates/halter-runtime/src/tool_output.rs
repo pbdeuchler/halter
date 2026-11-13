@@ -15,8 +15,9 @@ pub struct ToolOutputSettings {
     /// Largest model text committed whole, in bytes. `0` disables the bound.
     pub max_bytes: usize,
     /// Where the full text of an elided result is written, as
-    /// `<spill_dir>/<session id>/<tool message id>.txt`, readable by its
-    /// owner only. The runtime never deletes these files.
+    /// `<spill_dir>/<sanitized session id>/<message id>.txt`, readable by
+    /// its owner only. Must be absolute: the model reads the file back from
+    /// the session's working directory. The runtime never deletes these files.
     pub spill_dir: PathBuf,
 }
 
@@ -24,9 +25,20 @@ impl Default for ToolOutputSettings {
     fn default() -> Self {
         Self {
             max_bytes: 50 * 1024,
-            spill_dir: std::env::temp_dir().join("halter").join("tool-output"),
+            spill_dir: default_spill_dir(std::env::var("USER").ok().as_deref()),
         }
     }
+}
+
+/// `halter-<user>/tool-output` under the system temporary directory, which
+/// the default read roots cover. The directory is created owner-only, so on
+/// a temporary directory shared between users each needs a name of their own.
+fn default_spill_dir(user: Option<&str>) -> PathBuf {
+    let name = user.map_or_else(
+        || "halter".to_owned(),
+        |user| format!("halter-{}", sanitize_session_id(user)),
+    );
+    std::env::temp_dir().join(name).join("tool-output")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -80,7 +92,8 @@ pub(crate) fn elide_middle(text: &str, budget: usize) -> Option<Elided<'_>> {
 
 impl Elided<'_> {
     /// The head and tail around one marker line. `spill` is the file
-    /// holding the whole output.
+    /// holding the whole output; the sizes are those of the text cut here,
+    /// which is not always the file's (a JSON value is written reformatted).
     pub(crate) fn render(&self, spill: Option<&Path>) -> String {
         let bytes = self.middle.len();
         let lines = self.middle.matches('\n').count();
@@ -98,7 +111,7 @@ impl Elided<'_> {
             "\n"
         };
         format!(
-            "{}{separator}[{bytes} bytes ({lines} lines) of {total} bytes elided here; {kept}]\n{}",
+            "{}{separator}[{bytes} bytes ({lines} lines) of this {total}-byte result elided here; {kept}]\n{}",
             self.head, self.tail
         )
     }
@@ -135,21 +148,9 @@ fn write_private(path: &Path, full: &str) -> std::io::Result<()> {
     file.open(path)?.write_all(full.as_bytes())
 }
 
-/// Keep `full` as the spill file of tool message `message_id`. A failed
-/// write is not an error: it is logged and the caller's marker says the
-/// full output was not kept.
-async fn spill(
-    settings: &ToolOutputSettings,
-    session_id: &SessionId,
-    message_id: &MessageId,
-    full: String,
-) -> Option<PathBuf> {
-    // Session ids come from the host and may be any string; message ids are
-    // minted here, one per tool message, so a file is never written twice.
-    let path = settings
-        .spill_dir
-        .join(sanitize_session_id(&session_id.0))
-        .join(format!("{message_id}.txt"));
+/// Keep `full` in a new file at `path`. A failed write is not an error: it
+/// is logged and the caller's marker says the full output was not kept.
+async fn spill(path: PathBuf, session_id: &SessionId, full: String) -> Option<PathBuf> {
     let written = tokio::task::spawn_blocking({
         let path = path.clone();
         move || write_private(&path, &full)
@@ -170,6 +171,31 @@ async fn spill(
         .then_some(path)
 }
 
+/// `text` cut to `budget` around a marker naming `spill`, or `None` when it
+/// fits, `budget` is `0`, or the marker would cost as much as the cut saves.
+pub(crate) fn elide_to<'a>(text: &'a str, budget: usize, spill: &Path) -> Option<Elided<'a>> {
+    elide_middle(text, budget).filter(|elided| elided.render(Some(spill)).len() < text.len())
+}
+
+/// `text` bounded to the output budget, with `full()` kept in the spill
+/// file of tool message `message_id`; `None` leaves the text as it is.
+async fn bound_text(
+    settings: &ToolOutputSettings,
+    session_id: &SessionId,
+    message_id: &MessageId,
+    text: &str,
+    full: impl FnOnce() -> String,
+) -> Option<(String, ToolOutputElision)> {
+    // Session ids come from the host and may be any string; message ids are
+    // minted here, one per tool message, so a file is never written twice.
+    let path = settings
+        .spill_dir
+        .join(sanitize_session_id(&session_id.0))
+        .join(format!("{message_id}.txt"));
+    let elided = elide_to(text, settings.max_bytes, &path)?;
+    Some(elided.bounded(spill(path, session_id, full()).await))
+}
+
 /// Bound a tool error's message to the output budget, keeping the full
 /// message in the spill file of tool message `message_id`.
 pub(crate) async fn bound_error(
@@ -178,11 +204,15 @@ pub(crate) async fn bound_error(
     message_id: &MessageId,
     error: ToolError,
 ) -> ToolError {
-    let Some(elided) = elide_middle(&error.message, settings.max_bytes) else {
-        return error;
-    };
-    let kept = spill(settings, session_id, message_id, error.message.clone()).await;
-    ToolError::new(elided.bounded(kept).0)
+    let message = &error.message;
+    match bound_text(settings, session_id, message_id, message, || {
+        message.clone()
+    })
+    .await
+    {
+        Some((message, _)) => ToolError::new(message),
+        None => error,
+    }
 }
 
 /// Bound a tool result's model text, keeping its structured value whole.
@@ -195,15 +225,16 @@ pub(crate) async fn bound_result(
     result: ToolResult,
 ) -> ToolResult {
     let text = result.to_model_string();
-    let Some(elided) = elide_middle(&text, settings.max_bytes) else {
-        return result;
-    };
-    let full = match &result {
+    let full = || match &result {
         // One line of JSON cannot be searched or paged; pretty-printed it can.
         ToolResult::Json { value } if !value.is_string() => format!("{value:#}"),
         _ => text.to_string(),
     };
-    let (model_text, elision) = elided.bounded(spill(settings, session_id, message_id, full).await);
+    let Some((model_text, elision)) =
+        bound_text(settings, session_id, message_id, &text, full).await
+    else {
+        return result;
+    };
     ToolResult::Rendered {
         value: match result {
             ToolResult::Json { value } | ToolResult::Rendered { value, .. } => value,
@@ -305,13 +336,13 @@ mod tests {
         let lines = elide_middle(text, 14).expect("over budget");
         assert_eq!(
             lines.render(Some(Path::new("/tmp/out.txt"))),
-            "aaaa\n[15 bytes (3 lines) of 25 bytes elided here; full output: /tmp/out.txt \
+            "aaaa\n[15 bytes (3 lines) of this 25-byte result elided here; full output: /tmp/out.txt \
              (grep it, or read it with offset and limit)]\neeee\n"
         );
         let giant = elide_middle("0123456789", 4).expect("over budget");
         assert_eq!(
             giant.render(None),
-            "01\n[6 bytes (0 lines) of 10 bytes elided here; the full output was not kept]\n89"
+            "01\n[6 bytes (0 lines) of this 10-byte result elided here; the full output was not kept]\n89"
         );
     }
 
@@ -335,10 +366,32 @@ mod tests {
                     let rendered = ends.render(spill.as_deref().map(Path::new));
                     let marker = rendered.len() - ends.head.len() - ends.tail.len();
                     let path = spill.map_or(0, |path| path.len());
-                    prop_assert!(marker <= 112 + path, "marker is {marker} bytes");
+                    prop_assert!(marker <= 124 + path, "marker is {marker} bytes");
                     prop_assert_eq!(rendered.lines().filter(|line| line.contains("elided here")).count(), 1);
                 }
             }
+
+            // What is committed is never longer than what the tool returned,
+            // whether or not the spill file could be written.
+            let path = Path::new("/tmp/halter-user/tool-output/session/message.txt");
+            if let Some(ends) = elide_to(&text, budget, path) {
+                prop_assert!(ends.render(Some(path)).len() < text.len());
+                prop_assert!(ends.render(None).len() < text.len());
+            }
+        }
+    }
+
+    #[test]
+    fn default_spill_dir_is_per_user_under_the_temp_dir() {
+        for (user, name) in [
+            (Some("alice"), "halter-alice"),
+            (Some("../a b"), "halter-___a_b"),
+            (None, "halter"),
+        ] {
+            assert_eq!(
+                default_spill_dir(user),
+                std::env::temp_dir().join(name).join("tool-output")
+            );
         }
     }
 
@@ -707,14 +760,19 @@ mod tests {
             value: json!({ "ok": true }),
         };
         let large = ToolResult::Text { text: big() };
+        // Over budget by less than the marker would add.
+        let barely = ToolResult::Text {
+            text: "x".repeat(BUDGET + 1),
+        };
         let within = run("fixed", json!({}), fixed(Ok(small.clone()))).await;
+        let over = run("fixed", json!({}), fixed(Ok(barely.clone()))).await;
         let unbounded = run("fixed", json!({}), |services, _| {
             services.tools.register(Arc::new(Fixed(Ok(large.clone()))));
             services.tool_output.max_bytes = 0;
         })
         .await;
 
-        for (run, result) in [(within, small), (unbounded, large.clone())] {
+        for (run, result) in [(within, small), (over, barely), (unbounded, large)] {
             let (message, outcome) = run.committed().await;
             assert_eq!(message.content, result);
             assert_eq!(run.sent(), result.to_model_string());

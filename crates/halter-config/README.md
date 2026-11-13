@@ -483,13 +483,16 @@ Feature-gated tools must still be compiled in via Cargo features, even if named 
 ```toml
 [tools]
 max_output_bytes = 51200                  # default; 0 disables the bound
-output_dir = "/var/tmp/halter/tool-output" # default: halter/tool-output under the system temp dir
+output_dir = "/tmp/halter-me/tool-output" # default: halter-<user>/tool-output under the system temp dir
 ```
 
 - a result whose model-visible text is larger than `max_output_bytes` keeps its head and tail around one marker line
-- the full text is written to `<output_dir>/<session id>/<tool message id>.txt`, readable by its owner only, and the marker names that file
+- a result over the bound by less than the marker would add is left whole
+- the full text is written to `<output_dir>/<sanitized session id>/<message id>.txt`, readable by its owner only, and the marker names that file; the session id has every character outside `[A-Za-z0-9_-]` replaced by `_`, and the message id is the tool result message's
+- the default `output_dir` is `halter-<user>/tool-output` under the system temporary directory, with `<user>` taken from `USER` (`halter/tool-output` when it is unset), so users sharing a temporary directory do not share a directory
+- a relative `output_dir` is resolved against the process working directory when the runtime is built
 - the runtime never deletes these files; the default location leaves them to the operating system
-- `output_dir` must be under a root the read tools may reach (the temporary directory is one by default) for the model to open the file
+- `output_dir` must be under a root the read tools may reach for the model to open the file: the temporary directory is one by default, and any other location must be added to `[policy] allowed_read_roots`; building a runtime warns when it is not
 
 For the full tool catalog, see `../halter-tools/README.md`.
 

@@ -892,6 +892,8 @@ pub struct GrepOutput {
     next_offset: u64,
     #[serde(skip)]
     emitted: u64,
+    #[serde(skip)]
+    mode: OutputMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -979,6 +981,7 @@ impl GrepOutput {
                     && result.total_matches > next_offset),
             next_offset,
             emitted,
+            mode: config.output_mode,
         }
     }
 }
@@ -1022,11 +1025,21 @@ impl ToolOutput for GrepOutput {
         if text.is_empty() {
             text += "No matches\n";
         }
+        // Only content mode pages: the other modes list every file up to
+        // the stopping point again whatever the offset, with counts that
+        // include the skipped matches.
         if self.truncated {
-            text += &format!(
-                "[truncated after {} matches; more may exist: continue with offset={}]\n",
-                self.emitted, self.next_offset
-            );
+            let emitted = self.emitted;
+            text += &match self.mode {
+                OutputMode::Content => format!(
+                    "[truncated after {emitted} matches; more may exist: continue with offset={}]\n",
+                    self.next_offset
+                ),
+                OutputMode::Count | OutputMode::FilesWithMatches => format!(
+                    "[stopped after {emitted} matches; later files were not searched and the last \
+                     count may be short: raise max_matches]\n"
+                ),
+            };
         }
         text
     }
@@ -1326,6 +1339,36 @@ mod tests {
             config.pattern = "absent".to_owned();
         });
         assert_eq!(none.to_model_string(), "No matches\n");
+    }
+
+    #[test]
+    fn grep_stopped_at_the_limit_names_an_offset_only_in_content_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "needle 1\nneedle 2\n").expect("write");
+        std::fs::write(dir.path().join("b.txt"), "needle 3\n").expect("write");
+        let stopped = "[stopped after 2 matches; later files were not searched and the last \
+                       count may be short: raise max_matches]\n";
+
+        for (mode, expected) in [
+            (
+                OutputMode::Content,
+                "a.txt:1:needle 1\na.txt:2:needle 2\n\
+                 [truncated after 2 matches; more may exist: continue with offset=2]\n"
+                    .to_owned(),
+            ),
+            (OutputMode::Count, format!("a.txt: 2\n{stopped}")),
+            (OutputMode::FilesWithMatches, format!("a.txt\n{stopped}")),
+        ] {
+            let page = search(dir.path(), false, |config| {
+                config.max_matches = 2;
+                config.output_mode = mode;
+            });
+            assert!(page.truncated, "{mode:?}");
+            assert_eq!(page.to_model_string(), expected, "{mode:?}");
+
+            let whole = search(dir.path(), false, |config| config.output_mode = mode);
+            assert!(!whole.to_model_string().contains('['), "{mode:?}");
+        }
     }
 
     #[test]
