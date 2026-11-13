@@ -218,6 +218,10 @@ must_use_candidate = "allow"
 option_if_let_else = "allow"
 panic = "deny"
 panic_in_result_fn = "deny"
+# Halter divergence: clippy 1.100 made this nursery lint fire on
+# sys/unix/input.rs, which upstream has not changed. Allowed here so the
+# source stays byte-identical to upstream.
+redundant_clone = "allow"
 redundant_closure_for_method_calls = "allow"
 redundant_else = "allow"
 redundant_pub_crate = "allow"

@@ -37,8 +37,11 @@ bespoke `sys/windows` layer is gone).
   `--all-targets`; halter's CI does). `brush-builtins` additionally sets
   `unused_async_trait_impl = "allow"`: clippy 1.98 added that pedantic lint,
   and upstream's builtins implement the async `Execute` trait without
-  awaiting. Both crates already allow `unknown_lints`, so older toolchains
-  accept the entry.
+  awaiting. `brush-core` additionally sets `redundant_clone = "allow"`:
+  clippy 1.100 made that nursery lint fire on `sys/unix/input.rs`, which is
+  unchanged on upstream `main`; allowing it keeps the file byte-identical.
+  Drop the entry once upstream fixes the line. Both crates already allow
+  `unknown_lints`, so older toolchains accept the entries.
 
 
 ### `brush-core-vendored/src` (cancellation plumbing)
@@ -74,7 +77,7 @@ and stop it without taking the shell's execution lock.
 ### Clippy cleanups (no behavior change)
 
 Mechanical rewrites so `cargo clippy --all-targets -- -D warnings` stays clean
-on newer toolchains (Rust 1.99 at last re-check). Drop any that upstream has
+on newer toolchains (Rust 1.100 at last re-check). Drop any that upstream has
 already fixed.
 
 | File | Change |
