@@ -8,13 +8,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{
-    AssistantPart, Message, PromptSegment, StopReason, ToolResult, ToolSpec, Usage, UserPart,
-};
+use crate::{AssistantPart, Message, PromptSegment, StopReason, ToolSpec, Usage, UserPart};
 
-// Version 2 rejects output-only reports as context anchors. Rebuild persisted
-// ledgers from the transcript once so an old, undersized anchor cannot survive.
-const CURRENT_ACCOUNTING_VERSION: u8 = 2;
+// Version 2 rejects output-only reports as context anchors. Version 3 counts a
+// tool result as the text the model is sent, which includes its error: failed
+// calls used to count as nothing. Rebuild persisted ledgers from the
+// transcript once so an old, undersized anchor cannot survive.
+const CURRENT_ACCOUNTING_VERSION: u8 = 3;
 const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const PROMPT_SEGMENT_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_SPEC_OVERHEAD_TOKENS: u64 = 8;
@@ -287,11 +287,7 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
                 }
             })
             .sum(),
-        Message::Tool(message) => match &message.content {
-            ToolResult::Empty => 0,
-            ToolResult::Text { text } => estimate_text_tokens(text),
-            ToolResult::Json { value } => estimate_json_tokens(value),
-        },
+        Message::Tool(message) => estimate_text_tokens(&message.to_model_string()),
     })
 }
 
@@ -345,7 +341,7 @@ mod tests {
     use super::*;
     use crate::{
         AssistantMessage, CacheScope, MessageId, PromptSegmentId, PromptSegmentKind, SessionState,
-        ToolCapabilities, ToolConcurrency, Usage, UserMessage, Volatility,
+        ToolCapabilities, ToolConcurrency, ToolResult, Usage, UserMessage, Volatility,
     };
 
     fn assistant(text: &str, stop_reason: Option<StopReason>, usage: Option<Usage>) -> Message {
@@ -700,6 +696,39 @@ mod tests {
             created_at: Utc::now(),
             text: "x".repeat(37),
         });
+        let tool = |content, error: Option<&str>| {
+            Message::Tool(crate::ToolResultMessage {
+                id: MessageId::new(),
+                call_id: crate::ToolCallId::from("call_3"),
+                content,
+                error: error.map(crate::ToolError::new),
+                created_at: Utc::now(),
+            })
+        };
+        let rendered = ToolResult::Rendered {
+            value: json!({"content": "x".repeat(400)}),
+            model_text: "abcdefgh".to_owned(),
+            elision: None,
+        };
+        let text = ToolResult::Text {
+            text: "abcd".to_owned(),
+        };
+        // A tool message costs the text the model is sent for it: a rendered
+        // result's model text, never its value, and the error when it failed.
+        for (message, text) in [
+            (tool(rendered, None), "abcdefgh"),
+            (
+                tool(ToolResult::Empty, Some("abcdefghijkl")),
+                "abcdefghijkl",
+            ),
+            (tool(text, Some("boom")), "abcd\n\nerror: boom"),
+        ] {
+            assert_eq!(
+                estimate_message_tokens(&message),
+                MESSAGE_OVERHEAD_TOKENS + estimate_text_tokens(text),
+                "{text}"
+            );
+        }
 
         assert_eq!(
             estimate_message_tokens(&empty_tool),

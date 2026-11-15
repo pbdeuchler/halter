@@ -1,14 +1,16 @@
 // pattern: Imperative Shell
 
+use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobSet};
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
 use ignore::WalkBuilder;
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, ToolOutput, TypedTool};
 
 use super::common::{
     ToolScope, ensure_not_cancelled, optional_bool, optional_string, optional_u64, required_string,
@@ -21,8 +23,10 @@ const MAX_SORTED_CANDIDATES: usize = 10_000;
 pub struct GlobTool;
 
 #[async_trait]
-impl Tool for GlobTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for GlobTool {
+    type Output = GlobOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("glob"),
             description: "Find files by glob pattern (e.g. `**/*.rs`, `src/**/*.ts`) relative \
@@ -47,7 +51,7 @@ impl Tool for GlobTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Self::Output> {
         let _scope = ToolScope::new(&context, "glob");
         ensure_not_cancelled(&context.cancel)?;
         let pattern = required_string(&input, "pattern")?;
@@ -86,11 +90,11 @@ impl Tool for GlobTool {
                 .ok()
                 .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs());
-            matches.push(json!({
-                "path": path,
-                "file_type": file_type_name(metadata.file_type()),
-                "mtime": mtime,
-            }));
+            matches.push(GlobMatch {
+                path: path.to_path_buf(),
+                file_type: file_type_name(metadata.file_type()),
+                mtime,
+            });
             if sort_by_mtime && matches.len() >= MAX_SORTED_CANDIDATES {
                 break;
             }
@@ -104,23 +108,51 @@ impl Tool for GlobTool {
 
         if sort_by_mtime {
             matches.sort_by(|left, right| {
-                let left_mtime = left["mtime"].as_u64().unwrap_or(0);
-                let right_mtime = right["mtime"].as_u64().unwrap_or(0);
-                right_mtime
-                    .cmp(&left_mtime)
-                    .then_with(|| left["path"].as_str().cmp(&right["path"].as_str()))
+                right
+                    .mtime
+                    .unwrap_or(0)
+                    .cmp(&left.mtime.unwrap_or(0))
+                    .then_with(|| left.path.as_os_str().cmp(right.path.as_os_str()))
             });
             if let Some(max_results) = max_results {
                 matches.truncate(usize::try_from(max_results).unwrap_or(usize::MAX));
             }
         }
 
-        Ok(ToolResult::Json {
-            value: json!({
-                "matches": matches,
-                "total_matches": matches.len(),
-            }),
+        Ok(GlobOutput {
+            total_matches: matches.len(),
+            matches,
         })
+    }
+}
+
+#[derive(Debug, Serialize)]
+/// Result of a `glob` call.
+pub struct GlobOutput {
+    matches: Vec<GlobMatch>,
+    total_matches: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GlobMatch {
+    path: PathBuf,
+    file_type: &'static str,
+    mtime: Option<u64>,
+}
+
+impl ToolOutput for GlobOutput {
+    /// One path per line; directories carry a trailing `/`.
+    fn to_model_string(&self) -> String {
+        if self.matches.is_empty() {
+            return "No matches".to_owned();
+        }
+        self.matches
+            .iter()
+            .map(|entry| {
+                let suffix = if entry.file_type == "dir" { "/" } else { "" };
+                format!("{}{suffix}\n", entry.path.display())
+            })
+            .collect()
     }
 }
 
@@ -156,5 +188,46 @@ fn file_type_name(file_type: std::fs::FileType) -> &'static str {
         "symlink"
     } else {
         "file"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_output_renders_one_path_per_line_and_keeps_the_json_shape() {
+        let output = GlobOutput {
+            matches: vec![
+                GlobMatch {
+                    path: PathBuf::from("/w/a \"é\".rs"),
+                    file_type: "file",
+                    mtime: Some(5),
+                },
+                GlobMatch {
+                    path: PathBuf::from("/w/src"),
+                    file_type: "dir",
+                    mtime: None,
+                },
+            ],
+            total_matches: 2,
+        };
+
+        assert_eq!(output.to_model_string(), "/w/a \"é\".rs\n/w/src/\n");
+        assert_eq!(
+            serde_json::to_value(&output).expect("serialize"),
+            json!({
+                "matches": [
+                    { "path": "/w/a \"é\".rs", "file_type": "file", "mtime": 5 },
+                    { "path": "/w/src", "file_type": "dir", "mtime": null },
+                ],
+                "total_matches": 2,
+            })
+        );
+        let empty = GlobOutput {
+            matches: Vec::new(),
+            total_matches: 0,
+        };
+        assert_eq!(empty.to_model_string(), "No matches");
     }
 }

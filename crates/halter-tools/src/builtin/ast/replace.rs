@@ -4,13 +4,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ast_grep_core::{MatchStrictness, matcher::Pattern, source::Edit, tree_sitter::LanguageExt};
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::PathLockMap;
 use crate::ToolPolicy;
 
 use super::FileCandidate;
+use super::find::render_parse_errors;
 use super::language::{parse_strictness, resolve_language};
 use crate::builtin::common::{ensure_not_cancelled, optional_bool, optional_string, optional_u64};
 
@@ -68,7 +70,7 @@ impl ReplaceConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Serialize)]
 struct ReplaceChange {
     path: String,
     before: String,
@@ -77,13 +79,59 @@ struct ReplaceChange {
     end_line: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct FileChanges {
+    path: String,
+    count: u64,
+}
+
+#[derive(Debug, Serialize)]
+/// Result of an `ast_grep` replace.
+pub struct ReplaceOutput {
+    changes: Vec<ReplaceChange>,
+    file_changes: Vec<FileChanges>,
+    total_replacements: usize,
+    files_touched: u64,
+    files_searched: usize,
+    applied: bool,
+    limit_reached: bool,
+    parse_errors: Option<Vec<String>>,
+}
+
+impl ReplaceOutput {
+    /// A summary line, then each change as a `path:start-end` header over
+    /// its `-` before lines and `+` after lines.
+    pub(super) fn render(&self) -> String {
+        let verb = if self.applied {
+            "Applied"
+        } else {
+            "Dry run: would apply"
+        };
+        let mut text = format!(
+            "{verb} {} replacements in {} of {} files searched\n",
+            self.total_replacements, self.files_touched, self.files_searched
+        );
+        for change in &self.changes {
+            let (path, start, end) = (&change.path, change.start_line, change.end_line);
+            text += &format!("{path}:{start}-{end}\n");
+            for (sign, lines) in [('-', &change.before), ('+', &change.after)] {
+                text.extend(lines.lines().map(|line| format!("{sign}{line}\n")));
+            }
+        }
+        if self.limit_reached {
+            text += "[limit reached; more replacements remain]\n";
+        }
+        text + &render_parse_errors(self.parse_errors.as_deref())
+    }
+}
+
 pub(super) fn run(
     config: ReplaceConfig,
     candidates: Vec<FileCandidate>,
     path_locks: Arc<PathLockMap>,
     cancel: CancellationToken,
     policy: Arc<dyn ToolPolicy>,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<ReplaceOutput> {
     let mut changes = Vec::new();
     let mut file_counts = BTreeMap::<String, u64>::new();
     let mut parse_errors = Vec::new();
@@ -203,25 +251,19 @@ pub(super) fn run(
         }
     }
 
-    Ok(json!({
-        "changes": changes.iter().map(|change| json!({
-            "path": change.path,
-            "before": change.before,
-            "after": change.after,
-            "start_line": change.start_line,
-            "end_line": change.end_line,
-        })).collect::<Vec<_>>(),
-        "file_changes": file_counts.iter().map(|(path, count)| json!({
-            "path": path,
-            "count": count,
-        })).collect::<Vec<_>>(),
-        "total_replacements": changes.len(),
-        "files_touched": files_touched,
-        "files_searched": candidates.len(),
-        "applied": !config.dry_run,
-        "limit_reached": limit_reached,
-        "parse_errors": (!parse_errors.is_empty()).then_some(parse_errors),
-    }))
+    Ok(ReplaceOutput {
+        total_replacements: changes.len(),
+        changes,
+        file_changes: file_counts
+            .into_iter()
+            .map(|(path, count)| FileChanges { path, count })
+            .collect(),
+        files_touched,
+        files_searched: candidates.len(),
+        applied: !config.dry_run,
+        limit_reached,
+        parse_errors: (!parse_errors.is_empty()).then_some(parse_errors),
+    })
 }
 
 fn compile_pattern(
@@ -347,6 +389,12 @@ mod tests {
         )
         .expect("replace should succeed");
 
+        assert_eq!(
+            value.render(),
+            "Dry run: would apply 1 replacements in 1 of 1 files searched\n\
+             main.rs:1-1\n-fn alpha() {}\n+fn alpha() -> i32 { 0 }\n"
+        );
+        let value = serde_json::to_value(value).expect("serialize");
         assert_eq!(value["total_replacements"], 1);
         assert_eq!(
             std::fs::read_to_string(path).expect("read"),
@@ -386,6 +434,7 @@ mod tests {
         )
         .expect("replace should succeed");
 
+        let value = serde_json::to_value(value).expect("serialize");
         assert_eq!(value["total_replacements"], 2);
     }
 }

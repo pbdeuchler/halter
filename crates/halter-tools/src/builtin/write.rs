@@ -1,11 +1,14 @@
 // pattern: Imperative Shell
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, ToolOutput, TypedTool};
 
 use super::common::{ToolScope, ensure_not_cancelled, required_string, resolve_path};
 
@@ -14,8 +17,10 @@ use super::common::{ToolScope, ensure_not_cancelled, required_string, resolve_pa
 pub struct WriteTool;
 
 #[async_trait]
-impl Tool for WriteTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for WriteTool {
+    type Output = WriteOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("write"),
             description: "Write a UTF-8 file to disk, overwriting any existing file at `path` \
@@ -43,7 +48,7 @@ impl Tool for WriteTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Self::Output> {
         let _scope = ToolScope::new(&context, "write");
         ensure_not_cancelled(&context.cancel)?;
         let path = resolve_path(&context.working_dir, required_string(&input, "path")?);
@@ -61,8 +66,45 @@ impl Tool for WriteTool {
             Ok::<_, anyhow::Error>(())
         })
         .await??;
-        Ok(ToolResult::Json {
-            value: json!({ "path": canonical_path }),
+        Ok(WriteOutput {
+            path: canonical_path,
+            bytes: content.len(),
         })
+    }
+}
+
+#[derive(Debug, Serialize)]
+/// Result of a `write` call.
+pub struct WriteOutput {
+    path: PathBuf,
+    #[serde(skip)]
+    bytes: usize,
+}
+
+impl ToolOutput for WriteOutput {
+    fn to_model_string(&self) -> String {
+        format!("Wrote {} ({} bytes)", self.path.display(), self.bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_output_renders_a_confirmation_and_keeps_the_json_shape() {
+        let output = WriteOutput {
+            path: PathBuf::from("/work/a \"b\".txt"),
+            bytes: 12,
+        };
+
+        assert_eq!(
+            output.to_model_string(),
+            "Wrote /work/a \"b\".txt (12 bytes)"
+        );
+        assert_eq!(
+            serde_json::to_value(&output).expect("serialize"),
+            json!({ "path": "/work/a \"b\".txt" })
+        );
     }
 }

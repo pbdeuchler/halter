@@ -9,14 +9,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use halter_protocol::{
-    SessionId, ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec,
-};
+use halter_protocol::{SessionId, ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, ToolOutput, TypedTool};
 
 use super::common::{
     ToolScope, ensure_not_cancelled, optional_string, optional_u64, required_string,
@@ -157,8 +155,10 @@ impl TaskStore for InMemoryTaskStore {
 pub struct TaskTool;
 
 #[async_trait]
-impl Tool for TaskTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for TaskTool {
+    type Output = TaskOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("task"),
             description: "Manage an in-memory todo list scoped to the current session. \
@@ -200,24 +200,23 @@ impl Tool for TaskTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<TaskOutput> {
         let _scope = ToolScope::new(&context, "task");
         ensure_not_cancelled(&context.cancel)?;
         let action = required_string(&input, "action")?;
         let store = context.tool_sessions.task_session(&context.session_id);
-        let response = match action {
+        Ok(match action {
             "create" => create_action(&store, &input)?,
             "list" => list_action(&store),
             "complete" => complete_action(&store, &input)?,
             other => anyhow::bail!(
                 "invalid tool input: field 'action' must be one of 'create', 'list', 'complete' (got '{other}')"
             ),
-        };
-        Ok(ToolResult::Json { value: response })
+        })
     }
 }
 
-fn create_action(store: &Arc<Mutex<TaskList>>, input: &Value) -> anyhow::Result<Value> {
+fn create_action(store: &Arc<Mutex<TaskList>>, input: &Value) -> anyhow::Result<TaskOutput> {
     let subject = required_string(input, "subject")?.trim();
     if subject.is_empty() {
         anyhow::bail!("invalid tool input: field 'subject' must not be empty");
@@ -229,30 +228,64 @@ fn create_action(store: &Arc<Mutex<TaskList>>, input: &Value) -> anyhow::Result<
     let mut list = store.lock();
     let task = list.create(subject.to_owned(), description);
     let summary = list.summary();
-    Ok(json!({
-        "task": task,
-        "summary": summary,
-    }))
+    Ok(TaskOutput::Task { task, summary })
 }
 
-fn list_action(store: &Arc<Mutex<TaskList>>) -> Value {
+fn list_action(store: &Arc<Mutex<TaskList>>) -> TaskOutput {
     let list = store.lock();
-    json!({
-        "tasks": list.list(),
-        "summary": list.summary(),
-    })
+    TaskOutput::Tasks {
+        tasks: list.list(),
+        summary: list.summary(),
+    }
 }
 
-fn complete_action(store: &Arc<Mutex<TaskList>>, input: &Value) -> anyhow::Result<Value> {
+fn complete_action(store: &Arc<Mutex<TaskList>>, input: &Value) -> anyhow::Result<TaskOutput> {
     let id = optional_u64(input, "id")?
         .ok_or_else(|| anyhow::anyhow!("invalid tool input: missing integer field 'id'"))?;
     let mut list = store.lock();
     let task = list.complete(id)?;
     let summary = list.summary();
-    Ok(json!({
-        "task": task,
-        "summary": summary,
-    }))
+    Ok(TaskOutput::Task { task, summary })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+/// Result of a `task` call: the task it changed, or the whole list.
+pub enum TaskOutput {
+    Task {
+        task: Task,
+        summary: TaskSummary,
+    },
+    Tasks {
+        tasks: Vec<Task>,
+        summary: TaskSummary,
+    },
+}
+
+impl ToolOutput for TaskOutput {
+    /// One `[ ] id. subject` line per task, its description indented below,
+    /// then the counts.
+    fn to_model_string(&self) -> String {
+        let (tasks, summary) = match self {
+            Self::Task { task, summary } => (std::slice::from_ref(task), summary),
+            Self::Tasks { tasks, summary } => (tasks.as_slice(), summary),
+        };
+        let mut text = String::new();
+        for task in tasks {
+            let mark = match task.status {
+                TaskStatus::Pending => ' ',
+                TaskStatus::Completed => 'x',
+            };
+            text += &format!("[{mark}] {}. {}\n", task.id, task.subject);
+            for line in task.description.iter().flat_map(|text| text.lines()) {
+                text += &format!("    {line}\n");
+            }
+        }
+        text + &format!(
+            "{} tasks: {} pending, {} completed",
+            summary.total, summary.pending, summary.completed
+        )
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +301,8 @@ mod tests {
     };
 
     use super::*;
+    use crate::Tool;
+    use halter_protocol::ToolResult;
 
     fn tool_context(sessions: Arc<ToolSessionStore>) -> ToolContext {
         ToolContext {
@@ -287,7 +322,7 @@ mod tests {
 
     fn json_value(result: ToolResult) -> Value {
         match result {
-            ToolResult::Json { value } => value,
+            ToolResult::Rendered { value, .. } => value,
             other => panic!("expected json result, got {other:?}"),
         }
     }
@@ -566,6 +601,53 @@ mod tests {
                 .map(|task| task.subject.as_str())
                 .collect::<Vec<_>>(),
             ["restored"]
+        );
+    }
+
+    #[test]
+    fn task_output_renders_a_checklist_and_keeps_the_json_shape() {
+        let first = Task {
+            id: 1,
+            subject: "Write \"docs\"".to_owned(),
+            description: Some("first\nsecond".to_owned()),
+            status: TaskStatus::Pending,
+        };
+        let second = Task {
+            id: 2,
+            subject: "Ship é".to_owned(),
+            description: None,
+            status: TaskStatus::Completed,
+        };
+        let summary = TaskSummary {
+            total: 2,
+            pending: 1,
+            completed: 1,
+        };
+        let list = TaskOutput::Tasks {
+            tasks: vec![first.clone(), second.clone()],
+            summary,
+        };
+        assert_eq!(
+            list.to_model_string(),
+            "[ ] 1. Write \"docs\"\n    first\n    second\n[x] 2. Ship é\n\
+             2 tasks: 1 pending, 1 completed"
+        );
+        assert_eq!(
+            serde_json::to_value(&list).expect("serialize"),
+            json!({ "tasks": [first, second], "summary": summary })
+        );
+
+        let one = TaskOutput::Task {
+            task: second.clone(),
+            summary,
+        };
+        assert_eq!(
+            one.to_model_string(),
+            "[x] 2. Ship é\n2 tasks: 1 pending, 1 completed"
+        );
+        assert_eq!(
+            serde_json::to_value(&one).expect("serialize"),
+            json!({ "task": second, "summary": summary })
         );
     }
 }

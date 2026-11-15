@@ -21,6 +21,7 @@ pub use builtin::ImageTool;
 pub use builtin::ProfilingTool;
 #[cfg(feature = "pty")]
 pub use builtin::PtyTool;
+pub use builtin::common::Report;
 pub use builtin::fs_lock::PathLockMap;
 pub use builtin::{
     BackgroundTool, EditTool, GlobTool, GrepTool, InMemoryTaskStore, ProcessTool, ReadTool,
@@ -37,7 +38,7 @@ pub use policy::{
 };
 pub use runtime::{
     NoopSubagentControl, NoopToolEventSink, SubagentControl, SubagentParentContext, Tool,
-    ToolContext, ToolEventSink, ToolRuntime, ToolRuntimeEvent,
+    ToolContext, ToolEventSink, ToolOutput, ToolRuntime, ToolRuntimeEvent, TypedTool,
 };
 pub use session_store::ToolSessionStore;
 pub use subagent::register_subagent_tools;

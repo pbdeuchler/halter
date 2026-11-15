@@ -6,12 +6,13 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
 use parking_lot::Mutex;
 use portable_pty::{Child, ChildKiller, CommandBuilder, PtySize, native_pty_system};
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolRuntimeEvent};
+use crate::{ToolContext, ToolOutput, ToolRuntimeEvent, TypedTool};
 
 use super::common::{
     ToolScope, ensure_not_cancelled, optional_string, optional_u64, parse_env_map, required_string,
@@ -147,8 +148,10 @@ enum ReaderEvent {
 }
 
 #[async_trait]
-impl Tool for PtyTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for PtyTool {
+    type Output = PtyOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("pty"),
             description: "Manage an interactive PTY session".to_owned(),
@@ -177,7 +180,7 @@ impl Tool for PtyTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<PtyOutput> {
         let _scope = ToolScope::new(&context, "pty");
         ensure_not_cancelled(&context.cancel)?;
         context.policy.check_shell_enabled().await?;
@@ -219,32 +222,41 @@ impl Tool for PtyTool {
                     context.tool_sessions.activity_sender(),
                 )
                 .await?;
-                Ok(ToolResult::Json {
-                    value: json!({ "started": true }),
-                })
+                Ok(PtyOutput::Started { started: true })
             }
             "write" => {
                 let input = required_string(&input, "input")?.to_owned();
                 send_control(&session, ControlMessage::Input(input))?;
-                Ok(ToolResult::Json {
-                    value: json!({ "ok": true }),
-                })
+                Ok(PtyOutput::Done { ok: true })
             }
             "resize" => {
                 let cols = checked_u16(&input, "cols", 120)?;
                 let rows = checked_u16(&input, "rows", 40)?;
                 send_control(&session, ControlMessage::Resize { cols, rows })?;
-                Ok(ToolResult::Json {
-                    value: json!({ "ok": true }),
-                })
+                Ok(PtyOutput::Done { ok: true })
             }
             "kill" => {
                 stop_session(&session).await?;
-                Ok(ToolResult::Json {
-                    value: json!({ "ok": true }),
-                })
+                Ok(PtyOutput::Done { ok: true })
             }
             _ => anyhow::bail!("failed to execute pty tool: unknown action '{action}'"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+/// Result of a `pty` call. The terminal's own output streams as tool events.
+pub enum PtyOutput {
+    Started { started: bool },
+    Done { ok: bool },
+}
+
+impl ToolOutput for PtyOutput {
+    fn to_model_string(&self) -> String {
+        match self {
+            Self::Started { .. } => "started".to_owned(),
+            Self::Done { .. } => "ok".to_owned(),
         }
     }
 }
@@ -770,8 +782,8 @@ mod security_tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolContext, ToolPolicy,
-        ToolSessionStore,
+        DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, Tool, ToolContext,
+        ToolPolicy, ToolSessionStore,
     };
 
     use super::*;
@@ -1166,5 +1178,20 @@ mod security_tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[test]
+    fn pty_output_renders_one_word_and_keeps_the_json_shape() {
+        for (output, text, value) in [
+            (
+                PtyOutput::Started { started: true },
+                "started",
+                json!({ "started": true }),
+            ),
+            (PtyOutput::Done { ok: true }, "ok", json!({ "ok": true })),
+        ] {
+            assert_eq!(output.to_model_string(), text);
+            assert_eq!(serde_json::to_value(&output).expect("serialize"), value);
+        }
     }
 }

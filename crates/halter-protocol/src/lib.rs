@@ -7,6 +7,7 @@
 //! each other.
 // pattern: Functional Core
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
@@ -1285,8 +1286,72 @@ pub enum ToolResult {
     Empty,
     /// Plain text content.
     Text { text: String },
-    /// Structured JSON content.
+    /// Structured JSON content. The model reads it as compact JSON.
     Json { value: Value },
+    /// Structured content for hosts plus the exact text the model reads.
+    /// The text is committed with the result, so replaying a session sends
+    /// the same bytes without rendering again.
+    Rendered {
+        value: Value,
+        model_text: String,
+        /// Set when `model_text` is an elided view of a larger output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elision: Option<ToolOutputElision>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// What the runtime's output budget removed from a tool result's model text.
+pub struct ToolOutputElision {
+    /// Size of the model text before elision.
+    pub original_bytes: u64,
+    /// File holding the full output. `None` when it could not be
+    /// written. The file is not part of the session log and may be gone
+    /// after a restore.
+    pub spill_path: Option<PathBuf>,
+}
+
+impl ToolResult {
+    /// The text a provider sends to the model for this result.
+    #[must_use]
+    pub fn to_model_string(&self) -> Cow<'_, str> {
+        match self {
+            Self::Empty => "".into(),
+            Self::Text { text } => text.into(),
+            Self::Json { value } => value.to_string().into(),
+            Self::Rendered { model_text, .. } => model_text.into(),
+        }
+    }
+
+    /// The structured value, for results that carry one.
+    #[must_use]
+    pub const fn structured(&self) -> Option<&Value> {
+        match self {
+            Self::Json { value } | Self::Rendered { value, .. } => Some(value),
+            Self::Empty | Self::Text { .. } => None,
+        }
+    }
+}
+
+impl ToolResultMessage {
+    /// The text a provider sends to the model for this message: the result,
+    /// with the error appended when both are present.
+    #[must_use]
+    pub fn to_model_string(&self) -> Cow<'_, str> {
+        match (&self.content, &self.error) {
+            (content, None) => content.to_model_string(),
+            (ToolResult::Empty, Some(error)) => error.message.as_str().into(),
+            // Written out so the key order does not follow serde_json's
+            // `preserve_order` feature.
+            (ToolResult::Json { value }, Some(error)) => {
+                let error = Value::from(error.message.as_str());
+                format!(r#"{{"error":{error},"result":{value}}}"#).into()
+            }
+            (content, Some(error)) => {
+                format!("{}\n\nerror: {}", content.to_model_string(), error.message).into()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -2699,6 +2764,95 @@ mod tests {
         let encoded = serde_json::to_string(&message).expect("serialize message");
         let decoded: Message = serde_json::from_str(&encoded).expect("deserialize message");
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn tool_result_wire_form_is_stable_and_rendered_round_trips() {
+        let rendered = ToolResult::Rendered {
+            value: serde_json::json!({ "stdout": "a \"b\"\n" }),
+            model_text: "a \"b\"\n".to_owned(),
+            elision: None,
+        };
+        let elided = ToolResult::Rendered {
+            value: Value::Null,
+            model_text: "head\n[marker]\ntail".to_owned(),
+            elision: Some(ToolOutputElision {
+                original_bytes: 9000,
+                spill_path: None,
+            }),
+        };
+        // The first three are what every log written before `rendered`
+        // existed holds.
+        for (result, wire) in [
+            (ToolResult::Empty, r#"{"kind":"empty"}"#),
+            (
+                ToolResult::Text {
+                    text: "hi".to_owned(),
+                },
+                r#"{"kind":"text","text":"hi"}"#,
+            ),
+            (
+                ToolResult::Json {
+                    value: serde_json::json!({ "a": 1 }),
+                },
+                r#"{"kind":"json","value":{"a":1}}"#,
+            ),
+            (
+                rendered,
+                r#"{"kind":"rendered","value":{"stdout":"a \"b\"\n"},"model_text":"a \"b\"\n"}"#,
+            ),
+            (
+                elided,
+                r#"{"kind":"rendered","value":null,"model_text":"head\n[marker]\ntail","elision":{"original_bytes":9000,"spill_path":null}}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&result).expect("serialize"), wire);
+            assert_eq!(
+                serde_json::from_str::<ToolResult>(wire).expect("deserialize"),
+                result
+            );
+        }
+        assert!(serde_json::from_str::<ToolResult>(r#"{"kind":"rendered","value":1}"#).is_err());
+    }
+
+    #[test]
+    fn tool_results_render_for_the_model_without_escaping_text() {
+        let message = |content, error: Option<&str>| ToolResultMessage {
+            id: MessageId::new(),
+            call_id: ToolCallId::from("call_1"),
+            content,
+            error: error.map(ToolError::new),
+            created_at: Utc::now(),
+        };
+        let text = || ToolResult::Text {
+            text: "say \"hi\"\n".to_owned(),
+        };
+        let json = || ToolResult::Json {
+            value: serde_json::json!({ "out": "a\nb" }),
+        };
+        let rendered = || ToolResult::Rendered {
+            value: serde_json::json!({ "out": "a\nb" }),
+            model_text: "a\nb".to_owned(),
+            elision: None,
+        };
+        for (message, expected) in [
+            (message(ToolResult::Empty, None), ""),
+            (message(text(), None), "say \"hi\"\n"),
+            (message(json(), None), r#"{"out":"a\nb"}"#),
+            (message(rendered(), None), "a\nb"),
+            (message(ToolResult::Empty, Some("boom")), "boom"),
+            (message(text(), Some("boom")), "say \"hi\"\n\n\nerror: boom"),
+            (
+                message(json(), Some("boom")),
+                r#"{"error":"boom","result":{"out":"a\nb"}}"#,
+            ),
+            (message(rendered(), Some("boom")), "a\nb\n\nerror: boom"),
+        ] {
+            assert_eq!(message.to_model_string(), expected);
+        }
+        assert_eq!(ToolResult::Empty.structured(), None);
+        assert_eq!(text().structured(), None);
+        assert_eq!(json().structured(), rendered().structured());
     }
 
     #[test]

@@ -281,7 +281,7 @@ impl TraceRecorder {
 /// Path separators, control bytes, and drive letters all collapse to `_`,
 /// which means the recorder cannot be tricked into writing outside `dir`
 /// regardless of how a session id was constructed by upstream callers.
-fn sanitize_session_id(id: &str) -> String {
+pub(crate) fn sanitize_session_id(id: &str) -> String {
     if id.is_empty() {
         return "_".to_owned();
     }

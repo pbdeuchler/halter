@@ -7,9 +7,12 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use halter_protocol::ToolResult;
+
 use super::*;
 use crate::{
-    DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, ToolPolicy, ToolSessionStore,
+    DefaultToolPolicy, NoopToolEventSink, PathLockMap, PolicySettings, Tool, ToolPolicy,
+    ToolSessionStore,
 };
 
 fn context(root: &Path) -> ToolContext {
@@ -40,7 +43,7 @@ fn context(root: &Path) -> ToolContext {
 }
 
 async fn execute(context: &ToolContext, input: Value) -> Value {
-    let ToolResult::Json { value } = BackgroundTool
+    let ToolResult::Rendered { value, .. } = BackgroundTool
         .execute(context.clone(), input)
         .await
         .expect("background operation")
@@ -402,8 +405,9 @@ async fn registered_job_survives_originating_cancellation_and_shutdown_reaps_it(
             panic!("session shutdown must terminate its job before natural completion");
         }
     }
-    assert_eq!(tracked.summary()["status"]["state"], "exited");
-    assert_eq!(tracked.summary()["status"]["signal"], libc::SIGKILL);
+    let summary = serde_json::to_value(tracked.summary()).unwrap();
+    assert_eq!(summary["status"]["state"], "exited");
+    assert_eq!(summary["status"]["signal"], libc::SIGKILL);
     assert_reaped(job["pid"].as_i64().unwrap() as i32);
     assert!(!context.tool_sessions.has_process_state(&context.session_id));
     // Reopening receives an empty registry rather than a closed registry.
@@ -559,6 +563,41 @@ async fn spawn_preserves_explicit_cwd_and_env_and_checks_policy() {
             .await
             .is_err()
     );
+    context
+        .tool_sessions
+        .shutdown_session(&context.session_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn background_output_renders_each_action_as_text() {
+    let root = tempfile::tempdir().unwrap();
+    let context = context(root.path());
+    let text = async |input: Value| {
+        let result = BackgroundTool.execute(context.clone(), input).await;
+        result.unwrap().to_model_string().into_owned()
+    };
+    let command = "printf 'a \"b\"\\n'";
+
+    let job = execute(&context, json!({"action": "spawn", "command": command})).await;
+    let (id, pid) = (job["id"].as_str().unwrap(), &job["pid"]);
+    let cwd = job["cwd"].as_str().unwrap();
+    wait_for(&context, id, |output| output["status"]["state"] == "exited").await;
+
+    assert_eq!(
+        text(json!({"action": "output", "id": id})).await,
+        format!("[{id}: exited with code 0; bytes 0-6; pass cursor=6 for newer output]\na \"b\"\n")
+    );
+    assert_eq!(
+        text(json!({"action": "list"})).await,
+        format!("{id} (exited with code 0, pid {pid}, cwd {cwd})\n$ {command}")
+    );
+    assert_eq!(
+        text(json!({"action": "prune"})).await,
+        format!("Pruned 1 finished jobs; 0 remain\n{id}")
+    );
+    assert_eq!(text(json!({"action": "list"})).await, "No background jobs");
     context
         .tool_sessions
         .shutdown_session(&context.session_id)

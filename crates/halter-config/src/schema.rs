@@ -1324,12 +1324,39 @@ const fn default_tokens_per_minute() -> Option<u64> {
     Some(500_000)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-/// Built-in tool selection.
+/// Built-in tool selection and the bound on tool output.
 pub struct ToolsConfig {
     #[serde(default)]
     pub enabled: Vec<String>,
+    /// Largest tool result, in bytes of the text the model reads, that enters
+    /// the context whole. A larger result keeps its head and tail around a
+    /// marker line and its full text is written under `output_dir`. `0`
+    /// disables the bound.
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Directory for the full text of elided results, written as
+    /// `<output_dir>/<sanitized session id>/<message id>.txt`. Defaults to
+    /// `halter-<user>/tool-output` under the system temporary directory,
+    /// which the read tools can reach by default. A relative path is resolved
+    /// against the process working directory when the runtime is built.
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Vec::new(),
+            max_output_bytes: default_max_output_bytes(),
+            output_dir: None,
+        }
+    }
+}
+
+const fn default_max_output_bytes() -> usize {
+    50 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1578,6 +1605,28 @@ const fn default_subagent_event_forwarding_cap() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tools_config_bounds_output_by_default_and_parses_overrides() {
+        let parse = |text: &str| toml::from_str::<ToolsConfig>(text);
+        for (text, max_output_bytes, output_dir) in [
+            ("", 51_200, None),
+            ("enabled = [\"read\"]", 51_200, None),
+            ("max_output_bytes = 0", 0, None),
+            (
+                "max_output_bytes = 8\noutput_dir = \"/var/out\"",
+                8,
+                Some(PathBuf::from("/var/out")),
+            ),
+        ] {
+            let config = parse(text).expect("parse tools config");
+            assert_eq!(config.max_output_bytes, max_output_bytes);
+            assert_eq!(config.output_dir, output_dir);
+        }
+        assert_eq!(parse("").expect("parse"), ToolsConfig::default());
+        assert!(parse("max_output_bytes = -1").is_err());
+        assert!(parse("max_output = 1").is_err());
+    }
 
     #[test]
     fn config_requires_models_default() {

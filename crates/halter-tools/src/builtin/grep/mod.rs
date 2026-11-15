@@ -3,10 +3,10 @@
 mod types;
 
 use async_trait::async_trait;
-use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec};
+use halter_protocol::{ToolCapabilities, ToolConcurrency, ToolName, ToolSpec};
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext};
+use crate::{ToolContext, TypedTool};
 
 use super::common::{
     ToolScope, ensure_not_cancelled, optional_bool, optional_string, optional_u64, required_string,
@@ -16,15 +16,17 @@ use super::common::{
 use self::types::run_advanced_search;
 #[cfg(not(feature = "advanced-tools"))]
 use self::types::run_basic_search;
-use self::types::{DEFAULT_MAX_MATCHES, OutputMode, SearchConfig};
+use self::types::{DEFAULT_MAX_MATCHES, GrepOutput, OutputMode, SearchConfig};
 
 #[derive(Debug)]
 /// Built-in tool for regex search across files.
 pub struct GrepTool;
 
 #[async_trait]
-impl Tool for GrepTool {
-    fn spec(&self) -> ToolSpec {
+impl TypedTool for GrepTool {
+    type Output = GrepOutput;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("grep"),
             description: "Search file contents with regular expressions (ripgrep syntax). \
@@ -69,7 +71,7 @@ impl Tool for GrepTool {
         }
     }
 
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Self::Output> {
         let _scope = ToolScope::new(&context, "grep");
         ensure_not_cancelled(&context.cancel)?;
         let pattern = required_string(&input, "pattern")?;
@@ -110,7 +112,7 @@ impl Tool for GrepTool {
         })
         .await??;
 
-        Ok(ToolResult::Json { value: response })
+        Ok(response)
     }
 }
 

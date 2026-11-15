@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use halter_protocol::{SessionId, ToolConcurrency, ToolResult, ToolSpec};
+use halter_protocol::{SessionId, ToolConcurrency, ToolSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{PathLockMap, Tool, ToolContext};
+use crate::{PathLockMap, Report, ToolContext, TypedTool};
 
 pub const MAX_NOTE_BYTES: usize = 1_000_000;
 pub const RECOVERY_RESPONSE_BYTES: usize = 32_000;
@@ -464,8 +464,10 @@ impl NotesBackend for FsNotes {
 pub struct NotesTool<N: NotesBackend>(pub Arc<N>);
 
 #[async_trait]
-impl<N: NotesBackend> Tool for NotesTool<N> {
-    fn spec(&self) -> ToolSpec {
+impl<N: NotesBackend> TypedTool for NotesTool<N> {
+    type Output = Report;
+
+    fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: "notes".into(),
             description: self.0.description().to_owned(),
@@ -483,14 +485,10 @@ impl<N: NotesBackend> Tool for NotesTool<N> {
             provider_aliases: Default::default(),
         }
     }
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Report> {
         anyhow::ensure!(!context.cancel.is_cancelled(), "notes operation cancelled");
-        Ok(ToolResult::Json {
-            value: self
-                .0
-                .execute(&context.session_id, serde_json::from_value(input)?)
-                .await?,
-        })
+        let request = serde_json::from_value(input)?;
+        Ok(Report(self.0.execute(&context.session_id, request).await?))
     }
 }
 

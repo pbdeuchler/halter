@@ -165,8 +165,7 @@ fn render_compaction_message(message: &Message) -> String {
         ),
         Message::Tool(message) => match &message.content {
             halter_protocol::ToolResult::Empty => "tool: <empty>".to_owned(),
-            halter_protocol::ToolResult::Text { text } => format!("tool: {text}"),
-            halter_protocol::ToolResult::Json { value } => format!("tool: {value}"),
+            content => format!("tool: {}", content.to_model_string()),
         },
     }
 }
