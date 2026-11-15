@@ -57,6 +57,14 @@ once a `1.0.0` line is cut.
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the
   default `PolicySettings` failed with "allowed root does not exist". Unix
   behaviour is unchanged.
+- The default scratch write root is `<temp dir>/halter`
+  (`halter_tools::default_write_root()`) instead of `/tmp/halter`, in both
+  `PolicySettings` and `PolicyConfig`, and the policy creates it the first time
+  a check needs it. Before, a missing `/tmp/halter` failed every write check
+  with "allowed root does not exist", on any platform. A configured root that
+  doesn't exist is still an error. On macOS the scratch root moves from
+  `/tmp/halter` to the per-user `$TMPDIR/halter`. The starter config template no
+  longer lists `allowed_write_roots` explicitly, so it keeps the default.
 
 ## [0.10.0] - 2026-11-14
 

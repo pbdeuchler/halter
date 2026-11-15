@@ -63,7 +63,7 @@ pub struct PolicySettings {
 impl Default for PolicySettings {
     fn default() -> Self {
         Self {
-            allowed_write_roots: vec![PathBuf::from("."), PathBuf::from("/tmp/halter")],
+            allowed_write_roots: vec![PathBuf::from("."), default_write_root()],
             allowed_read_roots: default_read_roots(),
             sensitive_path_patterns: default_sensitive_patterns(),
             max_read_bytes: 1_048_576,
@@ -77,6 +77,13 @@ impl Default for PolicySettings {
             max_concurrent_subagents: 8,
         }
     }
+}
+
+/// Built-in scratch write root, `<temp dir>/halter`. Unlike configured roots,
+/// it is created on first use rather than reported missing.
+#[must_use]
+pub fn default_write_root() -> PathBuf {
+    std::env::temp_dir().join("halter")
 }
 
 fn default_read_roots() -> Vec<PathBuf> {
@@ -375,13 +382,21 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 /// Canonicalize a list of configured roots. A nonexistent root produces a
-/// typed `NonexistentRoot` error instead of being silently dropped (AC1.14).
+/// typed `NonexistentRoot` error instead of being silently dropped (AC1.14),
+/// except the built-in [`default_write_root`], which is created on demand.
 fn canonicalize_root_list(roots: &[PathBuf]) -> Result<Vec<PathBuf>, PolicyError> {
     let mut out = Vec::with_capacity(roots.len());
     for root in roots {
         let absolute = absolute_path_typed(root)?;
-        let canonical =
-            std::fs::canonicalize(&absolute).map_err(|_| PolicyError::NonexistentRoot {
+        let canonical = std::fs::canonicalize(&absolute)
+            .or_else(|error| {
+                if absolute != default_write_root() {
+                    return Err(error);
+                }
+                std::fs::create_dir_all(&absolute)?;
+                std::fs::canonicalize(&absolute)
+            })
+            .map_err(|_| PolicyError::NonexistentRoot {
                 root: absolute.clone(),
             })?;
         out.push(canonical);

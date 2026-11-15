@@ -153,7 +153,7 @@ roots = ["./.agent/skills"]
 roots = ["./.agent/plugins"]
 
 [policy]
-allowed_write_roots = ["./", "/tmp/halter"]
+# allowed_write_roots = ["./"]   # absent keeps "." and <temp dir>/halter
 max_read_bytes = 1048576
 max_subagent_depth = 3
 max_concurrent_subagents = 8

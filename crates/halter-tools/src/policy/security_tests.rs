@@ -465,6 +465,24 @@ async fn ac1_14_nonexistent_read_root_is_surfaced_not_silently_dropped() {
     }
 }
 
+#[test]
+fn ac1_14_only_the_builtin_scratch_root_is_created_on_demand() {
+    let dir = TempDir::new().expect("tempdir");
+    let missing = dir.path().join("missing");
+    let scratch = super::default_write_root();
+
+    let created = super::canonicalize_root_list(std::slice::from_ref(&scratch))
+        .expect("the built-in scratch root is created when absent");
+    assert_eq!(created, [std::fs::canonicalize(&scratch).unwrap()]);
+    assert!(scratch.is_dir());
+
+    match super::canonicalize_root_list(&[scratch, missing.clone()]) {
+        Err(PolicyError::NonexistentRoot { root }) => assert_eq!(root, missing),
+        other => panic!("a missing configured root must still fail, got {other:?}"),
+    }
+    assert!(!missing.exists(), "configured roots are never created");
+}
+
 // ------------- Issue #115: sensitive-path glob set cache
 
 #[tokio::test]

@@ -35,6 +35,7 @@ pub use notes::{
 };
 pub use policy::{
     CanonicalPath, DefaultToolPolicy, LoopbackAllow, Pid, PolicyError, PolicySettings, ToolPolicy,
+    default_write_root,
 };
 pub use runtime::{
     NoopSubagentControl, NoopToolEventSink, SubagentControl, SubagentParentContext, Tool,
