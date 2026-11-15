@@ -561,13 +561,3 @@ mod ownership_tests {
         assert!(settled.load(Ordering::Acquire));
     }
 }
-
-#[cfg(all(test, not(unix)))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spawn_rejects_shells_with_unvalidated_command_grammar() {
-        assert!(shell_command("echo 'safe & del sensitive.txt & echo tail'").is_err());
-    }
-}

@@ -295,10 +295,9 @@ mod tests {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&argv[4])
             .expect("valid base64");
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        assert!(rest.is_empty());
+        let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
         assert_eq!(String::from_utf16(&units).unwrap(), "echo \"é\"");
     }
 

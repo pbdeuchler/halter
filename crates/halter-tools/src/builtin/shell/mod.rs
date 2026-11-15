@@ -24,6 +24,7 @@ use super::common::{
 };
 
 /// How long a terminated process group gets to exit before it is killed.
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 /// How long output readers may run after the process group is gone. Only a
 /// descendant that escaped the group (e.g. via `setsid`) can hold pipes open.
