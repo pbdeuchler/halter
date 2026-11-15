@@ -399,22 +399,22 @@ mod tests {
 
     #[tokio::test]
     async fn shell_runs_in_the_working_dir_or_a_relative_cwd() {
+        // Asserted through a file the command creates, not `pwd` output,
+        // which Git Bash prints as `/c/...` on Windows.
         let root = tempfile::tempdir().unwrap();
-        let root_path = root.path().canonicalize().unwrap();
-        std::fs::create_dir(root_path.join("nested")).unwrap();
-        for (input, expected) in [
-            (json!({"command": "pwd -P"}), root_path.clone()),
-            (
-                json!({"command": "pwd -P", "cwd": "nested"}),
-                root_path.join("nested"),
-            ),
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        for (cwd, expected) in [
+            (None, root.path().to_owned()),
+            (Some("nested"), root.path().join("nested")),
         ] {
-            let value = run(tool_context(&root_path), input).await.unwrap();
-            assert_eq!(value["exit_code"], 0);
-            assert_eq!(
-                value["stdout"].as_str().unwrap().trim(),
-                expected.to_string_lossy()
-            );
+            let value = run(
+                tool_context(root.path()),
+                json!({"command": "echo here > marker", "cwd": cwd}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(value["exit_code"], 0, "{value}");
+            assert!(expected.join("marker").is_file(), "{cwd:?}");
         }
     }
 
@@ -431,13 +431,11 @@ mod tests {
         .unwrap();
         let value = run(
             context,
-            json!({"command": "pwd -P; printf %s \"${HALTER_X:-unset}\""}),
+            json!({"command": "test -d nested && printf 'at-root '; printf %s \"${HALTER_X:-unset}\""}),
         )
         .await
         .unwrap();
-        let stdout = value["stdout"].as_str().unwrap();
-        assert!(!stdout.contains("nested"), "{stdout}");
-        assert!(stdout.ends_with("unset"), "{stdout}");
+        assert_eq!(value["stdout"], "at-root unset");
     }
 
     #[tokio::test]
@@ -630,6 +628,26 @@ mod tests {
                 "cancelled": false,
             })
         );
+    }
+
+    /// The `-EncodedCommand` path end to end, against the PowerShell every
+    /// Windows host ships, whichever shell detection picked.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_runs_encoded_commands_verbatim() {
+        let output = std::process::Command::new("powershell.exe")
+            .args(detect::ShellKind::PowerShell.argv(
+                "$x = 'a \"quoted\" é'; Write-Output \"$x|$($x.Length) $env:HALTER_PS\"; exit 4",
+            ))
+            .env("HALTER_PS", "env")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4));
+        // The length proves `é` survived decoding even if the console code
+        // page mangles how it prints.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with("a \"quoted\" "), "{stdout}");
+        assert!(stdout.trim_end().ends_with("|12 env"), "{stdout}");
     }
 
     #[cfg(unix)]
