@@ -50,6 +50,14 @@ once a `1.0.0` line is cut.
 - The vendored `halter-brush-core` and `halter-brush-builtins` crates and the
   `vendor/` directory. They are no longer published.
 
+### Fixed
+
+- The default read roots use the system temp dir (`std::env::temp_dir()`)
+  instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
+  unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the
+  default `PolicySettings` failed with "allowed root does not exist". Unix
+  behaviour is unchanged.
+
 ## [0.10.0] - 2026-11-14
 
 Tools now return typed output: a structured value for hosts and separate text

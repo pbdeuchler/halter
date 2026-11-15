@@ -58,7 +58,7 @@ pub async fn collect_output(
         let read = {
             use tokio::io::AsyncReadExt;
 
-            let mut future = reader.read(&mut buffer[pending..BUFFER_SIZE]);
+            let future = reader.read(&mut buffer[pending..BUFFER_SIZE]);
             tokio::pin!(future);
             match tokio::select! {
                 value = &mut future => value,

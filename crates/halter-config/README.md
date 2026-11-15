@@ -526,7 +526,8 @@ Defaults:
 
 - `allowed_write_roots = [".", "/tmp/halter"]`
 - `allowed_read_roots = []` — runtime read roots then start from
-  `[ ".", $TMPDIR | "/tmp" ]`. A non-empty list replaces those built-ins.
+  `[".", <system temp dir>]` (`$TMPDIR` or `/tmp` on Unix, `%TEMP%` on
+  Windows). A non-empty list replaces those built-ins.
   Either way the runtime also reads under every configured
   `allowed_write_roots` entry
 - `sensitive_path_patterns` unset — the runtime denies the built-in globs

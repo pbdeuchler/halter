@@ -236,14 +236,6 @@ mod platform {
             result != 0
         }
     }
-
-    pub const fn process_group_id(_pid: i32) -> Option<i32> {
-        None
-    }
-
-    pub const fn kill_process_group(_pgid: i32, _signal: i32) -> bool {
-        false
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -279,14 +271,16 @@ pub(crate) fn signal_process(pid: i32, signal: i32) -> bool {
     platform::kill_pid(pid, signal)
 }
 
+#[cfg(unix)]
 #[cfg_attr(not(feature = "pty"), allow(dead_code))]
-/// Return the process group id for a pid when the platform supports it.
+/// Return the process group id for a pid. Unix only.
 pub fn process_group_id(pid: i32) -> Option<i32> {
     platform::process_group_id(pid)
 }
 
+#[cfg(unix)]
 #[cfg_attr(not(feature = "pty"), allow(dead_code))]
-/// Send a signal to a process group when the platform supports it.
+/// Send a signal to a process group. Unix only.
 pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
     platform::kill_process_group(pgid, signal)
 }

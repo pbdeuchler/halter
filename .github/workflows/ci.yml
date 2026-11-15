@@ -66,10 +66,9 @@ jobs:
       - run: cargo test --workspace --all-features --doc
         timeout-minutes: 10
 
-  # Compiles the `#[cfg(windows)]` branches natively and runs the process
-  # tools' tests: shell detection (Git Bash on the runner), PowerShell
-  # `-EncodedCommand`, and background/pty cleanup. The rest of halter-tools is
-  # not yet Windows-clean (e.g. default `/tmp` policy roots), so it is filtered.
+  # Compiles the `#[cfg(windows)]` branches natively and runs the halter-tools
+  # suite, including shell detection (Git Bash on the runner), PowerShell
+  # `-EncodedCommand`, and background/pty cleanup.
   windows:
     runs-on: windows-latest
     steps:
@@ -80,7 +79,7 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo check --workspace --all-features --all-targets
-      - run: cargo nextest run -p halter-tools --all-features --no-fail-fast -E 'test(/^builtin::(shell|background|pty)::/)'
+      - run: cargo nextest run -p halter-tools --all-features --no-fail-fast
         timeout-minutes: 20
 
   # Kani proofs for small pure cores (token ledger arithmetic, UTF-8

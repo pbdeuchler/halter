@@ -145,7 +145,7 @@ This struct defines the default policy envelope.
 Defaults:
 
 - `allowed_write_roots = [".", "/tmp/halter"]`
-- `allowed_read_roots = [".", $TMPDIR | "/tmp"]`
+- `allowed_read_roots = [".", std::env::temp_dir()]` (`$TMPDIR` or `/tmp` on Unix, `%TEMP%` on Windows)
 - `sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.secrets", "/etc/shadow", "/etc/shadow.*"]`
 - `max_read_bytes = 1_048_576`
 - shell enabled = `true` (the only shell restriction; there is no command allowlist)
