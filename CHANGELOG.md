@@ -8,6 +8,23 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-14
+
+Tools now return typed output: a structured value for hosts and separate text
+for the model, with a per-result budget on that text. The release also adds
+opt-in `tracing` and OpenTelemetry support and fixes long replies failing on
+their delta count. `ToolResult` gains a variant, `ToolsConfig` and
+`RuntimeServices` gain fields, the transcript no longer holds a tool's
+structured value, and the MSRV moves to 1.89, requiring a minor release on
+the pre-1.0 line.
+
+Published crates: `halter-protocol`, `halter-hooks`, `halter-config`,
+`halter-providers`, `halter-session`, `halter-tools`, `halter-runtime`, and
+`halter` at `0.10.0`. `halter-cli` also moves to `0.10.0` but remains
+`publish = false`. `halter-brush-core` stays at `0.6.0` and
+`halter-brush-builtins` at `0.3.0`: the only vendored change is a lint entry
+in `halter-brush-core`'s manifest, which does not affect the built crate.
+
 ### Added
 
 - `telemetry` feature on the `halter` crate with `halter::telemetry`, an
@@ -180,6 +197,31 @@ once a `1.0.0` line is cut.
   parent shutdown waiting on the close, hung indefinitely (runtime shutdown
   with a deadline timed out too). Lease release now runs to completion in
   its own task.
+
+### Upgrading from 0.9
+
+- Build with Rust 1.89 or later.
+- Exhaustive matches on `ToolResult` need a `Rendered { value, model_text,
+  elision }` arm. To get the text the model reads, call
+  `ToolResult::to_model_string()`; for the structured value, call
+  `structured()`.
+- Every in-tree tool now returns `Rendered`, so code that matched
+  `ToolResult::Json { value }` on a built-in tool's result stops matching.
+  `structured()` returns the same JSON shape as before.
+- Read a tool's structured value from the `ToolExecutionCompleted` event. The
+  transcript `ToolResultMessage` now holds only the model text.
+- `ToolsConfig` literals need `max_output_bytes` and `output_dir`, and
+  `RuntimeServices` literals need `tool_output`, or `..Default::default()`.
+- Tool results over 51,200 bytes of model text are now cut, with the full
+  output written to a file. Set `[tools] max_output_bytes = 0` to keep the
+  previous unbounded behavior.
+- Hooks that inspect `tool_response` see `kind = "rendered"` for built-in
+  tools instead of `"json"`.
+- A custom tool keeps working unchanged. To give it separate model text,
+  implement `TypedTool` with an `Output: ToolOutput` instead of `Tool`.
+- With `browser-tools`, drop `PLAYWRIGHT_DRIVER_VERSION` from the build
+  environment; `playwright-rs` 0.20.1 bundles its driver.
+- Requires `tokio` 1.54 or later.
 
 ## [0.9.0] - 2026-10-01
 
