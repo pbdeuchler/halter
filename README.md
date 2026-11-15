@@ -601,7 +601,7 @@ compaction = "model_summary"
 # custom durable store should set notes_root.
 
 [policy]
-allowed_write_roots = ["./", "/tmp/halter"]
+allowed_write_roots = ["./"]
 # Optional. Empty keeps the built-in read roots (working directory + temp
 # directory); an explicit list replaces them. Write roots stay readable either way.
 # allowed_read_roots = ["/srv/checkouts"]

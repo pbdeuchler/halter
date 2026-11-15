@@ -1404,8 +1404,10 @@ impl Default for PolicyConfig {
     }
 }
 
+/// `.` and `<temp dir>/halter`; mirrors `halter_tools::default_write_root`,
+/// which also creates the scratch root on first use.
 fn default_write_roots() -> Vec<PathBuf> {
-    vec![PathBuf::from("."), PathBuf::from("/tmp/halter")]
+    vec![PathBuf::from("."), std::env::temp_dir().join("halter")]
 }
 
 const fn default_max_read_bytes() -> usize {

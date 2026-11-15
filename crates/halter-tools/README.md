@@ -144,7 +144,9 @@ This struct defines the default policy envelope.
 
 Defaults:
 
-- `allowed_write_roots = [".", "/tmp/halter"]`
+- `allowed_write_roots = [".", <temp dir>/halter]` (`std::env::temp_dir()`; the
+  scratch root is created on first use, while any other configured root that
+  does not exist is an error)
 - `allowed_read_roots = [".", std::env::temp_dir()]` (`$TMPDIR` or `/tmp` on Unix, `%TEMP%` on Windows)
 - `sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.secrets", "/etc/shadow", "/etc/shadow.*"]`
 - `max_read_bytes = 1_048_576`
@@ -901,7 +903,7 @@ enabled = [
 ]
 
 [policy]
-allowed_write_roots = ["./", "/tmp/halter"]
+allowed_write_roots = ["./"]
 max_read_bytes = 1048576
 max_subagent_depth = 3
 max_concurrent_subagents = 8
