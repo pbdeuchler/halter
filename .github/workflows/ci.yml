@@ -80,7 +80,7 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo check --workspace --all-features --all-targets
-      - run: cargo nextest run -p halter-tools --all-features --no-fail-fast -E 'test(/^builtin::(shell|background|pty)::/)'
+      - run: cargo nextest run -p halter-tools --all-features --no-fail-fast
         timeout-minutes: 20
 
   # Kani proofs for small pure cores (token ledger arithmetic, UTF-8
