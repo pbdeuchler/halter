@@ -15,7 +15,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::CanonicalPath;
-use crate::builtin::process::{kill_process_group, list_descendants, signal_process};
+#[cfg(unix)]
+use crate::builtin::process::kill_process_group;
+use crate::builtin::process::{list_descendants, signal_process};
 
 const TERM_GRACE: Duration = Duration::from_millis(500);
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -38,6 +40,7 @@ pub(super) struct BackgroundJob {
 
 struct OwnedProcessIds {
     pid: Option<u32>,
+    #[cfg(unix)]
     group: u32,
 }
 
@@ -248,6 +251,7 @@ impl BackgroundJob {
         let (status_tx, status) = watch::channel(JobStatus::Running);
         let owned_process = Arc::new(Mutex::new(Some(OwnedProcessIds {
             pid: Some(pid),
+            #[cfg(unix)]
             group: pid,
         })));
         let ownership = OwnedProcessGuard(owned_process.clone());

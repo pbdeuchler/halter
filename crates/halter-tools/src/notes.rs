@@ -164,6 +164,7 @@ impl FsNotes {
     fn execute_sync(&self, session: &SessionId, request: NotesRequest) -> anyhow::Result<Value> {
         let dir = self.root.join(hash(&session.0));
         let _guard = self.locks.acquire_write(&dir)?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut directory = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

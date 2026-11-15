@@ -18,8 +18,11 @@ use super::common::{
     ToolScope, ensure_not_cancelled, optional_string, optional_u64, parse_env_map, required_string,
     resolve_path,
 };
-use super::process::{kill_process_group, kill_tree, process_group_id};
+use super::process::kill_tree;
+#[cfg(unix)]
+use super::process::{kill_process_group, process_group_id};
 
+#[cfg(unix)]
 const TERM_SIGNAL: i32 = 15;
 const KILL_SIGNAL: i32 = 9;
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -81,6 +84,7 @@ struct PtyTerminationState {
 
 struct PtyChildKiller {
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    #[cfg(unix)]
     process_group: Option<i32>,
 }
 
@@ -418,10 +422,12 @@ fn prepare_pty(
     let writer = pair.master.take_writer()?;
     let child = pair.slave.spawn_command(command)?;
     let child_pid = child.process_id().map(|pid| pid as i32);
+    #[cfg(unix)]
     let process_group = child_pid.and_then(process_group_id);
     let mut control = termination.lock();
     control.killer = Some(PtyChildKiller {
         killer: Some(child.clone_killer()),
+        #[cfg(unix)]
         process_group,
     });
     let stopped = control.stopped || lifetime.is_cancelled();

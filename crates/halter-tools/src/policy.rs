@@ -80,13 +80,7 @@ impl Default for PolicySettings {
 }
 
 fn default_read_roots() -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from(".")];
-    if let Some(tmp) = std::env::var_os("TMPDIR") {
-        roots.push(PathBuf::from(tmp));
-    } else {
-        roots.push(PathBuf::from("/tmp"));
-    }
-    roots
+    vec![PathBuf::from("."), std::env::temp_dir()]
 }
 
 fn default_sensitive_patterns() -> Vec<String> {

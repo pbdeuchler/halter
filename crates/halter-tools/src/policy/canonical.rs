@@ -178,14 +178,9 @@ fn write_leaf_atomic(path: &CanonicalPath, bytes: &[u8]) -> Result<(), PolicyErr
 fn write_leaf_atomic(path: &CanonicalPath, bytes: &[u8]) -> Result<(), PolicyError> {
     use std::io::Write;
 
-    let parent = path
-        .path
-        .parent()
-        .ok_or_else(|| PolicyError::ParentTraversal {
-            attempted: path.path.clone(),
-        })?;
+    let parent = &path.parent_dir;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| PolicyError::io(parent.to_path_buf(), error))?;
+        .map_err(|error| PolicyError::io(parent.clone(), error))?;
     temp.write_all(bytes)
         .and_then(|()| temp.flush())
         .map_err(|error| PolicyError::io(path.path.clone(), error))?;

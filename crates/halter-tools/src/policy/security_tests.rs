@@ -30,6 +30,10 @@ async fn ac1_13_capability_surface_compile_fence(p: &dyn ToolPolicy) {
     let _ = p.check_subagent_spawn_typed(0, 0).await;
 }
 
+// Denied by the default `**/.ssh/**` glob on every platform. `/etc/shadow`
+// is not: Windows resolves it under the current drive (`D:/etc/shadow`).
+const SENSITIVE_PATH: &str = "/home/user/.ssh/id_rsa";
+
 fn tmp_policy(root: &std::path::Path) -> DefaultToolPolicy {
     DefaultToolPolicy::new(PolicySettings {
         allowed_read_roots: vec![root.to_path_buf()],
@@ -58,7 +62,9 @@ async fn ac1_1_read_under_allowed_root_succeeds() {
 
 // ------------- AC1.2: /etc/shadow (sensitive path glob) rejected
 
+// Unix-only: `/etc/shadow` is a Unix path.
 #[tokio::test]
+#[cfg(unix)]
 async fn ac1_2_reads_of_etc_shadow_are_rejected() {
     let dir = TempDir::new().expect("tempdir");
     let policy = tmp_policy(dir.path());
@@ -118,7 +124,9 @@ async fn ac1_4_secrets_file_reads_are_rejected() {
 
 // ------------- AC1.5: symlink escape on write path rejected
 
+// Unix-only: creating a symlink on Windows needs elevated privileges.
 #[tokio::test]
+#[cfg(unix)]
 async fn ac1_5_symlink_suffix_escape_is_rejected() {
     let base = TempDir::new().expect("base tempdir");
     let outside = TempDir::new().expect("outside tempdir");
@@ -129,13 +137,7 @@ async fn ac1_5_symlink_suffix_escape_is_rejected() {
     let inside = base.path().join("allowed");
     std::fs::create_dir(&inside).unwrap();
     let link = inside.join("escape");
-    #[cfg(unix)]
     std::os::unix::fs::symlink(outside.path(), &link).unwrap();
-    #[cfg(not(unix))]
-    {
-        // Windows symlink creation requires privileges; skip on non-unix.
-        return;
-    }
 
     let policy = DefaultToolPolicy::new(PolicySettings {
         allowed_write_roots: vec![base.path().to_path_buf()],
@@ -402,10 +404,10 @@ fn h33_check_write_path_blocking_rejects_sensitive_path() {
     let dir = TempDir::new().expect("tempdir");
     let policy = tmp_policy(dir.path());
 
-    // `/etc/shadow` is rejected by the sensitive-path glob before any I/O —
+    // A sensitive path is rejected by the glob before any I/O —
     // the sync mirror must reject it for the same reason.
     let err = policy
-        .check_write_path_blocking(std::path::Path::new("/etc/shadow"))
+        .check_write_path_blocking(std::path::Path::new(SENSITIVE_PATH))
         .expect_err("sensitive path must be denied by sync mirror");
     assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
 }
@@ -456,7 +458,8 @@ async fn ac1_14_nonexistent_read_root_is_surfaced_not_silently_dropped() {
         .expect_err("nonexistent root must surface an error");
     match err {
         PolicyError::NonexistentRoot { root } => {
-            assert_eq!(root, ghost);
+            // Windows qualifies a rooted path with the current drive.
+            assert_eq!(root, std::path::absolute(&ghost).unwrap());
         }
         other => panic!("expected NonexistentRoot, got {other:?}"),
     }
@@ -468,7 +471,7 @@ async fn ac1_14_nonexistent_read_root_is_surfaced_not_silently_dropped() {
 async fn default_policy_compiles_lazily() {
     let policy = DefaultToolPolicy::new(PolicySettings::default());
     let err = policy
-        .check_read_path(std::path::Path::new("/etc/shadow"), 16)
+        .check_read_path(std::path::Path::new(SENSITIVE_PATH), 16)
         .await
         .expect_err("shadow read before initialization must be denied");
     assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
@@ -568,20 +571,20 @@ async fn clone_preserves_cache_semantics() {
     // Clone before initialization; each instance lazily compiles independently.
     let cloned_uninit = policy.clone();
     let err = cloned_uninit
-        .check_read_path(std::path::Path::new("/etc/shadow"), 16)
+        .check_read_path(std::path::Path::new(SENSITIVE_PATH), 16)
         .await
         .expect_err("clone before init must still deny sensitive path");
     assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
 
     // Force initialization of the original policy.
     let _ = policy
-        .check_read_path(std::path::Path::new("/etc/shadow"), 16)
+        .check_read_path(std::path::Path::new(SENSITIVE_PATH), 16)
         .await;
 
     // Cloning an initialized policy copies the compiled glob set.
     let cloned_init = policy.clone();
     let err = cloned_init
-        .check_read_path(std::path::Path::new("/etc/shadow"), 16)
+        .check_read_path(std::path::Path::new(SENSITIVE_PATH), 16)
         .await
         .expect_err("clone after init must deny sensitive path");
     assert!(matches!(err, PolicyError::SensitivePathDenied { .. }));
@@ -597,7 +600,7 @@ async fn concurrent_sensitive_checks_are_safe() {
     for _ in 0..8 {
         let p = Arc::clone(&policy);
         handles.push(tokio::spawn(async move {
-            p.check_read_path(std::path::Path::new("/etc/shadow"), 16)
+            p.check_read_path(std::path::Path::new(SENSITIVE_PATH), 16)
                 .await
         }));
     }
