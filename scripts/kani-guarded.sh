@@ -45,7 +45,9 @@ start=$(date +%s)
 peak_mb=0
 while kill -0 "$kani_pid" 2>/dev/null; do
   pids="$(tree_pids "$kani_pid" | tr ' ' ',')"
-  rss_kb=$(ps -o rss= -p "$pids" 2>/dev/null | awk '{s += $1} END {print s + 0}')
+  # ps exits non-zero once every pid in the tree is gone (kani exited after
+  # `kill -0`); awk still prints 0, and the next `kill -0` ends the loop.
+  rss_kb=$(ps -o rss= -p "$pids" 2>/dev/null | awk '{s += $1} END {print s + 0}') || true
   rss_mb=$((rss_kb / 1024))
   ((rss_mb > peak_mb)) && peak_mb=$rss_mb
   if ((rss_mb > max_rss_mb)); then
