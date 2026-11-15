@@ -96,7 +96,7 @@ roots = ["./.agent/plugins"]
 enabled = ["read", "glob", "grep", "write", "edit", "shell", "task"]
 
 [policy]
-allowed_write_roots = ["./", "/tmp/halter"]
+allowed_write_roots = ["./"]
 max_read_bytes = 1048576
 max_subagent_depth = 3
 max_concurrent_subagents = 8

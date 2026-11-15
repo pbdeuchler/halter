@@ -506,7 +506,7 @@ Example:
 
 ```toml
 [policy]
-allowed_write_roots = ["./", "/tmp/halter"]
+allowed_write_roots = ["./"]
 allowed_read_roots = []       # empty keeps the built-in read roots
 max_read_bytes = 1048576
 max_subagent_depth = 3
@@ -524,7 +524,9 @@ allowed_hosts = []
 
 Defaults:
 
-- `allowed_write_roots = [".", "/tmp/halter"]`
+- `allowed_write_roots = [".", <temp dir>/halter]` (`std::env::temp_dir()`; the
+  scratch root is created on first use, while any other configured root that
+  does not exist is an error)
 - `allowed_read_roots = []` — runtime read roots then start from
   `[".", <system temp dir>]` (`$TMPDIR` or `/tmp` on Unix, `%TEMP%` on
   Windows). A non-empty list replaces those built-ins.
@@ -808,7 +810,7 @@ enabled = [
 ]
 
 [policy]
-allowed_write_roots = ["./", "/tmp/halter"]
+allowed_write_roots = ["./"]
 max_read_bytes = 1048576
 max_subagent_depth = 3
 max_concurrent_subagents = 8
