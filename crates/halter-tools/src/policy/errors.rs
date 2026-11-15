@@ -34,12 +34,6 @@ pub enum PolicyError {
     #[error("shell usage is disabled by policy")]
     ShellDisabled,
 
-    #[error("shell command rejected: {reason} (fragment: {fragment:?})")]
-    ShellCommandRejected {
-        reason: &'static str,
-        fragment: String,
-    },
-
     #[error("network request denied for '{url}' (rule: {rule})")]
     NetworkDenied { url: String, rule: &'static str },
 

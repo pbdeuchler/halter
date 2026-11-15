@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -199,37 +199,12 @@ impl BackgroundJob {
         activity: watch::Sender<()>,
     ) -> anyhow::Result<Arc<Self>> {
         let cwd_path = cwd.path().to_owned();
-        let mut process = shell_command(&command)?;
-        process.current_dir(&cwd_path).env_clear();
-        // Deliberately inherit only shell essentials, never service tokens or
-        // startup-hook variables. Explicit environment entries are caller-owned.
-        for key in [
-            "PATH",
-            "HOME",
-            "USER",
-            "LOGNAME",
-            "TERM",
-            "LANG",
-            "LC_ALL",
-            "LC_CTYPE",
-            "TZ",
-            "SystemRoot",
-            "WINDIR",
-            "ComSpec",
-            "PATHEXT",
-        ] {
-            if let Some(value) = std::env::var_os(key) {
-                process.env(key, value);
-            }
-        }
+        let mut process = crate::builtin::shell::shell_command(&command);
+        process.current_dir(&cwd_path);
         if let Some(env) = env {
             process.envs(env);
         }
-        process
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        process.stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -240,7 +215,6 @@ impl BackgroundJob {
                 directory.metadata()?.is_dir(),
                 "failed to spawn background job: cwd is not a directory"
             );
-            process.process_group(0);
             // SAFETY: fchdir is async-signal-safe. The owned fd lives in the
             // closure through spawn and no allocation/locking occurs here.
             unsafe {
@@ -421,22 +395,6 @@ impl Drop for BackgroundJob {
     }
 }
 
-#[cfg(unix)]
-fn shell_command(command: &str) -> anyhow::Result<Command> {
-    let mut process = Command::new("/bin/sh");
-    process.args(["-c", command]);
-    Ok(process)
-}
-
-#[cfg(not(unix))]
-fn shell_command(_command: &str) -> anyhow::Result<Command> {
-    // Policy parses shell commands as Bash. cmd.exe uses different quoting
-    // rules, so executing the same string there would bypass authorization.
-    anyhow::bail!(
-        "background spawn is unsupported on this platform: shell command policy requires a Unix shell"
-    )
-}
-
 async fn capture(
     mut reader: impl AsyncRead + Unpin,
     output: Arc<Mutex<OutputBuffer>>,
@@ -601,15 +559,5 @@ mod ownership_tests {
         let error = job.wait().await.unwrap_err();
         assert!(error.to_string().contains("without recording completion"));
         assert!(settled.load(Ordering::Acquire));
-    }
-}
-
-#[cfg(all(test, not(unix)))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spawn_rejects_shells_with_unvalidated_command_grammar() {
-        assert!(shell_command("echo 'safe & del sensitive.txt & echo tail'").is_err());
     }
 }

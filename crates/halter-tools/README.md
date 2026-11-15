@@ -33,7 +33,7 @@ It determines:
 - which tools are available
 - which arguments they accept
 - policy errors and limits
-- shell allowlisting behavior
+- which shell commands run in, and how
 - how subagents are spawned and managed
 
 For many users, this crate is the practical heart of the system.
@@ -148,12 +148,7 @@ Defaults:
 - `allowed_read_roots = [".", $TMPDIR | "/tmp"]`
 - `sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.secrets", "/etc/shadow", "/etc/shadow.*"]`
 - `max_read_bytes = 1_048_576`
-- shell enabled = `true`
-- `shell_mode = Strict` (rejects `eval`, `exec`, `source`, `.`, and function definitions at the AST level)
-- shell allowlist = `git`, `cargo`, `rg`, `ls`, `find`, `true`, `cd`. A single
-  `*` entry short-circuits to allow — like `allowed_hosts`, it leaves
-  `shell_mode` as the only shell restriction — and an empty list denies every
-  external command
+- shell enabled = `true` (the only shell restriction; there is no command allowlist)
 - shell timeout = `30`
 - network enabled = `false`
 - `allowed_loopback = []` (loopback addresses require an explicit entry to be reached)
@@ -177,8 +172,8 @@ without changing the observable error surface.
 
 `ToolPolicy` exposes a capability-oriented surface
 (`check_read_path`, `check_write_path`, `check_process_signal`,
-`check_shell_enabled`, `check_shell_command_strict`, `check_network`,
-`check_subagent_spawn_typed`, `shell_mode`) that returns `PolicyError`
+`check_shell_enabled`, `check_network`, `check_subagent_spawn_typed`)
+that returns `PolicyError`
 and binds resolved paths to a parent-directory fd via `CanonicalPath`.
 Name-based bypass methods (`check_shell("shell")`,
 `check_shell("process")`) and the older string-error surface have been
@@ -197,7 +192,6 @@ That separation is essential.
 You will commonly see errors like:
 
 - `failed to execute shell tool: shell usage is disabled by policy`
-- `failed to execute shell tool: program '{}' is not in the allowlist`
 - `failed to execute write tool: path '{}' is outside allowed_write_roots`
 - `failed to execute spawn_agent tool: subagent depth {} exceeds max_subagent_depth {}`
 - `failed to execute spawn_agent tool: active subagents {} exceed max_concurrent_subagents {}`
@@ -350,36 +344,45 @@ This is one of the most valuable tools for real repository work.
 
 ## `shell`
 
-Runs a command in a persistent shell session.
+Runs one command in a fresh, non-interactive shell, the way Codex and pi do.
 
 Typical input:
 
 ```json
 {
   "command": "cargo test -p halter-tools",
-  "cwd": "/workspace/halter",
+  "cwd": "crates/halter-tools",
+  "env": { "RUST_LOG": "debug" },
   "timeout_ms": 30000
 }
 ```
 
-Optional fields can include environment variables, depending on the calling integration.
-
 ### Important semantics
 
-- persistent shell session, not one isolated process per call
-- gated by `policy.shell.enabled`
-- executable must be on the allowlist
-- command runtime constrained by timeout policy
-
-### Common allowlist surprise
-
-If the model tries to use a program not on the allowlist, you'll get:
-
-> `failed to execute shell tool: program '{}' is not in the allowlist`
-
-### CLI-user advice
-
-If your workflow needs `python`, `just`, `make`, `npm`, `docker`, or `sort`, add them explicitly to the shell allowlist.
+- The shell is detected once per process. `$SHELL` is used when it names an
+  existing bash, zsh, or POSIX sh (`sh`, `dash`, `ash`, `ksh`, `mksh`, `yash`).
+  Otherwise the first of `bash`, `zsh`, `sh` on `PATH` is used, then `/bin/sh`.
+  On Windows the order is `bash` (Git Bash, never the System32 WSL launcher),
+  `pwsh`, then `powershell`.
+- The tool description names the detected shell and its version, and adds
+  notes the model needs for it: zsh glob/word-splitting behaviour, missing
+  features in bash older than 4 or plain POSIX sh, PowerShell syntax, BSD
+  userland on macOS, and Git Bash paths on Windows.
+- Every call is a new `<shell> -c <command>` (`-EncodedCommand` for
+  PowerShell). `cd`, `export`, and shell variables don't carry over; pass `cwd`
+  and `env` instead.
+- The environment is scrubbed to an allowlist of variable names (`PATH`,
+  `HOME`, locale, temp dirs, and Windows essentials), plus `env`, so
+  credentials in the agent's environment don't reach commands.
+- The command runs in its own process group. When it exits, times out, is
+  cancelled, or the session stops, the whole group gets TERM, a 500 ms grace
+  period, then KILL. Children started with `&` therefore don't outlive the
+  call; use `background` for long-running processes.
+- Output is stdout and stderr, streamed as `ToolOutput` events and capped at
+  1 MiB each. A timeout or cancellation returns the output so far.
+- Gated by `policy.shell.enabled`; runtime defaults to `policy.shell.timeout_secs`.
+- There is no command allowlist. Approval hooks and `policy.shell.enabled` are
+  the controls.
 
 ---
 
@@ -396,11 +399,11 @@ such as a development server. It has five actions:
 | `kill` | `id` | Final status after termination and child reaping |
 | `prune` | — | Removes finished job records and output; preserves running jobs |
 
-Jobs use independent shells. `cwd` defaults to the session working directory;
-relative paths resolve against it. Persistent shell variables and functions
-aren't inherited. Spawning applies the shell command policy and authorizes the
-working directory through the read policy. The environment contains shell
-essentials plus explicit overrides.
+Jobs run in the same detected shell as `shell`, each started fresh. `cwd`
+defaults to the session working directory; relative paths resolve against it.
+Spawning requires `policy.shell.enabled` and authorizes the working directory
+through the read policy. The environment is the same scrubbed set as `shell`
+plus explicit overrides.
 
 Each job retains the latest 64 KiB of output. `next_cursor` counts all bytes
 produced, including discarded bytes; `truncated` indicates that the requested
@@ -409,8 +412,7 @@ retains running and completed job records until shutdown or explicit pruning.
 
 Session shutdown terminates jobs and awaits their monitors. Unix jobs receive
 TERM, a 500 ms grace period, then KILL for the owned process group and currently
-discoverable descendants. Background spawn is currently Unix-only: Windows
-needs command authorization matching its shell grammar before it can be enabled. Commands
+discoverable descendants. On Windows only the job's own process is killed. Commands
 that deliberately escape process-group and ancestry ownership aren't supported.
 Output and live process ownership are process-local: resume doesn't relaunch
 jobs or use saved PIDs to signal processes.
@@ -459,6 +461,9 @@ Actions:
 - `kill`
 
 Use this for interactive terminal workflows where a plain shell command is not enough.
+
+The command runs under the same detected shell, non-login `-c` invocation, and
+scrubbed environment as `shell`, inside a pseudo-terminal.
 
 Examples:
 
@@ -840,7 +845,7 @@ Typical sequence:
 
 ## Security and operational guidance
 
-- Keep shell allowlists tight.
+- Gate `shell` with an approval hook, or disable it, where commands need review.
 - Keep write roots narrow.
 - Prefer `edit` over broad `write` when patching existing files.
 - Limit subagent depth and concurrency deliberately.
@@ -854,7 +859,7 @@ Hooks are the event-driven overlay.
 Use policy for:
 
 - filesystem scope
-- shell program allowlisting
+- whether shell is available at all
 - output/read limits
 - subagent ceilings
 
@@ -883,7 +888,6 @@ max_concurrent_subagents = 2
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "true", "cd"]
 timeout_secs = 20
 ```
 
@@ -904,7 +908,6 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "true", "cd", "python", "echo"]
 timeout_secs = 30
 ```
 
@@ -916,13 +919,10 @@ timeout_secs = 30
 
 If `pty` is not compiled in, listing it under `tools.enabled` is not enough.
 
-### Allowlisting too little for real workflows
+### Treating `shell` as sandboxed
 
-A shell allowlist of only `git` and `ls` will frustrate most coding flows.
-
-### Allowlisting too much without review
-
-Adding `rm`, `sudo`, `docker`, or arbitrary network tools changes your risk posture significantly.
+`shell` runs any command the agent's user can run. Filesystem and network
+policy don't apply to what the command itself does.
 
 ### Using `write` when `edit` would be safer
 
@@ -948,7 +948,6 @@ If you `spawn_agent` repeatedly and never `wait_agent`, you can exhaust concurre
 ## Recommendations for CLI users
 
 - Be explicit about files, directories, and commands you want the agent to inspect.
-- Tune your shell allowlist to your actual stack.
 - Prefer repo-local `allowed_write_roots` whenever possible.
 - Use subagents for parallelizable, narrow tasks.
 - If a tool call fails, read the policy error literally; it usually tells you exactly what to fix.

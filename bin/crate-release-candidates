@@ -49,8 +49,6 @@ done
 
 # Publish order is dependency order. halter-cli is intentionally omitted.
 crates=(
-  "halter-brush-core|vendor/brush-core-vendored/Cargo.toml"
-  "halter-brush-builtins|vendor/brush-builtins-vendored/Cargo.toml"
   "halter-protocol|crates/halter-protocol/Cargo.toml"
   "halter-hooks|crates/halter-hooks/Cargo.toml"
   "halter-config|crates/halter-config/Cargo.toml"

@@ -378,7 +378,7 @@ Config value hierarchy:
 
 1. Built-in defaults.
 2. Layered config files, when using `load_layered`: user config, then project config, then the explicit config path. Later files replace earlier values, except skill and plugin root arrays append and dedupe.
-3. Supported `HALTER_*` environment overrides, such as `HALTER_TOOLS_ENABLED` or `HALTER_POLICY_SHELL_ALLOW`. These are applied after file loading, so they win over file values.
+3. Supported `HALTER_*` environment overrides, such as `HALTER_TOOLS_ENABLED` or `HALTER_POLICY_SHELL_ENABLED`. These are applied after file loading, so they win over file values.
 
 Provider credential hierarchy:
 
@@ -484,7 +484,7 @@ Plugins are discovered one level below each plugin root. Each child directory is
 
 The manifest must include non-empty string fields `name` and `version`. Optional manifest fields include `skills`, `agents`, `hooks`, `mcpServers`, `lspServers`, `allowedHttpHosts`, and `allowedEnvVars`. `skills` and `agents` may be a string path or an array of string paths. Skill and agent entries must be paths relative to the plugin root and must start with `./`, unless they use a plugin alias. Supported aliases are `${CLAUDE_PLUGIN_ROOT}`, `${PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, and `${PLUGIN_DATA}`. `${PLUGIN_ROOT}` resolves to the enclosing plugin root (or the skill's own root for standalone skills), and `${PLUGIN_DATA}` resolves to `<root>/.data`. These aliases are also rendered inside skill (`SKILL.md`) bodies and agent prompt files at load time. Parent-directory traversal is rejected, and resolved paths must stay inside the plugin root.
 
-Plugin `skills` entries can point at a single skill directory containing `SKILL.md` or at a directory tree that should be searched recursively for skills. Plugin `agents` entries can point at one prompt file or a directory of prompt files; each file becomes an agent named after its file stem. Hooks are loaded from the manifest's `hooks` path, or from `hooks/hooks.json` when the manifest omits `hooks`. Hook parse failures are retained as hook warnings instead of aborting the whole resource compile.
+Plugin `skills` entries can point at a single skill directory containing `SKILL.md` or at a directory tree that should be searched recursively for skills. Plugin `agents` entries can point at one prompt file or a directory of prompt files; each file becomes an agent named after its file stem. Hooks are loaded from the manifest's `hooks` path, or from `hooks/hooks.json` when the manifest omits `hooks`. Hook parse failures are retained as hook warnings instead of aborting the whole resource compile. Command hooks with `"shell": "bash"` (the default) run in the same detected shell as the `shell` tool, as a login shell (`-lc`) when that is bash or zsh so profile `PATH` setup applies, and with `-c` for plain sh. `"shell": "pwsh"` runs `pwsh -Command`. Unlike the `shell` tool, command hooks inherit the **full environment** of the halter process, credentials included, plus hook variables such as `PLUGIN_ROOT` and `SESSION_ID`; see `crates/halter-hooks/README.md`.
 
 Compiled resources use stable identifiers. Skill ids are based on the canonical skill path, plugin ids are based on plugin name, version, and canonical plugin path, and the final resource snapshot revision is a SHA-256 of the serialised snapshot plus hook file revisions, so any change to a stored field yields a new revision. Session stores key persisted snapshots by that revision. Skill bodies and agent prompts are rendered before hashing, so changing an alias expansion (e.g., loading the same plugin through a different absolute root) produces a different snapshot revision.
 
@@ -618,10 +618,6 @@ allowed_hosts = []
 
 [policy.shell]
 enabled = true
-# `["*"]` allows every program; `[]` denies every external command.
-allow = ["git", "cargo", "rg", "ls", "find", "true", "cd", "python", "pwd", "cwd", "echo"]
-# "strict" (default) also rejects function definitions and eval/exec/source/.
-mode = "strict"
 timeout_secs = 30
 
 [sessions]
@@ -1001,7 +997,7 @@ Subagent tools include:
 
 This crate also enforces policy boundaries such as:
 
-- shell allowlisting
+- the shell on/off switch
 - write-root restrictions
 - network host and loopback restrictions
 - read/output size limits
@@ -1285,7 +1281,7 @@ Halter does its best to operate in a sane and safe way, but does not provide har
 Enforced mechanically, best effort, by tool policy:
 
 - where writes may occur
-- which shell programs may run through the shell parser and allowlist
+- whether the shell tool may run at all (there is no per-command allowlist)
 - which network hosts may be reached; loopback requires a separate allowlist
 - how much can be read or emitted
 - how many subagents may be active
@@ -1602,7 +1598,6 @@ The config crate supports a focused set of environment overrides, including:
 - `HALTER_POLICY_NETWORK_ENABLED`
 - `HALTER_SKILL_ROOTS`
 - `HALTER_PLUGIN_ROOTS`
-- `HALTER_POLICY_SHELL_ALLOW`
 - `HALTER_POLICY_ALLOWED_HOSTS`
 - `HALTER_TOOLS_ENABLED`
 
@@ -1620,8 +1615,8 @@ bin/release 0.9.0                            # releases the [Unreleased] section
 bin/release --title "Short name" 0.9.0 notes.md   # or a changelog file ("-" for stdin)
 ```
 
-The script moves every crate under `crates/` to the new version (vendored
-brush crates keep theirs) and writes the changelog into
+The script moves every crate under `crates/` to the new version and writes
+the changelog into
 `## [0.9.0] - <date>` in `CHANGELOG.md`. It runs `cargo check`, then shows
 you the diff and the release notes. Nothing is committed until you confirm.
 After you confirm, it commits `Bump crate versions for v0.9.0`, pushes `main`

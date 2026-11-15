@@ -8,6 +8,48 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** the `shell` tool no longer runs commands in an embedded brush
+  shell. Each call now starts a fresh `<shell> -c <command>` (Codex/pi style),
+  so `cd`, `export`, and shell variables don't carry over between calls. Pass
+  `cwd` and `env` instead.
+- The shell is detected once per process: `$SHELL` if it names bash, zsh, or a
+  POSIX sh, otherwise `bash`, `zsh`, then `sh` on `PATH`. On Windows the order
+  is Git Bash, `pwsh`, then `powershell`. The tool description names the
+  shell, its version, and notes for its dialect and the host OS (zsh globbing,
+  bash 3 and POSIX sh gaps, PowerShell syntax, BSD userland on macOS).
+- Each command runs in its own process group, which is terminated (TERM, a
+  500 ms grace period, then KILL) when the command exits, times out, is
+  cancelled, or the session stops. Children started with `&` no longer outlive
+  the call; use `background` for long-running processes. A timeout or
+  cancellation now returns the output captured so far.
+- `background` jobs run in the same detected shell instead of `/bin/sh`, and
+  spawning no longer requires Unix.
+- `pty` runs in the detected shell with the same scrubbed environment as
+  `shell`, instead of `/bin/sh` with its own variable list.
+- Command hooks with `shell = "bash"` use the detected shell. Bash and zsh
+  still run as login shells (`-lc`); a POSIX sh, including ksh, now runs with
+  `-c`. A `$SHELL` such as fish no longer drops hooks to `/bin/sh`: the
+  `PATH` fallback (bash, then zsh) is used.
+- The detected shell is public as `halter_tools::{detected_shell, Shell, ShellKind}`.
+- `env` entries with an empty key, `=` or NUL in the key, or NUL in the value
+  are rejected by `shell` and `background`.
+
+### Removed
+
+- **Breaking:** the shell command allowlist and strict mode. `policy.shell.allow`
+  and `policy.shell.mode` are gone from the config (and now fail as unknown
+  fields), along with the `HALTER_POLICY_SHELL_ALLOW` override.
+  `policy.shell.enabled` and `timeout_secs` remain.
+- **Breaking:** `ShellMode`, `PolicySettings::{shell_mode, allowed_shell_commands}`,
+  `ToolPolicy::{shell_mode, check_shell_command_strict}`,
+  `PolicyError::ShellCommandRejected`, `ShellModeConfig`, and
+  `ToolSessionStore::shell_session`. `ToolSessionStore::background_session` and
+  `BackgroundRegistry` are now public.
+- The vendored `halter-brush-core` and `halter-brush-builtins` crates and the
+  `vendor/` directory. They are no longer published.
+
 ## [0.10.0] - 2026-11-14
 
 Tools now return typed output: a structured value for hosts and separate text

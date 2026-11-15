@@ -23,6 +23,7 @@ pub use builtin::ProfilingTool;
 pub use builtin::PtyTool;
 pub use builtin::common::Report;
 pub use builtin::fs_lock::PathLockMap;
+pub use builtin::shell::detect::{Shell, ShellKind, detected as detected_shell};
 pub use builtin::{
     BackgroundTool, EditTool, GlobTool, GrepTool, InMemoryTaskStore, ProcessTool, ReadTool,
     ShellTool, Task, TaskList, TaskStatus, TaskStore, TaskSummary, TaskTool, WriteTool,
@@ -33,8 +34,7 @@ pub use notes::{
     RECOVERY_RESPONSE_BYTES, RECOVERY_RESULT_LIMIT, recovery_lines, recovery_preview,
 };
 pub use policy::{
-    CanonicalPath, DefaultToolPolicy, LoopbackAllow, Pid, PolicyError, PolicySettings, ShellMode,
-    ToolPolicy,
+    CanonicalPath, DefaultToolPolicy, LoopbackAllow, Pid, PolicyError, PolicySettings, ToolPolicy,
 };
 pub use runtime::{
     NoopSubagentControl, NoopToolEventSink, SubagentControl, SubagentParentContext, Tool,

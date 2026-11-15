@@ -160,10 +160,6 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-# `["*"]` allows every program; `[]` denies every external command.
-allow = ["git", "cargo", "rg", "ls", "find", "true", "cd"]
-# "strict" also rejects function definitions and eval/exec/source/.
-mode = "strict"
 timeout_secs = 30
 
 [policy.network]
@@ -295,11 +291,6 @@ fn env_override_specs() -> &'static [EnvOverrideSpec] {
             env_var: "HALTER_PLUGIN_ROOTS",
             path: &["resources", "plugins", "roots"],
             parse: parse_colon_list,
-        },
-        EnvOverrideSpec {
-            env_var: "HALTER_POLICY_SHELL_ALLOW",
-            path: &["policy", "shell", "allow"],
-            parse: parse_comma_list,
         },
         EnvOverrideSpec {
             env_var: "HALTER_POLICY_ALLOWED_HOSTS",
@@ -652,7 +643,7 @@ api_key = "openai-key"
             ("HALTER_SESSION_BACKEND", "memory"),
             ("HALTER_POLICY_SHELL_ENABLED", "false"),
             ("HALTER_SKILL_ROOTS", "./skills:./vendor/skills"),
-            ("HALTER_POLICY_SHELL_ALLOW", "git,just"),
+            ("HALTER_POLICY_ALLOWED_HOSTS", "example.com,api.example.com"),
             ("HALTER_TOOLS_ENABLED", "read,glob"),
         ]);
 
@@ -669,7 +660,10 @@ api_key = "openai-key"
             decoded.resources.skills.roots,
             vec![PathBuf::from("./skills"), PathBuf::from("./vendor/skills")]
         );
-        assert_eq!(decoded.policy.shell.allow, vec!["git", "just"]);
+        assert_eq!(
+            decoded.policy.network.allowed_hosts,
+            vec!["example.com", "api.example.com"]
+        );
         assert_eq!(decoded.tools.enabled, vec!["read", "glob"]);
     }
 
@@ -758,7 +752,7 @@ api_key = "test-key"
 roots = ["./user-skills"]
 
 [policy.shell]
-allow = ["git"]
+timeout_secs = 10
 "#,
         )
         .await
@@ -770,7 +764,7 @@ allow = ["git"]
 roots = ["./project-skills"]
 
 [policy.shell]
-allow = ["just"]
+timeout_secs = 20
 "#,
         )
         .await
@@ -791,7 +785,7 @@ allow = ["just"]
                 PathBuf::from("./project-skills")
             ]
         );
-        assert_eq!(loaded.policy.shell.allow, vec!["just"]);
+        assert_eq!(loaded.policy.shell.timeout_secs, 20);
     }
 
     #[test]

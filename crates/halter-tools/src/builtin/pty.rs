@@ -25,44 +25,6 @@ const KILL_SIGNAL: i32 = 9;
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
-// Minimum env vars passed through to spawned PTYs. Keeps the surface small
-// while preserving locale and shell ergonomics. Anything more should come
-// from explicit caller-supplied env in `PtyConfig::env`.
-const PTY_ENV_ALLOWLIST: &[&str] = &[
-    "PATH", "HOME", "USER", "LOGNAME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "PWD", "SHELL",
-];
-
-/// Args passed to `sh`. We use `-c` (not `-lc`) so the spawned shell does not
-/// source login rc files (e.g. `~/.bash_profile`, `/etc/profile`) which can
-/// run arbitrary user-controlled startup code that bypasses the policy.
-fn pty_shell_args() -> &'static [&'static str] {
-    &["-c"]
-}
-
-/// Build the env vector that will be set on the spawned PTY after a clear.
-/// Order: allowlisted parent vars first, then caller-supplied overrides.
-/// Takes the parent environment and caller-supplied overrides explicitly so
-/// tests never need to mutate process-wide environment variables.
-fn pty_scrubbed_env(
-    parent: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-    overrides: Option<&HashMap<String, String>>,
-) -> Vec<(String, std::ffi::OsString)> {
-    let mut out: Vec<(String, std::ffi::OsString)> = Vec::new();
-    for (key, value) in parent {
-        if let Some(key) = key.to_str()
-            && PTY_ENV_ALLOWLIST.contains(&key)
-        {
-            out.push((key.to_owned(), value));
-        }
-    }
-    if let Some(overrides) = overrides {
-        for (key, value) in overrides {
-            out.push((key.clone(), std::ffi::OsString::from(value)));
-        }
-    }
-    out
-}
-
 /// Reads a `u16` pty dimension from `input[key]`, falling back to `default`
 /// when unset. Rejects values that do not fit in `u16` instead of silently
 /// truncating via `as u16`. (finding L29)
@@ -198,11 +160,6 @@ impl TypedTool for PtyTool {
                     cols: checked_u16(&input, "cols", 120)?,
                     rows: checked_u16(&input, "rows", 40)?,
                 };
-                let mode = context.policy.shell_mode();
-                context
-                    .policy
-                    .check_shell_command_strict(&config.command, mode)
-                    .await?;
                 let cwd = config
                     .cwd
                     .as_deref()
@@ -438,19 +395,20 @@ fn prepare_pty(
         pixel_height: 0,
     })?;
 
-    #[cfg(unix)]
-    let mut command = CommandBuilder::new("/bin/sh");
-    #[cfg(not(unix))]
-    let mut command = CommandBuilder::new("sh");
-    for arg in pty_shell_args() {
-        command.arg(arg);
-    }
-    command.arg(&config.command);
+    let shell = super::shell::detect::detected();
+    let mut command = CommandBuilder::new(&shell.path);
+    command.args(shell.kind.argv(&config.command));
     if let Some(cwd) = config.cwd.as_ref() {
         command.cwd(cwd);
     }
     command.env_clear();
-    for (key, value) in pty_scrubbed_env(std::env::vars_os(), config.env.as_ref()) {
+    for (key, value) in super::shell::inherited_env().chain(
+        config
+            .env
+            .iter()
+            .flatten()
+            .map(|(key, value)| (key.into(), value.into())),
+    ) {
         command.env(key, value);
     }
 
@@ -771,11 +729,11 @@ fn terminate_pty_child(target: &mut PtyChildKiller) {
 
 // AC1.9 (PTY half): Adversarial pinning for the rc-file inheritance and env
 // scrubbing rules. See `docs/design-plans/2026-04-17-review-remediation-core.md`
-// §AC1.9 — `sh -lc` is rejected; the spawned shell uses `-c` only and runs
-// with a scrubbed env.
+// §AC1.9 — `sh -lc` is rejected. The PTY now spawns through the shared shell
+// launcher, so the `-c`-only and scrubbed-env pins live with it in
+// `shell::detect` and `shell` tests.
 #[cfg(test)]
 mod security_tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use serde_json::json;
@@ -1025,55 +983,11 @@ mod security_tests {
     }
 
     #[test]
-    fn ac1_9_pty_uses_dash_c_not_dash_lc() {
-        // Pinning: the shell args must never include `-l` (login shell, sources
-        // ~/.bash_profile, /etc/profile, ...). If this assertion fails, a
-        // contributor reintroduced rc-file inheritance — a well-known bypass.
-        let args = pty_shell_args();
-        assert_eq!(args, &["-c"], "PTY shell args must be `-c`, got {args:?}");
-        assert!(
-            !args.iter().any(|a| a.contains('l')),
-            "args must not contain `-l` / `-lc` flag (would source rc files)"
-        );
-    }
-
-    #[test]
     fn pty_tool_spec_marks_tool_as_mutating() {
         let spec = PtyTool.spec();
 
         assert!(spec.capabilities.mutating);
         assert_eq!(spec.concurrency, ToolConcurrency::Exclusive);
-    }
-
-    #[test]
-    fn ac1_9_pty_env_is_clear_then_allowlist_then_overrides() {
-        let mut overrides = HashMap::new();
-        overrides.insert("CALLER_OVERRIDE".to_owned(), "yes".to_owned());
-
-        let env = pty_scrubbed_env(
-            [
-                (
-                    std::ffi::OsString::from("AWS_SECRET_ACCESS_KEY"),
-                    std::ffi::OsString::from("leaked"),
-                ),
-                (
-                    std::ffi::OsString::from("PATH"),
-                    std::ffi::OsString::from("/usr/bin"),
-                ),
-            ],
-            Some(&overrides),
-        );
-        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-
-        assert!(
-            !keys.contains(&"AWS_SECRET_ACCESS_KEY"),
-            "scrub must drop AWS_SECRET_ACCESS_KEY, got {keys:?}"
-        );
-        assert!(keys.contains(&"PATH"), "PATH must be preserved");
-        assert!(
-            keys.contains(&"CALLER_OVERRIDE"),
-            "caller-supplied overrides must survive"
-        );
     }
 
     #[tokio::test]
@@ -1106,11 +1020,6 @@ mod security_tests {
         let root = tempfile::tempdir().unwrap();
         let policy: Arc<dyn ToolPolicy> = Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_read_roots: vec![root.path().to_owned()],
-            allowed_shell_commands: vec![
-                "printf".to_owned(),
-                "sleep".to_owned(),
-                "stty".to_owned(),
-            ],
             ..PolicySettings::default()
         }));
         let mut context = tool_context_with(policy);

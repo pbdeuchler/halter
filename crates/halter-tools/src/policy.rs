@@ -5,18 +5,16 @@
 //
 // The trait surface is intentionally small and capability-typed:
 // `check_read_path`, `check_write_path`, `check_process_signal`,
-// `check_shell_enabled`, `check_shell_command_strict`, `check_network`,
+// `check_shell_enabled`, `check_network`,
 // `check_subagent_spawn_typed`. Each call returns either `()` or a
 // `CanonicalPath` (a path + parent dir fd), and errors are `PolicyError`
 // variants — no name-based bypass surface and no anyhow erasure.
 
-use std::io::Cursor;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
-use brush_parser::{Parser, ParserOptions, ast};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 mod canonical;
@@ -27,18 +25,6 @@ mod security_tests;
 
 pub use canonical::CanonicalPath;
 pub use errors::{Pid, PolicyError};
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ShellMode {
-    /// Reject function definitions and `eval`/`exec`/`source`/`.` commands,
-    /// then apply the configured program allowlist.
-    #[default]
-    Strict,
-    /// Apply only the configured program allowlist. Documented as *not* a
-    /// complete isolation boundary; available for workflows that need function
-    /// definitions or `eval`.
-    Relaxed,
-}
 
 /// A permitted sidecar at a loopback address (for e.g. a local
 /// development proxy or a container-bound service). Presence in
@@ -58,13 +44,6 @@ pub struct PolicySettings {
     pub sensitive_path_patterns: Vec<String>,
     pub max_read_bytes: usize,
     pub shell_enabled: bool,
-    pub shell_mode: ShellMode,
-    /// Program names allowed through the shell tool. An empty list denies every
-    /// external command. Shell assignments without a command are still allowed.
-    /// A single `*` entry is short-circuited to allow, mirroring
-    /// [`Self::allowed_hosts`]: every program passes the allowlist gate, and
-    /// [`ShellMode`] remains the only shell restriction.
-    pub allowed_shell_commands: Vec<String>,
     pub shell_timeout_secs: u64,
     pub network_enabled: bool,
     /// Remote-host allowlist. Default is `vec!["*"]` (allow any non-loopback
@@ -89,16 +68,6 @@ impl Default for PolicySettings {
             sensitive_path_patterns: default_sensitive_patterns(),
             max_read_bytes: 1_048_576,
             shell_enabled: true,
-            shell_mode: ShellMode::Strict,
-            allowed_shell_commands: vec![
-                "git".to_owned(),
-                "cargo".to_owned(),
-                "rg".to_owned(),
-                "ls".to_owned(),
-                "find".to_owned(),
-                "true".to_owned(),
-                "cd".to_owned(),
-            ],
             shell_timeout_secs: 30,
             network_enabled: false,
             allowed_hosts: vec!["*".to_owned()],
@@ -160,22 +129,9 @@ pub trait ToolPolicy: Send + Sync {
     /// process-tree boundary when configured.
     async fn check_process_signal(&self, pid: Pid) -> Result<(), PolicyError>;
 
-    /// Authorize the shell capability generically (e.g. spawning a PTY).
+    /// Authorize running shell commands (the `shell`, `background` and `pty`
+    /// tools). This is a kill switch only; commands are not inspected.
     async fn check_shell_enabled(&self) -> Result<(), PolicyError>;
-
-    /// The shell mode this policy is configured to enforce. Tools that aren't
-    /// hand-picking a mode (i.e. production builtins) should pull this and
-    /// pass it to `check_shell_command_strict`. Tests pick a mode explicitly.
-    fn shell_mode(&self) -> ShellMode;
-
-    /// Authorize `command` under a specific `ShellMode`. Strict mode rejects
-    /// function definitions and `eval`/`exec`/`source`/`.` invocations via
-    /// the brush-parser AST walk.
-    async fn check_shell_command_strict(
-        &self,
-        command: &str,
-        mode: ShellMode,
-    ) -> Result<(), PolicyError>;
 
     /// Authorize a network request to `url`. Loopback addresses are denied
     /// unless an entry in `allowed_loopback` matches; other hosts must match
@@ -216,14 +172,6 @@ impl DefaultToolPolicy {
     #[must_use]
     pub fn settings(&self) -> &PolicySettings {
         &self.settings
-    }
-
-    fn check_shell_enabled_inner(&self) -> Result<(), PolicyError> {
-        if self.settings.shell_enabled {
-            Ok(())
-        } else {
-            Err(PolicyError::ShellDisabled)
-        }
     }
 
     fn sensitive_glob_set(&self) -> Result<&GlobSet, PolicyError> {
@@ -339,28 +287,11 @@ impl ToolPolicy for DefaultToolPolicy {
     }
 
     async fn check_shell_enabled(&self) -> Result<(), PolicyError> {
-        self.check_shell_enabled_inner()
-    }
-
-    fn shell_mode(&self) -> ShellMode {
-        self.settings.shell_mode
-    }
-
-    async fn check_shell_command_strict(
-        &self,
-        command: &str,
-        mode: ShellMode,
-    ) -> Result<(), PolicyError> {
-        self.check_shell_enabled_inner()?;
-        if command.trim().is_empty() {
-            return Ok(());
+        if self.settings.shell_enabled {
+            Ok(())
+        } else {
+            Err(PolicyError::ShellDisabled)
         }
-        let program = parse_shell_program(command)?;
-        if matches!(mode, ShellMode::Strict) {
-            reject_strict_mode_constructs(&program)?;
-        }
-        reject_unallowed_shell_commands(&program, &self.settings.allowed_shell_commands)?;
-        Ok(())
     }
 
     async fn check_network(&self, url: &str) -> Result<(), PolicyError> {
@@ -539,242 +470,4 @@ fn extract_host_and_port(url: &str) -> Option<(String, Option<u16>)> {
     } else {
         Some((after_auth.to_owned(), None))
     }
-}
-
-fn parse_shell_program(command: &str) -> Result<ast::Program, PolicyError> {
-    let mut parser = Parser::new(Cursor::new(command), &ParserOptions::default());
-    parser
-        .parse_program()
-        .map_err(|e| PolicyError::ShellCommandRejected {
-            reason: "unparseable",
-            fragment: e.to_string(),
-        })
-}
-
-fn reject_strict_mode_constructs(program: &ast::Program) -> Result<(), PolicyError> {
-    for command in &program.complete_commands {
-        visit_compound_list_strict(command)?;
-    }
-    Ok(())
-}
-
-fn visit_compound_list_strict(list: &ast::CompoundList) -> Result<(), PolicyError> {
-    for item in &list.0 {
-        visit_and_or_list_strict(&item.0)?;
-    }
-    Ok(())
-}
-
-fn visit_and_or_list_strict(list: &ast::AndOrList) -> Result<(), PolicyError> {
-    visit_pipeline_strict(&list.first)?;
-    for item in &list.additional {
-        match item {
-            ast::AndOr::And(pipeline) | ast::AndOr::Or(pipeline) => {
-                visit_pipeline_strict(pipeline)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn visit_pipeline_strict(pipeline: &ast::Pipeline) -> Result<(), PolicyError> {
-    for command in &pipeline.seq {
-        visit_command_strict(command)?;
-    }
-    Ok(())
-}
-
-fn visit_command_strict(command: &ast::Command) -> Result<(), PolicyError> {
-    match command {
-        ast::Command::Simple(simple) => visit_simple_strict(simple),
-        ast::Command::Compound(compound, _) => visit_compound_strict(compound),
-        ast::Command::Function(_) => Err(PolicyError::ShellCommandRejected {
-            reason: "function_definition",
-            fragment: "fn() {...}".to_owned(),
-        }),
-        ast::Command::ExtendedTest(..) => Ok(()),
-    }
-}
-
-fn visit_compound_strict(command: &ast::CompoundCommand) -> Result<(), PolicyError> {
-    match command {
-        ast::CompoundCommand::Arithmetic(_) => Ok(()),
-        ast::CompoundCommand::ArithmeticForClause(cmd) => {
-            visit_compound_list_strict(&cmd.body.list)
-        }
-        ast::CompoundCommand::BraceGroup(cmd) => visit_compound_list_strict(&cmd.list),
-        ast::CompoundCommand::Subshell(cmd) => visit_compound_list_strict(&cmd.list),
-        ast::CompoundCommand::ForClause(cmd) => visit_compound_list_strict(&cmd.body.list),
-        ast::CompoundCommand::CaseClause(cmd) => {
-            for case in &cmd.cases {
-                if let Some(list) = &case.cmd {
-                    visit_compound_list_strict(list)?;
-                }
-            }
-            Ok(())
-        }
-        ast::CompoundCommand::IfClause(cmd) => {
-            visit_compound_list_strict(&cmd.condition)?;
-            visit_compound_list_strict(&cmd.then)?;
-            if let Some(elses) = &cmd.elses {
-                for else_clause in elses {
-                    if let Some(condition) = &else_clause.condition {
-                        visit_compound_list_strict(condition)?;
-                    }
-                    visit_compound_list_strict(&else_clause.body)?;
-                }
-            }
-            Ok(())
-        }
-        ast::CompoundCommand::WhileClause(cmd) | ast::CompoundCommand::UntilClause(cmd) => {
-            visit_compound_list_strict(&cmd.0)?;
-            visit_compound_list_strict(&cmd.1.list)
-        }
-        ast::CompoundCommand::Coprocess(cmd) => visit_command_strict(&cmd.body),
-    }
-}
-
-fn visit_simple_strict(simple: &ast::SimpleCommand) -> Result<(), PolicyError> {
-    let Some(program) = simple.word_or_name.as_ref() else {
-        return Ok(());
-    };
-    let program = program.value.trim();
-    match program {
-        "eval" => Err(PolicyError::ShellCommandRejected {
-            reason: "eval",
-            fragment: program.to_owned(),
-        }),
-        "exec" => Err(PolicyError::ShellCommandRejected {
-            reason: "exec",
-            fragment: program.to_owned(),
-        }),
-        "source" => Err(PolicyError::ShellCommandRejected {
-            reason: "source",
-            fragment: program.to_owned(),
-        }),
-        "." => Err(PolicyError::ShellCommandRejected {
-            reason: "dot_source",
-            fragment: program.to_owned(),
-        }),
-        _ => Ok(()),
-    }
-}
-
-fn reject_unallowed_shell_commands(
-    program: &ast::Program,
-    allowed: &[String],
-) -> Result<(), PolicyError> {
-    // `*` allows every program, exactly as it does for `allowed_hosts`.
-    // Strict mode's construct rejection still runs; only per-program
-    // enforcement is waived, and it needs an explicit list to come back.
-    if allowed.iter().any(|entry| entry == "*") {
-        return Ok(());
-    }
-    for command in &program.complete_commands {
-        visit_compound_list_allowlist(command, allowed)?;
-    }
-    Ok(())
-}
-
-fn visit_compound_list_allowlist(
-    list: &ast::CompoundList,
-    allowed: &[String],
-) -> Result<(), PolicyError> {
-    for item in &list.0 {
-        visit_and_or_list_allowlist(&item.0, allowed)?;
-    }
-    Ok(())
-}
-
-fn visit_and_or_list_allowlist(
-    list: &ast::AndOrList,
-    allowed: &[String],
-) -> Result<(), PolicyError> {
-    visit_pipeline_allowlist(&list.first, allowed)?;
-    for item in &list.additional {
-        match item {
-            ast::AndOr::And(pipeline) | ast::AndOr::Or(pipeline) => {
-                visit_pipeline_allowlist(pipeline, allowed)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn visit_pipeline_allowlist(
-    pipeline: &ast::Pipeline,
-    allowed: &[String],
-) -> Result<(), PolicyError> {
-    for command in &pipeline.seq {
-        visit_command_allowlist(command, allowed)?;
-    }
-    Ok(())
-}
-
-fn visit_command_allowlist(command: &ast::Command, allowed: &[String]) -> Result<(), PolicyError> {
-    match command {
-        ast::Command::Simple(simple) => visit_simple_allowlist(simple, allowed),
-        ast::Command::Compound(compound, _) => visit_compound_allowlist(compound, allowed),
-        ast::Command::Function(_) | ast::Command::ExtendedTest(..) => Ok(()),
-    }
-}
-
-fn visit_compound_allowlist(
-    command: &ast::CompoundCommand,
-    allowed: &[String],
-) -> Result<(), PolicyError> {
-    match command {
-        ast::CompoundCommand::Arithmetic(_) => Ok(()),
-        ast::CompoundCommand::ArithmeticForClause(cmd) => {
-            visit_compound_list_allowlist(&cmd.body.list, allowed)
-        }
-        ast::CompoundCommand::BraceGroup(cmd) => visit_compound_list_allowlist(&cmd.list, allowed),
-        ast::CompoundCommand::Subshell(cmd) => visit_compound_list_allowlist(&cmd.list, allowed),
-        ast::CompoundCommand::ForClause(cmd) => {
-            visit_compound_list_allowlist(&cmd.body.list, allowed)
-        }
-        ast::CompoundCommand::CaseClause(cmd) => {
-            for case in &cmd.cases {
-                if let Some(list) = &case.cmd {
-                    visit_compound_list_allowlist(list, allowed)?;
-                }
-            }
-            Ok(())
-        }
-        ast::CompoundCommand::IfClause(cmd) => {
-            visit_compound_list_allowlist(&cmd.condition, allowed)?;
-            visit_compound_list_allowlist(&cmd.then, allowed)?;
-            if let Some(elses) = &cmd.elses {
-                for else_clause in elses {
-                    if let Some(condition) = &else_clause.condition {
-                        visit_compound_list_allowlist(condition, allowed)?;
-                    }
-                    visit_compound_list_allowlist(&else_clause.body, allowed)?;
-                }
-            }
-            Ok(())
-        }
-        ast::CompoundCommand::WhileClause(cmd) | ast::CompoundCommand::UntilClause(cmd) => {
-            visit_compound_list_allowlist(&cmd.0, allowed)?;
-            visit_compound_list_allowlist(&cmd.1.list, allowed)
-        }
-        ast::CompoundCommand::Coprocess(cmd) => visit_command_allowlist(&cmd.body, allowed),
-    }
-}
-
-fn visit_simple_allowlist(
-    simple: &ast::SimpleCommand,
-    allowed: &[String],
-) -> Result<(), PolicyError> {
-    let Some(program) = simple.word_or_name.as_ref() else {
-        return Ok(());
-    };
-    let program = program.value.trim();
-    if allowed.iter().any(|allowed| allowed == program) {
-        return Ok(());
-    }
-    Err(PolicyError::ShellCommandRejected {
-        reason: "command_not_allowed",
-        fragment: program.to_owned(),
-    })
 }

@@ -14,14 +14,12 @@ use crate::builtin::background::BackgroundRegistry;
 use crate::builtin::browser::session::BrowserSession;
 #[cfg(feature = "pty")]
 use crate::builtin::pty::PtySessionHandle;
-use crate::builtin::shell::session::ShellSession;
 use crate::builtin::task::TaskList;
 
 #[derive(Default)]
 /// Per-session storage for stateful tools.
 pub struct ToolSessionStore {
     activity: tokio::sync::watch::Sender<()>,
-    shell_sessions: DashMap<String, Arc<ShellSession>>,
     process_lifetimes: DashMap<String, CancellationToken>,
     task_sessions: DashMap<String, Arc<Mutex<TaskList>>>,
     background_sessions: DashMap<String, Arc<BackgroundRegistry>>,
@@ -43,17 +41,13 @@ impl ToolSessionStore {
         self.activity.clone()
     }
 
-    /// Whether native processes or shell background tasks still own work.
-    /// Empty persistent tool slots and completed job records do not count.
+    /// Whether background jobs or PTY processes still own work. Empty
+    /// persistent tool slots and completed job records do not count.
     pub fn has_running_jobs(&self, session_id: &SessionId) -> bool {
         if self
             .background_sessions
             .get(&session_id.0)
             .is_some_and(|jobs| jobs.has_running())
-            || self
-                .shell_sessions
-                .get(&session_id.0)
-                .is_some_and(|shell| shell.has_running())
         {
             return true;
         }
@@ -78,7 +72,7 @@ impl ToolSessionStore {
         }
     }
 
-    #[cfg(any(test, feature = "pty", feature = "browser-tools"))]
+    /// The session's process admission token; cancelled once the session stops.
     pub(crate) fn process_lifetime(&self, session_id: &SessionId) -> CancellationToken {
         self.process_lifetimes
             .get(&session_id.0)
@@ -114,9 +108,6 @@ impl ToolSessionStore {
         if let Some(jobs) = jobs {
             jobs.request_stop(force).await;
         }
-        if let Some(shell) = self.shell_sessions.get(&session_id.0) {
-            shell.request_stop(force);
-        }
         #[cfg(feature = "pty")]
         if let Some(pty) = self.pty_sessions.get(&session_id.0) {
             crate::builtin::pty::request_stop_session(&pty);
@@ -147,7 +138,6 @@ impl ToolSessionStore {
                 .iter()
                 .map(|entry| entry.key().clone()),
         );
-        ids.extend(self.shell_sessions.iter().map(|entry| entry.key().clone()));
         #[cfg(feature = "pty")]
         ids.extend(self.pty_sessions.iter().map(|entry| entry.key().clone()));
         #[cfg(feature = "browser-tools")]
@@ -158,7 +148,9 @@ impl ToolSessionStore {
         );
         ids.into_iter().map(SessionId::from).collect()
     }
-    pub(crate) fn background_session(&self, session_id: &SessionId) -> Arc<BackgroundRegistry> {
+    /// Return the background job registry for a halter session.
+    #[must_use]
+    pub fn background_session(&self, session_id: &SessionId) -> Arc<BackgroundRegistry> {
         let Some(lifetime) = self
             .process_lifetimes
             .get(&session_id.0)
@@ -200,15 +192,6 @@ impl ToolSessionStore {
         {
             errors.push(error.to_string());
         }
-        let shell = self
-            .shell_sessions
-            .get(&session_id.0)
-            .map(|entry| entry.clone());
-        if let Some(shell) = shell
-            && let Err(error) = crate::builtin::shell::session::shutdown_shell_session(&shell).await
-        {
-            errors.push(error.to_string());
-        }
         #[cfg(feature = "pty")]
         let pty = self
             .pty_sessions
@@ -234,7 +217,6 @@ impl ToolSessionStore {
             }
         }
         self.background_sessions.remove(&session_id.0);
-        self.shell_sessions.remove(&session_id.0);
         #[cfg(feature = "pty")]
         self.pty_sessions.remove(&session_id.0);
         #[cfg(feature = "browser-tools")]
@@ -246,32 +228,6 @@ impl ToolSessionStore {
             errors.join("; ")
         );
         Ok(())
-    }
-
-    /// Return the persistent shell session slot for a halter session.
-    #[must_use]
-    pub fn shell_session(&self, session_id: &SessionId) -> Arc<ShellSession> {
-        let Some(lifetime) = self
-            .process_lifetimes
-            .get(&session_id.0)
-            .filter(|lifetime| !lifetime.is_cancelled())
-        else {
-            return Arc::new(ShellSession::new(
-                Self::closed_lifetime(),
-                self.activity.clone(),
-            ));
-        };
-        let shell = self
-            .shell_sessions
-            .entry(session_id.0.clone())
-            .or_insert_with(|| {
-                let shell = Arc::new(ShellSession::new(lifetime.clone(), self.activity.clone()));
-                self.activity.send_replace(());
-                shell
-            })
-            .clone();
-        drop(lifetime);
-        shell
     }
 
     /// Returns the in-memory task list bound to this session, creating it on
@@ -286,13 +242,12 @@ impl ToolSessionStore {
             .clone()
     }
 
-    /// Whether this process holds a shell, background, pty or browser session for
+    /// Whether this process holds a background, pty or browser session for
     /// `session_id`. Slots are created on first use, so `false` means that
     /// state, if the session ever had it, died with an earlier process.
     #[must_use]
     pub fn has_process_state(&self, session_id: &SessionId) -> bool {
-        let held = self.shell_sessions.contains_key(&session_id.0)
-            || self.background_sessions.contains_key(&session_id.0);
+        let held = self.background_sessions.contains_key(&session_id.0);
         #[cfg(feature = "pty")]
         let held = held || self.pty_sessions.contains_key(&session_id.0);
         #[cfg(feature = "browser-tools")]
@@ -399,7 +354,7 @@ mod tests {
         let session = SessionId::from("held");
         // (slot first used, whether that counts as process state)
         #[allow(unused_mut)]
-        let mut cases = vec![("none", false), ("task", false), ("shell", true)];
+        let mut cases = vec![("none", false), ("task", false), ("background", true)];
         #[cfg(feature = "pty")]
         cases.push(("pty", true));
         #[cfg(feature = "browser-tools")]
@@ -409,7 +364,7 @@ mod tests {
             store.open_session(&session);
             match slot {
                 "task" => drop(store.task_session(&session)),
-                "shell" => drop(store.shell_session(&session)),
+                "background" => drop(store.background_session(&session)),
                 #[cfg(feature = "pty")]
                 "pty" => drop(store.pty_session(&session)),
                 #[cfg(feature = "browser-tools")]
@@ -434,7 +389,6 @@ mod tests {
         for index in 0..128 {
             let id = SessionId::from(format!("closed-{index}"));
             store.open_session(&id);
-            drop(store.shell_session(&id));
             drop(store.background_session(&id));
             #[cfg(feature = "pty")]
             drop(store.pty_session(&id));
@@ -445,7 +399,6 @@ mod tests {
                 store.stop_session_resources(&id, force).await;
             }
             assert!(store.process_lifetime(&id).is_cancelled());
-            drop(store.shell_session(&id));
             drop(store.background_session(&id));
             #[cfg(feature = "pty")]
             drop(store.pty_session(&id));
@@ -457,7 +410,6 @@ mod tests {
             );
         }
         assert!(store.process_lifetimes.is_empty());
-        assert!(store.shell_sessions.is_empty());
         assert!(store.background_sessions.is_empty());
         #[cfg(feature = "pty")]
         assert!(store.pty_sessions.is_empty());

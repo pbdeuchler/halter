@@ -5412,7 +5412,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let _ = services.tool_sessions.shell_session(session.id());
+            let _ = services.tool_sessions.background_session(session.id());
             let first_handle = session.clone();
             let first = tokio::spawn(async move { first_handle.shutdown(None).await });
             tokio::time::timeout(Duration::from_secs(5), started.notified())
@@ -10753,7 +10753,7 @@ mod tests {
                 .await
                 .expect("seed tool call");
             if live {
-                let _ = services.tool_sessions.shell_session(&id);
+                let _ = services.tool_sessions.background_session(&id);
             }
 
             // The second resume adds nothing: the model was already told.

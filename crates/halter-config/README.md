@@ -515,8 +515,6 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "true", "cd"]
-mode = "strict"
 timeout_secs = 30
 
 [policy.network]
@@ -538,10 +536,9 @@ Defaults:
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
 - shell enabled by default
-- shell allowlist defaults to `git`, `cargo`, `rg`, `ls`, `find`, `true`, `cd`.
-  `["*"]` allows every program; `[]` denies every external command
-- `policy.shell.mode = "strict"` — also rejects function definitions and
-  `eval`/`exec`/`source`/`.`. `"relaxed"` applies only the allowlist
+- `[policy.shell]` takes only `enabled` and `timeout_secs`. The `allow` and
+  `mode` keys were removed with the shell allowlist and are rejected as
+  unknown fields
 - network disabled by default
 
 Validation rules include:
@@ -661,7 +658,6 @@ These are appended with duplicates removed:
 
 These are replaced by later layers:
 
-- `policy.shell.allow`
 - `policy.allowed_write_roots`
 - `policy.network.allowed_hosts`
 - `tools.enabled`
@@ -682,14 +678,13 @@ Currently supported:
 - `HALTER_POLICY_NETWORK_ENABLED`
 - `HALTER_SKILL_ROOTS`
 - `HALTER_PLUGIN_ROOTS`
-- `HALTER_POLICY_SHELL_ALLOW`
 - `HALTER_POLICY_ALLOWED_HOSTS`
 - `HALTER_TOOLS_ENABLED`
 
 ### Parsing behavior
 
 - `HALTER_SKILL_ROOTS` and `HALTER_PLUGIN_ROOTS` use `:` as the separator
-- allow/host/tool lists use `,` as the separator
+- host/tool lists use `,` as the separator
 - booleans use Rust-style boolean parsing (`true` / `false`)
 
 Examples:
@@ -698,7 +693,6 @@ Examples:
 export HALTER_SESSION_BACKEND=memory
 export HALTER_POLICY_SHELL_ENABLED=false
 export HALTER_SKILL_ROOTS=./skills:./vendor/skills
-export HALTER_POLICY_SHELL_ALLOW=git,just,rg
 export HALTER_TOOLS_ENABLED=read,glob,grep
 ```
 
@@ -820,14 +814,13 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "true", "cd", "python"]
 timeout_secs = 30
 
 [sessions]
 backend = "memory"
 ```
 
-### OpenRouter-backed subagents with restricted shell
+### OpenRouter-backed subagents with a short shell timeout
 
 ```toml
 version = 1
@@ -850,7 +843,6 @@ max_concurrent_subagents = 4
 
 [policy.shell]
 enabled = true
-allow = ["git", "rg", "ls"]
 timeout_secs = 15
 ```
 
@@ -908,7 +900,7 @@ and validated.
 - Keep `halter.toml` small and environment-specific secrets out of source control.
 - Use `load_layered(...)` if you need a user → project → explicit override model.
 - Use env overrides sparingly and only for the supported keys.
-- Treat `tools.enabled` and shell allowlists as explicit policy, not convenience defaults.
+- Treat `tools.enabled` and `policy.shell.enabled` as explicit policy, not convenience defaults.
 - Fingerprint the final merged config if you cache resource or runtime artifacts.
 
 ---

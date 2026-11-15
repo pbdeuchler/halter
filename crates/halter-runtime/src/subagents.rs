@@ -1766,7 +1766,6 @@ mod tests {
         Arc::get_mut(&mut services).unwrap().policy =
             Arc::new(DefaultToolPolicy::new(PolicySettings {
                 allowed_read_roots: vec![root.path().to_owned()],
-                allowed_shell_commands: ["sleep".to_owned()].into_iter().collect(),
                 ..PolicySettings::default()
             }));
         let runtime = SessionRuntime::new(services.clone());
@@ -2348,7 +2347,7 @@ mod tests {
             .unwrap();
         assert_eq!(waited.status.unwrap().state, SubagentState::Completed);
         assert_eq!(requests.lock().unwrap().len(), 2);
-        let _ = services.tool_sessions.shell_session(&child.session_id);
+        let _ = services.tool_sessions.background_session(&child.session_id);
         assert!(services.tool_sessions.has_process_state(&child.session_id));
         control
             .close(CloseSubagentRequest {
@@ -2360,7 +2359,7 @@ mod tests {
         assert!(!services.tool_sessions.has_process_state(&child.session_id));
         assert!(!control.owns_session(&child.session_id).await);
         let (reopened, _) = runtime.resume_session(&child.session_id).await.unwrap();
-        let shell = services.tool_sessions.shell_session(&child.session_id);
+        let shell = services.tool_sessions.background_session(&child.session_id);
         control.force_close_session(parent.session_id()).await;
         control.close_session(parent.session_id()).await.unwrap();
         control
@@ -2373,7 +2372,7 @@ mod tests {
         assert!(
             Arc::ptr_eq(
                 &shell,
-                &services.tool_sessions.shell_session(&child.session_id)
+                &services.tool_sessions.background_session(&child.session_id)
             ),
             "historical closure must not stop a separately reopened child"
         );
@@ -2416,7 +2415,9 @@ mod tests {
         assert!(control.agent_ids().await.contains(&agent));
         assert!(!control.owns_session(child.session_id()).await);
         let (reopened, _) = runtime.resume_session(child.session_id()).await.unwrap();
-        let shell = services.tool_sessions.shell_session(child.session_id());
+        let shell = services
+            .tool_sessions
+            .background_session(child.session_id());
         control
             .close(CloseSubagentRequest {
                 target: agent,
@@ -2428,7 +2429,9 @@ mod tests {
         control.close_session(parent.session_id()).await.unwrap();
         assert!(Arc::ptr_eq(
             &shell,
-            &services.tool_sessions.shell_session(child.session_id())
+            &services
+                .tool_sessions
+                .background_session(child.session_id())
         ));
         assert_shell_accepts_work(&services, child.session_id()).await;
         reopened.shutdown(None).await.unwrap();
@@ -2551,7 +2554,7 @@ mod tests {
                 .status
                 .session_id
                 .clone();
-            let _ = services.tool_sessions.shell_session(&child);
+            let _ = services.tool_sessions.background_session(&child);
             activity.borrow_and_update();
             if close_parent {
                 control
@@ -2911,7 +2914,7 @@ mod tests {
                     }),
                 },
             );
-            let _ = services.tool_sessions.shell_session(&child_id);
+            let _ = services.tool_sessions.background_session(&child_id);
             store.fail_once.store(true, Ordering::SeqCst);
             let closing = tokio::spawn({
                 let control = control.clone();

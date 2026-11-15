@@ -4,7 +4,6 @@ use std::fs;
 use std::io;
 use std::str;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{ToolEventSink, ToolRuntimeEvent};
@@ -22,7 +21,6 @@ pub async fn collect_output(
     emit: std::sync::Arc<dyn ToolEventSink>,
     tool_name: &'static str,
     cancel: CancellationToken,
-    activity: mpsc::Sender<()>,
 ) -> anyhow::Result<String> {
     let mut collected = String::new();
     let mut buffer = vec![0u8; BUFFER_SIZE + 4];
@@ -73,9 +71,6 @@ pub async fn collect_output(
             }
         };
 
-        if read > 0 {
-            let _ = activity.try_send(());
-        }
         pending += read;
 
         while pending > 0 {

@@ -27,7 +27,9 @@ async fn abandoned_temporary_owner_cleans_up_before_or_during_finish() {
         .await
         .unwrap();
         let owner = TemporarySession::new(&session, &TurnId::new());
-        let _ = services.tool_sessions.shell_session(session.session_id());
+        let _ = services
+            .tool_sessions
+            .background_session(session.session_id());
         assert!(
             services
                 .tool_sessions
@@ -69,7 +71,9 @@ async fn abandoned_temporary_owner_cleans_up_before_or_during_finish() {
         );
         assert_eq!(services.turn_registry.in_flight_count(), 0);
         // A stale getter must neither readmit the session nor leave a slot.
-        let _ = services.tool_sessions.shell_session(session.session_id());
+        let _ = services
+            .tool_sessions
+            .background_session(session.session_id());
         assert!(
             !services
                 .tool_sessions

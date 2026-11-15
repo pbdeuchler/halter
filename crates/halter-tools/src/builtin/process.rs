@@ -431,7 +431,7 @@ mod tests {
     use super::*;
     use crate::Tool;
 
-    fn tool_context(root: &std::path::Path, allowed_shell_commands: Vec<String>) -> ToolContext {
+    fn tool_context(root: &std::path::Path) -> ToolContext {
         ToolContext {
             session_id: halter_protocol::SessionId::new(),
             working_dir: root.to_path_buf(),
@@ -442,7 +442,6 @@ mod tests {
             emit: Arc::new(NoopToolEventSink),
             policy: Arc::new(DefaultToolPolicy::new(PolicySettings {
                 allowed_write_roots: vec![root.to_path_buf()],
-                allowed_shell_commands,
                 ..PolicySettings::default()
             })) as Arc<dyn ToolPolicy>,
             shell_timeout_secs: 30,
@@ -458,7 +457,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let error = ProcessTool
             .execute(
-                tool_context(temp.path(), vec!["rg".to_owned()]),
+                tool_context(temp.path()),
                 json!({
                     "action": "kill_tree",
                     "pid": 1

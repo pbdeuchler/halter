@@ -20,8 +20,7 @@ use halter::prelude::*;
 use halter_config::{
     CompactionStrategyKind, ContextConfig, HarnessConfig, ModelConfig, ModelSlot, ModelSlotRef,
     ModelsConfig, NetworkPolicyConfig, PolicyConfig, ProviderConfig, ProvidersConfig,
-    ResourcesConfig, RuntimeConfig, SearchRoots, SessionsConfig, ShellModeConfig,
-    ShellPolicyConfig, ToolsConfig,
+    ResourcesConfig, RuntimeConfig, SearchRoots, SessionsConfig, ShellPolicyConfig, ToolsConfig,
 };
 use halter_protocol::{
     AssistantPart, CacheScope, Message, PromptSegment, PromptSegmentId, PromptSegmentKind,
@@ -1131,11 +1130,6 @@ fn default_factory_config() -> HarnessConfig {
             max_concurrent_subagents: 8,
             shell: ShellPolicyConfig {
                 enabled: true,
-                allow: factory_example_shell_allowlist()
-                    .into_iter()
-                    .map(ToOwned::to_owned)
-                    .collect(),
-                mode: ShellModeConfig::Strict,
                 timeout_secs: 30,
             },
             network: NetworkPolicyConfig {
@@ -1202,13 +1196,6 @@ fn factory_example_tools() -> [&'static str; 17] {
         "send_input",
         "close_agent",
         "browser",
-    ]
-}
-
-fn factory_example_shell_allowlist() -> [&'static str; 19] {
-    [
-        "git", "cargo", "rg", "ls", "find", "true", "cd", "python", "python3", "pwd", "echo",
-        "date", "gh", "which", "sort", "nl", "sed", "wc", "head",
     ]
 }
 
@@ -4188,7 +4175,7 @@ mod tests {
     fn default_factory_config_matches_factory_tool_shell_and_default_model_settings() {
         let config = default_factory_config();
         assert_eq!(config.tools.enabled, factory_example_tools());
-        assert_eq!(config.policy.shell.allow, factory_example_shell_allowlist());
+        assert!(config.policy.shell.enabled);
         assert!(config.policy.network.enabled);
         assert_eq!(
             config.context.compaction_threshold,
