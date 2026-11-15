@@ -97,6 +97,10 @@ pub fn parse_env_map(value: Option<&Value>) -> anyhow::Result<Option<HashMap<Str
         let value = value
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("invalid tool input: env values must be strings"))?;
+        anyhow::ensure!(
+            !key.is_empty() && !key.contains(['=', '\0']) && !value.contains('\0'),
+            "invalid tool input: invalid environment entry '{key}'"
+        );
         env.insert(key.clone(), value.to_owned());
     }
     Ok(Some(env))
@@ -206,6 +210,26 @@ mod tests {
             "[{\"a\":2,\"b\":1}]"
         );
         assert_eq!(serde_json::to_value(&report).expect("serialize"), report.0);
+    }
+
+    #[test]
+    fn parse_env_map_accepts_string_maps_and_rejects_malformed_entries() {
+        assert_eq!(parse_env_map(None).unwrap(), None);
+        assert_eq!(parse_env_map(Some(&json!(null))).unwrap(), None);
+        assert_eq!(
+            parse_env_map(Some(&json!({"A": "1"}))).unwrap(),
+            Some(HashMap::from([("A".to_owned(), "1".to_owned())]))
+        );
+        for bad in [
+            json!("A=1"),
+            json!({"A": 1}),
+            json!({"": "1"}),
+            json!({"A=B": "1"}),
+            json!({"A\u{0}": "1"}),
+            json!({"A": "1\u{0}"}),
+        ] {
+            assert!(parse_env_map(Some(&bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

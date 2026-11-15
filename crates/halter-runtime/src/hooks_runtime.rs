@@ -1053,7 +1053,15 @@ fn build_command(
     expanded_command: &str,
     request: &HookDispatchRequest,
 ) -> anyhow::Result<tokio::process::Child> {
-    let (program, args) = shell_invocation(command.shell, expanded_command);
+    // Unlike the model-facing shell tools, hooks keep the full parent
+    // environment: they are trusted plugin configuration, and scripts commonly
+    // read credentials or profile-set variables from it. Documented in the
+    // halter-hooks README ("Command hook environment").
+    let (program, args) = shell_invocation(
+        command.shell,
+        halter_tools::detected_shell(),
+        expanded_command,
+    );
     let mut child = Command::new(program);
     child
         .args(args)
@@ -1120,13 +1128,22 @@ fn build_payload(
     Ok(Value::Object(payload))
 }
 
-fn shell_invocation(shell: halter_hooks::HookShell, command: &str) -> (String, Vec<String>) {
-    match shell {
-        halter_hooks::HookShell::Bash => posix_shell_invocation(command),
-        halter_hooks::HookShell::Pwsh => (
-            "pwsh".to_owned(),
-            vec!["-Command".to_owned(), command.to_owned()],
-        ),
+/// Program and args for a command hook. `bash` hooks run in the detected POSIX
+/// shell, as a login shell when it is bash or zsh so profile `PATH` setup
+/// (nvm, pyenv, Homebrew) applies; plain sh has no reliable `-l`.
+fn shell_invocation(
+    shell: halter_hooks::HookShell,
+    detected: &halter_tools::Shell,
+    command: &str,
+) -> (std::path::PathBuf, Vec<String>) {
+    use halter_hooks::HookShell;
+    use halter_tools::ShellKind;
+    let args = |flag: &str| vec![flag.to_owned(), command.to_owned()];
+    match (shell, detected.kind) {
+        (HookShell::Pwsh, _) => ("pwsh".into(), args("-Command")),
+        (HookShell::Bash, ShellKind::Bash | ShellKind::Zsh) => (detected.path.clone(), args("-lc")),
+        (HookShell::Bash, ShellKind::Posix) => (detected.path.clone(), args("-c")),
+        (HookShell::Bash, ShellKind::PowerShell) => ("sh".into(), args("-c")),
     }
 }
 
@@ -1256,34 +1273,6 @@ fn set_alias_envs(child: &mut Command, aliases: &[&str], value: String) {
     for alias in aliases {
         child.env(alias, &value);
     }
-}
-
-fn posix_shell_invocation(command: &str) -> (String, Vec<String>) {
-    if let Some(shell) = preferred_posix_login_shell() {
-        return (shell, vec!["-lc".to_owned(), command.to_owned()]);
-    }
-
-    (
-        "/bin/sh".to_owned(),
-        vec!["-c".to_owned(), command.to_owned()],
-    )
-}
-
-fn preferred_posix_login_shell() -> Option<String> {
-    preferred_posix_login_shell_from(std::env::var("SHELL").ok().as_deref())
-}
-
-fn preferred_posix_login_shell_from(shell: Option<&str>) -> Option<String> {
-    let trimmed = shell?.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let basename = Path::new(trimmed)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(trimmed);
-    matches!(basename, "bash" | "zsh" | "ksh").then(|| trimmed.to_owned())
 }
 
 fn expand_env_placeholders(value: &str, allowed: &BTreeSet<String>) -> String {
@@ -1428,29 +1417,55 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use halter_tools::{CanonicalPath, Pid, PolicySettings, ShellMode};
+    use halter_tools::{CanonicalPath, Pid, PolicySettings};
 
     #[test]
-    fn shell_invocation_falls_back_to_sh_for_non_posix_user_shells() {
-        assert_eq!(
-            preferred_posix_login_shell_from(Some("/opt/homebrew/bin/fish")),
-            None
-        );
-    }
-
-    #[test]
-    fn shell_invocation_uses_supported_login_shells() {
-        assert_eq!(
-            preferred_posix_login_shell_from(Some("/bin/zsh")),
-            Some("/bin/zsh".to_owned())
-        );
-        assert_eq!(
-            shell_invocation(halter_hooks::HookShell::Pwsh, "echo hi"),
+    fn shell_invocation_uses_the_detected_shell_and_logs_in_only_where_supported() {
+        use halter_hooks::HookShell;
+        use halter_tools::{Shell, ShellKind};
+        let shell = |kind, path: &str| Shell {
+            kind,
+            path: path.into(),
+            version: None,
+        };
+        for (hook, detected, program, flag) in [
             (
-                "pwsh".to_owned(),
-                vec!["-Command".to_owned(), "echo hi".to_owned()]
-            )
-        );
+                HookShell::Bash,
+                shell(ShellKind::Zsh, "/bin/zsh"),
+                "/bin/zsh",
+                "-lc",
+            ),
+            (
+                HookShell::Bash,
+                shell(ShellKind::Bash, "/usr/bin/bash"),
+                "/usr/bin/bash",
+                "-lc",
+            ),
+            (
+                HookShell::Bash,
+                shell(ShellKind::Posix, "/bin/dash"),
+                "/bin/dash",
+                "-c",
+            ),
+            (
+                HookShell::Bash,
+                shell(ShellKind::PowerShell, "pwsh.exe"),
+                "sh",
+                "-c",
+            ),
+            (
+                HookShell::Pwsh,
+                shell(ShellKind::Zsh, "/bin/zsh"),
+                "pwsh",
+                "-Command",
+            ),
+        ] {
+            assert_eq!(
+                shell_invocation(hook, &detected, "echo hi"),
+                (program.into(), vec![flag.to_owned(), "echo hi".to_owned()]),
+                "{hook:?} with {detected:?}"
+            );
+        }
     }
 
     #[test]
@@ -1721,16 +1736,6 @@ mod tests {
                 Ok(())
             }
             async fn check_shell_enabled(&self) -> Result<(), PolicyError> {
-                Ok(())
-            }
-            fn shell_mode(&self) -> ShellMode {
-                ShellMode::Strict
-            }
-            async fn check_shell_command_strict(
-                &self,
-                _command: &str,
-                _mode: ShellMode,
-            ) -> Result<(), PolicyError> {
                 Ok(())
             }
             async fn check_network(&self, url: &str) -> Result<(), PolicyError> {

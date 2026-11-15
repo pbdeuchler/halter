@@ -82,7 +82,7 @@ HEADING="## [${version}] - $(date +%Y-%m-%d)" BODY="${body}" awk '
 mv CHANGELOG.md.next CHANGELOG.md
 
 # The workspace crates move in lockstep: each package version and each
-# halter-* path dependency. Vendored crates keep their own versions.
+# halter-* path dependency.
 old="${current//./\\.}"
 sed -i.bak -E \
   -e "s/^version = \"${old}\"$/version = \"${version}\"/" \

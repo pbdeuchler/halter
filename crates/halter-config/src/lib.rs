@@ -32,7 +32,7 @@ pub use schema::{
     ResilienceConfig, ResilienceOverrideConfig, ResilienceTimeoutsConfig,
     ResilienceTimeoutsOverrideConfig, ResolvedProviderAuth, ResolvedProviderConfig,
     ResourcesConfig, RuntimeConfig, SMALL_MODEL_ID, SUBAGENT_MODEL_ID, SearchRoots, SessionBackend,
-    SessionsConfig, ShellModeConfig, ShellPolicyConfig, SystemPromptPreset, ToolsConfig,
+    SessionsConfig, ShellPolicyConfig, SystemPromptPreset, ToolsConfig,
     resolve_provider_runtime_config,
 };
 

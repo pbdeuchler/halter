@@ -10,8 +10,8 @@ use halter_config::{
     CompactionStrategyKind, ConfiguredProvider, DEFAULT_MODEL_ID, HarnessConfig, ModelConfig,
     ModelJudgeConfig, ModelJudgeMode, ModelSlot, ModelSlotRef, OpenAiOAuthConfig, PolicyConfig,
     PromptsConfig, ResilienceConfig, ResolvedProviderAuth, ResolvedProviderConfig, SMALL_MODEL_ID,
-    SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, ShellModeConfig, SystemPromptPreset,
-    expand_path, load_path, resolve_provider_runtime_config,
+    SUBAGENT_MODEL_ID, SessionBackend, SessionsConfig, SystemPromptPreset, expand_path, load_path,
+    resolve_provider_runtime_config,
 };
 use halter_hooks::{Hook, Hooks, RegisteredHookPriority, RegisteredHooks};
 use halter_protocol::{
@@ -32,7 +32,7 @@ use halter_runtime::{
 };
 use halter_session::{InMemorySessionStore, SessionStore};
 use halter_tools::{
-    DefaultToolPolicy, LoopbackAllow, PathLockMap, PolicySettings, ShellMode, Tool, ToolRuntime,
+    DefaultToolPolicy, LoopbackAllow, PathLockMap, PolicySettings, Tool, ToolRuntime,
     ToolSessionStore, register_builtin_tools, register_subagent_tools,
 };
 use tracing::{debug, info, warn};
@@ -1220,11 +1220,6 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
             .unwrap_or_else(|| defaults.sensitive_path_patterns.clone()),
         max_read_bytes: config.max_read_bytes,
         shell_enabled: config.shell.enabled,
-        shell_mode: match config.shell.mode {
-            ShellModeConfig::Strict => ShellMode::Strict,
-            ShellModeConfig::Relaxed => ShellMode::Relaxed,
-        },
-        allowed_shell_commands: config.shell.allow.clone(),
         shell_timeout_secs: config.shell.timeout_secs,
         network_enabled: config.network.enabled,
         allowed_hosts,
@@ -1497,7 +1492,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_from_config_maps_read_roots_sensitive_patterns_and_shell_mode() {
+    fn policy_from_config_maps_read_roots_and_sensitive_patterns() {
         type Case = (
             &'static str,
             fn(&mut PolicyConfig),
@@ -1548,19 +1543,15 @@ mod tests {
                 |settings, _| assert_eq!(settings.sensitive_path_patterns, vec!["**/*.pem"]),
             ),
             (
-                "default_shell_mode_is_strict",
-                |_| {},
-                |settings, _| assert_eq!(settings.shell_mode, ShellMode::Strict),
-            ),
-            (
-                "relaxed_shell_mode_maps_through",
-                |config| config.shell.mode = ShellModeConfig::Relaxed,
-                |settings, _| assert_eq!(settings.shell_mode, ShellMode::Relaxed),
-            ),
-            (
-                "wildcard_allowlist_maps_through",
-                |config| config.shell.allow = vec!["*".to_owned()],
-                |settings, _| assert_eq!(settings.allowed_shell_commands, vec!["*"]),
+                "shell_switch_and_timeout_map_through",
+                |config| {
+                    config.shell.enabled = false;
+                    config.shell.timeout_secs = 7;
+                },
+                |settings, _| {
+                    assert!(!settings.shell_enabled);
+                    assert_eq!(settings.shell_timeout_secs, 7);
+                },
             ),
         ];
 

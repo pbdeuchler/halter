@@ -24,7 +24,9 @@ use job::{BackgroundJob, JobOutput, JobSummary};
 const OUTPUT_CAPACITY: usize = 64 * 1024;
 
 #[derive(Default)]
-pub(crate) struct BackgroundRegistry {
+/// A session's managed background jobs. Obtained from
+/// [`crate::ToolSessionStore::background_session`].
+pub struct BackgroundRegistry {
     state: Mutex<RegistryState>,
     lifetime: tokio_util::sync::CancellationToken,
     running: Arc<AtomicUsize>,
@@ -166,7 +168,7 @@ impl TypedTool for BackgroundTool {
     fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("background"),
-            description: "Spawn, list, read output from, stop, or prune finished managed background commands. Prune removes finished job records and retained output; running jobs are preserved. Jobs survive interruption of agent execution and are terminated when the session closes. Commands use an independent shell with explicit cwd/env; persistent shell state is not inherited. Output is bounded and cursors count bytes of combined stdout/stderr.".to_owned(),
+            description: "Spawn, list, read output from, stop, or prune finished managed background commands. Prune removes finished job records and retained output; running jobs are preserved. Jobs survive interruption of agent execution and are terminated when the session closes. Commands run in the same shell as the `shell` tool, started fresh with explicit cwd/env. Output is bounded and cursors count bytes of combined stdout/stderr.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -199,27 +201,15 @@ impl TypedTool for BackgroundTool {
                     !command.trim().is_empty(),
                     "invalid tool input: command must not be empty"
                 );
-                context
-                    .policy
-                    .check_shell_command_strict(command, context.policy.shell_mode())
-                    .await?;
+                context.policy.check_shell_enabled().await?;
                 let cwd = match input.get("cwd") {
                     None | Some(Value::Null) => context.working_dir.clone(),
                     Some(Value::String(cwd)) => resolve_path(&context.working_dir, cwd),
                     Some(_) => anyhow::bail!("invalid tool input: cwd must be a string"),
                 };
-                // The shell policy governs command execution, and the read
-                // policy prevents starting in a denied/sensitive directory.
+                // The read policy prevents starting in a denied/sensitive directory.
                 let cwd = context.policy.check_read_path(&cwd, 0).await?;
                 let env = parse_env_map(input.get("env"))?;
-                if let Some(env) = &env {
-                    for (key, value) in env {
-                        anyhow::ensure!(
-                            !key.is_empty() && !key.contains(['=', '\0']) && !value.contains('\0'),
-                            "invalid tool input: invalid environment entry '{key}'"
-                        );
-                    }
-                }
                 BackgroundOutput::Job(registry.spawn(&context, command, cwd, env).await?)
             }
             "list" => BackgroundOutput::Jobs {

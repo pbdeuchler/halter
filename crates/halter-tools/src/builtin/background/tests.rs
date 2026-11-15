@@ -29,12 +29,6 @@ fn context(root: &Path) -> ToolContext {
         emit: Arc::new(NoopToolEventSink),
         policy: Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_read_roots: vec![root.to_owned()],
-            allowed_shell_commands: [
-                "printf", "sleep", "trap", "wait", "head", "exit", "pwd", "sh",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
             ..PolicySettings::default()
         })),
         shell_timeout_secs: 30,
@@ -318,7 +312,7 @@ async fn aborting_foreground_shell_future_stops_its_worker_and_owned_descendants
 }
 
 #[tokio::test]
-async fn session_shutdown_reaps_shell_jobs_and_preserves_task_list() {
+async fn session_shutdown_reaps_background_jobs_and_preserves_task_list() {
     let root = tempfile::tempdir().unwrap();
     let context = context(root.path());
     context
@@ -326,18 +320,16 @@ async fn session_shutdown_reaps_shell_jobs_and_preserves_task_list() {
         .task_session(&context.session_id)
         .lock()
         .create("keep me".to_owned(), None);
-    crate::ShellTool
-        .execute(
-            context.clone(),
-            json!({"command": "sh -c 'printf %s \"$$\" > pid; sleep 30' &"}),
-        )
-        .await
-        .unwrap();
-    let pid: i32 = tokio::fs::read_to_string(root.path().join("pid"))
-        .await
-        .unwrap()
-        .parse()
-        .unwrap();
+    let job = execute(
+        &context,
+        json!({"action": "spawn", "command": "printf ready; sleep 30"}),
+    )
+    .await;
+    wait_for(&context, job["id"].as_str().unwrap(), |output| {
+        output["output"] == "ready"
+    })
+    .await;
+    let pid = job["pid"].as_i64().unwrap() as i32;
     // SAFETY: signal zero only probes the owned test child without mutation.
     let exists = unsafe { libc::kill(pid, 0) };
     assert_eq!(exists, 0);
@@ -365,7 +357,7 @@ async fn registered_job_survives_originating_cancellation_and_shutdown_reaps_it(
     let mut context = context(root.path());
     let job = execute(
         &context,
-        json!({"action": "spawn", "command": "trap '' TERM; sleep 30 & printf ready; wait"}),
+        json!({"action": "spawn", "command": "exec sh -c \"trap '' TERM; sleep 30 & printf ready; wait\""}),
     )
     .await;
     let id = job["id"].as_str().unwrap();
@@ -425,7 +417,7 @@ async fn kill_waits_for_stubborn_process_group_and_is_idempotent() {
     let context = context(root.path());
     let job = execute(
         &context,
-        json!({"action": "spawn", "command": "trap '' TERM; sleep 30 & printf '%s' \"$!\"; wait"}),
+        json!({"action": "spawn", "command": "exec sh -c \"trap '' TERM; sleep 30 & printf '%s' \\\"\\$!\\\"; wait\""}),
     )
     .await;
     let id = job["id"].as_str().unwrap();
@@ -517,7 +509,6 @@ async fn spawn_preserves_explicit_cwd_and_env_and_checks_policy() {
     for input in [
         json!({"action": "spawn", "command": "printf forbidden", "cwd": "/etc"}),
         json!({"action": "spawn", "command": "printf forbidden", "env": {"BAD=KEY": "value"}}),
-        json!({"action": "spawn", "command": "rm missing"}),
         json!({"action": "spawn", "command": ""}),
     ] {
         assert!(

@@ -103,7 +103,6 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
-allow = ["git", "cargo", "rg", "ls", "find", "true", "cd"]
 timeout_secs = 30
 
 [policy.network]
@@ -136,7 +135,7 @@ exclusive. Halter does not parse `.env` files.
 - `context.compaction_threshold` defaults to `models.default.max_input_tokens - 20_000`. Set one of the two, or config loading and `build()` fail. `context.max_tokens` (default `max_input_tokens`) hard-caps the session context: a turn past it fails with `ContextCapExceeded` instead of reaching the provider.
 - `context.compaction` is `"model_summary"` (default: the model writes a context checkpoint and the next window starts from it, after a nudge to persist todos when the `task` tool is registered) or `"provider_default"` (the provider's native compaction; `build()` fails if the default model's provider cannot compact).
 - `providers.<name>.base_url`, `api_key`, `headers`, and `temperature` are provider-level, not role-level. OpenAI also accepts provider-level `oauth`.
-- Environment overrides include `HALTER_TOOLS_ENABLED`, `HALTER_SKILL_ROOTS`, `HALTER_PLUGIN_ROOTS`, `HALTER_POLICY_SHELL_ALLOW`, `HALTER_POLICY_SHELL_ENABLED`, `HALTER_POLICY_NETWORK_ENABLED`, `HALTER_POLICY_ALLOWED_HOSTS`, and `HALTER_SESSION_BACKEND`.
+- Environment overrides include `HALTER_TOOLS_ENABLED`, `HALTER_SKILL_ROOTS`, `HALTER_PLUGIN_ROOTS`, `HALTER_POLICY_SHELL_ENABLED`, `HALTER_POLICY_NETWORK_ENABLED`, `HALTER_POLICY_ALLOWED_HOSTS`, and `HALTER_SESSION_BACKEND`.
 - Resource-root paths expand leading `~/` only. `$VAR`, `${VAR}`, `~user`, and shell escapes are not expanded.
 - Explicit `tools.enabled` is an allowlist. An empty list registers all compiled built-ins.
 - Feature-gated tools must be compiled in and enabled by config before the model can use them.
@@ -166,6 +165,7 @@ Use resources for durable agent behavior instead of appending instructions to ev
 - Plugin `skills` and `agents` paths must be `./...` or an accepted plugin alias. Parent-directory traversal is rejected.
 - Agent prompt files become named `agent_type` values for `spawn_agent`.
 - `hooks/hooks.json` is used when the manifest does not name a hooks file.
+- Command hooks inherit the full process environment (credentials included), unlike the `shell`/`background`/`pty` tools, which scrub it to essentials. HTTP hook headers only expand variables in `allowedEnvVars`.
 
 Compiled skills are inserted as prefix-cacheable prompt segments between system instructions and transcript history. Recompile resources with `ResourceCompiler::from_config(&config).compile().await?`, then call `harness.replace_resources(resources)` when a long-lived process needs future turns to see updated skills, agents, plugins, or hooks.
 
@@ -280,7 +280,7 @@ Base tools:
 
 - `read`, `glob`, `grep`: file discovery and reads.
 - `write`, `edit`: atomic file writes.
-- `shell`: persistent shell session, gated by shell policy and allowlist.
+- `shell`: one command per call in a fresh detected shell (bash, zsh, sh, or PowerShell); `cd`/`export` do not persist. Gated by `policy.shell.enabled`.
 - `process`: process-tree inspection and termination.
 - `task`: in-memory todo list scoped to the session.
 
@@ -307,7 +307,7 @@ Policy is enforced by tools, not by prompting.
 
 - Writes are limited by `allowed_write_roots`.
 - Reads are limited by `max_read_bytes`, configured read roots inside `PolicySettings`, and sensitive-path patterns.
-- Shell commands are parsed and checked against the allowlist. Strict mode rejects function definitions and `eval`, `exec`, `source`, and `.` invocations.
+- Shell has an on/off switch (`policy.shell.enabled`) and a timeout; there is no per-command allowlist. Gate commands with an approval hook if they need review.
 - Network is denied unless `policy.network.enabled = true`.
 - Remote hosts use `allowed_hosts`; loopback hosts require explicit `allowed_loopback`.
 - Process signals are bounded by the Halter process tree when the high-level builder creates policy.
@@ -411,7 +411,7 @@ Run the narrowest meaningful command first. Broaden to the workspace when a chan
 - Missing resource snapshot: use `Halter::from_config_file`, `Halter::from_config(config, snapshot)`, or builder resources.
 - Missing provider credentials: set the provider-specific env var or `[providers.<name>].api_key`. For OpenAI, `[providers.openai].oauth` is also valid.
 - Feature-gated tool unavailable: enable the Cargo feature and include the tool in `tools.enabled`.
-- Shell command denied: add the program to `policy.shell.allow` or change the workflow.
+- Shell disabled: set `policy.shell.enabled = true` (or `HALTER_POLICY_SHELL_ENABLED=true`).
 - Path denied: make the root exist and include it in policy. Parent traversal is rejected.
 - Network denied: enable network, allow the host, and explicitly allow loopback when needed.
 - Unknown `agent_type`: load plugin agent prompt files or omit `agent_type`.

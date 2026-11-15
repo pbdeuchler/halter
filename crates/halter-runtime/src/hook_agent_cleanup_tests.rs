@@ -185,7 +185,6 @@ async fn hook_fixture(
     services.models = Arc::new(models);
     services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
         allowed_read_roots: vec![root.to_owned()],
-        allowed_shell_commands: vec!["sleep".to_owned()],
         ..PolicySettings::default()
     }));
     services.tools.register(Arc::new(CaptureAgentTool {

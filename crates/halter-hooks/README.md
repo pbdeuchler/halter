@@ -252,6 +252,24 @@ Typical source categories include:
 
 The `halter` crate bridges plugin resource loading and these dispatch structures.
 
+### Command hook environment
+
+Command hooks inherit the **full environment** of the halter process,
+including any API keys and tokens in it. This is unlike the `shell`,
+`background`, and `pty` tools, which pass commands only an essentials
+allowlist (`PATH`, `HOME`, locale, temp dirs). Hooks are trusted plugin
+configuration, so they keep the same environment the user's own scripts would
+see. Only install plugins whose hook commands you trust with your credentials.
+
+On top of the inherited environment, the runtime sets `PLUGIN_ROOT`
+(`CLAUDE_PLUGIN_ROOT`), `PLUGIN_ID`, `HOOK_EVENT`, `HOOK_VERSION`,
+`HOOK_SOURCE_PATH`, `SESSION_ID`, `TURN_ID`, and `PROJECT_DIR`
+(`CLAUDE_PROJECT_DIR`, `HALTER_PROJECT_DIR`), followed by the hook's own
+`env` entries with `${PLUGIN_ROOT}`/`${PLUGIN_DATA}` expanded.
+
+HTTP hooks differ: header values may only expand variables named in both
+the hook's `allowed_env_vars` and the plugin manifest's `allowedEnvVars`.
+
 ---
 
 ## Dispatch pipeline

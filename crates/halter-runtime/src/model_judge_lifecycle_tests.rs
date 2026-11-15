@@ -202,7 +202,6 @@ fn services(
         models: Arc::new(models),
         policy: Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_read_roots: vec![working_dir.to_owned()],
-            allowed_shell_commands: ["sleep".to_owned()].into_iter().collect(),
             ..PolicySettings::default()
         })),
         ..Default::default()

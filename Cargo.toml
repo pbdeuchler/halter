@@ -10,14 +10,12 @@ members = [
     "crates/halter",
     "crates/halter-cli",
     "examples/software-factory",
-    "vendor/brush-builtins-vendored",
-    "vendor/brush-core-vendored",
 ]
 resolver = "3"
 
 [workspace.package]
 # Actual minimum supported toolchain: rusqlite requires 1.89 (transitive
-# dependencies and the vendored brush crates require 1.88). Keep the `msrv`
+# dependencies require 1.88). Keep the `msrv`
 # CI job in .github/workflows/ci.yml in sync with this value.
 rust-version = "1.89"
 edition = "2024"
@@ -30,9 +28,6 @@ ast-grep-language = { version = "0.42.1", default-features = false, features = [
 async-openai = { version = "0.34.0", default-features = false, features = ["byot", "chat-completion", "responses", "rustls"] }
 async-trait = "0.1.89"
 base64 = "0.22.1"
-brush-builtins = { package = "halter-brush-builtins", version = "0.3.0", path = "vendor/brush-builtins-vendored" }
-brush-core = { package = "halter-brush-core", version = "0.6.0", path = "vendor/brush-core-vendored" }
-brush-parser = "0.4.0"
 bytes = { version = "1.10.1", features = ["serde"] }
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
 clap = { version = "4.5.48", features = ["derive"] }

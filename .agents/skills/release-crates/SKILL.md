@@ -15,12 +15,10 @@ commit before any tag exists.
 
 ## The release graph
 
-Ten crates publish, in this dependency order — the list lives in `bin/crate-release-candidates`
+Eight crates publish, in this dependency order — the list lives in `bin/crate-release-candidates`
 and that file is the source of truth:
 
 ```
-halter-brush-core       vendor/brush-core-vendored/Cargo.toml
-halter-brush-builtins   vendor/brush-builtins-vendored/Cargo.toml
 halter-protocol         crates/halter-protocol/Cargo.toml
 halter-hooks            crates/halter-hooks/Cargo.toml
 halter-config           crates/halter-config/Cargo.toml
@@ -36,10 +34,6 @@ Facts that shape every step:
 - The **eight `crates/halter-*` crates plus `halter`** move as one semver-coupled unit. They
   always share a version number. `halter-cli` (`publish = false`) is bumped in lockstep so the
   workspace reads consistently; `examples/software-factory` (`publish = false`) is not versioned.
-- The **two vendored brush crates** version independently. They only move when
-  `vendor/` changes, and their numbers (currently `halter-brush-core` 0.5.x,
-  `halter-brush-builtins` 0.2.x) have nothing to do with the halter line. Do not sweep them
-  with a blanket find-and-replace, and do not assume they are unchanged — check.
 - Versions are **literal strings**, not `version.workspace`. Each manifest has its own
   `version = "X.Y.Z"` under `[package]`, *and* inter-crate dependency lines carry
   `{ path = "...", version = "X.Y.Z" }`. Both must move. `crates/halter/Cargo.toml` alone has
@@ -51,7 +45,7 @@ Facts that shape every step:
 ```bash
 LAST=$(git describe --tags --match 'v*' --abbrev=0)
 git log --oneline "$LAST"..HEAD
-git diff --stat "$LAST"..HEAD -- crates/ vendor/ examples/
+git diff --stat "$LAST"..HEAD -- crates/ examples/
 ```
 
 Read the commits, not just the stat. You are looking for the story the release notes have to
@@ -63,8 +57,8 @@ Then let the release tooling tell you what would actually publish:
 CRATE_RELEASE_BASE_REF="$LAST" bin/crate-release-candidates
 ```
 
-Run this **before** bumping (to see what the last release left behind — the vendored crates in
-particular can carry an unpublished bump from a prior merge) and **again after** bumping to
+Run this **before** bumping (to see what the last release left behind, such as an unpublished
+bump from a prior merge) and **again after** bumping to
 confirm the final publish set. Its stderr narrates `candidate:` / `unchanged:` per crate; its
 stdout is the `name|version|manifest` rows the workflow consumes.
 
@@ -110,14 +104,10 @@ fallback.
 ## 3. Bump the manifests
 
 Rewrite `version = "<old>"` → `version = "<new>"` across the nine `crates/*/Cargo.toml` files,
-covering both `[package]` and inter-crate dependency lines. Confirm the vendored manifests and
-the `brush-*` entries in the root `[workspace.dependencies]` were not caught by the sweep unless
-you intend to move them.
+covering both `[package]` and inter-crate dependency lines.
 
 ```bash
 grep -rn 'version = "' crates/*/Cargo.toml
-grep -n 'brush-' Cargo.toml
-grep -n '^version' vendor/*/Cargo.toml
 ```
 
 ## 4. Write the release notes
@@ -227,8 +217,7 @@ done
 ```
 
 The index path is `{name[0:2]}/{name[2:4]}/{name}` for names of four or more characters — so all
-`halter*` crates live under `ha/lt/`. Check the vendored crates at their own versions when they
-are part of the release.
+`halter*` crates live under `ha/lt/`.
 
 ### If the publish fails partway
 
