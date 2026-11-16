@@ -256,7 +256,7 @@ Builder rules:
 - Use `with_compiled_resources(...)` when hooks and hook warnings should survive compilation.
 - Use `with_session_store(...)` to replace the configured built-in backend.
 - Use `with_plugin_hook(...)` or `with_plugin_hook_priority(...)` for in-process SDK hooks.
-- Use `with_compaction(Arc<dyn CompactionStrategy>)` to replace the configured compaction strategy. The runtime still decides *when* from the session token ledger; the strategy decides what the rewrite is, can drive the model and tools through its `CompactionContext`, and may contribute tools, prompt segments, and threshold reminders. Never enable a provider's server-side auto-compaction.
+- Use `with_compaction(Arc<dyn CompactionStrategy>)` to replace the configured compaction strategy. The runtime still decides *when* from the session token ledger; the strategy decides what the rewrite is, can drive the model and tools through its `CompactionContext`, and may contribute tools, prompt segments, and threshold reminders. Implement `needs_compaction` when the strategy can tell from state that there is nothing to do: the pass is then skipped before `PreCompact`. `PostCompact` fires only after a rewrite replaced the context. Never enable a provider's server-side auto-compaction.
 
 ## Custom tools
 

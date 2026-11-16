@@ -132,6 +132,21 @@ In practice, the most operationally important events are usually:
 - `PreCompact`
 - `PostCompact`
 
+### Compaction hooks
+
+Both carry `trigger`: `auto` for ledger-triggered passes (including
+CleanWindow rollover), or the caller's string for `compact(..)`.
+
+- `PreCompact` (`custom_instructions`) fires when a pass is about to run. It
+  can block: an automatic pass then continues uncompacted with a `Warning`,
+  a rollover fails the turn, and a manual pass returns without compacting.
+  It does not fire when the strategy's `needs_compaction` says there is
+  nothing to do.
+- `PostCompact` (`compact_summary`) fires only after a compaction replaced
+  the context. A skipped pass, a strategy failure, a block, or a strategy
+  that declines after `PreCompact` (`compact` returns `Ok(None)`) never
+  reaches it.
+
 ---
 
 ## Hook responses

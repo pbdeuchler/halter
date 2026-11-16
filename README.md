@@ -1218,7 +1218,9 @@ happens*.
   try again until the ledger has grown by half the threshold, so a refused
   request is not resent at every boundary. `session.compact(..)` propagates
   failures. `PreCompact`/`PostCompact` hooks fire on both paths,
-  with trigger `auto` for the automatic one.
+  with trigger `auto` for the automatic one. `PostCompact` fires only after a
+  compaction replaced the context, and a pass the strategy rules out up front
+  (`CompactionStrategy::needs_compaction`) fires neither hook.
 - `context.compaction` picks the strategy. `"model_summary"` (the default)
   asks the session's own model for a context checkpoint: when the `task` tool
   is registered it first nudges the model to persist its remaining work there
@@ -1245,19 +1247,34 @@ happens*.
 use std::sync::Arc;
 
 use halter::HalterBuilder;
-use halter::compaction::{CompactionContext, CompactionEffects, CompactionStrategy};
+use halter::compaction::{
+    CompactionContext, CompactionEffects, CompactionStrategy, CompactionTrigger,
+};
+use halter_protocol::{ProviderCapabilities, SessionState};
 
 struct KeepEverything;
 
 #[async_trait::async_trait]
 impl CompactionStrategy for KeepEverything {
+    // Asked before any hook. `false` skips the pass: no `PreCompact`, no
+    // `compact` call, no `PostCompact`. The default is `true`.
+    fn needs_compaction(
+        &self,
+        state: &SessionState,
+        _capabilities: &ProviderCapabilities,
+        _trigger: CompactionTrigger<'_>,
+    ) -> bool {
+        !state.messages.is_empty()
+    }
+
     async fn compact(
         &self,
         ctx: CompactionContext<'_>,
     ) -> anyhow::Result<Option<CompactionEffects>> {
         // `ctx.state()` (messages, `token_ledger`), `ctx.prompt_segments()`,
         // `ctx.tool_specs()`, `ctx.model()`, and `ctx.provider()` are readable.
-        // `Ok(None)` means there was nothing to compact.
+        // `Ok(None)` means there was nothing to compact after all:
+        // `PreCompact` has fired, `PostCompact` will not.
         let _ = ctx;
         Ok(None)
     }
