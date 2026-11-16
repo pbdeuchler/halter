@@ -166,6 +166,12 @@ A response can express:
 - whether tool/output display should be suppressed
 - a stop condition
 
+A hook's system messages are added to the conversation where the hook ran,
+not to the system prompt, so they don't invalidate the provider's prompt
+cache. One from a `PreToolUse` or `PostToolUse` hook reaches the model just
+after that tool batch's results. Additional context is different: it is
+appended to the system prompt, so changing it does rewrite the cached prefix.
+
 ---
 
 ## Merge semantics

@@ -32,4 +32,5 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tracing-subscriber.workspace = true

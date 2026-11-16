@@ -452,6 +452,26 @@ Providers may have different tool-call ID expectations. The `tool_call_id_policy
 
 Some providers require non-empty assistant content. The runtime and protocol layers normalize accordingly.
 
+### System messages and the prompt cache
+
+Every codec keeps appends cache-friendly: adding a message to the history
+never changes the encoded tools, system prompt, or earlier messages. System
+messages before the first other message join the system prompt. A later one
+(a hook's message, a compaction reminder, a resume notice) is encoded in
+place:
+
+| API | Later system message |
+| --- | --- |
+| Responses | `developer` input item, also when chaining with `previous_response_id` |
+| Chat Completions | `system` message |
+| Anthropic Messages | user turn, text wrapped in `<system-reminder>` tags |
+
+One appended inside a tool batch (by a `PreToolUse` or `PostToolUse` hook)
+moves to just after the batch's results, since no API accepts other content
+between tool calls and their results. Empty system messages are dropped. The
+property test in `src/prefix_stability_tests.rs` checks this for every
+codec; a new codec should join it.
+
 ---
 
 ## Realistic assembly example
@@ -507,6 +527,7 @@ If you want to add a provider backend, the rough checklist is:
 5. handle cancellation correctly
 6. decide whether compaction is supported
 7. add tests for streaming, tool calls, failures, and replay behavior
+8. add the codec to the prefix-stability property test
 
 ### Design advice
 
