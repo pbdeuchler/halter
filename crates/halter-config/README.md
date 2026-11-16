@@ -161,6 +161,8 @@ api_key = "..."
 [providers.openrouter]
 base_url = "https://openrouter.ai/api"
 api_key = "..."
+# OpenAI and OpenRouter only: the `strict` value sent on every function tool.
+strict_tools = false
 
 # OpenRouter only: which upstream provider should serve the model. Sent as the
 # `provider` object of every OpenRouter request body, compaction included.
@@ -179,6 +181,17 @@ provider fails validation.
 The rules themselves live on `halter_protocol::OpenRouterRouting::normalized`,
 which this crate applies while resolving the config and `OpenRouterProvider`
 applies to values supplied directly.
+
+`strict_tools` (default `false`) is sent as `strict` on every function tool of
+an OpenAI or OpenRouter request; halter always sends the field, because the
+Responses API treats an omitted `strict` as `true`. Strict mode requires every
+tool schema to list all of its properties in `required` (optional ones become
+nullable) and to set `additionalProperties = false`. Halter sends schemas
+unchanged, so with `strict_tools = true` a tool whose schema does not qualify
+fails the request with the upstream's invalid-request error, which is not
+retried. Halter's built-in tools have optional properties, so enable it only
+for a tool set built for strict mode. Configuring `strict_tools` for
+`[providers.anthropic]` fails validation.
 
 Each provider also accepts an optional `headers` sub-table. Entries override
 the provider's default or hardcoded HTTP headers (`Authorization`, `x-api-key`,

@@ -423,6 +423,14 @@ is already OpenRouter's default and `false` would permit nothing. The same
 rules apply to a value handed straight to `OpenRouterProvider`, so nothing
 unchecked reaches a request body.
 
+`[providers.openai]` and `[providers.openrouter]` accept `strict_tools`
+(default `false`), sent as `strict` on every function tool. Halter always
+sends the field, because the Responses API treats an omitted `strict` as
+`true`. Strict mode requires every tool schema to list all of its properties
+in `required` and to set `additionalProperties = false`; halter sends schemas
+unchanged, so a tool that does not qualify fails the request with a
+non-retried invalid-request error. Halter's built-in tools do not qualify.
+
 Provider request resilience is configured globally under `[resilience]` and can
 be partially overridden per provider. The same retry policy applies uniformly to
 Anthropic, OpenAI, and OpenRouter, and covers both streaming turns and

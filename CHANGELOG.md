@@ -35,6 +35,14 @@ once a `1.0.0` line is cut.
 - The detected shell is public as `halter_tools::{detected_shell, Shell, ShellKind}`.
 - `env` entries with an empty key, `=` or NUL in the key, or NUL in the value
   are rejected by `shell` and `background`.
+- **Breaking:** `OpenAiProvider::new_with_headers_and_resilience`,
+  `OpenAiProvider::new_with_oauth_headers_and_resilience`, and
+  `OpenRouterProvider::new_with_headers_and_resilience` take a new
+  `halter_providers::ResponsesOptions` argument before the resilience policy.
+  The shorter constructors use `ResponsesOptions::default()`.
+- `[providers.openai]` and `[providers.openrouter]` accept `strict_tools`
+  (default `false`), the `strict` value sent on every Responses function tool.
+  Setting it for `[providers.anthropic]` fails validation.
 
 ### Removed
 
@@ -76,6 +84,11 @@ once a `1.0.0` line is cut.
 - After an automatic compaction fails, the turn waits for the ledger to grow by
   half the threshold before trying again (`ContextSettings::compaction_due_after`).
   Before, the same request was resent at every boundary.
+- OpenAI and OpenRouter Responses requests send `"strict": false` on every
+  function tool. Before, `strict` was omitted, which the Responses API defines
+  as `true`, so whether tool schemas were enforced depended on the upstream.
+  Halter's built-in tools have optional properties and do not meet strict
+  mode's schema rules.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the

@@ -22,7 +22,7 @@ use halter_providers::{
     AnthropicProvider, DefaultProviderErrorClassifier, FullTurnJudgePlan, FullTurnPanelist,
     ModelJudgeMember, ModelJudgeProvider, ModelRegistry, OpenAiOAuthCredentials, OpenAiProvider,
     OpenRouterProvider, Provider, ProviderErrorClassifier, ProviderTimeouts, ResiliencePolicy,
-    RetryPolicy,
+    ResponsesOptions, RetryPolicy,
 };
 use halter_runtime::{
     CleanWindow, CompactionStrategy, ContextSettings, DefaultContextManager,
@@ -1044,7 +1044,10 @@ fn build_provider(
     );
     // One integration strategy for every family: each provider constructor
     // wraps its transport core in `ResilientProvider` internally; the builder
-    // only supplies the policy and classifier.
+    // only supplies request options, the policy, and the classifier.
+    let responses_options = ResponsesOptions {
+        strict_tools: provider.strict_tools,
+    };
     let provider: Arc<dyn halter_providers::Provider> = match provider.provider {
         ConfiguredProvider::Anthropic => {
             Arc::new(AnthropicProvider::new_with_headers_and_resilience(
@@ -1063,6 +1066,7 @@ fn build_provider(
                     provider.base_url.clone(),
                     &provider.headers,
                     provider.temperature,
+                    responses_options,
                     resilience_policy,
                     classifier,
                 )?)
@@ -1073,6 +1077,7 @@ fn build_provider(
                     provider.base_url.clone(),
                     &provider.headers,
                     provider.temperature,
+                    responses_options,
                     resilience_policy,
                     classifier,
                 )?)
@@ -1085,6 +1090,7 @@ fn build_provider(
                 &provider.headers,
                 provider.temperature,
                 provider.routing.clone(),
+                responses_options,
                 resilience_policy,
                 classifier,
             )?)

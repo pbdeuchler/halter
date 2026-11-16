@@ -803,6 +803,13 @@ pub struct ProviderConfig {
     /// `[providers.openrouter]`. When unset, OpenRouter picks freely.
     #[serde(default)]
     pub routing: Option<OpenRouterRouting>,
+    /// OpenAI and OpenRouter only: the `strict` value sent on every function
+    /// tool. Defaults to `false`. `true` requires every tool schema to list
+    /// all properties in `required` and set `additionalProperties = false`;
+    /// halter sends schemas unchanged, so one that does not qualify fails
+    /// the request.
+    #[serde(default)]
+    pub strict_tools: Option<bool>,
     /// Partial override for the global `[resilience]` provider policy.
     #[serde(default)]
     pub resilience: Option<ResilienceOverrideConfig>,
@@ -855,6 +862,9 @@ pub struct ResolvedProviderConfig {
     /// object of every request this provider emits. Always `None` for
     /// providers other than OpenRouter.
     pub routing: Option<OpenRouterRouting>,
+    /// `strict` value for function tools on Responses providers; `false`
+    /// unless configured.
+    pub strict_tools: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -954,6 +964,7 @@ where
         headers,
         temperature,
         routing,
+        strict_tools: configured.and_then(|config| config.strict_tools) == Some(true),
     })
 }
 
@@ -1010,6 +1021,11 @@ fn validate_provider_config(name: &str, provider: &ProviderConfig) -> anyhow::Re
             );
         }
         normalized_openrouter_routing(&format!("providers.{name}.routing"), routing)?;
+    }
+    if provider.strict_tools.is_some() && name == ConfiguredProvider::Anthropic.as_str() {
+        anyhow::bail!(
+            "invalid configuration: providers.{name}.strict_tools is only supported for providers.openai and providers.openrouter"
+        );
     }
     if let Some(resilience) = &provider.resilience {
         resilience.validate(&format!("providers.{name}.resilience"))?;
@@ -2487,6 +2503,68 @@ stream_idle_secs = 0
         .expect("resolve provider");
 
         assert_eq!(resolved.routing, None);
+    }
+
+    /// `strict_tools` resolves to the configured value and to `false` when
+    /// unset, for both Responses providers. Kills resolving it to a constant
+    /// (the `Some(true)` rows) and defaulting it to `true` (the `None` rows).
+    #[test]
+    fn provider_resolution_resolves_strict_tools() {
+        let cases = [
+            (ConfiguredProvider::OpenAi, None, false),
+            (ConfiguredProvider::OpenAi, Some(true), true),
+            (ConfiguredProvider::OpenRouter, None, false),
+            (ConfiguredProvider::OpenRouter, Some(false), false),
+            (ConfiguredProvider::OpenRouter, Some(true), true),
+        ];
+
+        for (provider, strict_tools, expected) in cases {
+            let resolved = resolve_provider_runtime_config(
+                provider,
+                Some(&ProviderConfig {
+                    api_key: Some("configured-key".to_owned()),
+                    strict_tools,
+                    ..ProviderConfig::default()
+                }),
+                |_| Ok(None),
+            )
+            .expect("resolve provider");
+
+            assert_eq!(
+                resolved.strict_tools, expected,
+                "{provider} {strict_tools:?}"
+            );
+        }
+    }
+
+    /// `strict_tools` is a Responses tool field; on Anthropic it would be
+    /// silently meaningless, so validation names the misplaced key. The
+    /// OpenAI and OpenRouter rows must load. Kills deleting the check (the
+    /// Anthropic row) and applying it to every provider (the other rows).
+    #[test]
+    fn strict_tools_validation_accepts_only_responses_providers() {
+        let cases = [
+            (
+                "anthropic",
+                Some("providers.anthropic.strict_tools is only supported"),
+            ),
+            ("openai", None),
+            ("openrouter", None),
+        ];
+
+        for (provider, want) in cases {
+            let toml = format!(
+                "version = 1\n\n[models.default]\nprovider = \"{provider}\"\nmodel = \"m\"\n\n[providers.{provider}]\napi_key = \"k\"\nstrict_tools = true\n"
+            );
+            let parsed: HarnessConfig = toml::from_str(&toml).expect("parse config");
+            match (parsed.validate(), want) {
+                (Ok(()), None) => {}
+                (Err(error), Some(want)) => {
+                    assert!(error.to_string().contains(want), "{provider}: {error}");
+                }
+                (result, _) => panic!("{provider}: unexpected result {result:?}"),
+            }
+        }
     }
 
     /// Every rejected routing form, at both doors: `validate_provider_config`

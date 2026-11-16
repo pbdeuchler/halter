@@ -71,8 +71,9 @@ OpenAI, OpenRouter, and Anthropic all wrap their transport core in
 `new(...)` — yields bounded retries with exponential backoff for transient
 failures (rate limits, 5xx/overload, network faults) on both `stream(...)` and
 `compact(...)`. Pass a custom policy and classifier with
-`new_with_headers_and_resilience(...)`; the higher-level builder only supplies
-the policy from config. Retryability is decided by one shared classifier
+`new_with_headers_and_resilience(...)`, which for OpenAI and OpenRouter also
+takes [`ResponsesOptions`](#responses-request-options); the higher-level
+builder only supplies the options and the policy from config. Retryability is decided by one shared classifier
 across provider families, server-supplied backoff hints (`Retry-After`,
 "try again in …") are honored, and jitter stays within `max_backoff`.
 Deterministic setup failures (wrong api kind, unencodable request) are fatal
@@ -395,6 +396,28 @@ value, so slugs are trimmed and a preference that names nothing, blanks a slug,
 or repeats one fails construction rather than reaching a request body.
 Config-driven use goes through `[providers.openrouter.routing]` in
 `halter-config`, which applies the same rules while resolving the config.
+
+---
+
+## Responses request options
+
+`ResponsesOptions` carries the Responses-request settings that
+`OpenAiProvider::new_with_headers_and_resilience`,
+`OpenAiProvider::new_with_oauth_headers_and_resilience`, and
+`OpenRouterProvider::new_with_headers_and_resilience` take; the shorter
+constructors use `ResponsesOptions::default()`.
+
+- `strict_tools` (default `false`) is sent as `strict` on every function tool.
+  It is always sent, because the Responses API treats an omitted `strict` as
+  `true`. `true` makes the upstream enforce each schema, which requires every
+  object to list all of its properties in `required` (optional ones become
+  nullable) and to set `"additionalProperties": false`. Halter does not rewrite
+  schemas: one that does not qualify fails the request with the upstream's
+  invalid-request error, which is not retried. Halter's built-in tools have
+  optional properties and do not qualify.
+
+Config-driven use goes through `strict_tools` in `[providers.openai]` and
+`[providers.openrouter]`.
 
 ---
 

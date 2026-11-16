@@ -45,6 +45,9 @@ pub(crate) struct ResponsesRequestOptions<'a> {
     pub store: Option<bool>,
     pub prompt_cache_key: Option<&'a str>,
     pub include_encrypted_reasoning: bool,
+    /// Value of every function tool's `strict` field. Always sent, because
+    /// the Responses API defaults an omitted `strict` to `true`.
+    pub strict_tools: bool,
     pub reasoning_summary: Option<&'a str>,
     pub instruction_mode: ResponsesInstructionMode,
     /// Sampling temperature forwarded to the Responses API when configured.
@@ -142,7 +145,7 @@ pub(crate) fn encode_responses_request(
     if !request.tools.is_empty() {
         body.insert(
             "tools".to_owned(),
-            Value::Array(encode_responses_tools(request)),
+            Value::Array(encode_responses_tools(request, options.strict_tools)),
         );
     }
 
@@ -1299,7 +1302,7 @@ fn validate_responses_input_item_ids(input: &[Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn encode_responses_tools(request: &ProviderRequest) -> Vec<Value> {
+fn encode_responses_tools(request: &ProviderRequest, strict: bool) -> Vec<Value> {
     request
         .tools
         .iter()
@@ -1309,6 +1312,7 @@ fn encode_responses_tools(request: &ProviderRequest) -> Vec<Value> {
                 "name": tool_name_for_provider(&tool.name, &request.tools, request.model.provider_kind),
                 "description": tool.description,
                 "parameters": tool.input_schema,
+                "strict": strict,
             })
         })
         .collect()
@@ -1761,6 +1765,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: Some(request.prompt.prefix_cache_key.as_str()),
                 include_encrypted_reasoning: true,
+                strict_tools: false,
                 reasoning_summary: Some("auto"),
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: Some(0.5),
@@ -1816,6 +1821,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::TopLevelRequired,
                 temperature: None,
@@ -1849,6 +1855,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::TopLevelRequired,
                 temperature: None,
@@ -1881,6 +1888,7 @@ mod tests {
                 store: None,
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::TopLevelRequired,
                 temperature: None,
@@ -1911,6 +1919,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -1941,6 +1950,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -1962,6 +1972,7 @@ mod tests {
                 store: None,
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -1987,6 +1998,38 @@ mod tests {
                 && item["call_id"] == "call_123"
         }));
         assert!(body.get("temperature").is_none());
+    }
+
+    /// `strict` is always on the wire, because the Responses API reads an
+    /// omitted `strict` as `true` and then rejects calls that leave optional
+    /// properties out. Kills dropping the `"strict"` key from
+    /// `encode_responses_tools` (the `false` row) and hardcoding it (both).
+    #[test]
+    fn responses_tools_always_carry_the_configured_strict_flag() {
+        for strict_tools in [false, true] {
+            let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter);
+            let body = encode_responses_request(
+                &request,
+                ResponsesRequestOptions {
+                    stream: true,
+                    store: Some(false),
+                    prompt_cache_key: None,
+                    include_encrypted_reasoning: false,
+                    strict_tools,
+                    reasoning_summary: None,
+                    instruction_mode: ResponsesInstructionMode::DeveloperMessage,
+                    temperature: None,
+                    routing: None,
+                },
+            )
+            .expect("encode request");
+
+            let tools = body["tools"].as_array().expect("tools");
+            assert!(!tools.is_empty());
+            for tool in tools {
+                assert_eq!(tool["strict"], json!(strict_tools), "strict={strict_tools}");
+            }
+        }
     }
 
     /// The dedicated `/v1/responses/compact` endpoint takes the compaction
@@ -2107,6 +2150,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -2140,6 +2184,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -2304,6 +2349,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
