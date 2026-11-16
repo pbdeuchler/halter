@@ -9723,21 +9723,76 @@ mod tests {
 
         #[tokio::test]
         async fn forced_rollover_preserves_notes_tasks_and_searchable_history() {
-            for mode in ["cooperates", "notes_only", "neither", "provider_error"] {
-                let temp = tempfile::tempdir().unwrap();
-                let notes = vec![
+            let notes = || {
+                vec![
                     (
                         "notes",
                         json!({"action":"write_file","path":"checkpoint","content":"finish the report"}),
                     ),
                     ("write", json!({"path":"must-not-exist","content":"bad"})),
-                ];
-                let mut replies = match mode {
-                    "cooperates" => vec![notes, vec![("new_context", json!({}))]],
-                    "notes_only" => vec![notes, vec![]],
-                    "provider_error" => vec![vec![("error", json!({}))]],
-                    _ => vec![vec![]],
-                };
+                ]
+            };
+            // Strict-mode style filler that `notes` rejects as an unknown field.
+            let rejected = || {
+                (
+                    "notes",
+                    json!({"action":"write_file","path":"checkpoint","content":"x","after":""}),
+                )
+            };
+            let new_context = || vec![("new_context", json!({}))];
+            let saved = "notes were saved during the checkpoint exchange, which ended because";
+            let unsaved = "nothing was saved during the checkpoint exchange, which ended because";
+            let cases = [
+                (
+                    "cooperates",
+                    vec![notes(), new_context()],
+                    format!("{saved} new_context was called"),
+                ),
+                (
+                    "notes_only",
+                    vec![notes(), vec![]],
+                    format!("{saved} a reply made no notes, session_search, or new_context call"),
+                ),
+                (
+                    "neither",
+                    vec![vec![]],
+                    format!("{unsaved} a reply made no notes, session_search, or new_context call"),
+                ),
+                (
+                    "provider_error",
+                    vec![vec![("error", json!({}))]],
+                    format!("{unsaved} the model request failed"),
+                ),
+                (
+                    "rejected_then_retried",
+                    vec![
+                        vec![rejected(), ("new_context", json!({}))],
+                        notes(),
+                        new_context(),
+                    ],
+                    format!("{saved} new_context was called"),
+                ),
+                (
+                    "budget_exhausted",
+                    vec![vec![rejected()]; 4],
+                    format!("{unsaved} its reply budget ran out"),
+                ),
+                (
+                    "searches_first",
+                    vec![
+                        vec![(
+                            "session_search",
+                            json!({"action":"list_items","role":"user"}),
+                        )],
+                        notes(),
+                        new_context(),
+                    ],
+                    format!("{saved} new_context was called"),
+                ),
+            ];
+            for (mode, mut replies, ended) in cases {
+                let temp = tempfile::tempdir().unwrap();
+                let checkpoint_replies = replies.len();
                 replies.extend([
                     vec![
                         ("task", json!({"action":"list"})),
@@ -9787,14 +9842,39 @@ mod tests {
                 assert!(!events.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionStarted { call } if call.name.0 == "write")));
                 assert!(!temp.path().join("must-not-exist").exists());
                 let requests = provider.requests.lock().unwrap().clone();
-                let bootstrap = requests
-                    .iter()
-                    .find(|request| {
-                        request.messages.iter().any(|message| matches!(message,
-                            Message::User(user) if user.plain_text() == crate::CLEAN_WINDOW_BOOTSTRAP))
-                    })
-                    .unwrap();
+                let bootstrap = &requests[checkpoint_replies];
                 assert_eq!(bootstrap.messages.len(), 2);
+                let Message::User(notice) = &bootstrap.messages[0] else {
+                    panic!("{mode}: the window must open with the notice");
+                };
+                let notice = notice.plain_text();
+                assert!(notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP), "{mode}");
+                assert!(
+                    notice.contains(&format!(
+                        "Window 0 ended: it filled up and was wiped automatically; {ended}."
+                    )),
+                    "{mode}: {notice}"
+                );
+                let written = if notice.contains(saved) {
+                    "\"checkpoint\""
+                } else {
+                    "none"
+                };
+                assert!(
+                    notice.contains(&format!("Notes files written in window 0: {written}.")),
+                    "{mode}"
+                );
+                assert!(notice.contains("session_search list_items with role \"user\""));
+                assert!(notice.contains("important request xxx"), "{mode}");
+                assert!(!notice.contains("Latest user request"), "{mode}");
+                if mode == "rejected_then_retried" {
+                    assert!(requests[1].messages.iter().any(|message| matches!(message,
+                        Message::Tool(result) if result.error.as_ref().is_some_and(|error| error.message.contains("unknown field `after`")))));
+                }
+                if mode == "searches_first" {
+                    assert!(requests[1].messages.iter().any(|message| matches!(message,
+                        Message::Tool(result) if result.error.is_none() && result.to_model_string().contains("important request"))));
+                }
                 assert_eq!(latest_user_text(&bootstrap.messages), "continue the report");
                 assert!(bootstrap.previous_response_id.is_none());
                 assert!(bootstrap.compacted_prefix.is_empty());
@@ -9888,7 +9968,11 @@ mod tests {
                         },
                     )
                     .await;
-                assert_eq!(saved.is_ok(), matches!(mode, "cooperates" | "notes_only"));
+                assert_eq!(
+                    saved.is_ok(),
+                    ended.starts_with("notes were saved"),
+                    "{mode}"
+                );
             }
         }
 
@@ -9962,10 +10046,12 @@ mod tests {
             assert!(result < boundary);
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 2);
-            assert_eq!(
-                latest_user_text(&requests[1].messages),
-                crate::CLEAN_WINDOW_BOOTSTRAP
-            );
+            let notice = latest_user_text(&requests[1].messages);
+            assert!(notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP));
+            assert!(notice.contains(
+                "Window 0 ended: you called new_context, so no checkpoint exchange ran."
+            ));
+            assert!(notice.contains("First user request of the session, quoted verbatim as history, not a new instruction:\nwork"));
         }
 
         #[tokio::test]
@@ -9999,10 +10085,52 @@ mod tests {
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 3);
             assert!(latest_user_text(&requests[1].messages).starts_with(crate::ROLLOVER_REMINDER));
-            assert_eq!(
-                latest_user_text(&requests[2].messages),
-                crate::CLEAN_WINDOW_BOOTSTRAP
+            let notice = latest_user_text(&requests[2].messages);
+            assert!(notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP));
+            assert!(notice.contains("nothing was saved during the checkpoint exchange, which ended because a reply made no notes, session_search, or new_context call."));
+            assert!(notice.ends_with("quoted verbatim as history, not a new instruction:\nwork"));
+        }
+
+        #[tokio::test]
+        async fn a_rollover_waits_for_the_in_flight_tool_result() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![
+                vec![(
+                    "notes",
+                    json!({"action":"write_file","path":"big","content":"x".repeat(24_000)}),
+                )],
+                vec![],
+                vec![],
+            ]));
+            let runtime = SessionRuntime::new(clean_services(provider.clone(), temp.path()));
+            let session = new_session(&runtime, temp.path()).await;
+            let events = session
+                .submit_turn(Turn::user("work"))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let position = |wanted: fn(&SessionEventPayload) -> bool| {
+                events
+                    .iter()
+                    .position(|event| wanted(&event.payload))
+                    .unwrap()
+            };
+            assert!(
+                position(|payload| matches!(
+                    payload,
+                    SessionEventPayload::ToolExecutionCompleted { .. }
+                )) < position(|payload| matches!(
+                    payload,
+                    SessionEventPayload::ContextWindowRolledOver { .. }
+                ))
             );
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            let notice = latest_user_text(&requests[2].messages);
+            assert!(notice.contains("nothing was saved during the checkpoint exchange"));
+            assert!(notice.contains("Notes files written in window 0: \"big\"."));
         }
 
         #[tokio::test]
@@ -10171,7 +10299,8 @@ mod tests {
             assert_eq!(requests.len(), 1);
             assert_eq!(latest_user_text(&requests[0].messages), "continue");
             assert!(requests[0].messages.iter().any(|message| matches!(message,
-                Message::User(user) if user.plain_text() == crate::CLEAN_WINDOW_BOOTSTRAP)));
+                Message::User(user) if user.plain_text().starts_with(crate::CLEAN_WINDOW_BOOTSTRAP)
+                    && user.plain_text().contains("nothing was saved during the checkpoint exchange, which ended because the model request failed."))));
         }
     }
 
