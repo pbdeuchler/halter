@@ -65,6 +65,23 @@ once a `1.0.0` line is cut.
   doesn't exist is still an error. On macOS the scratch root moves from
   `/tmp/halter` to the per-user `$TMPDIR/halter`. The starter config template no
   longer lists `allowed_write_roots` explicitly, so it keeps the default.
+- **Breaking:** `[resilience.request_retry] deadline_secs` (`RetryPolicy::deadline`)
+  is now a budget for the total backoff slept between attempts, not wall time
+  from before the first attempt. Before, any attempt that ran at least
+  `deadline_secs` exhausted the budget by itself, so at the defaults (60s
+  deadline, 60s `request_secs`, 60s `stream_idle_secs`) a stalled request or
+  stream timed out and was never retried. Time inside an attempt is bounded by
+  the timeouts; a retry sequence is bounded by `max_attempts` and this budget.
+  Configs that set a large deadline only to cover attempt time can lower it.
+- The streaming HTTP client no longer sets a reqwest `read_timeout` of
+  `stream_idle_secs`. That timer started at send, so it raced `request_secs`
+  for the response headers and won with a less specific error whenever
+  `request_secs` was the longer one. The body stays bounded by the per-event
+  `stream_idle_secs` timer.
+- **Breaking:** config validation rejects `timeouts.connect_secs` that is not
+  less than `timeouts.request_secs`, globally and in each provider's effective
+  config, with an error naming both keys. Such a connect timeout could never
+  fire.
 
 ## [0.10.0] - 2026-11-14
 

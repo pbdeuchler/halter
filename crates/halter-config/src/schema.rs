@@ -594,6 +594,15 @@ impl ResilienceTimeoutsConfig {
         validate_positive_u64(&format!("{path}.connect_secs"), self.connect_secs)?;
         validate_positive_u64(&format!("{path}.request_secs"), self.request_secs)?;
         validate_positive_u64(&format!("{path}.stream_idle_secs"), self.stream_idle_secs)?;
+        // Both timers start at send; an equal or longer connect timeout can
+        // never fire, so the user gets the request error for a connect fault.
+        if self.connect_secs >= self.request_secs {
+            anyhow::bail!(
+                "invalid configuration: {path}.connect_secs ({}s) must be less than {path}.request_secs ({}s), which encloses it",
+                self.connect_secs,
+                self.request_secs
+            );
+        }
         Ok(())
     }
 }
@@ -601,7 +610,10 @@ impl ResilienceTimeoutsConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// Provider request retry policy. `max_attempts` includes the initial
-/// request; retries stop when either the attempt budget or deadline is spent.
+/// request; retries stop when either the attempt budget or the backoff budget
+/// `deadline_secs` is spent. `deadline_secs` caps the total time slept
+/// between attempts, not wall time: time inside an attempt (bounded by
+/// `timeouts`) never counts, so no attempt timeout can exhaust it.
 pub struct RequestRetryConfig {
     #[serde(default = "default_provider_retry_max_attempts")]
     pub max_attempts: u32,
@@ -2074,6 +2086,59 @@ base_backoff_ms = 40000
                 && rendered.contains("must not exceed"),
             "unexpected error: {rendered}"
         );
+    }
+
+    /// `connect_secs` must be strictly inside `request_secs`, checked over the
+    /// defaults, user-supplied globals, and the effective provider override.
+    /// Mutations killed: deleting the check (every rejected row); `>=` to `>`
+    /// (the "equal" row); validating only the global block (the override row,
+    /// whose override alone is valid).
+    #[test]
+    fn connect_timeout_must_be_inside_request_timeout() {
+        let cases = [
+            ("defaults", "", None),
+            (
+                "user global valid",
+                "[resilience.timeouts]\nconnect_secs = 5\nrequest_secs = 6\n",
+                None,
+            ),
+            (
+                "user global equal",
+                "[resilience.timeouts]\nconnect_secs = 30\nrequest_secs = 30\n",
+                Some(
+                    "resilience.timeouts.connect_secs (30s) must be less than resilience.timeouts.request_secs (30s)",
+                ),
+            ),
+            (
+                "user global inverted",
+                "[resilience.timeouts]\nconnect_secs = 90\n",
+                Some(
+                    "resilience.timeouts.connect_secs (90s) must be less than resilience.timeouts.request_secs (60s)",
+                ),
+            ),
+            (
+                "provider override inverts the effective config",
+                "[providers.openai.resilience.timeouts]\nrequest_secs = 5\n",
+                Some(
+                    "providers.openai.resilience (effective).timeouts.connect_secs (10s) must be less than",
+                ),
+            ),
+        ];
+        for (name, extra, want_error) in cases {
+            let toml = format!(
+                "version = 1\n\n[models.default]\nprovider = \"openai\"\nmodel = \"gpt-5\"\n\n[providers.openai]\napi_key = \"test-key\"\n\n{extra}"
+            );
+            let parsed: HarnessConfig = toml::from_str(&toml).expect(name);
+            match (parsed.validate(), want_error) {
+                (Ok(()), None) => {}
+                (Err(error), Some(fragment)) => {
+                    let rendered = error.to_string();
+                    assert!(rendered.contains(fragment), "{name}: {rendered}");
+                }
+                (Ok(()), Some(_)) => panic!("{name}: expected a validation error"),
+                (Err(error), None) => panic!("{name}: {error:#}"),
+            }
+        }
     }
 
     #[test]

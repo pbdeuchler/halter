@@ -18,8 +18,12 @@ use crate::resilience::ProviderTimeouts;
 
 /// Build the (unary, streaming) reqwest client pair shared by every provider
 /// transport. The unary client bounds the whole request with
-/// `timeouts.request`; the streaming client instead bounds only the idle gap
-/// between body reads so long-lived SSE responses are not killed mid-stream.
+/// `timeouts.request`. The streaming client sets no read or total timeout:
+/// its header wait is bounded by the setup timer (`timeouts.request`) and its
+/// body by `ResilientProvider`'s per-event `stream_idle` timer, which every
+/// public provider wraps it in. A reqwest `read_timeout` would start at
+/// `send()` and race the setup timer with a worse error, making
+/// `request > stream_idle` dead config.
 pub(crate) fn provider_http_clients(
     timeouts: ProviderTimeouts,
 ) -> anyhow::Result<(Client, Client)> {
@@ -32,7 +36,6 @@ pub(crate) fn provider_http_clients(
     let streaming_client = Client::builder()
         .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(timeouts.connect)
-        .read_timeout(timeouts.stream_idle)
         .build()
         .context("failed to build provider streaming http client")?;
     Ok((unary_client, streaming_client))
@@ -625,36 +628,73 @@ mod tests {
         assert_eq!(error.backoff_hint, Some(Duration::from_secs(2)));
     }
 
+    /// The header wait is bounded by `request` alone. Rows: headers never
+    /// arrive (the setup timer fires with its own message); headers arrive
+    /// after `stream_idle` but before `request` (must succeed). Mutation
+    /// killed by the second row: re-adding `.read_timeout(timeouts.stream_idle)`
+    /// to the streaming client, which starts at `send()` and so races the
+    /// setup timer with a reqwest error.
     #[tokio::test]
-    async fn post_json_event_stream_times_out_request_setup() {
-        // Server accepts the connection but never responds.
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let address = listener.local_addr().expect("local addr");
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept socket");
-            let _ = read_http_request(&mut socket).await;
-            std::future::pending::<()>().await;
-        });
-
-        let timeouts = ProviderTimeouts {
-            connect: Duration::from_secs(1),
-            request: Duration::from_millis(50),
-            stream_idle: Duration::from_secs(1),
-        };
-        let client = JsonHttpClient::try_new_with_timeouts(timeouts).expect("http client");
-        let error = client
-            .post_json_event_stream(
-                request(format!("http://{address}"), Vec::new()),
-                CancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("setup should time out");
-        let error = provider_error_from_anyhow(error);
-        assert_eq!(error.kind, ProviderErrorKind::Transient);
-        assert!(error.message.contains("timed out"));
+    async fn post_json_event_stream_header_wait_is_bounded_by_request_only() {
+        let ms = Duration::from_millis;
+        let cases = [
+            (
+                "headers never arrive",
+                ms(50),
+                ms(1_000),
+                None,
+                Some("request timed out"),
+            ),
+            (
+                "headers after stream_idle",
+                ms(1_000),
+                ms(30),
+                Some(ms(150)),
+                None,
+            ),
+        ];
+        for (name, request_timeout, stream_idle, header_delay, expected_error) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let address = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept socket");
+                let _ = read_http_request(&mut socket).await;
+                let Some(delay) = header_delay else {
+                    return std::future::pending::<()>().await;
+                };
+                tokio::time::sleep(delay).await;
+                let body = "data: {\"a\":1}\n\ndata: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+            let client = JsonHttpClient::try_new_with_timeouts(ProviderTimeouts {
+                connect: ms(10),
+                request: request_timeout,
+                stream_idle,
+            })
+            .expect("http client");
+            let result = client
+                .post_json_event_stream(
+                    request(format!("http://{address}"), Vec::new()),
+                    CancellationToken::new(),
+                )
+                .await;
+            match (result, expected_error) {
+                (Ok(_), None) => {}
+                (Err(error), Some(expected)) => {
+                    let error = provider_error_from_anyhow(error);
+                    assert_eq!(error.kind, ProviderErrorKind::Transient, "{name}");
+                    assert!(error.message.contains(expected), "{name}: {error:?}");
+                }
+                (Ok(_), Some(_)) => panic!("{name}: expected an error"),
+                (Err(error), None) => panic!("{name}: unexpected error {error:#}"),
+            }
+        }
     }
 
     #[tokio::test]
