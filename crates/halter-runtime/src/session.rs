@@ -9978,13 +9978,34 @@ mod tests {
 
         #[tokio::test]
         async fn failed_new_context_does_not_wipe_the_window() {
+            struct RefusedNewContext;
+            #[async_trait]
+            impl Tool for RefusedNewContext {
+                fn spec(&self) -> ToolSpec {
+                    ToolSpec {
+                        name: ToolName::from("new_context"),
+                        description: "Always fails".to_owned(),
+                        input_schema: json!({"type": "object", "properties": {}}),
+                        concurrency: ToolConcurrency::Exclusive,
+                        capabilities: ToolCapabilities::default(),
+                        provider_aliases: Default::default(),
+                    }
+                }
+                async fn execute(
+                    &self,
+                    _context: ToolContext,
+                    _input: serde_json::Value,
+                ) -> anyhow::Result<ToolResult> {
+                    anyhow::bail!("refused")
+                }
+            }
             let temp = tempfile::tempdir().unwrap();
-            let provider = Arc::new(Script::new(vec![
-                vec![("new_context", json!({"unexpected": true}))],
-                vec![],
-            ]));
-            let runtime = SessionRuntime::new(clean_services(provider.clone(), temp.path()));
+            let provider = Arc::new(Script::new(vec![vec![("new_context", json!({}))], vec![]]));
+            let services = clean_services(provider.clone(), temp.path());
+            let runtime = SessionRuntime::new(services.clone());
             let session = new_session(&runtime, temp.path()).await;
+            // The runtime registers the strategy's own tools; replace after.
+            services.tools.register(Arc::new(RefusedNewContext));
             let events = session
                 .submit_turn(Turn::user("keep this request"))
                 .await
@@ -10012,9 +10033,15 @@ mod tests {
         }
 
         #[tokio::test]
+        /// The call carries a field the schema does not list, as models send:
+        /// refusing it (the old "takes an empty object" check) leaves the
+        /// window unwiped and fails here.
         async fn voluntary_rollover_runs_after_the_tool_result_without_a_checkpoint_inference() {
             let temp = tempfile::tempdir().unwrap();
-            let provider = Arc::new(Script::new(vec![vec![("new_context", json!({}))], vec![]]));
+            let provider = Arc::new(Script::new(vec![
+                vec![("new_context", json!({"reason": "good stopping point"}))],
+                vec![],
+            ]));
             let services = clean_services(provider.clone(), temp.path());
             let runtime = SessionRuntime::new(services.clone());
             let session = new_session(&runtime, temp.path()).await;

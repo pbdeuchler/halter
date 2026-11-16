@@ -301,12 +301,10 @@ impl Tool for NewContextTool {
             provider_aliases: Default::default(),
         }
     }
-    async fn execute(&self, context: ToolContext, input: Value) -> anyhow::Result<ToolResult> {
+    /// The input is ignored: a model that adds a field it was not asked for
+    /// still gets its rollover.
+    async fn execute(&self, context: ToolContext, _input: Value) -> anyhow::Result<ToolResult> {
         anyhow::ensure!(!context.cancel.is_cancelled(), "context rollover cancelled");
-        anyhow::ensure!(
-            input.as_object().is_some_and(|object| object.is_empty()),
-            "new_context takes an empty object"
-        );
         Ok(ToolResult::Text {
             text: "Context rollover requested.".to_owned(),
         })
