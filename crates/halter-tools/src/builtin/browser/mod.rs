@@ -511,9 +511,6 @@ impl Target {
 fn parse_target(input: &Value) -> anyhow::Result<Target> {
     if let Some(reference) = optional_string(input, "ref") {
         let trimmed = reference.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("invalid tool input: 'ref' must not be empty");
-        }
         // Tolerate the @ prefix the python tool uses (`@e5`) — strip it so
         // the underlying selector is `aria-ref=e5`.
         let cleaned = trimmed.strip_prefix('@').unwrap_or(trimmed).to_owned();
@@ -522,12 +519,8 @@ fn parse_target(input: &Value) -> anyhow::Result<Target> {
         });
     }
     if let Some(selector) = optional_string(input, "selector") {
-        let trimmed = selector.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("invalid tool input: 'selector' must not be empty");
-        }
         return Ok(Target {
-            kind: TargetKind::Selector(trimmed.to_owned()),
+            kind: TargetKind::Selector(selector.trim().to_owned()),
         });
     }
     anyhow::bail!(
