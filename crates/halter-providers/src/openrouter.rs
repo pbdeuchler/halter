@@ -166,7 +166,7 @@ fn config(
         request: ResponsesProviderRequestConfig {
             store: Some(false),
             include_prompt_cache_key: true,
-            include_encrypted_reasoning: false,
+            include_encrypted_reasoning: options.include_encrypted_reasoning,
             strict_tools: options.strict_tools,
             reasoning_summary: Some("auto"),
             instruction_mode: crate::openai_codec::ResponsesInstructionMode::DeveloperMessage,
@@ -344,15 +344,24 @@ mod tests {
     /// in `config` (the `true` row) and a `Default` that turns strict on (the
     /// default row).
     #[test]
-    fn openrouter_config_carries_strict_tools_from_options() {
+    fn openrouter_config_carries_responses_options() {
         let cases = [
-            (ResponsesOptions::default(), false),
-            (ResponsesOptions { strict_tools: true }, true),
+            (ResponsesOptions::default(), (false, true)),
+            (
+                ResponsesOptions {
+                    strict_tools: true,
+                    include_encrypted_reasoning: false,
+                },
+                (true, false),
+            ),
         ];
 
         for (options, expected) in cases {
-            let config = config(ResiliencePolicy::default(), None, options);
-            assert_eq!(config.request.strict_tools, expected);
+            let request = config(ResiliencePolicy::default(), None, options).request;
+            assert_eq!(
+                (request.strict_tools, request.include_encrypted_reasoning),
+                expected
+            );
         }
     }
 

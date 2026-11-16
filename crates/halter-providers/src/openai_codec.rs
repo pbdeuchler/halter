@@ -348,10 +348,7 @@ pub(crate) fn decode_responses_response(
                     });
                     events.push(StreamEvent::ThinkingEnd {
                         id: block_id,
-                        signature: item
-                            .get("encrypted_content")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
+                        signature: Some(item.to_string()),
                     });
                 }
             }
@@ -551,11 +548,11 @@ impl ResponsesStreamDecoder {
                     self.finish_text_block(Some(&output_message_text(&message)), &mut events);
                 }
                 OutputItem::Reasoning(reasoning) => {
-                    self.finish_reasoning_block(
-                        Some(&reasoning_item_text(&reasoning)),
-                        reasoning.encrypted_content,
-                        &mut events,
-                    );
+                    let text = reasoning_item_text(&reasoning);
+                    // The whole item is the replay signature, so the next
+                    // stateless request can send it back verbatim.
+                    let item = serde_json::to_string(&OutputItem::Reasoning(reasoning)).ok();
+                    self.finish_reasoning_block(Some(&text), item, &mut events);
                 }
                 OutputItem::FunctionCall(call) => {
                     self.finish_tool_call(
@@ -1061,14 +1058,7 @@ fn encode_responses_input(
             Message::System(_) => {}
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
-                if let Some(message) = encode_responses_assistant_message(assistant) {
-                    input.push(message);
-                }
-                for part in &assistant.parts {
-                    if let AssistantPart::ToolCall(call) = part {
-                        input.push(encode_responses_tool_call(call, request));
-                    }
-                }
+                input.extend(encode_responses_assistant_items(assistant, request, true));
             }
             Message::Tool(tool) => input.push(encode_responses_tool_output(tool)),
         }
@@ -1089,14 +1079,8 @@ fn encode_responses_input_slice(
             Message::System(_) => {}
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
-                if let Some(message) = encode_responses_assistant_message(assistant) {
-                    input.push(message);
-                }
-                for part in &assistant.parts {
-                    if let AssistantPart::ToolCall(call) = part {
-                        input.push(encode_responses_tool_call(call, request));
-                    }
-                }
+                // The chained response already holds its reasoning items.
+                input.extend(encode_responses_assistant_items(assistant, request, false));
             }
             Message::Tool(tool) => input.push(encode_responses_tool_output(tool)),
         }
@@ -1149,6 +1133,52 @@ fn encode_responses_user_message(message: &halter_protocol::UserMessage) -> anyh
         "role": "user",
         "content": content,
     }))
+}
+
+/// Input items for one assistant message: its reasoning items, then its text,
+/// then its tool calls. The items depend only on the stored message and the
+/// request model, so a transcript prefix encodes to the same bytes on every
+/// later request.
+///
+/// A reasoning item is the output item the stream decoder stored as the
+/// thinking block's signature, replayed verbatim. It is sent only when
+/// `replay_reasoning` is set, the message came from the request's provider
+/// and model (another model's encrypted content is rejected upstream), and
+/// the message also has text or a tool call (the Responses API rejects a
+/// reasoning item without the item that followed it). Signatures that are not
+/// a reasoning item, such as an Anthropic signature or a bare
+/// `encrypted_content` string stored by an older halter, are skipped.
+fn encode_responses_assistant_items(
+    message: &halter_protocol::AssistantMessage,
+    request: &ProviderRequest,
+    replay_reasoning: bool,
+) -> Vec<Value> {
+    let following: Vec<Value> = encode_responses_assistant_message(message)
+        .into_iter()
+        .chain(message.parts.iter().filter_map(|part| match part {
+            AssistantPart::ToolCall(call) => Some(encode_responses_tool_call(call, request)),
+            AssistantPart::Text { .. } | AssistantPart::Thinking(_) => None,
+        }))
+        .collect();
+    let replayed: &[AssistantPart] = if replay_reasoning
+        && !following.is_empty()
+        && message.replay_meta.provider_name.as_ref() == Some(&request.model.provider)
+        && message.replay_meta.model.as_ref() == Some(&request.model.id)
+    {
+        &message.parts
+    } else {
+        &[]
+    };
+    replayed
+        .iter()
+        .filter_map(|part| match part {
+            AssistantPart::Thinking(block) => block.signature.as_deref(),
+            AssistantPart::Text { .. } | AssistantPart::ToolCall(_) => None,
+        })
+        .filter_map(|signature| serde_json::from_str::<Value>(signature).ok())
+        .filter(|item| item["type"] == "reasoning")
+        .chain(following)
+        .collect()
 }
 
 fn encode_responses_assistant_message(
@@ -2032,6 +2062,263 @@ mod tests {
         }
     }
 
+    /// Encodes `request`'s input with stateless options.
+    fn responses_input(request: &ProviderRequest) -> Vec<Value> {
+        let body = encode_responses_request(
+            request,
+            ResponsesRequestOptions {
+                stream: true,
+                store: Some(false),
+                prompt_cache_key: None,
+                include_encrypted_reasoning: true,
+                strict_tools: false,
+                reasoning_summary: Some("auto"),
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
+                temperature: None,
+                routing: None,
+            },
+        )
+        .expect("encode request");
+        body["input"].as_array().expect("input").clone()
+    }
+
+    /// An assistant message from `sample_request`'s model with the given parts.
+    fn assistant_from(id: &str, provider: &str, model: &str, parts: Vec<AssistantPart>) -> Message {
+        Message::Assistant(AssistantMessage {
+            id: MessageId::from(id),
+            created_at: Utc::now(),
+            parts,
+            stop_reason: None,
+            usage: None,
+            replay_meta: halter_protocol::ReplayMeta {
+                provider_name: Some(ProviderName::from(provider)),
+                model: Some(ModelId::from(model)),
+            },
+        })
+    }
+
+    fn thinking(signature: &str) -> AssistantPart {
+        AssistantPart::Thinking(halter_protocol::ThinkingBlock {
+            text: "thought".to_owned(),
+            signature: Some(signature.to_owned()),
+        })
+    }
+
+    /// Item shapes taken from the pi and rig captures: OpenAI models return
+    /// `encrypted_content` and an empty `content`; GLM on Fireworks returns
+    /// `status` and the reasoning as a summary part, with no encrypted content.
+    const GPT_REASONING: &str =
+        r#"{"type":"reasoning","id":"rs_1","summary":[],"content":[],"encrypted_content":"enc_1"}"#;
+    const GLM_REASONING: &str = r#"{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"Look first."}],"status":"completed"}"#;
+
+    /// Which reasoning items a history assistant message replays, and where.
+    /// Each row names the mutation it kills.
+    #[test]
+    fn responses_input_replays_same_model_reasoning_items_first() {
+        let call = || {
+            AssistantPart::ToolCall(ToolCall {
+                id: ToolCallId::from("call_123"),
+                name: "read".into(),
+                arguments: json!({"path": "README.md"}),
+            })
+        };
+        let text = || AssistantPart::Text {
+            text: "checked".to_owned(),
+        };
+        let cases = [
+            // Kills dropping the replay, or emitting reasoning after the
+            // message or tool call.
+            (
+                "gpt item before message and call",
+                assistant_from(
+                    "msg_h",
+                    "provider",
+                    "model",
+                    vec![thinking(GPT_REASONING), text(), call()],
+                ),
+                vec![GPT_REASONING, "message", "function_call"],
+            ),
+            // Kills requiring `encrypted_content`; two blocks keep their order.
+            (
+                "glm items in part order",
+                assistant_from(
+                    "msg_h",
+                    "provider",
+                    "model",
+                    vec![thinking(GLM_REASONING), call(), thinking(GPT_REASONING)],
+                ),
+                vec![GLM_REASONING, GPT_REASONING, "function_call"],
+            ),
+            // Kills dropping the model check.
+            (
+                "other model",
+                assistant_from(
+                    "msg_h",
+                    "provider",
+                    "other",
+                    vec![thinking(GPT_REASONING), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // Kills dropping the provider check.
+            (
+                "other provider",
+                assistant_from(
+                    "msg_h",
+                    "other",
+                    "model",
+                    vec![thinking(GPT_REASONING), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // Kills dropping the `type == "reasoning"` filter.
+            (
+                "non-reasoning JSON signature",
+                assistant_from(
+                    "msg_h",
+                    "provider",
+                    "model",
+                    vec![thinking(r#"{"type":"message"}"#), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // A bare `encrypted_content` from an older halter, or an
+            // Anthropic signature, is not JSON and is skipped.
+            (
+                "legacy signature",
+                assistant_from(
+                    "msg_h",
+                    "provider",
+                    "model",
+                    vec![thinking("enc_legacy"), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // Kills dropping the following-item guard: a lone reasoning item
+            // is rejected upstream.
+            (
+                "thinking only",
+                assistant_from("msg_h", "provider", "model", vec![thinking(GPT_REASONING)]),
+                vec![],
+            ),
+        ];
+
+        for (name, assistant, want) in cases {
+            let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter);
+            request.messages = vec![Message::User(UserMessage::text("hello")), assistant];
+            let input = responses_input(&request);
+            // Skip the developer and user messages.
+            // Reasoning rows compare the whole item, other rows the type.
+            let got: Vec<Value> = input[2..]
+                .iter()
+                .map(|item| match item["type"].as_str() {
+                    Some("reasoning") => item.clone(),
+                    other => json!(other),
+                })
+                .collect();
+            let want: Vec<Value> = want
+                .into_iter()
+                .map(|row| serde_json::from_str(row).unwrap_or_else(|_| json!(row)))
+                .collect();
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// A `previous_response_id` request sends only the new slice; the
+    /// chained response already holds its reasoning items, so re-sending them
+    /// would duplicate ids. Kills passing `true` on the slice path.
+    #[test]
+    fn chained_responses_input_does_not_replay_reasoning() {
+        let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        request.messages = vec![assistant_from(
+            "msg_h",
+            "provider",
+            "model",
+            vec![
+                thinking(GPT_REASONING),
+                AssistantPart::Text {
+                    text: "ok".to_owned(),
+                },
+            ],
+        )];
+        request.previous_response_id = Some("resp_1".to_owned());
+        let input = responses_input(&request);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+    }
+
+    /// Prompt caching needs request N's input to be a byte prefix of request
+    /// N+1's. A reasoning item replayed on request N must still be there,
+    /// unchanged and in place, after the transcript grows. Kills replaying
+    /// reasoning only for the latest assistant message, and any encoding that
+    /// depends on a message's position in the transcript.
+    #[test]
+    fn responses_input_with_reasoning_is_a_byte_prefix_of_the_next_request() {
+        let first_turn = vec![
+            Message::User(UserMessage::text("hello")),
+            assistant_from(
+                "msg_h1",
+                "provider",
+                "model",
+                vec![
+                    thinking(GPT_REASONING),
+                    AssistantPart::ToolCall(ToolCall {
+                        id: ToolCallId::from("call_1"),
+                        name: "read".into(),
+                        arguments: json!({"path": "README.md"}),
+                    }),
+                ],
+            ),
+            Message::Tool(ToolResultMessage {
+                id: MessageId::from("tool_output_1"),
+                call_id: ToolCallId::from("call_1"),
+                content: ToolResult::Json {
+                    value: json!({"ok": true}),
+                },
+                error: None,
+                created_at: Utc::now(),
+            }),
+        ];
+        let second_turn = first_turn
+            .iter()
+            .cloned()
+            .chain([
+                assistant_from(
+                    "msg_h2",
+                    "provider",
+                    "model",
+                    vec![
+                        thinking(GLM_REASONING),
+                        AssistantPart::Text {
+                            text: "done".to_owned(),
+                        },
+                    ],
+                ),
+                Message::User(UserMessage::text("next")),
+            ])
+            .collect();
+        let mut first = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter);
+        first.messages = first_turn;
+        let second = ProviderRequest {
+            messages: second_turn,
+            ..first.clone()
+        };
+
+        let serialize = |input: &[Value]| serde_json::to_string(input).expect("serialize input");
+        let first_input = responses_input(&first);
+        let second_input = responses_input(&second);
+        let first_bytes = serialize(&first_input);
+        let second_prefix = serialize(&second_input[..first_input.len()]);
+
+        assert!(first_bytes.contains(r#""encrypted_content":"enc_1""#));
+        assert_eq!(second_prefix, first_bytes);
+        assert_eq!(
+            second_input[first_input.len()],
+            serde_json::from_str::<Value>(GLM_REASONING).expect("item")
+        );
+    }
+
     /// The dedicated `/v1/responses/compact` endpoint takes the compaction
     /// input shape only. `store` and `stream` belong to the streaming turn
     /// endpoint and must stay absent here, matching the reference Codex
@@ -2724,9 +3011,11 @@ mod tests {
             event,
             StreamEvent::ThinkingDelta { delta, .. } if delta == "think"
         )));
+        // The signature is the whole done item, so it replays verbatim.
         assert!(decoded.iter().any(|event| matches!(
             event,
-            StreamEvent::ThinkingEnd { signature, .. } if signature.as_deref() == Some("enc_123")
+            StreamEvent::ThinkingEnd { signature: Some(signature), .. }
+                if signature == r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think"}],"encrypted_content":"enc_123","status":"completed"}"#
         )));
         assert!(decoded.iter().any(|event| matches!(
             event,

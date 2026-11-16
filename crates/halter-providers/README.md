@@ -415,9 +415,40 @@ constructors use `ResponsesOptions::default()`.
   schemas: one that does not qualify fails the request with the upstream's
   invalid-request error, which is not retried. Halter's built-in tools have
   optional properties and do not qualify.
+- `include_encrypted_reasoning` (default `true`) adds
+  `include: ["reasoning.encrypted_content"]` to requests for models with a
+  reasoning effort.
 
-Config-driven use goes through `strict_tools` in `[providers.openai]` and
+Config-driven use goes through the same keys in `[providers.openai]` and
 `[providers.openrouter]`.
+
+### Reasoning replay
+
+The Responses stream decoder stores each `reasoning` output item, serialized
+whole, as the signature of the thinking block it produces. Request encoding
+sends those items back as input items, so a stateless request (`store: false`)
+still carries the model's earlier reasoning, as pi and rig do:
+
+```json
+{"type":"reasoning","id":"rs_…","summary":[],"content":[],"encrypted_content":"…"}
+{"type":"reasoning","id":"rs_…","summary":[{"type":"summary_text","text":"…"}],"status":"completed"}
+```
+
+The first shape is an OpenAI model's, the second GLM's on Fireworks. For each
+history assistant message the input holds its reasoning items in part order,
+then its text message, then its function calls. An item is replayed only when:
+
+- the message's `replay_meta` names the request's provider and model, since
+  another model's encrypted content is rejected;
+- the message also has text or a tool call, since the API rejects a reasoning
+  item without the item that followed it;
+- the signature parses as a `reasoning` item. Anthropic signatures and the bare
+  `encrypted_content` strings older halter versions stored are skipped.
+
+The encoding depends only on the stored message and the request model, so a
+request's input stays a byte prefix of the next request's. A
+`previous_response_id` request sends no reasoning items, because the chained
+response already holds them, and compaction input omits them.
 
 ---
 

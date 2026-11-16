@@ -31,7 +31,7 @@ pub(crate) enum CompactStrategy {
 /// Embedder-tunable request options for the Responses-backed providers,
 /// [`OpenAiProvider`](crate::OpenAiProvider) and
 /// [`OpenRouterProvider`](crate::OpenRouterProvider).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponsesOptions {
     /// Sent as `strict` on every function tool; `false` by default. The
     /// field is always present on the wire because the Responses API treats
@@ -46,6 +46,23 @@ pub struct ResponsesOptions {
     /// only when every tool the provider serves has such a schema. Halter's
     /// built-in tools have optional properties and do not.
     pub strict_tools: bool,
+    /// Requests `include: ["reasoning.encrypted_content"]` whenever the model
+    /// has a reasoning effort; `true` by default. On a stateless request
+    /// (`store: false`) the encrypted content is what lets a replayed
+    /// reasoning item carry the model's reasoning into the next request.
+    /// Reasoning items the upstream returns are replayed either way, with
+    /// whatever the upstream put in them; OpenAI rejects, on a stateless
+    /// request, a replayed item that has no encrypted content.
+    pub include_encrypted_reasoning: bool,
+}
+
+impl Default for ResponsesOptions {
+    fn default() -> Self {
+        Self {
+            strict_tools: false,
+            include_encrypted_reasoning: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

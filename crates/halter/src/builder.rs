@@ -1047,6 +1047,7 @@ fn build_provider(
     // only supplies request options, the policy, and the classifier.
     let responses_options = ResponsesOptions {
         strict_tools: provider.strict_tools,
+        include_encrypted_reasoning: provider.include_encrypted_reasoning,
     };
     let provider: Arc<dyn halter_providers::Provider> = match provider.provider {
         ConfiguredProvider::Anthropic => {

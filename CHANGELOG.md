@@ -43,6 +43,17 @@ once a `1.0.0` line is cut.
 - `[providers.openai]` and `[providers.openrouter]` accept `strict_tools`
   (default `false`), the `strict` value sent on every Responses function tool.
   Setting it for `[providers.anthropic]` fails validation.
+- OpenAI and OpenRouter replay reasoning items. The Responses stream decoder
+  now stores the whole `reasoning` output item as JSON in
+  `ThinkingBlock::signature` (before, only its `encrypted_content`). Requests
+  send each stored item back ahead of that turn's text and tool calls when the
+  message came from the same provider and model, so stateless (`store: false`)
+  requests keep the model's reasoning, as pi and rig do. Signatures stored by
+  older versions are not replayed.
+- OpenRouter requests now ask for `include: ["reasoning.encrypted_content"]`
+  for models with a reasoning effort. `include_encrypted_reasoning` in
+  `[providers.openai]` and `[providers.openrouter]` (default `true`) and
+  `ResponsesOptions::include_encrypted_reasoning` turn it off.
 
 ### Removed
 

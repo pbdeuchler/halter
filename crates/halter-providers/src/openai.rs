@@ -261,7 +261,7 @@ fn config(
         request: ResponsesProviderRequestConfig {
             store: None,
             include_prompt_cache_key: true,
-            include_encrypted_reasoning: true,
+            include_encrypted_reasoning: options.include_encrypted_reasoning,
             strict_tools: options.strict_tools,
             reasoning_summary: Some("auto"),
             instruction_mode: crate::openai_codec::ResponsesInstructionMode::DeveloperMessage,
@@ -520,14 +520,25 @@ mod tests {
     /// Kills hardcoding `strict_tools` in `config`, which `oauth_config`
     /// inherits.
     #[test]
-    fn openai_provider_configs_carry_strict_tools_from_options() {
-        for strict_tools in [false, true] {
-            let options = ResponsesOptions { strict_tools };
+    fn openai_provider_configs_carry_responses_options() {
+        for (strict_tools, include_encrypted_reasoning) in
+            [(false, true), (true, false), (false, false), (true, true)]
+        {
+            let options = ResponsesOptions {
+                strict_tools,
+                include_encrypted_reasoning,
+            };
             for config in [
                 config(ResiliencePolicy::default(), options),
                 oauth_config(ResiliencePolicy::default(), options),
             ] {
-                assert_eq!(config.request.strict_tools, strict_tools);
+                assert_eq!(
+                    (
+                        config.request.strict_tools,
+                        config.request.include_encrypted_reasoning
+                    ),
+                    (strict_tools, include_encrypted_reasoning)
+                );
             }
         }
     }

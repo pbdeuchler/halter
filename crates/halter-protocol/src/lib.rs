@@ -570,6 +570,12 @@ pub enum AssistantPart {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// Provider thinking block with optional replay signature.
+///
+/// The signature is opaque provider replay state. Anthropic stores its
+/// thinking signature. The Responses providers (OpenAI, OpenRouter) store the
+/// whole `reasoning` output item as JSON (`id`, `summary`, and, when present,
+/// `encrypted_content`, `content` and `status`) and send it back as an input
+/// item on later requests to the same provider and model.
 pub struct ThinkingBlock {
     pub text: SharedStr,
     pub signature: Option<ReplaySignature>,

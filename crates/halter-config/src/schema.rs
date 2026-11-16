@@ -810,6 +810,12 @@ pub struct ProviderConfig {
     /// the request.
     #[serde(default)]
     pub strict_tools: Option<bool>,
+    /// OpenAI and OpenRouter only: request
+    /// `include: ["reasoning.encrypted_content"]` for models with a
+    /// reasoning effort, so replayed reasoning items carry the model's
+    /// encrypted reasoning on stateless requests. Defaults to `true`.
+    #[serde(default)]
+    pub include_encrypted_reasoning: Option<bool>,
     /// Partial override for the global `[resilience]` provider policy.
     #[serde(default)]
     pub resilience: Option<ResilienceOverrideConfig>,
@@ -865,6 +871,9 @@ pub struct ResolvedProviderConfig {
     /// `strict` value for function tools on Responses providers; `false`
     /// unless configured.
     pub strict_tools: bool,
+    /// Whether Responses providers request encrypted reasoning content;
+    /// `true` unless configured.
+    pub include_encrypted_reasoning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -965,6 +974,9 @@ where
         temperature,
         routing,
         strict_tools: configured.and_then(|config| config.strict_tools) == Some(true),
+        include_encrypted_reasoning: configured
+            .and_then(|config| config.include_encrypted_reasoning)
+            != Some(false),
     })
 }
 
@@ -1022,10 +1034,20 @@ fn validate_provider_config(name: &str, provider: &ProviderConfig) -> anyhow::Re
         }
         normalized_openrouter_routing(&format!("providers.{name}.routing"), routing)?;
     }
-    if provider.strict_tools.is_some() && name == ConfiguredProvider::Anthropic.as_str() {
-        anyhow::bail!(
-            "invalid configuration: providers.{name}.strict_tools is only supported for providers.openai and providers.openrouter"
-        );
+    if name == ConfiguredProvider::Anthropic.as_str() {
+        for (key, set) in [
+            ("strict_tools", provider.strict_tools.is_some()),
+            (
+                "include_encrypted_reasoning",
+                provider.include_encrypted_reasoning.is_some(),
+            ),
+        ] {
+            if set {
+                anyhow::bail!(
+                    "invalid configuration: providers.{name}.{key} is only supported for providers.openai and providers.openrouter"
+                );
+            }
+        }
     }
     if let Some(resilience) = &provider.resilience {
         resilience.validate(&format!("providers.{name}.resilience"))?;
@@ -2506,24 +2528,42 @@ stream_idle_secs = 0
     }
 
     /// `strict_tools` resolves to the configured value and to `false` when
-    /// unset, for both Responses providers. Kills resolving it to a constant
-    /// (the `Some(true)` rows) and defaulting it to `true` (the `None` rows).
+    /// unset; `include_encrypted_reasoning` to the configured value and to
+    /// `true` when unset; for both Responses providers. Kills resolving
+    /// either to a constant (the explicit rows) or flipping either default
+    /// (the `None` rows).
     #[test]
-    fn provider_resolution_resolves_strict_tools() {
+    fn provider_resolution_resolves_responses_options() {
         let cases = [
-            (ConfiguredProvider::OpenAi, None, false),
-            (ConfiguredProvider::OpenAi, Some(true), true),
-            (ConfiguredProvider::OpenRouter, None, false),
-            (ConfiguredProvider::OpenRouter, Some(false), false),
-            (ConfiguredProvider::OpenRouter, Some(true), true),
+            (ConfiguredProvider::OpenAi, None, None, (false, true)),
+            (
+                ConfiguredProvider::OpenAi,
+                Some(true),
+                Some(false),
+                (true, false),
+            ),
+            (ConfiguredProvider::OpenRouter, None, None, (false, true)),
+            (
+                ConfiguredProvider::OpenRouter,
+                Some(false),
+                Some(true),
+                (false, true),
+            ),
+            (
+                ConfiguredProvider::OpenRouter,
+                Some(true),
+                Some(false),
+                (true, false),
+            ),
         ];
 
-        for (provider, strict_tools, expected) in cases {
+        for (provider, strict_tools, include_encrypted_reasoning, expected) in cases {
             let resolved = resolve_provider_runtime_config(
                 provider,
                 Some(&ProviderConfig {
                     api_key: Some("configured-key".to_owned()),
                     strict_tools,
+                    include_encrypted_reasoning,
                     ..ProviderConfig::default()
                 }),
                 |_| Ok(None),
@@ -2531,30 +2571,40 @@ stream_idle_secs = 0
             .expect("resolve provider");
 
             assert_eq!(
-                resolved.strict_tools, expected,
-                "{provider} {strict_tools:?}"
+                (resolved.strict_tools, resolved.include_encrypted_reasoning),
+                expected,
+                "{provider} {strict_tools:?} {include_encrypted_reasoning:?}"
             );
         }
     }
 
-    /// `strict_tools` is a Responses tool field; on Anthropic it would be
-    /// silently meaningless, so validation names the misplaced key. The
-    /// OpenAI and OpenRouter rows must load. Kills deleting the check (the
-    /// Anthropic row) and applying it to every provider (the other rows).
+    /// `strict_tools` and `include_encrypted_reasoning` are Responses
+    /// request fields; on Anthropic they would be silently meaningless, so
+    /// validation names the misplaced key. The OpenAI and OpenRouter rows
+    /// must load. Kills deleting either check (the Anthropic rows) and
+    /// applying them to every provider (the other rows).
     #[test]
-    fn strict_tools_validation_accepts_only_responses_providers() {
+    fn responses_options_validation_accepts_only_responses_providers() {
         let cases = [
             (
                 "anthropic",
+                "strict_tools",
                 Some("providers.anthropic.strict_tools is only supported"),
             ),
-            ("openai", None),
-            ("openrouter", None),
+            (
+                "anthropic",
+                "include_encrypted_reasoning",
+                Some("providers.anthropic.include_encrypted_reasoning is only supported"),
+            ),
+            ("openai", "strict_tools", None),
+            ("openai", "include_encrypted_reasoning", None),
+            ("openrouter", "strict_tools", None),
+            ("openrouter", "include_encrypted_reasoning", None),
         ];
 
-        for (provider, want) in cases {
+        for (provider, key, want) in cases {
             let toml = format!(
-                "version = 1\n\n[models.default]\nprovider = \"{provider}\"\nmodel = \"m\"\n\n[providers.{provider}]\napi_key = \"k\"\nstrict_tools = true\n"
+                "version = 1\n\n[models.default]\nprovider = \"{provider}\"\nmodel = \"m\"\n\n[providers.{provider}]\napi_key = \"k\"\n{key} = true\n"
             );
             let parsed: HarnessConfig = toml::from_str(&toml).expect("parse config");
             match (parsed.validate(), want) {
