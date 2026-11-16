@@ -206,6 +206,21 @@ pub(crate) fn encode_compaction_request(
 pub(crate) fn decode_compaction_response(
     response: &Value,
 ) -> anyhow::Result<ProviderCompactionResponse> {
+    // Only a summary the model finished is a summary: a refusal or a
+    // `max_tokens` cut still carries text, and applying it would replace the
+    // session's history with a fragment.
+    let stop_reason = response.get("stop_reason").and_then(Value::as_str);
+    if !matches!(stop_reason, Some("end_turn" | "stop_sequence")) {
+        let category = response
+            .pointer("/stop_details/category")
+            .and_then(Value::as_str)
+            .map(|category| format!(" ({category})"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "failed to decode anthropic compaction response: stop_reason {}{category}",
+            stop_reason.unwrap_or("missing")
+        );
+    }
     let text = response_text(response);
     if text.trim().is_empty() {
         return Ok(ProviderCompactionResponse {
@@ -1109,14 +1124,17 @@ fn render_compaction_message(message: &Message) -> String {
         Message::System(system) => format!("system:\n{}", system.text),
         Message::User(user) => format!("user:\n{}", render_user_parts(&user.parts)),
         Message::Assistant(assistant) => {
+            // Thinking stays out: quoting it back as text is what the API
+            // refuses as reasoning extraction, and the summary needs what
+            // was said and done, not how it was reasoned.
             let parts = assistant
                 .parts
                 .iter()
-                .map(|part| match part {
-                    AssistantPart::Text { text } => text.clone(),
-                    AssistantPart::Thinking(block) => format!("[thinking]\n{}", block.text),
+                .filter_map(|part| match part {
+                    AssistantPart::Text { text } => Some(text.clone()),
+                    AssistantPart::Thinking(_) => None,
                     AssistantPart::ToolCall(call) => {
-                        format!("[tool_call {}]\n{}", call.name, call.arguments)
+                        Some(format!("[tool_call {}]\n{}", call.name, call.arguments))
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1733,6 +1751,7 @@ mod tests {
             "content": [
                 {"type": "text", "text": "Summary of the compacted turn"}
             ],
+            "stop_reason": "end_turn",
             "usage": {
                 "input_tokens": 30,
                 "output_tokens": 9,
@@ -1743,6 +1762,85 @@ mod tests {
         assert_eq!(decoded.usage.input_tokens, 30);
         assert_eq!(decoded.output[0]["type"], COMPACTED_CONTEXT_TYPE);
         assert_eq!(decoded.output[0]["text"], "Summary of the compacted turn");
+    }
+
+    #[test]
+    fn compaction_response_applies_only_a_finished_summary() {
+        // (case, stop fields, Ok(output items) or Err(message fragment))
+        let cases: [(&str, Value, Result<usize, &str>); 6] = [
+            ("end_turn", json!({"stop_reason": "end_turn"}), Ok(1)),
+            (
+                "stop_sequence",
+                json!({"stop_reason": "stop_sequence"}),
+                Ok(1),
+            ),
+            (
+                // The eval's truncated summary: text present, cut mid-list.
+                "refusal with partial text",
+                json!({
+                    "stop_reason": "refusal",
+                    "stop_details": {"category": "reasoning_extraction"},
+                }),
+                Err("stop_reason refusal (reasoning_extraction)"),
+            ),
+            (
+                "max_tokens",
+                json!({"stop_reason": "max_tokens"}),
+                Err("stop_reason max_tokens"),
+            ),
+            ("missing", json!({}), Err("stop_reason missing")),
+            (
+                "null",
+                json!({"stop_reason": null}),
+                Err("stop_reason missing"),
+            ),
+        ];
+        for (case, stop, expected) in cases {
+            let mut response = json!({
+                "content": [{"type": "text", "text": "Summary so far:\n  -"}],
+                "usage": {"input_tokens": 30, "output_tokens": 9},
+            });
+            response
+                .as_object_mut()
+                .expect("object")
+                .extend(stop.as_object().expect("object").clone());
+            match (decode_compaction_response(&response), expected) {
+                (Ok(decoded), Ok(items)) => assert_eq!(decoded.output.len(), items, "{case}"),
+                (Err(error), Err(fragment)) => {
+                    assert!(error.to_string().contains(fragment), "{case}: {error}");
+                }
+                (got, want) => panic!("{case}: got {got:?}, want {want:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_transcript_omits_thinking() {
+        let mut request = sample_compaction_request();
+        request.messages = vec![Message::Assistant(AssistantMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            parts: vec![
+                AssistantPart::Thinking(halter_protocol::ThinkingBlock {
+                    text: "private reasoning".into(),
+                    signature: Some("sig-123".to_owned()),
+                }),
+                AssistantPart::Text {
+                    text: "visible answer".to_owned(),
+                },
+            ],
+            stop_reason: None,
+            usage: None,
+            replay_meta: Default::default(),
+        })];
+        let body = encode_compaction_request(&request, None).expect("encode compaction");
+        let transcript = body["messages"][0]["content"][0]["text"]
+            .as_str()
+            .expect("transcript text");
+
+        assert!(transcript.contains("visible answer"), "{transcript}");
+        assert!(!transcript.contains("private reasoning"), "{transcript}");
+        assert!(!transcript.contains("[thinking]"), "{transcript}");
     }
 
     fn sample_request(messages: Vec<Message>) -> ProviderRequest {

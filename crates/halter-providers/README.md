@@ -149,9 +149,15 @@ If supported, compacts session history for context management.
 This is the transport primitive behind the runtime's `ProviderDefault`
 strategy (`context.compaction = "provider_default"`). The strategy decides which
 messages a rewrite may replace from `ProviderCapabilities::compaction_strategy`
-— everything before the latest assistant block for a dedicated endpoint, only
-the prefix before the latest user message for an inline request — and the adapter
-encodes the request it is handed. When it runs is decided by the runtime's
+— everything before the latest assistant block for a dedicated endpoint; for
+an inline request, everything before the latest assistant block of the current
+turn, with the latest user message kept verbatim at the head of the window —
+and the adapter encodes the request it is handed. Inline adapters apply only a
+summary the model finished: the Anthropic adapter rejects any `stop_reason`
+other than `end_turn` or `stop_sequence`, and the OpenRouter adapter any
+`status` other than `completed`. The Anthropic transcript leaves out thinking
+blocks, and the OpenRouter request carries the instructions as the final user
+input rather than as top-level `instructions`. When it runs is decided by the runtime's
 session token ledger, never by the provider: an adapter must not enable
 server-side auto-compaction. That is why the Anthropic adapter sends an
 ordinary summarization request rather than the `compact_20260112` context

@@ -1214,8 +1214,10 @@ happens*.
   `halter::compaction::ContextCapExceeded` instead of blowing the provider
   window.
 - Automatic compaction is best-effort: a strategy that cannot run degrades the
-  turn to an uncompacted context with a `Warning` event. `session.compact(..)`
-  propagates failures. `PreCompact`/`PostCompact` hooks fire on both paths,
+  turn to an uncompacted context with a `Warning` event, and the turn does not
+  try again until the ledger has grown by half the threshold, so a refused
+  request is not resent at every boundary. `session.compact(..)` propagates
+  failures. `PreCompact`/`PostCompact` hooks fire on both paths,
   with trigger `auto` for the automatic one.
 - `context.compaction` picks the strategy. `"model_summary"` (the default)
   asks the session's own model for a context checkpoint: when the `task` tool
