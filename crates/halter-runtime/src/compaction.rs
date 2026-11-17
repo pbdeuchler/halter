@@ -34,6 +34,18 @@ impl ContextSettings {
         effective_tokens >= self.compaction_threshold
     }
 
+    /// [`compaction_due`](Self::compaction_due), backing off after a pass
+    /// that failed at `failed_at` tokens: the next attempt waits until the
+    /// context has grown by half a threshold, so a provider that refuses a
+    /// transcript is not re-sent it at every boundary.
+    #[must_use]
+    pub fn compaction_due_after(&self, effective_tokens: u64, failed_at: Option<u64>) -> bool {
+        self.compaction_due(effective_tokens)
+            && failed_at.is_none_or(|at| {
+                effective_tokens >= at.saturating_add(self.compaction_threshold / 2)
+            })
+    }
+
     /// Enforce the hard cap on the effective ledger count.
     pub fn check_cap(&self, effective_tokens: u64) -> Result<(), ContextCapExceeded> {
         match self.max_tokens {
@@ -117,6 +129,46 @@ mod tests {
                 case.due,
                 "{} tokens",
                 case.effective_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_backs_off_for_half_a_threshold_after_a_failure() {
+        let settings = ContextSettings {
+            compaction_threshold: 1_000,
+            max_tokens: None,
+        };
+        // (case, effective tokens, failed at, due)
+        let cases = [
+            ("below threshold, never failed", 999, None, false),
+            ("at threshold, never failed", 1_000, None, true),
+            ("same size as the failure", 1_200, Some(1_200), false),
+            (
+                "grown less than half a threshold",
+                1_699,
+                Some(1_200),
+                false,
+            ),
+            ("grown half a threshold", 1_700, Some(1_200), true),
+            (
+                "shrunk below threshold after a failure",
+                900,
+                Some(800),
+                false,
+            ),
+            (
+                "failure near the top of the range",
+                u64::MAX,
+                Some(u64::MAX),
+                true,
+            ),
+        ];
+        for (case, tokens, failed_at, due) in cases {
+            assert_eq!(
+                settings.compaction_due_after(tokens, failed_at),
+                due,
+                "{case}"
             );
         }
     }

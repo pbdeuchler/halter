@@ -52,6 +52,30 @@ once a `1.0.0` line is cut.
 
 ### Fixed
 
+- `ProviderDefault` inline compaction (Anthropic, OpenRouter) can now shed a
+  long tool-using turn. The window it keeps verbatim is the latest user
+  message, then the current turn's latest assistant block and its tool
+  results; everything before that block is summarized. Before, only messages
+  before the latest user message were eligible, so a single long turn never
+  shrank and every later pass reported "Compacted 0 older messages".
+- Automatic `ProviderDefault` passes that would only re-summarize the existing
+  compacted prefix are skipped. Before, each one cost a provider call, rewrote
+  the summary, and invalidated the prompt cache behind it. A manual
+  `compact(..)` still runs one. `compacted_count` now counts the messages that
+  left the window.
+- The Anthropic compaction transcript no longer quotes thinking blocks as
+  `[thinking]` text, which the API refused as reasoning extraction.
+- Anthropic compaction rejects a response whose `stop_reason` is not
+  `end_turn` or `stop_sequence` (refusal, `max_tokens`, missing), and
+  OpenRouter compaction rejects a `status` other than `completed`. Before, a
+  truncated or refused summary replaced the session history.
+- OpenRouter compaction sends its instructions as the last user input instead
+  of top-level `instructions`. Behind a transcript that ended on the
+  assistant, models continued the conversation and that reply became the
+  summary.
+- After an automatic compaction fails, the turn waits for the ledger to grow by
+  half the threshold before trying again (`ContextSettings::compaction_due_after`).
+  Before, the same request was resent at every boundary.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the

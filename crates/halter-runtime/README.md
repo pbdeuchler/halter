@@ -379,7 +379,9 @@ and the current prompt/tool request base).
 At each consistent boundary — right after an assistant response with no tool
 calls, and before every provider request once the pending appends have landed
 — a ledger at or past `ContextSettings::compaction_threshold` runs the
-strategy, and then `max_tokens` is enforced with `ContextCapExceeded`. A tool
+strategy, and then `max_tokens` is enforced with `ContextCapExceeded`. After a
+strategy failure the rest of the turn waits for the ledger to grow by half the
+threshold before trying again (`ContextSettings::compaction_due_after`). A tool
 call is never separated from its result, and server-side auto-compaction is
 never used.
 
@@ -413,9 +415,12 @@ reply becomes the next window as one user-role message after the static
 prefix, with a todo reminder when the nudge ran calls. `ProviderDefault`
 hands `Provider::compact` the window its
 `ProviderCapabilities::compaction_strategy` allows: everything before the
-latest assistant block for a dedicated endpoint, or the prefix before the
-latest user message for an inline request. In both cases the summary remains
-before the preserved suffix in the next provider request.
+latest assistant block for a dedicated endpoint; for an inline request,
+everything before the current turn's latest assistant block, with the latest
+user message kept verbatim at the head of the window. In both cases the
+summary remains before the preserved messages in the next provider request.
+An automatic pass that would shed no messages is skipped instead of
+re-summarizing the existing summary; a manual pass still runs.
 
 ### CleanWindow
 

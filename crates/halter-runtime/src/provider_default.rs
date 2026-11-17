@@ -8,7 +8,9 @@ use halter_protocol::{
     ProviderCompactionStrategy,
 };
 
-use crate::compaction_strategy::{CompactionContext, CompactionStrategy, compaction_instructions};
+use crate::compaction_strategy::{
+    CompactionContext, CompactionStrategy, CompactionTrigger, compaction_instructions,
+};
 use crate::context::CompactionEffects;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,7 +44,14 @@ impl CompactionStrategy for ProviderDefault {
         };
         let state = ctx.state();
         let (eligible, preserved) = split_window(strategy, &state.messages);
-        if eligible.is_empty() && state.compacted_prefix.is_empty() {
+        // Messages that leave the verbatim window. Zero means a rewrite could
+        // only re-summarize the existing prefix: worth a provider call when a
+        // caller asks for it, never on the ledger's trigger.
+        let compacted_count = state.messages.len() - preserved.len();
+        if compacted_count == 0
+            && (state.compacted_prefix.is_empty()
+                || !matches!(ctx.trigger(), CompactionTrigger::Manual { .. }))
+        {
             return Ok(None);
         }
 
@@ -67,8 +76,7 @@ impl CompactionStrategy for ProviderDefault {
             );
         }
         let summary = format!(
-            "Compacted {} older messages into {} provider-native items; kept {} verbatim.",
-            eligible.len(),
+            "Compacted {compacted_count} older messages into {} provider-native items; kept {} verbatim.",
             response.output.len(),
             preserved.len()
         );
@@ -77,7 +85,7 @@ impl CompactionStrategy for ProviderDefault {
             messages: preserved,
             compacted_context: CompactedContext::from(response.output),
             result: CompactionResult {
-                compacted_count: eligible.len(),
+                compacted_count,
                 summary,
             },
             usage: response.usage,
@@ -89,29 +97,43 @@ impl CompactionStrategy for ProviderDefault {
 ///
 /// A dedicated endpoint restores compacted context as provider-native items,
 /// so everything before the latest assistant block is eligible and that
-/// block stays verbatim. An inline request summarizes the prefix before the
-/// latest user message and keeps that user-led suffix verbatim. Both shapes
-/// preserve chronology because provider-native compacted items are encoded
-/// before `messages` in the next request.
+/// block stays verbatim. Both shapes preserve chronology because
+/// provider-native compacted items are encoded before `messages` in the
+/// next request.
+///
+/// An inline summary is re-injected as system text, so the window must
+/// still open with the latest user message: it stays verbatim, followed by
+/// the latest assistant block of its turn and that block's tool results.
+/// Everything before that block is eligible — including the user message,
+/// so the summary knows what the work it describes was for — which lets a
+/// long tool-using turn shed its older exchanges without splitting a call
+/// from its result. A turn with no assistant block yet keeps the user-led
+/// suffix and offers only the prefix before it.
 pub(crate) fn split_window(
     strategy: ProviderCompactionStrategy,
     messages: &[Message],
 ) -> (Vec<Message>, Vec<Message>) {
+    let last = |pick: fn(&Message) -> bool| messages.iter().rposition(pick);
     match strategy {
         ProviderCompactionStrategy::Dedicated => {
-            let pivot = messages
-                .iter()
-                .rposition(|message| matches!(message, Message::Assistant(_)))
-                .unwrap_or(messages.len());
+            let pivot =
+                last(|message| matches!(message, Message::Assistant(_))).unwrap_or(messages.len());
             (messages[..pivot].to_vec(), messages[pivot..].to_vec())
         }
         ProviderCompactionStrategy::Inline => {
-            let pivot = messages
-                .iter()
-                .rposition(|message| matches!(message, Message::User(_)))
-                .unwrap_or(messages.len());
-
-            (messages[..pivot].to_vec(), messages[pivot..].to_vec())
+            let Some(user) = last(|message| matches!(message, Message::User(_))) else {
+                return (messages.to_vec(), Vec::new());
+            };
+            match last(|message| matches!(message, Message::Assistant(_))) {
+                Some(block) if block > user => (
+                    messages[..block].to_vec(),
+                    std::iter::once(&messages[user])
+                        .chain(&messages[block..])
+                        .cloned()
+                        .collect(),
+                ),
+                _ => (messages[..user].to_vec(), messages[user..].to_vec()),
+            }
         }
     }
 }
@@ -119,7 +141,10 @@ pub(crate) fn split_window(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use halter_protocol::{AssistantMessage, AssistantPart, MessageId, UserMessage};
+    use halter_protocol::{
+        AssistantMessage, AssistantPart, MessageId, ToolCallId, ToolResult, ToolResultMessage,
+        UserMessage,
+    };
 
     use super::*;
 
@@ -140,83 +165,135 @@ mod tests {
         })
     }
 
-    #[test]
-    fn split_window_follows_the_provider_strategy() {
-        struct Case {
-            name: &'static str,
-            strategy: ProviderCompactionStrategy,
-            messages: Vec<Message>,
-            eligible: usize,
-            preserved_first: Option<&'static str>,
-        }
-        let cases = [
-            Case {
-                name: "dedicated keeps the latest assistant block",
-                strategy: ProviderCompactionStrategy::Dedicated,
-                messages: vec![user("first"), assistant("answer"), user("follow up")],
-                eligible: 1,
-                preserved_first: Some("answer"),
-            },
-            Case {
-                name: "dedicated without an assistant compacts everything",
-                strategy: ProviderCompactionStrategy::Dedicated,
-                messages: vec![user("first"), user("second")],
-                eligible: 2,
-                preserved_first: None,
-            },
-            Case {
-                name: "inline compacts the prefix before the latest user",
-                strategy: ProviderCompactionStrategy::Inline,
-                messages: vec![
-                    user("first"),
-                    assistant("answer"),
-                    user("latest"),
-                    assistant("tail"),
-                ],
-                eligible: 2,
-                preserved_first: Some("latest"),
-            },
-            Case {
-                name: "inline keeps an entire single user turn even when it is large",
-                strategy: ProviderCompactionStrategy::Inline,
-                messages: vec![user("only user"), assistant(&"x".repeat(80_000))],
-                eligible: 0,
-                preserved_first: Some("only user"),
-            },
-            Case {
-                name: "inline without a user compacts everything",
-                strategy: ProviderCompactionStrategy::Inline,
-                messages: vec![assistant("only")],
-                eligible: 1,
-                preserved_first: None,
-            },
-            Case {
-                name: "empty transcript",
-                strategy: ProviderCompactionStrategy::Inline,
-                messages: Vec::new(),
-                eligible: 0,
-                preserved_first: None,
-            },
-        ];
+    fn tool(call_id: &str) -> Message {
+        Message::Tool(ToolResultMessage {
+            id: MessageId::new(),
+            call_id: ToolCallId::from(call_id),
+            content: ToolResult::Empty,
+            error: None,
+            created_at: Utc::now(),
+        })
+    }
 
-        for case in cases {
-            let (eligible, preserved) = split_window(case.strategy, &case.messages);
-            assert_eq!(eligible.len(), case.eligible, "{}", case.name);
-            assert_eq!(
-                eligible.len() + preserved.len(),
-                case.messages.len(),
-                "{}: nothing is lost",
-                case.name
-            );
-            let first = preserved.first().map(|message| match message {
+    fn labels(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .map(|message| match message {
                 Message::User(user) => user.plain_text(),
                 Message::Assistant(assistant) => match &assistant.parts[0] {
                     AssistantPart::Text { text } => text.clone(),
                     _ => unreachable!(),
                 },
-                _ => unreachable!(),
-            });
-            assert_eq!(first.as_deref(), case.preserved_first, "{}", case.name);
+                Message::Tool(tool) => tool.call_id.to_string(),
+                Message::System(_) => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_window_follows_the_provider_strategy() {
+        // (case, strategy, transcript, eligible, preserved)
+        type Case = (
+            &'static str,
+            ProviderCompactionStrategy,
+            Vec<Message>,
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        use ProviderCompactionStrategy::{Dedicated, Inline};
+        let cases: [Case; 9] = [
+            (
+                "dedicated keeps the latest assistant block",
+                Dedicated,
+                vec![user("first"), assistant("answer"), user("follow up")],
+                &["first"],
+                &["answer", "follow up"],
+            ),
+            (
+                "dedicated without an assistant compacts everything",
+                Dedicated,
+                vec![user("first"), user("second")],
+                &["first", "second"],
+                &[],
+            ),
+            (
+                // The shape of every refused or no-op pass in the eval runs:
+                // one user instruction, then a long run of tool exchanges.
+                "inline sheds the older exchanges of a long tool turn",
+                Inline,
+                vec![
+                    user("task"),
+                    assistant("a1"),
+                    tool("t1"),
+                    assistant("a2"),
+                    tool("t2"),
+                    assistant("a3"),
+                    tool("t3"),
+                ],
+                &["task", "a1", "t1", "a2", "t2"],
+                &["task", "a3", "t3"],
+            ),
+            (
+                "inline folds prior turns and the current turn's older exchanges",
+                Inline,
+                vec![
+                    user("first"),
+                    assistant("answer"),
+                    user("latest"),
+                    assistant("a1"),
+                    tool("t1"),
+                    assistant("tail"),
+                ],
+                &["first", "answer", "latest", "a1", "t1"],
+                &["latest", "tail"],
+            ),
+            (
+                "inline at the start of a turn keeps the user-led suffix",
+                Inline,
+                vec![user("first"), assistant("answer"), user("latest")],
+                &["first", "answer"],
+                &["latest"],
+            ),
+            (
+                "inline with one exchange in the turn has nothing to shed",
+                Inline,
+                vec![user("only user"), assistant("large"), tool("t1")],
+                &["only user"],
+                &["only user", "large", "t1"],
+            ),
+            (
+                "inline without a user compacts everything",
+                Inline,
+                vec![assistant("only")],
+                &["only"],
+                &[],
+            ),
+            (
+                "dedicated empty transcript",
+                Dedicated,
+                Vec::new(),
+                &[],
+                &[],
+            ),
+            ("inline empty transcript", Inline, Vec::new(), &[], &[]),
+        ];
+
+        for (case, strategy, messages, eligible, preserved) in cases {
+            let (got_eligible, got_preserved) = split_window(strategy, &messages);
+            assert_eq!(labels(&got_eligible), eligible, "{case}: eligible");
+            assert_eq!(labels(&got_preserved), preserved, "{case}: preserved");
+            // The verbatim window replays on its own after the summary, so it
+            // must open with a user message when one exists and never hold a
+            // tool result whose call is not in front of it.
+            if strategy == Inline && messages.iter().any(|m| matches!(m, Message::User(_))) {
+                assert!(
+                    matches!(got_preserved.first(), Some(Message::User(_))),
+                    "{case}: window opens with the user"
+                );
+            }
+            if let Some(Message::Tool(_)) = got_preserved.get(1) {
+                panic!("{case}: a tool result follows the user without its call");
+            }
         }
     }
 }

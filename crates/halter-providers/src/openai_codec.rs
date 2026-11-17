@@ -173,12 +173,18 @@ pub(crate) fn encode_openrouter_compact_request(
         anyhow::bail!("failed to encode openrouter compaction request: unsupported api kind");
     }
 
-    let input = encode_responses_compact_input(request)?;
+    // The ask rides as the last user turn, as a model-summary request's does:
+    // behind a transcript that ends on the assistant, top-level
+    // `instructions` read as a system prompt and the model continues the
+    // conversation instead of summarizing it.
+    let mut input = encode_responses_compact_input(request)?;
+    input.push(encode_responses_user_message(
+        &halter_protocol::UserMessage::text(request.instructions.clone()),
+    )?);
     validate_responses_input_item_ids(&input)?;
     let mut body = json!({
         "model": request.model.model.clone(),
         "input": input,
-        "instructions": request.instructions.clone(),
         "stream": false,
         "store": false,
     });
@@ -216,6 +222,20 @@ pub(crate) fn decode_responses_compact_response(
 pub(crate) fn decode_openrouter_compact_response(
     response: &Value,
 ) -> anyhow::Result<ProviderCompactionResponse> {
+    // An incomplete response still carries the text produced before the cut;
+    // only a completed one is a summary.
+    if let Some(status) = response
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| *status != "completed")
+    {
+        let reason = response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default();
+        anyhow::bail!("failed to decode openrouter compaction response: status {status}{reason}");
+    }
     let output = response
         .get("output")
         .and_then(Value::as_array)
@@ -2043,10 +2063,19 @@ mod tests {
         let input = body["input"].as_array().expect("input");
 
         assert_eq!(body["model"], "gpt-5");
-        assert_eq!(body["instructions"], "Summarize the session");
+        assert!(body.get("instructions").is_none());
         assert_eq!(body["stream"], false);
         assert_eq!(body["store"], false);
         assert!(body.get("provider").is_none());
+        // The ask is the final user turn, after the whole transcript.
+        assert_eq!(
+            input.last(),
+            Some(&json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Summarize the session"}],
+            }))
+        );
         assert!(input.iter().any(|item| item["role"] == "developer"));
         assert!(input.iter().any(|item| item["role"] == "user"));
         assert!(input.iter().any(|item| item["type"] == "function_call"));
@@ -2182,6 +2211,44 @@ mod tests {
                 ],
             })]
         );
+    }
+
+    #[test]
+    fn openrouter_compaction_response_applies_only_a_completed_summary() {
+        // (case, status fields, Ok(output items) or Err(message fragment))
+        let cases: [(&str, Value, Result<usize, &str>); 4] = [
+            ("completed", json!({"status": "completed"}), Ok(1)),
+            ("status absent", json!({}), Ok(1)),
+            (
+                "incomplete with partial text",
+                json!({
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                }),
+                Err("status incomplete (max_output_tokens)"),
+            ),
+            ("failed", json!({"status": "failed"}), Err("status failed")),
+        ];
+        for (case, status, expected) in cases {
+            let mut response = json!({
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "## User Intent\n-"}],
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            });
+            response
+                .as_object_mut()
+                .expect("object")
+                .extend(status.as_object().expect("object").clone());
+            match (decode_openrouter_compact_response(&response), expected) {
+                (Ok(decoded), Ok(items)) => assert_eq!(decoded.output.len(), items, "{case}"),
+                (Err(error), Err(fragment)) => {
+                    assert!(error.to_string().contains(fragment), "{case}: {error}");
+                }
+                (got, want) => panic!("{case}: got {got:?}, want {want:?}"),
+            }
+        }
     }
 
     #[test]

@@ -59,6 +59,15 @@ const TOOL_RUNTIME_EVENT_BYTES_CAP: usize = 1024 * 1024;
 /// manual passes carry the caller-supplied trigger.
 const AUTOMATIC_COMPACTION_TRIGGER: &str = "auto";
 
+/// What a turn carries from one context boundary to the next: the ledger
+/// count the last boundary left, and where automatic compaction last failed
+/// so the next attempt can back off.
+#[derive(Debug, Clone, Copy)]
+struct BoundaryLedger {
+    tokens: u64,
+    failed_compaction_at: Option<u64>,
+}
+
 /// Per-session entry in the runtime hook store: the [`Hooks`] instance
 /// shared by every live handle for one session, plus a weak reference to
 /// the single [`EvictionGuard`] those handles share. The weak reference is
@@ -1492,7 +1501,10 @@ impl SessionExecutor {
             &mut state,
             &mut events,
         );
-        let mut ledger_at_boundary = state.token_ledger.effective_tokens();
+        let mut ledger_at_boundary = BoundaryLedger {
+            tokens: state.token_ledger.effective_tokens(),
+            failed_compaction_at: None,
+        };
 
         // CleanWindow prepares the window before delivering fresh input so
         // rollover cannot erase it. Prefix compaction includes fresh input in
@@ -2579,7 +2591,7 @@ impl SessionExecutor {
         events: &mut Vec<PendingEvent>,
         fired_hook_ids: &mut BTreeSet<String>,
         hook_ctx: HookInvocationContext<'_>,
-        ledger_at_last_boundary: &mut u64,
+        ledger_at_last_boundary: &mut BoundaryLedger,
         turn_usage: &mut Usage,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
@@ -2589,7 +2601,7 @@ impl SessionExecutor {
         let boundary = CompactionBoundary::new(
             &blueprint.session_id,
             state.context_window,
-            *ledger_at_last_boundary,
+            ledger_at_last_boundary.tokens,
             state.token_ledger.effective_tokens(),
             settings.compaction_threshold,
             &state.compaction_notifications,
@@ -2621,7 +2633,10 @@ impl SessionExecutor {
         let due = if clean_window {
             requested || settings.rollover_due(state.token_ledger.effective_tokens())
         } else {
-            settings.compaction_due(state.token_ledger.effective_tokens())
+            settings.compaction_due_after(
+                state.token_ledger.effective_tokens(),
+                ledger_at_last_boundary.failed_compaction_at,
+            )
         };
         debug!(
             session_id = %blueprint.session_id,
@@ -2639,26 +2654,29 @@ impl SessionExecutor {
             "evaluated context boundary"
         );
         if due {
-            self.run_automatic_compaction(
-                blueprint,
-                snapshot.clone(),
-                state,
-                events,
-                fired_hook_ids,
-                hook_ctx,
-                turn_usage,
-                cancel,
-            )
-            .await?;
+            let failed = self
+                .run_automatic_compaction(
+                    blueprint,
+                    snapshot.clone(),
+                    state,
+                    events,
+                    fired_hook_ids,
+                    hook_ctx,
+                    turn_usage,
+                    cancel,
+                )
+                .await?;
+            ledger_at_last_boundary.failed_compaction_at =
+                failed.then(|| state.token_ledger.effective_tokens());
         }
         // A successful pass may run PostCompact hooks that append prompt-only
         // context. Refresh the request base before the caller enforces the
         // cap; otherwise those segments would reach the provider uncounted.
         self.prepare_token_ledger(blueprint, &snapshot, state, events);
-        *ledger_at_last_boundary = state.token_ledger.effective_tokens();
+        ledger_at_last_boundary.tokens = state.token_ledger.effective_tokens();
         if clean_window
             && state.context_window != window_before_boundary
-            && settings.rollover_due(*ledger_at_last_boundary)
+            && settings.rollover_due(ledger_at_last_boundary.tokens)
         {
             anyhow::bail!(
                 "clean window bootstrap exceeds its rollover threshold; increase context.compaction_threshold or reduce prompt and tool declarations"
@@ -2673,6 +2691,9 @@ impl SessionExecutor {
     /// uncompacted context with a warning event, because the alternative is
     /// that every turn past the threshold becomes unrecoverable. Hook
     /// dispatch failures propagate like everywhere else in the turn.
+    ///
+    /// Returns whether the strategy itself failed, so the caller can back
+    /// off instead of resending the same request at the next boundary.
     #[expect(clippy::too_many_arguments)]
     async fn run_automatic_compaction(
         &self,
@@ -2684,7 +2705,7 @@ impl SessionExecutor {
         hook_ctx: HookInvocationContext<'_>,
         turn_usage: &mut Usage,
         cancel: &CancellationToken,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let pre_dispatch = run_pre_compact(
             self,
             fired_hook_ids,
@@ -2710,7 +2731,7 @@ impl SessionExecutor {
                     ),
                 },
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let trigger =
@@ -2773,7 +2794,7 @@ impl SessionExecutor {
                         ),
                     },
                 );
-                return Ok(());
+                return Ok(true);
             }
         };
 
@@ -2790,7 +2811,7 @@ impl SessionExecutor {
         for message in apply_hook_side_effects(state, &post_dispatch) {
             self.push_event(events, SessionEventPayload::MessageItem { message });
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Commit events and fan them out to the live stream, ancestor streams,
@@ -7706,7 +7727,12 @@ mod tests {
         const USER_PROMPT: &str = "write a note";
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut services = configured_services(Arc::new(CompactingToolLoopProvider), temp.path());
+        let mut services = configured_services(
+            Arc::new(CompactingToolLoopProvider::new(
+                halter_protocol::ProviderCompactionStrategy::Dedicated,
+            )),
+            temp.path(),
+        );
         register_builtin_tools(&services.tools, &[]);
         // Keep the threshold just above this feature set's prompt/tool base:
         // the user prompt and provider anchor stay below it, while the tool
@@ -7918,7 +7944,8 @@ mod tests {
     #[tokio::test]
     async fn automatic_compaction_failure_degrades_to_a_warning() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut services = configured_services(Arc::new(FailingCompactionProvider), temp.path());
+        let mut services =
+            configured_services(Arc::new(FailingCompactionProvider::default()), temp.path());
         install_context_settings(&mut services, tiny_context_settings(None));
         install_compaction(&mut services, Arc::new(crate::ProviderDefault));
         let runtime = SessionRuntime::new(services.clone());
@@ -7953,12 +7980,151 @@ mod tests {
         assert_eq!(stored.state.messages.len(), 2);
     }
 
+    /// A refused compaction is not resent at the very next boundary: the
+    /// eval transcripts show seven byte-identical refused requests in one
+    /// turn. Turn one first crosses the threshold after its reply and fails
+    /// there; turn two starts fresh, retries before its request, and backs
+    /// off after its small reply. Kills dropping the `failed_at` clause from
+    /// `compaction_due_after` (`[1, 3]`) and a backoff that outlives its
+    /// turn (`[1, 1]`).
+    #[tokio::test]
+    async fn automatic_compaction_backs_off_after_a_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(FailingCompactionProvider::default());
+        let mut services = configured_services(provider.clone(), temp.path());
+        install_compaction(&mut services, Arc::new(crate::ProviderDefault));
+        install_context_settings(&mut services, tiny_context_settings(None));
+        let session = new_session(&SessionRuntime::new(services), temp.path()).await;
+
+        let mut calls = Vec::new();
+        for prompt in ["x".repeat(150), "next".to_owned()] {
+            let events = session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    SessionEventPayload::TurnCompleted { .. }
+                ))
+            );
+            calls.push(provider.compactions());
+        }
+
+        assert_eq!(calls, vec![1, 2], "cumulative compaction calls per turn");
+    }
+
+    /// Inline compaction that could only re-summarize the existing prefix is
+    /// a no-op on the ledger's trigger. This is the eval transcripts' shape:
+    /// a turn opens with a compaction, its first tool result leaves the
+    /// ledger over, and the old guard sent a "Compacted 0 older messages"
+    /// pass that rewrote the summary and broke the prompt cache. Turn one's
+    /// lone exchange has nothing to shed; turn two compacts turn one away
+    /// before its request, then must not compact again after its tool
+    /// result. Kills restoring the old guard
+    /// (`eligible.is_empty() && compacted_prefix.is_empty()`), which makes a
+    /// second call.
+    #[tokio::test]
+    async fn provider_default_inline_skips_prefix_only_automatic_rewrites() {
+        const USER_PROMPT: &str = "write a note";
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CompactingToolLoopProvider::new(
+            halter_protocol::ProviderCompactionStrategy::Inline,
+        ));
+        let mut services = configured_services(provider.clone(), temp.path());
+        register_builtin_tools(&services.tools, &[]);
+        // Every boundary is due: the threshold is the bare prompt's count.
+        let user_tokens = halter_protocol::estimate_message_tokens(&Message::User(
+            halter_protocol::UserMessage::text(USER_PROMPT),
+        ));
+        let compaction_threshold =
+            default_request_base_tokens(&services).saturating_add(user_tokens);
+        install_context_settings(
+            &mut services,
+            ContextSettings {
+                compaction_threshold,
+                max_tokens: None,
+            },
+        );
+        install_compaction(&mut services, Arc::new(crate::ProviderDefault));
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+
+        let mut calls = Vec::new();
+        for _ in 0..2 {
+            session
+                .submit_turn(Turn::user(USER_PROMPT))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+            calls.push(provider.compactions());
+        }
+
+        assert_eq!(calls, vec![0, 1], "cumulative compaction calls per turn");
+        let stored = services
+            .sessions
+            .load_session(session.session_id())
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert!(!stored.state.compacted_prefix.is_empty());
+        assert!(matches!(
+            stored.state.messages.first(),
+            Some(Message::User(user)) if user.plain_text() == USER_PROMPT
+        ));
+    }
+
+    /// A manual pass still runs when only the prefix could be rewritten: the
+    /// caller asked for it. The second turn's request-time compaction leaves
+    /// a lone exchange, so the manual pass sheds nothing. Kills dropping the
+    /// `Manual` exception from the no-op guard.
+    #[tokio::test]
+    async fn provider_default_inline_runs_a_prefix_only_manual_rewrite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(NativeCompactionProvider::new(
+            halter_protocol::ProviderCompactionStrategy::Inline,
+            vec![serde_json::json!({"type": "compaction", "text": "SUMMARY"})],
+            Usage::default(),
+        ));
+        let mut services = configured_services(provider.clone(), temp.path());
+        install_compaction(&mut services, Arc::new(crate::ProviderDefault));
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
+        let session = new_session(&SessionRuntime::new(services), temp.path()).await;
+
+        for prompt in ["x".repeat(6_000), "y".repeat(6_000)] {
+            session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+        }
+        assert_eq!(provider.compactions(), 1, "automatic passes");
+
+        session.compact("manual", None).await.expect("compact");
+        assert_eq!(provider.compactions(), 2, "manual pass");
+        let replay = session.replay().await.expect("replay");
+        assert!(replay.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::ContextCompacted { summary, .. }
+                if summary.starts_with("Compacted 0 older messages")
+        )));
+    }
+
     /// Manual compaction keeps propagating: the caller asked for it
     /// explicitly and a silent no-op would be a lie.
     #[tokio::test]
     async fn manual_compact_propagates_strategy_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut services = configured_services(Arc::new(FailingCompactionProvider), temp.path());
+        let mut services =
+            configured_services(Arc::new(FailingCompactionProvider::default()), temp.path());
         install_compaction(&mut services, Arc::new(crate::ProviderDefault));
         let runtime = SessionRuntime::new(services.clone());
         let session = new_session(&runtime, temp.path()).await;
@@ -8574,8 +8740,17 @@ mod tests {
         }
     }
 
-    /// Fake provider whose compaction endpoint always fails.
-    struct FailingCompactionProvider;
+    /// Fake provider whose compaction endpoint always fails, counting calls.
+    #[derive(Default)]
+    struct FailingCompactionProvider {
+        compactions: Mutex<usize>,
+    }
+
+    impl FailingCompactionProvider {
+        fn compactions(&self) -> usize {
+            *self.compactions.lock().expect("compactions")
+        }
+    }
 
     #[async_trait]
     impl Provider for FailingCompactionProvider {
@@ -8596,20 +8771,37 @@ mod tests {
             _request: halter_protocol::ProviderCompactionRequest,
             _cancel: CancellationToken,
         ) -> anyhow::Result<halter_protocol::ProviderCompactionResponse> {
+            *self.compactions.lock().expect("compactions") += 1;
             anyhow::bail!("compaction endpoint exploded")
         }
     }
 
     /// The tool-loop provider with compaction support, so a mid-turn
     /// boundary can actually compact.
-    struct CompactingToolLoopProvider;
+    struct CompactingToolLoopProvider {
+        strategy: halter_protocol::ProviderCompactionStrategy,
+        compactions: Mutex<usize>,
+    }
+
+    impl CompactingToolLoopProvider {
+        fn new(strategy: halter_protocol::ProviderCompactionStrategy) -> Self {
+            Self {
+                strategy,
+                compactions: Mutex::new(0),
+            }
+        }
+
+        fn compactions(&self) -> usize {
+            *self.compactions.lock().expect("compactions")
+        }
+    }
 
     #[async_trait]
     impl Provider for CompactingToolLoopProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 supports_compaction: true,
-                compaction_strategy: Some(halter_protocol::ProviderCompactionStrategy::Dedicated),
+                compaction_strategy: Some(self.strategy),
                 ..ProviderCapabilities::default()
             }
         }
@@ -8627,6 +8819,7 @@ mod tests {
             _request: halter_protocol::ProviderCompactionRequest,
             _cancel: CancellationToken,
         ) -> anyhow::Result<halter_protocol::ProviderCompactionResponse> {
+            *self.compactions.lock().expect("compactions") += 1;
             Ok(halter_protocol::ProviderCompactionResponse {
                 output: vec![serde_json::json!({"type": "reasoning", "encrypted_content": "gist"})],
                 usage: Usage::default(),
@@ -8642,6 +8835,7 @@ mod tests {
         output: Vec<serde_json::Value>,
         compaction_usage: Usage,
         requests: Mutex<Vec<ProviderRequest>>,
+        compactions: Mutex<usize>,
     }
 
     impl NativeCompactionProvider {
@@ -8655,11 +8849,16 @@ mod tests {
                 output,
                 compaction_usage,
                 requests: Mutex::new(Vec::new()),
+                compactions: Mutex::new(0),
             }
         }
 
         fn requests(&self) -> Vec<ProviderRequest> {
             self.requests.lock().expect("requests").clone()
+        }
+
+        fn compactions(&self) -> usize {
+            *self.compactions.lock().expect("compactions")
         }
     }
 
@@ -8687,6 +8886,7 @@ mod tests {
             _request: halter_protocol::ProviderCompactionRequest,
             _cancel: CancellationToken,
         ) -> anyhow::Result<halter_protocol::ProviderCompactionResponse> {
+            *self.compactions.lock().expect("compactions") += 1;
             Ok(halter_protocol::ProviderCompactionResponse {
                 output: self.output.clone(),
                 usage: self.compaction_usage.clone(),

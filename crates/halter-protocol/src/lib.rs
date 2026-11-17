@@ -1919,10 +1919,10 @@ pub struct ProviderCapabilities {
     /// provider-delegated strategy branches on this to decide which messages
     /// a rewrite may replace: a dedicated endpoint restores compacted context
     /// as provider-native items, so everything before the latest assistant
-    /// block is eligible; an inline request summarizes the prefix before the
-    /// latest user message and keeps that user-led suffix verbatim, so the
-    /// summary stays ahead of it in the next request. `None` means the
-    /// provider cannot compact.
+    /// block is eligible; an inline request summarizes everything before the
+    /// current turn's latest assistant block and keeps the latest user
+    /// message verbatim at the head of the window, so the summary stays ahead
+    /// of it in the next request. `None` means the provider cannot compact.
     #[serde(default)]
     pub compaction_strategy: Option<ProviderCompactionStrategy>,
     pub supports_tool_result_media: bool,
@@ -1942,9 +1942,10 @@ pub enum ProviderCompactionStrategy {
     Dedicated,
     /// In-band compaction via the regular completions endpoint
     /// (e.g. OpenRouter's responses passthrough). Lossy: the runtime
-    /// compacts the prefix before the latest user message, keeps that
-    /// suffix verbatim, and wraps the result in explicit compaction tags so
-    /// the model can distinguish it from authoritative system content.
+    /// compacts everything before the current turn's latest assistant block,
+    /// keeps the latest user message and that block verbatim, and wraps the
+    /// result in explicit compaction tags so the model can distinguish it
+    /// from authoritative system content.
     Inline,
 }
 

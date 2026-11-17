@@ -349,7 +349,14 @@ mod tests {
             let body: Value =
                 serde_json::from_slice(&request[headers_end + 4..]).expect("parse request body");
             assert_eq!(body["model"], "gpt-5");
-            assert_eq!(body["instructions"], "Summarize the session");
+            assert!(body.get("instructions").is_none());
+            assert_eq!(
+                body["input"]
+                    .as_array()
+                    .and_then(|input| input.last())
+                    .map(|item| (&item["role"], &item["content"][0]["text"])),
+                Some((&json!("user"), &json!("Summarize the session")))
+            );
             assert_eq!(body["stream"], false);
             assert_eq!(body["store"], false);
             assert!(body.get("tools").is_none());
