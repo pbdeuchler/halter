@@ -11,6 +11,7 @@ use halter_protocol::{
 };
 use serde_json::{Value, json};
 
+use crate::builtin::common::{optional_bool, optional_string, parse_input, required_string};
 use crate::{
     SubagentControl, Tool, ToolContext, ToolOutput, ToolRuntime, ToolRuntimeEvent, TypedTool,
 };
@@ -177,9 +178,12 @@ impl TypedTool for SpawnAgentTool {
             .subagent_parent
             .as_ref()
             .context("failed to execute spawn_agent tool: missing parent session context")?;
-        let request: SpawnSubagentRequest = serde_json::from_value(input)
-            .context("failed to execute spawn_agent tool: invalid input")?;
-        let request = self.normalize_request(request)?;
+        let request = self.normalize_request(SpawnSubagentRequest {
+            message: required_string(&input, "message")?.to_owned(),
+            agent_type: optional_string(&input, "agent_type").map(Into::into),
+            fork_context: optional_bool(&input, "fork_context")?.unwrap_or(false),
+            model: optional_string(&input, "model").map(Into::into),
+        })?;
         let status = self
             .control
             .spawn(parent, request, context.cancel.clone())
@@ -241,8 +245,7 @@ impl TypedTool for SendInputTool {
 
     async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<SubagentStatus> {
         emit_started(&context, "send_input");
-        let request: SendSubagentInputRequest = serde_json::from_value(input)
-            .context("failed to execute send_input tool: invalid input")?;
+        let request: SendSubagentInputRequest = parse_input(input)?;
         let status = self.control.send_input(request).await?;
         emit_completed(&context, "send_input");
         Ok(status)
@@ -290,8 +293,7 @@ impl TypedTool for WaitAgentTool {
         input: Value,
     ) -> anyhow::Result<WaitSubagentResponse> {
         emit_started(&context, "wait_agent");
-        let request: WaitSubagentRequest = serde_json::from_value(input)
-            .context("failed to execute wait_agent tool: invalid input")?;
+        let request: WaitSubagentRequest = parse_input(input)?;
         let response = self.control.wait(request, context.cancel.clone()).await?;
         emit_completed(&context, "wait_agent");
         Ok(response)
@@ -343,8 +345,7 @@ impl TypedTool for CloseAgentTool {
         input: Value,
     ) -> anyhow::Result<CloseSubagentResponse> {
         emit_started(&context, "close_agent");
-        let request: CloseSubagentRequest = serde_json::from_value(input)
-            .context("failed to execute close_agent tool: invalid input")?;
+        let request: CloseSubagentRequest = parse_input(input)?;
         let response = self.control.close(request).await?;
         emit_completed(&context, "close_agent");
         Ok(response)
@@ -572,6 +573,45 @@ mod tests {
                 "integer"
             );
             assert_eq!(spec.input_schema["properties"]["timeout_ms"]["minimum"], 0);
+        }
+    }
+
+    /// The model sees which field is wrong, not just "invalid input".
+    #[tokio::test]
+    async fn malformed_control_inputs_name_the_field() {
+        let control = Arc::new(RecordingSubagentControl::default());
+        for (tool, input, expected) in [
+            (
+                Arc::new(SendInputTool::new(control.clone())) as Arc<dyn Tool>,
+                json!({ "message": "hi" }),
+                "missing field `target`",
+            ),
+            (
+                Arc::new(WaitAgentTool::new(control.clone())),
+                json!({ "targets": "agent-1" }),
+                "invalid type: string \"agent-1\"",
+            ),
+            (
+                Arc::new(CloseAgentTool::new(control.clone())),
+                json!({ "target": "agent-1", "timeout_ms": "soon" }),
+                "invalid type: string \"soon\"",
+            ),
+        ] {
+            let context = ToolContext {
+                session_id: SessionId::new(),
+                working_dir: ".".into(),
+                path_locks: Arc::new(crate::PathLockMap::default()),
+                tool_sessions: Arc::new(crate::ToolSessionStore::default()),
+                snapshot: Arc::new(ResourceSnapshot::empty()),
+                cancel: CancellationToken::new(),
+                emit: Arc::new(NoopToolEventSink),
+                policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default())),
+                shell_timeout_secs: 30,
+                subagent_parent: None,
+            };
+            let error = tool.execute(context, input).await.unwrap_err().to_string();
+            assert!(error.starts_with("invalid tool input: "), "{error}");
+            assert!(error.contains(expected), "{error}");
         }
     }
 

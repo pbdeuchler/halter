@@ -35,6 +35,21 @@ once a `1.0.0` line is cut.
 - The detected shell is public as `halter_tools::{detected_shell, Shell, ShellKind}`.
 - `env` entries with an empty key, `=` or NUL in the key, or NUL in the value
   are rejected by `shell` and `background`.
+- Built-in tools read their input leniently. None rejects a field it does not
+  know (`notes` and `session_search` dropped `deny_unknown_fields`), and an
+  optional parameter given as `null`, a blank string, `0`, `[]` or `{}` counts
+  as absent, so a model that fills every schema property gets the defaults
+  instead of an error. Required fields and real values of the wrong type are
+  still errors. `halter_tools::placeholder_as_default` gives serde-typed tool
+  inputs the same rule.
+- `write` takes `create_dirs` (default `false`). When true, missing parent
+  directories are created first, each one approved by the write policy before
+  it exists. Without it, a missing parent is an error that names the directory
+  and the flag.
+- `edit` ignores an `expected_sha256` that is not a 64-digit hex sha256 (such as
+  `""` or `"unused"`), and accepts one in upper case. A stale one names the
+  file's current hash.
+- Calling an unknown tool returns an error that lists the available tools.
 
 ### Removed
 
@@ -89,6 +104,9 @@ once a `1.0.0` line is cut.
   doesn't exist is still an error. On macOS the scratch root moves from
   `/tmp/halter` to the per-user `$TMPDIR/halter`. The starter config template no
   longer lists `allowed_write_roots` explicitly, so it keeps the default.
+- `spawn_agent`, `send_input`, `wait_agent` and `close_agent` return serde's account
+  of what is wrong with a malformed input ("invalid tool input: missing field
+  `target`") instead of a bare "invalid input" that hid it from the model.
 
 ## [0.10.0] - 2026-11-14
 

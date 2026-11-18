@@ -11,7 +11,8 @@ use tracing::debug;
 use crate::{ToolContext, ToolOutput, TypedTool};
 
 use super::common::{
-    ToolScope, ensure_not_cancelled, hash_text, optional_bool, required_string, resolve_path,
+    ToolScope, ensure_not_cancelled, hash_text, optional_bool, optional_string, required_string,
+    resolve_path,
 };
 
 #[derive(Debug)]
@@ -29,8 +30,9 @@ impl TypedTool for EditTool {
                 `old_string` must match the file's raw text exactly, including whitespace, \
                 and be unique — keep it minimal, just enough context to be unique. If it is \
                 not unique the edit fails: add surrounding context, or set `replace_all` to \
-                change every occurrence (handy for renames). Pass `expected_sha256` (from \
-                `read`) to fail fast if the file changed underneath you."
+                change every occurrence (handy for renames). Pass `expected_sha256` (the \
+                sha256 from `read` or a previous `edit`) to fail fast if the file changed \
+                underneath you; omit it otherwise."
                 .to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -60,10 +62,11 @@ impl TypedTool for EditTool {
         let path = resolve_path(&context.working_dir, required_string(&input, "path")?);
         let old_string = required_string(&input, "old_string")?;
         let new_string = required_string(&input, "new_string")?;
-        let expected_sha256 = input
-            .get("expected_sha256")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
+        // Anything but a SHA-256 hex digest is a placeholder ("", "unused"),
+        // never a hash that could match, so it is treated as absent.
+        let expected_sha256 = optional_string(&input, "expected_sha256")
+            .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase);
         let replace_all = optional_bool(&input, "replace_all")?.unwrap_or(false);
         if old_string.is_empty() {
             anyhow::bail!("failed to execute edit tool: old_string must not be empty");
@@ -81,7 +84,6 @@ impl TypedTool for EditTool {
         let path_for_edit = canonical_path.clone();
         let old = old_string.to_owned();
         let new = new_string.to_owned();
-        let expected_sha256 = expected_sha256.clone();
         let result = tokio::task::spawn_blocking(move || {
             use std::io::Read;
 
@@ -95,7 +97,8 @@ impl TypedTool for EditTool {
                 && expected_sha256 != file_hash_before
             {
                 anyhow::bail!(
-                    "failed to execute edit tool: expected_sha256 does not match '{}'",
+                    "failed to execute edit tool: '{}' changed since expected_sha256 was taken \
+                     (its sha256 is now {file_hash_before}); read it again, or omit expected_sha256",
                     path_for_edit.display()
                 );
             }
@@ -237,25 +240,51 @@ mod tests {
         assert!(error.to_string().contains("replace_all=true"));
     }
 
+    /// Only a real sha256 that no longer matches refuses the edit; anything
+    /// that is not a sha256 is a placeholder and is ignored.
     #[tokio::test]
-    async fn edit_rejects_stale_expected_hash() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("note.txt"), "hello").expect("write");
+    async fn edit_checks_expected_hash_only_when_it_is_a_sha256() {
+        let stale = hash_text("before");
+        let current = hash_text("hello").to_ascii_uppercase();
+        for (expected_sha256, refused) in [
+            (json!(stale), true),
+            (json!(current), false),
+            (json!("stale"), false),
+            (json!("unused"), false),
+            (json!(""), false),
+            (json!(null), false),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("note.txt");
+            std::fs::write(&path, "hello").expect("write");
 
-        let error = EditTool
-            .execute(
-                tool_context(temp.path()),
-                json!({
-                    "path": "note.txt",
-                    "old_string": "hello",
-                    "new_string": "goodbye",
-                    "expected_sha256": "stale"
-                }),
-            )
-            .await
-            .expect_err("stale hash should fail");
+            let result = EditTool
+                .execute(
+                    tool_context(temp.path()),
+                    json!({
+                        "path": "note.txt",
+                        "old_string": "hello",
+                        "new_string": "goodbye",
+                        "expected_sha256": expected_sha256
+                    }),
+                )
+                .await;
 
-        assert!(error.to_string().contains("expected_sha256"));
+            let written = std::fs::read_to_string(&path).expect("read");
+            match result {
+                Err(error) => {
+                    assert!(refused, "{expected_sha256}: {error}");
+                    let error = error.to_string();
+                    assert!(error.contains("read it again"), "{error}");
+                    assert!(error.contains(&hash_text("hello")), "{error}");
+                    assert_eq!(written, "hello");
+                }
+                Ok(_) => {
+                    assert!(!refused, "{expected_sha256} should be refused");
+                    assert_eq!(written, "goodbye");
+                }
+            }
+        }
     }
 
     #[test]

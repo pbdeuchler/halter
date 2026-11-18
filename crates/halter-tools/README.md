@@ -90,6 +90,13 @@ The runtime asks for a tool by name. This crate decides:
 
 ### Built-in tools
 
+Tool input is read leniently, because models fill strict schemas with whatever
+they have. No built-in tool rejects a field it does not know, and an optional
+parameter given as `null`, a blank string, `0`, `[]` or `{}` counts as absent
+(no optional parameter gives one of those a meaning of its own; `false` is
+always read as `false`). A required field still has to be there with the right
+type, and a real value of the wrong type is still an error.
+
 - `ReadTool`
 - `WriteTool`
 - `EditTool`
@@ -254,6 +261,9 @@ Characteristics:
 - whole-file write
 - atomic replacement semantics
 - constrained by `allowed_write_roots`
+- the parent directory must exist, unless `create_dirs` is `true`; then each
+  missing directory is created after the write policy approves it, shallowest
+  first, so a denied directory stops the call before anything under it exists
 
 Use `write` when you want to create or fully replace a file.
 
@@ -278,7 +288,7 @@ Optional safety field:
 
 - `expected_sha256`
 
-This is useful when you want optimistic concurrency protection against editing stale file contents.
+This is useful when you want optimistic concurrency protection against editing stale file contents. A value that is not a 64-digit hex sha256 (`""`, `"unused"`) is ignored; a real sha256 that no longer matches refuses the edit and reports the file's current hash.
 
 Use `edit` rather than `write` when:
 

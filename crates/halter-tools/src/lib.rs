@@ -21,7 +21,7 @@ pub use builtin::ImageTool;
 pub use builtin::ProfilingTool;
 #[cfg(feature = "pty")]
 pub use builtin::PtyTool;
-pub use builtin::common::Report;
+pub use builtin::common::{Report, placeholder_as_default};
 pub use builtin::fs_lock::PathLockMap;
 pub use builtin::shell::detect::{Shell, ShellKind, detected as detected_shell};
 pub use builtin::{
