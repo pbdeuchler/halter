@@ -486,6 +486,16 @@ pub struct HookWarning {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// System instruction message carried in the transcript.
+///
+/// Where it reaches the model depends on its position. System messages
+/// before the first other message are the session's leading system content
+/// and join the provider's system prompt. Any later one (a hook's message, a
+/// compaction reminder, a resume notice) is encoded where it sits: a
+/// `developer` item on the Responses API, a `system` message on Chat
+/// Completions, and a user turn wrapped in `<system-reminder>` tags on
+/// Anthropic Messages, which has no system role in its message list. One
+/// appended inside a tool batch moves to just after the batch's results.
+/// Appending a system message therefore never rewrites the cached prefix.
 pub struct SystemMessage {
     pub id: MessageId,
     pub created_at: Timestamp,
@@ -597,7 +607,7 @@ pub struct ToolResultMessage {
 #[serde(tag = "role", rename_all = "snake_case")]
 /// A transcript item visible to providers and session stores.
 pub enum Message {
-    /// System instructions.
+    /// System instructions. See [`SystemMessage`] for where providers put them.
     System(SystemMessage),
     /// User input.
     User(UserMessage),

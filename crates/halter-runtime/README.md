@@ -400,7 +400,9 @@ contribute tools and system-prompt segments. At each boundary,
 threshold, and persisted notification ids; it returns exactly-once reminders
 for the current window and nothing else: the trigger stays the runtime's.
 Each delivered reminder is logged as `CompactionNotified { id }` followed by
-its `MessageItem`, so the delivered set replays from the log.
+its `MessageItem`, so the delivered set replays from the log. A
+`Message::System` reminder lands at the end of the history, not in the
+system prompt, so it does not invalidate the prompt cache.
 When a pass returns `Err` or `Ok(None)` after appending, the runtime records a
 `ContextRestored` event that puts the window back; the pass's messages, tool
 runs, and usage stay in the log and the session totals. Install one with
@@ -535,8 +537,11 @@ A realistic prompt assembly pass can include:
 - configured prompt overrides
 - compiled resource instructions
 - the skill index (names and descriptions; bodies arrive as user messages when the model calls `skill`)
-- hook-injected system messages
-- selected conversation history
+- selected conversation history, including hook-injected system messages
+
+System messages after the first other message stay where they are in the
+history: providers encode them in place rather than in the system prompt, so
+adding one leaves the cached prefix intact (see `SystemMessage`).
 
 This is important because the final model request is not just "the last user message".
 

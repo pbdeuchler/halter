@@ -76,6 +76,19 @@ once a `1.0.0` line is cut.
 - After an automatic compaction fails, the turn waits for the ledger to grow by
   half the threshold before trying again (`ContextSettings::compaction_due_after`).
   Before, the same request was resent at every boundary.
+- A system message after the first other message is encoded in place
+  instead of in the system prompt, so it no longer invalidates the prompt
+  cache. On Anthropic it is a user turn wrapped in `<system-reminder>` tags,
+  on Responses a `developer` item, and on Chat Completions a `system`
+  message. This covers CleanWindow's 50% and 75% reminders, hook system
+  messages, rejected-input reasons and the resume notice. Each CleanWindow
+  reminder used to re-write the whole window to the cache: about 113-121k
+  extra cache-write tokens per Opus eval run. One a hook appends inside a
+  tool batch follows the batch's results. System messages before the first
+  other message still join the system prompt, so sessions without later
+  system messages encode exactly as before.
+- Chained Responses requests (`previous_response_id`) no longer drop later
+  system messages, and the Responses compaction request includes them.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the

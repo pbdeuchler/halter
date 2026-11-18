@@ -52,6 +52,9 @@ impl<'a> CompactionTrigger<'a> {
 /// One exactly-once message a strategy wants delivered in the current
 /// logical window. The runtime persists delivered ids per window, so a
 /// stateless strategy can provide milestone reminders that fire once.
+/// The message is appended to the transcript; a
+/// [`Message::System`](halter_protocol::Message::System) is encoded in place
+/// there, so a reminder does not invalidate the prompt cache.
 #[derive(Debug, Clone)]
 pub struct CompactionNotification {
     pub id: String,

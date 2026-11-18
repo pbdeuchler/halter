@@ -16,27 +16,59 @@ pub(crate) fn request_section_hash(value: &serde_json::Value) -> String {
     format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
 }
 
+/// The system prompt: the assembled prefix, then the leading system messages.
 pub(crate) fn collect_system_text(request: &ProviderRequest) -> Option<String> {
-    let mut sections = Vec::new();
-    let rendered_prefix = request.prompt.rendered_prefix.trim();
-    if !rendered_prefix.is_empty() {
-        sections.push(rendered_prefix.to_owned());
-    }
+    let sections = std::iter::once(request.prompt.rendered_prefix.trim())
+        .chain(leading_system_text(&request.messages))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
+}
 
-    for message in &request.messages {
-        if let Message::System(system) = message {
-            let text = system.text.trim();
-            if !text.is_empty() {
-                sections.push(text.to_owned());
+/// Trimmed text of the system messages before the first other message: the
+/// session's leading system content, which belongs in the system prompt.
+/// Every later system message stays where it is in the conversation (see
+/// [`in_band_messages`]), so appending one never rewrites the cached prefix.
+pub(crate) fn leading_system_text(messages: &[Message]) -> impl Iterator<Item = &str> {
+    messages
+        .iter()
+        .map_while(|message| match message {
+            Message::System(system) => Some(system.text.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+}
+
+/// `messages[start..]` in the order providers accept, without the leading
+/// system messages and without empty system messages. No dialect accepts
+/// other content between tool calls and their results, so a system message
+/// a hook appends inside a tool batch moves to just after the batch.
+pub(crate) fn in_band_messages(messages: &[Message], start: usize) -> Vec<&Message> {
+    let mut ordered = Vec::with_capacity(messages.len());
+    let mut deferred = Vec::new();
+    let mut in_batch = false;
+    let in_band = messages
+        .iter()
+        .enumerate()
+        .skip_while(|(_, message)| matches!(message, Message::System(_)));
+    for (index, message) in in_band {
+        let queue = match message {
+            Message::System(system) if system.text.trim().is_empty() => continue,
+            Message::System(_) if in_batch => &mut deferred,
+            Message::System(_) | Message::Tool(_) => &mut ordered,
+            Message::User(_) | Message::Assistant(_) => {
+                ordered.append(&mut deferred);
+                in_batch = matches!(message, Message::Assistant(assistant)
+                    if assistant.parts.iter().any(|part| matches!(part, AssistantPart::ToolCall(_))));
+                &mut ordered
             }
+        };
+        if index >= start {
+            queue.push(message);
         }
     }
-
-    if sections.is_empty() {
-        None
-    } else {
-        Some(sections.join("\n\n"))
-    }
+    ordered.extend(deferred);
+    ordered
 }
 
 pub(crate) fn assistant_text(message: &AssistantMessage) -> String {

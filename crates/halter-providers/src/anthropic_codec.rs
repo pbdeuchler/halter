@@ -10,7 +10,10 @@ use halter_protocol::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::codec_common::{canonical_tool_name, normalized_tool_call_id, tool_name_for_provider};
+use crate::codec_common::{
+    canonical_tool_name, collect_system_text, in_band_messages, leading_system_text,
+    normalized_tool_call_id, tool_name_for_provider,
+};
 
 const CACHE_CONTROL_EPHEMERAL: &str = "ephemeral";
 const COMPACTED_CONTEXT_TYPE: &str = "halter_compacted_context";
@@ -247,7 +250,7 @@ fn encode_system_blocks(request: &ProviderRequest) -> Option<Value> {
         // Fast path: hand the provider one flat system string, identical
         // to the legacy behavior so callers that bypass the assembler
         // (and thus omit section metadata) keep working.
-        return collect_system_text_legacy(request).map(Value::String);
+        return collect_system_text(request).map(Value::String);
     }
 
     let system_blob = render_segments(request.prompt.system_segments());
@@ -271,30 +274,6 @@ fn encode_system_blocks(request: &ProviderRequest) -> Option<Value> {
     }
 }
 
-/// Legacy single-string system field. Keeps backward compatibility for
-/// requests assembled outside the runtime path (test fixtures, hand-built
-/// `ProviderRequest`s).
-fn collect_system_text_legacy(request: &ProviderRequest) -> Option<String> {
-    let mut sections = Vec::new();
-    let rendered_prefix = request.prompt.rendered_prefix.trim();
-    if !rendered_prefix.is_empty() {
-        sections.push(rendered_prefix.to_owned());
-    }
-    for message in &request.messages {
-        if let Message::System(system) = message {
-            let text = system.text.trim();
-            if !text.is_empty() {
-                sections.push(text.to_owned());
-            }
-        }
-    }
-    if sections.is_empty() {
-        None
-    } else {
-        Some(sections.join("\n\n"))
-    }
-}
-
 fn render_segments(segments: &[PromptSegment]) -> Option<String> {
     let combined = segments
         .iter()
@@ -311,7 +290,7 @@ fn render_segments(segments: &[PromptSegment]) -> Option<String> {
 
 /// Everything the assembler placed in `rendered_prefix` that does NOT
 /// belong to the system or skills sections — append segments, summaries,
-/// in-band compacted prefix items, and any `Message::System` payloads.
+/// in-band compacted prefix items, and the leading `Message::System` payloads.
 fn render_system_tail(request: &ProviderRequest) -> Option<String> {
     let mut sections = Vec::new();
     if let Some(text) = render_segments(request.prompt.append_segments()) {
@@ -320,14 +299,7 @@ fn render_system_tail(request: &ProviderRequest) -> Option<String> {
     if let Some(text) = render_compacted_prefix(&request.compacted_prefix) {
         sections.push(text);
     }
-    for message in &request.messages {
-        if let Message::System(system) = message {
-            let text = system.text.trim();
-            if !text.is_empty() {
-                sections.push(text.to_owned());
-            }
-        }
-    }
+    sections.extend(leading_system_text(&request.messages).map(str::to_owned));
     if sections.is_empty() {
         None
     } else {
@@ -458,9 +430,20 @@ fn encode_messages(request: &ProviderRequest) -> anyhow::Result<Vec<Value>> {
     let mut encoded = Vec::new();
     let mut pending_tool_results = Vec::new();
 
-    for message in &request.messages {
+    for message in in_band_messages(&request.messages, 0) {
         match message {
-            Message::System(_) => {}
+            // Messages take only user and assistant turns, so a later system
+            // message is a user turn, tagged so the model can tell it apart.
+            Message::System(system) => {
+                flush_tool_results(&mut encoded, &mut pending_tool_results);
+                encoded.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": format!("<system-reminder>\n{}\n</system-reminder>", system.text),
+                    }],
+                }));
+            }
             Message::User(user) => {
                 flush_tool_results(&mut encoded, &mut pending_tool_results);
                 encoded.push(json!({
