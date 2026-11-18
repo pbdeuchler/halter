@@ -28,11 +28,49 @@ pub(crate) enum CompactStrategy {
     InlineResponses,
 }
 
+/// Embedder-tunable request options for the Responses-backed providers,
+/// [`OpenAiProvider`](crate::OpenAiProvider) and
+/// [`OpenRouterProvider`](crate::OpenRouterProvider).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponsesOptions {
+    /// Sent as `strict` on every function tool; `false` by default. The
+    /// field is always present on the wire because the Responses API treats
+    /// an omitted `strict` as `true`.
+    ///
+    /// `true` makes the upstream enforce each tool's `parameters` schema,
+    /// and the upstream only accepts schemas built for that: every object
+    /// lists all of its properties in `required` (optional ones become
+    /// nullable) and sets `"additionalProperties": false`. Halter sends the
+    /// schemas unchanged; one that does not qualify fails the request with
+    /// the upstream's invalid-request error, which is not retried. Turn it on
+    /// only when every tool the provider serves has such a schema. Halter's
+    /// built-in tools have optional properties and do not.
+    pub strict_tools: bool,
+    /// Requests `include: ["reasoning.encrypted_content"]` whenever the model
+    /// has a reasoning effort; `true` by default. On a stateless request
+    /// (`store: false`) the encrypted content is what lets a replayed
+    /// reasoning item carry the model's reasoning into the next request.
+    /// Reasoning items the upstream returns are replayed either way, with
+    /// whatever the upstream put in them; OpenAI rejects, on a stateless
+    /// request, a replayed item that has no encrypted content.
+    pub include_encrypted_reasoning: bool,
+}
+
+impl Default for ResponsesOptions {
+    fn default() -> Self {
+        Self {
+            strict_tools: false,
+            include_encrypted_reasoning: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponsesProviderRequestConfig {
     pub store: Option<bool>,
     pub include_prompt_cache_key: bool,
     pub include_encrypted_reasoning: bool,
+    pub strict_tools: bool,
     pub reasoning_summary: Option<&'static str>,
     pub instruction_mode: ResponsesInstructionMode,
 }
@@ -137,6 +175,7 @@ impl ResponsesProvider {
                     .include_prompt_cache_key
                     .then_some(request.prompt.prefix_cache_key.as_str()),
                 include_encrypted_reasoning: self.config.request.include_encrypted_reasoning,
+                strict_tools: self.config.request.strict_tools,
                 reasoning_summary: self.config.request.reasoning_summary,
                 instruction_mode: self.config.request.instruction_mode,
                 temperature: self.temperature,
@@ -388,6 +427,7 @@ mod tests {
                 store: Some(false),
                 include_prompt_cache_key: false,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
             },
@@ -491,6 +531,7 @@ mod tests {
                     store: None,
                     include_prompt_cache_key: false,
                     include_encrypted_reasoning: false,
+                    strict_tools: false,
                     reasoning_summary: None,
                     instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 },
@@ -650,6 +691,7 @@ mod tests {
                         store: Some(false),
                         include_prompt_cache_key: false,
                         include_encrypted_reasoning: false,
+                        strict_tools: false,
                         reasoning_summary: None,
                         instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                     },

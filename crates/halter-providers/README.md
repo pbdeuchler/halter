@@ -71,8 +71,9 @@ OpenAI, OpenRouter, and Anthropic all wrap their transport core in
 `new(...)` — yields bounded retries with exponential backoff for transient
 failures (rate limits, 5xx/overload, network faults) on both `stream(...)` and
 `compact(...)`. Pass a custom policy and classifier with
-`new_with_headers_and_resilience(...)`; the higher-level builder only supplies
-the policy from config. Retryability is decided by one shared classifier
+`new_with_headers_and_resilience(...)`, which for OpenAI and OpenRouter also
+takes [`ResponsesOptions`](#responses-request-options); the higher-level
+builder only supplies the options and the policy from config. Retryability is decided by one shared classifier
 across provider families, server-supplied backoff hints (`Retry-After`,
 "try again in …") are honored, and jitter stays within `max_backoff`.
 Deterministic setup failures (wrong api kind, unencodable request) are fatal
@@ -395,6 +396,59 @@ value, so slugs are trimmed and a preference that names nothing, blanks a slug,
 or repeats one fails construction rather than reaching a request body.
 Config-driven use goes through `[providers.openrouter.routing]` in
 `halter-config`, which applies the same rules while resolving the config.
+
+---
+
+## Responses request options
+
+`ResponsesOptions` carries the Responses-request settings that
+`OpenAiProvider::new_with_headers_and_resilience`,
+`OpenAiProvider::new_with_oauth_headers_and_resilience`, and
+`OpenRouterProvider::new_with_headers_and_resilience` take; the shorter
+constructors use `ResponsesOptions::default()`.
+
+- `strict_tools` (default `false`) is sent as `strict` on every function tool.
+  It is always sent, because the Responses API treats an omitted `strict` as
+  `true`. `true` makes the upstream enforce each schema, which requires every
+  object to list all of its properties in `required` (optional ones become
+  nullable) and to set `"additionalProperties": false`. Halter does not rewrite
+  schemas: one that does not qualify fails the request with the upstream's
+  invalid-request error, which is not retried. Halter's built-in tools have
+  optional properties and do not qualify.
+- `include_encrypted_reasoning` (default `true`) adds
+  `include: ["reasoning.encrypted_content"]` to requests for models with a
+  reasoning effort.
+
+Config-driven use goes through the same keys in `[providers.openai]` and
+`[providers.openrouter]`.
+
+### Reasoning replay
+
+The Responses stream decoder stores each `reasoning` output item, serialized
+whole, as the signature of the thinking block it produces. Request encoding
+sends those items back as input items, so a stateless request (`store: false`)
+still carries the model's earlier reasoning, as pi and rig do:
+
+```json
+{"type":"reasoning","id":"rs_…","summary":[],"content":[],"encrypted_content":"…"}
+{"type":"reasoning","id":"rs_…","summary":[{"type":"summary_text","text":"…"}],"status":"completed"}
+```
+
+The first shape is an OpenAI model's, the second GLM's on Fireworks. For each
+history assistant message the input holds its reasoning items in part order,
+then its text message, then its function calls. An item is replayed only when:
+
+- the message's `replay_meta` names the request's provider and model, since
+  another model's encrypted content is rejected;
+- the message also has text or a tool call, since the API rejects a reasoning
+  item without the item that followed it;
+- the signature parses as a `reasoning` item. Anthropic signatures and the bare
+  `encrypted_content` strings older halter versions stored are skipped.
+
+The encoding depends only on the stored message and the request model, so a
+request's input stays a byte prefix of the next request's. A
+`previous_response_id` request sends no reasoning items, because the chained
+response already holds them, and compaction input omits them.
 
 ---
 
