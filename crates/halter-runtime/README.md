@@ -437,22 +437,52 @@ window transition. A successful `new_context` call requests rollover at the
 next consistent boundary, after all pending tool results have been recorded.
 It does not spend another inference asking for a checkpoint.
 
-For forced rollover, the runtime allows at most two checkpoint replies:
-one to save notes, then one to call `new_context`. Only `notes` and
-`new_context` calls execute. Other calls and text remain in the event log,
-but do not enter the next request. The wipe happens even if neither tool is
-called, a notes operation fails, or the checkpoint provider is unavailable.
-Cancellation still stops the turn. A PreCompact hook that blocks rollover
-fails the turn before another provider request. PostCompact hooks run after
-successful rollover.
+For forced rollover, the runtime asks for a checkpoint and allows at most
+four checkpoint replies. Only `notes`, `session_search`, and `new_context`
+calls execute; other calls and text remain in the event log but do not enter
+the next request. The reminder does not ask for item IDs, which the model
+cannot see; it asks for what only the model knows, and the model can use
+`session_search` to quote earlier requests exactly. A failed call, such as a
+rejected `notes` write, gets its error back and another reply, even if
+`new_context` succeeded in the same reply. The exchange ends, and the window
+is wiped, when `new_context` succeeds in a reply with no failed call, when a
+reply makes none of the three calls, when the provider request fails or the
+hard cap blocks it, when tool execution fails, or when the four replies are
+spent. Cancellation stops the turn and keeps the window for the next
+boundary. A PreCompact hook that blocks rollover fails the turn before
+another provider request. PostCompact hooks run after successful rollover.
 
-`ContextWindowRolledOver` commits the new bootstrap, advances the logical
-window, clears the old transcript, provider response chain, dynamic prompt
-additions, and file-view cache, and rebuilds the token ledger. The static
-system prefix stays unchanged. The current turn continues with:
+`ContextWindowRolledOver` commits the new window's opening notice, advances
+the logical window, clears the old transcript, provider response chain,
+dynamic prompt additions, and file-view cache, and rebuilds the token
+ledger. The static system prefix stays unchanged. The current turn continues
+from one user message, built once and never edited, so it stays a stable
+cache prefix for the whole window. It opens with `CLEAN_WINDOW_BOOTSTRAP`
+and says how the window ended, for example:
 
-> Session context has been wiped. Use the todo (task), notes, and
-> session_search tools to regain context and continue your tasks.
+> Session context has been wiped. This notice comes from the harness, not
+> the user.
+> Window 0 ended: it filled up and was wiped automatically; notes were
+> saved during the checkpoint exchange, which ended because new_context was
+> called.
+> Notes files written in window 0: "checkpoint". Read one with notes
+> read_file; notes list_files_by_prefix lists every file, older ones
+> included.
+> The full history of every window stays searchable: session_search
+> list_items with role "user" lists every user request, read_item reads any
+> item in full, and search_contents finds text.
+> First: read your notes, re-read the user requests quoted below and check
+> the notes against them, check the task list, then continue the work.
+
+The other endings are "you called new_context, so no checkpoint exchange
+ran", or "nothing was saved" with "a reply made no notes, session_search, or
+new_context call", "the model request failed", "the tool calls could not
+run", or "its reply budget ran out". The notice then quotes the session's
+first user request and the latest one before the wipe, each as a separate
+text part labelled as history and capped at 4,000 bytes with a pointer to
+`session_search`. The first request is carried verbatim from notice to
+notice, so it costs at most about 2,000 tokens per window with the latest
+one, and only when requests are long.
 
 The session-scoped `task` list survives rollover. Its default store is still
 in memory; it does not survive restarting the harness process. Notes survive
@@ -461,10 +491,11 @@ session store (SQLite for persistence across process restarts).
 
 The remaining 10% of the threshold, plus the default 20,000-token gap to the
 model limit, provides room for the checkpoint exchange. Large tool results
-can consume that room in one step. The hard cap applies to checkpoint
-requests too; if it prevents a checkpoint, CleanWindow warns and wipes
-without one. Choose a threshold that leaves room for your tools and model.
-If the bootstrap itself exceeds the rollover threshold, the turn fails with
+can consume that room in one step, and so can a `session_search` read
+during the checkpoint. The hard cap applies to checkpoint requests too; if
+it prevents a checkpoint, CleanWindow warns and wipes, and the notice says
+the model request failed. Choose a threshold that leaves room for your tools and model.
+If the notice itself exceeds the rollover threshold, the turn fails with
 an actionable configuration error instead of repeatedly wiping the window.
 
 | Tool | Actions and limits |

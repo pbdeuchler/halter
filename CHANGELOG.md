@@ -35,6 +35,20 @@ once a `1.0.0` line is cut.
 - The detected shell is public as `halter_tools::{detected_shell, Shell, ShellKind}`.
 - `env` entries with an empty key, `=` or NUL in the key, or NUL in the value
   are rejected by `shell` and `background`.
+- CleanWindow opens each new window with a harness notice instead of a fixed
+  sentence. `CLEAN_WINDOW_BOOTSTRAP` is now its fixed first line, so match it
+  with `starts_with`, not equality. The notice says how the window ended and
+  whether a checkpoint was saved, lists the notes files written in that
+  window, names the `session_search` calls that recover every user request,
+  says what to do first, and quotes the session's first user request and the
+  latest one before the wipe (each capped at 4,000 bytes). It is built once
+  per rollover, so it stays a stable cache prefix for the whole window.
+- The CleanWindow checkpoint reminder no longer asks for window and item IDs
+  the model cannot see. It asks for what only the model knows (requirements
+  from other messages, decisions, verified progress, files changed,
+  learnings, next steps), and `session_search` now runs during the checkpoint
+  exchange alongside `notes` and `new_context`. The 50% and 75% reminders no
+  longer mention stable history IDs.
 
 ### Removed
 
@@ -76,6 +90,12 @@ once a `1.0.0` line is cut.
 - After an automatic compaction fails, the turn waits for the ledger to grow by
   half the threshold before trying again (`ContextSettings::compaction_due_after`).
   Before, the same request was resent at every boundary.
+- A rejected CleanWindow checkpoint write no longer wipes the window
+  silently. The model gets the error and another reply, up to four checkpoint
+  replies in all, and a `new_context` beside a failed call does not end the
+  exchange. The new window's notice reports whether anything was saved and
+  why the exchange ended: `new_context`, no checkpoint call, a failed or
+  over-cap model request, failed tool execution, or a spent budget.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the
