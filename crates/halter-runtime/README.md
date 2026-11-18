@@ -295,6 +295,12 @@ Runs one compaction pass through the configured `CompactionStrategy`, with
 way automatic compaction does. Unlike the automatic path, a strategy failure
 propagates to the caller, who asked for compaction explicitly.
 
+When there is nothing to compact the call still returns `Ok(())` and logs
+`ContextCompacted { summary: "No compaction needed.", effects: None }`, a
+marker that changes no state. `PostCompact` does not fire and the
+`SessionStart` hooks are not re-armed. `PreCompact` fires only if the
+strategy's `needs_compaction` could not rule the pass out up front.
+
 With `ProviderDefault` installed by hand on a provider that cannot compact
 natively (the builder refuses that combination from config), you can see an
 error like:
@@ -403,8 +409,15 @@ Each delivered reminder is logged as `CompactionNotified { id }` followed by
 its `MessageItem`, so the delivered set replays from the log.
 When a pass returns `Err` or `Ok(None)` after appending, the runtime records a
 `ContextRestored` event that puts the window back; the pass's messages, tool
-runs, and usage stay in the log and the session totals. Install one with
-`HalterBuilder::with_compaction`.
+runs, and usage stay in the log and the session totals. Before any hook, the
+runtime asks `needs_compaction(state, capabilities, trigger)` (default
+`true`); `false` skips the pass without `PreCompact`, `PostCompact`, or a
+state change, which is how `ModelSummary` skips an empty session and
+`ProviderDefault` skips a pass that would shed no message (a manual pass over
+an existing prefix still runs). A strategy that
+can only tell by doing the work returns `Ok(None)` from `compact`: `PreCompact`
+has fired, `PostCompact` does not, and an automatic pass backs off as after
+a failure. Install one with `HalterBuilder::with_compaction`.
 
 `ModelSummary` runs up to two inferences: when the `task` tool is registered,
 a nudge to persist remaining work (only that reply's `task` calls run; its text

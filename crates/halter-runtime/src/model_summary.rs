@@ -4,11 +4,13 @@
 
 use async_trait::async_trait;
 use halter_protocol::{
-    AssistantMessage, AssistantPart, CompactedContext, CompactionResult, Message, ToolCall,
-    UserMessage,
+    AssistantMessage, AssistantPart, CompactedContext, CompactionResult, Message,
+    ProviderCapabilities, SessionState, ToolCall, UserMessage,
 };
 
-use crate::compaction_strategy::{CompactionContext, CompactionStrategy, compaction_instructions};
+use crate::compaction_strategy::{
+    CompactionContext, CompactionStrategy, CompactionTrigger, compaction_instructions,
+};
 use crate::context::CompactionEffects;
 
 /// Name of the built-in todo tool the nudge targets.
@@ -47,14 +49,24 @@ pub struct ModelSummary;
 
 #[async_trait]
 impl CompactionStrategy for ModelSummary {
+    /// Anything at all to checkpoint: a transcript or a legacy prefix.
+    fn needs_compaction(
+        &self,
+        state: &SessionState,
+        _capabilities: &ProviderCapabilities,
+        _trigger: CompactionTrigger<'_>,
+    ) -> bool {
+        !state.messages.is_empty() || !state.compacted_prefix.is_empty()
+    }
+
     async fn compact(
         &self,
         mut ctx: CompactionContext<'_>,
     ) -> anyhow::Result<Option<CompactionEffects>> {
-        let compacted_count = ctx.state().messages.len();
-        if compacted_count == 0 && ctx.state().compacted_prefix.is_empty() {
+        if !self.needs_compaction(ctx.state(), &ctx.provider().capabilities(), ctx.trigger()) {
             return Ok(None);
         }
+        let compacted_count = ctx.state().messages.len();
 
         let mut todo_persisted = false;
         if ctx
@@ -207,5 +219,41 @@ mod tests {
         ]));
         assert_eq!(text, "one\ntwo");
         assert_eq!(assistant_text(&reply(Vec::new())), "");
+    }
+
+    /// Kills dropping either side of the `||`: an empty session must skip
+    /// before any hook fires, and a legacy prefix alone is still work.
+    #[test]
+    fn needs_compaction_unless_the_session_is_empty() {
+        // (case, has a message, has a prefix, needs)
+        let cases = [
+            ("empty", false, false, false),
+            ("transcript", true, false, true),
+            ("legacy prefix only", false, true, true),
+        ];
+        for (case, has_message, has_prefix, needs) in cases {
+            let state = SessionState {
+                messages: if has_message {
+                    vec![Message::User(UserMessage::text("hi"))]
+                } else {
+                    Vec::new()
+                },
+                compacted_prefix: if has_prefix {
+                    vec![json!({"type": "compaction"})]
+                } else {
+                    Vec::new()
+                },
+                ..SessionState::default()
+            };
+            assert_eq!(
+                ModelSummary.needs_compaction(
+                    &state,
+                    &ProviderCapabilities::default(),
+                    CompactionTrigger::Automatic
+                ),
+                needs,
+                "{case}"
+            );
+        }
     }
 }

@@ -35,7 +35,8 @@ impl ContextSettings {
     }
 
     /// [`compaction_due`](Self::compaction_due), backing off after a pass
-    /// that failed at `failed_at` tokens: the next attempt waits until the
+    /// that failed, or ran and declined, at `failed_at` tokens: the next
+    /// attempt waits until the
     /// context has grown by half a threshold, so a provider that refuses a
     /// transcript is not re-sent it at every boundary.
     #[must_use]

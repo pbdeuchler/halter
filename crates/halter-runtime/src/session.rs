@@ -60,8 +60,9 @@ const TOOL_RUNTIME_EVENT_BYTES_CAP: usize = 1024 * 1024;
 const AUTOMATIC_COMPACTION_TRIGGER: &str = "auto";
 
 /// What a turn carries from one context boundary to the next: the ledger
-/// count the last boundary left, and where automatic compaction last failed
-/// so the next attempt can back off.
+/// count the last boundary left, and where automatic compaction last ran
+/// without rewriting (failed, or declined after doing work) so the next
+/// attempt can back off.
 #[derive(Debug, Clone, Copy)]
 struct BoundaryLedger {
     tokens: u64,
@@ -1246,96 +1247,97 @@ impl SessionExecutor {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let pre_dispatch = run_pre_compact(
-            self,
-            &fired_hook_ids,
-            hook_ctx,
-            trigger,
+        let strategy_trigger = CompactionTrigger::Manual {
             custom_instructions,
-        )
-        .await?;
-        track_fired_hook_ids(&mut fired_hook_ids, &pre_dispatch);
-        self.record_hook_dispatch(&mut events, &pre_dispatch);
-        for message in apply_hook_side_effects(&mut state, &pre_dispatch) {
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
-        }
-        if pre_dispatch.merged.block_reason.is_some() {
-            let _ = self
-                .commit_and_publish(
-                    &stored.blueprint,
-                    None,
-                    Some(expected_head),
-                    Some(state),
-                    events,
-                    None,
-                )
-                .await?;
-            return Ok(());
-        }
-
-        let compaction = match self
-            .compact_via_strategy(
-                &stored.blueprint,
-                snapshot.clone(),
-                &mut state,
-                &mut events,
-                &mut fired_hook_ids,
-                &turn_id,
-                CompactionTrigger::Manual {
-                    custom_instructions,
-                },
-                hook_cancel.child_token(),
-                &mut Usage::default(),
-            )
-            .await
-        {
-            Ok(compaction) => compaction,
-            Err(error) => {
-                // The pass's exchange and the restore that ended it are
-                // already in `events`; commit them so the log tells the
-                // truth, then surface the failure.
-                if !events.is_empty() {
-                    let _ = self
-                        .commit_and_publish(
-                            &stored.blueprint,
-                            Some(snapshot),
-                            Some(expected_head),
-                            Some(state),
-                            events,
-                            None,
-                        )
-                        .await?;
-                }
-                return Err(error);
-            }
         };
-        let (summary, payload) = match compaction {
+        let compaction = if self.compaction_needed(&stored.blueprint, &state, strategy_trigger) {
+            let pre_dispatch = run_pre_compact(
+                self,
+                &fired_hook_ids,
+                hook_ctx,
+                trigger,
+                custom_instructions,
+            )
+            .await?;
+            track_fired_hook_ids(&mut fired_hook_ids, &pre_dispatch);
+            self.record_hook_dispatch(&mut events, &pre_dispatch);
+            for message in apply_hook_side_effects(&mut state, &pre_dispatch) {
+                self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+            }
+            if pre_dispatch.merged.block_reason.is_some() {
+                let _ = self
+                    .commit_and_publish(
+                        &stored.blueprint,
+                        None,
+                        Some(expected_head),
+                        Some(state),
+                        events,
+                        None,
+                    )
+                    .await?;
+                return Ok(());
+            }
+            match self
+                .compact_via_strategy(
+                    &stored.blueprint,
+                    snapshot.clone(),
+                    &mut state,
+                    &mut events,
+                    &mut fired_hook_ids,
+                    &turn_id,
+                    strategy_trigger,
+                    hook_cancel.child_token(),
+                    &mut Usage::default(),
+                )
+                .await
+            {
+                Ok(compaction) => compaction,
+                Err(error) => {
+                    // The pass's exchange and the restore that ended it are
+                    // already in `events`; commit them so the log tells the
+                    // truth, then surface the failure.
+                    if !events.is_empty() {
+                        let _ = self
+                            .commit_and_publish(
+                                &stored.blueprint,
+                                Some(snapshot),
+                                Some(expected_head),
+                                Some(state),
+                                events,
+                                None,
+                            )
+                            .await?;
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        match compaction {
             Some(effects) => {
                 let (result, payload) =
                     effects.apply_for_policy(&mut state, self.services.compaction.window_policy());
-                (result.summary, payload)
+                // Only a rewrite re-arms the compact-sourced SessionStart
+                // hooks and reaches PostCompact: both claim it happened.
+                state.pending_session_start_source = Some(HookSessionStartSource::Compact);
+                self.push_event(&mut events, payload);
+                let post_dispatch =
+                    run_post_compact(self, &fired_hook_ids, hook_ctx, trigger, &result.summary)
+                        .await?;
+                self.record_hook_dispatch(&mut events, &post_dispatch);
+                for message in apply_hook_side_effects(&mut state, &post_dispatch) {
+                    self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+                }
             }
-            None => {
-                let summary = "No compaction needed.".to_owned();
-                (
-                    summary.clone(),
-                    SessionEventPayload::ContextCompacted {
-                        summary,
-                        effects: None,
-                    },
-                )
-            }
-        };
-        // A manual pass re-arms the compact-sourced SessionStart hooks
-        // whether or not anything was rewritten.
-        state.pending_session_start_source = Some(HookSessionStartSource::Compact);
-        self.push_event(&mut events, payload);
-
-        let post_dispatch =
-            run_post_compact(self, &fired_hook_ids, hook_ctx, trigger, &summary).await?;
-        self.record_hook_dispatch(&mut events, &post_dispatch);
-        for message in apply_hook_side_effects(&mut state, &post_dispatch) {
-            self.push_event(&mut events, SessionEventPayload::MessageItem { message });
+            // The caller's answer: a durable marker that changes no state.
+            None => self.push_event(
+                &mut events,
+                SessionEventPayload::ContextCompacted {
+                    summary: "No compaction needed.".to_owned(),
+                    effects: None,
+                },
+            ),
         }
 
         let _ = self
@@ -2506,6 +2508,27 @@ impl SessionExecutor {
         );
     }
 
+    /// [`CompactionStrategy::needs_compaction`] against the default model's
+    /// provider, asked before any hook fires. A model or provider that does
+    /// not resolve answers with default capabilities, so the pass runs and
+    /// [`Self::compact_via_strategy`] reports the resolution error.
+    fn compaction_needed(
+        &self,
+        blueprint: &SessionBlueprint,
+        state: &SessionState,
+        trigger: CompactionTrigger<'_>,
+    ) -> bool {
+        let models = &self.services.models;
+        let capabilities = models
+            .model(&blueprint.default_model)
+            .and_then(|model| models.provider(&model.provider))
+            .map(|provider| provider.capabilities())
+            .unwrap_or_default();
+        self.services
+            .compaction
+            .needs_compaction(state, &capabilities, trigger)
+    }
+
     /// Hand the session to the configured strategy for one compaction pass
     /// against the session's default model. The strategy may append to
     /// `state` and `events` on the way. When it returns `Err` or `Ok(None)`
@@ -2686,14 +2709,17 @@ impl SessionExecutor {
     }
 
     /// One ledger-triggered compaction pass with `PreCompact`/`PostCompact`
-    /// hooks around it. Automatic compaction is best-effort: a hook that
+    /// hooks around it. A strategy with nothing to rewrite skips the pass
+    /// before either hook; `PostCompact` fires only once a rewrite has
+    /// replaced the context. Automatic compaction is best-effort: a hook that
     /// blocks it or a strategy that cannot run degrades the turn to an
     /// uncompacted context with a warning event, because the alternative is
     /// that every turn past the threshold becomes unrecoverable. Hook
     /// dispatch failures propagate like everywhere else in the turn.
     ///
-    /// Returns whether the strategy itself failed, so the caller can back
-    /// off instead of resending the same request at the next boundary.
+    /// Returns whether the strategy ran without rewriting — it failed, or
+    /// declined after doing work — so the caller can back off instead of
+    /// repeating the same pass, and its `PreCompact`, at the next boundary.
     #[expect(clippy::too_many_arguments)]
     async fn run_automatic_compaction(
         &self,
@@ -2706,6 +2732,22 @@ impl SessionExecutor {
         turn_usage: &mut Usage,
         cancel: &CancellationToken,
     ) -> anyhow::Result<bool> {
+        let trigger =
+            if self.services.compaction.window_policy() == crate::WindowPolicy::CleanWindow {
+                CompactionTrigger::Rollover {
+                    requested: crate::session_search::new_context_requested(&state.messages),
+                }
+            } else {
+                CompactionTrigger::Automatic
+            };
+        if !self.compaction_needed(blueprint, state, trigger) {
+            debug!(
+                session_id = %self.session_id,
+                effective_tokens = state.token_ledger.effective_tokens(),
+                "automatic compaction was due but found nothing to compact"
+            );
+            return Ok(false);
+        }
         let pre_dispatch = run_pre_compact(
             self,
             fired_hook_ids,
@@ -2734,14 +2776,6 @@ impl SessionExecutor {
             return Ok(false);
         }
 
-        let trigger =
-            if self.services.compaction.window_policy() == crate::WindowPolicy::CleanWindow {
-                CompactionTrigger::Rollover {
-                    requested: crate::session_search::new_context_requested(&state.messages),
-                }
-            } else {
-                CompactionTrigger::Automatic
-            };
         let summary = match self
             .compact_via_strategy(
                 blueprint,
@@ -2776,9 +2810,9 @@ impl SessionExecutor {
                 debug!(
                     session_id = %self.session_id,
                     effective_tokens = state.token_ledger.effective_tokens(),
-                    "automatic compaction was due but found nothing to compact"
+                    "automatic compaction ran but the strategy declined to rewrite"
                 );
-                "No compaction needed.".to_owned()
+                return Ok(true);
             }
             Err(error) => {
                 warn!(
@@ -7811,132 +7845,127 @@ mod tests {
         }
     }
 
+    /// `PostCompact` claims a rewrite replaced the context, so it fires only
+    /// after one; a strategy that knows up front it has nothing to do skips
+    /// both hooks. Kills dropping the `compaction_needed` early return
+    /// ("declines up front" sees `PreCompact`), firing `PostCompact` on
+    /// `Ok(None)` again or not backing off after it ("declines after
+    /// running" sees `PostCompact`, or a second `PreCompact` at the turn's
+    /// next boundary), ignoring the
+    /// block reason ("blocked" compacts), and skipping `PostCompact` after a
+    /// rewrite ("rewrites" misses it).
     #[tokio::test]
-    async fn automatic_compaction_runs_pre_and_post_compact_hooks() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
-        install_context_settings(&mut services, tiny_context_settings(None));
-        let mut registered = RegisteredHooks::default();
-        for event in [HookEventName::PreCompact, HookEventName::PostCompact] {
-            registered.register(
-                PluginId::from("internal"),
-                RegisteredHookPriority::AfterPlugins,
-                Hook::callback(event, |_input| async move { HookResponse::passthrough() }),
+    async fn automatic_compaction_fires_post_compact_only_after_a_rewrite() {
+        // (case, strategy, PreCompact blocks, compaction hooks that fire, compacted)
+        type Case = (
+            &'static str,
+            Arc<dyn CompactionStrategy>,
+            bool,
+            &'static [&'static str],
+            bool,
+        );
+        let cases: [Case; 4] = [
+            (
+                "rewrites",
+                Arc::new(WipingCompaction),
+                false,
+                &["PreCompact", "PostCompact"],
+                true,
+            ),
+            (
+                "declines up front",
+                Arc::new(NoopCompaction),
+                false,
+                &[],
+                false,
+            ),
+            (
+                "declines after running",
+                Arc::new(AbandonedCompaction),
+                false,
+                &["PreCompact"],
+                false,
+            ),
+            // A block is policy, not a failed pass: it is asked again at the
+            // turn's next due boundary rather than backed off.
+            (
+                "blocked by PreCompact",
+                Arc::new(WipingCompaction),
+                true,
+                &["PreCompact", "PreCompact"],
+                false,
+            ),
+        ];
+        for (case, strategy, blocks, fired, compacted) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+            install_context_settings(&mut services, tiny_context_settings(None));
+            install_compaction(&mut services, strategy);
+            let mut registered = RegisteredHooks::default();
+            for event in [HookEventName::PreCompact, HookEventName::PostCompact] {
+                registered.register(
+                    PluginId::from("internal"),
+                    RegisteredHookPriority::AfterPlugins,
+                    Hook::callback(event, move |_input| async move {
+                        if blocks && event == HookEventName::PreCompact {
+                            HookResponse::block("not while the notes are open")
+                        } else {
+                            HookResponse::passthrough()
+                        }
+                    }),
+                );
+            }
+            Arc::get_mut(&mut services)
+                .expect("unique services")
+                .registered_hooks = Arc::new(registered);
+            let session = new_session(&SessionRuntime::new(services), temp.path()).await;
+
+            let events = session
+                .submit_turn(Turn::user("x".repeat(150)))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+
+            let hooks = events
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    SessionEventPayload::HookCompleted { run }
+                        if run.event_name.ends_with("Compact") =>
+                    {
+                        Some(run.event_name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(hooks, fired, "{case}");
+            assert_eq!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    SessionEventPayload::ContextCompacted { .. }
+                )),
+                compacted,
+                "{case}"
             );
-        }
-        Arc::get_mut(&mut services)
-            .expect("unique services")
-            .registered_hooks = Arc::new(registered);
-        let runtime = SessionRuntime::new(services.clone());
-        let session = new_session(&runtime, temp.path()).await;
-
-        let events = session
-            .submit_turn(Turn::user("x".repeat(150)))
-            .await
-            .expect("submit turn")
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect events");
-
-        for expected in ["PreCompact", "PostCompact"] {
-            assert!(
+            assert_eq!(
                 events.iter().any(|event| matches!(
                     &event.payload,
-                    SessionEventPayload::HookCompleted { run }
-                        if run.event_name == expected && run.status == HookRunStatus::Completed
+                    SessionEventPayload::Warning { message }
+                        if message.contains("blocked by a PreCompact hook")
+                            && message.contains("not while the notes are open")
                 )),
-                "{expected} must fire around automatic compaction"
+                blocks,
+                "{case}"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    SessionEventPayload::TurnCompleted { .. }
+                )),
+                "{case}"
             );
         }
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
-        );
-    }
-
-    #[tokio::test]
-    async fn automatic_noop_compaction_still_runs_post_compact_hooks() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
-        install_context_settings(&mut services, tiny_context_settings(None));
-        install_compaction(&mut services, Arc::new(NoopCompaction));
-        let mut registered = RegisteredHooks::default();
-        registered.register(
-            PluginId::from("internal"),
-            RegisteredHookPriority::AfterPlugins,
-            Hook::callback(HookEventName::PostCompact, |_input| async move {
-                HookResponse::passthrough()
-            }),
-        );
-        Arc::get_mut(&mut services)
-            .expect("unique services")
-            .registered_hooks = Arc::new(registered);
-        let session = new_session(&SessionRuntime::new(services), temp.path()).await;
-
-        let events = session
-            .submit_turn(Turn::user("x".repeat(150)))
-            .await
-            .expect("submit turn")
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect events");
-
-        assert!(events.iter().any(|event| matches!(
-            &event.payload,
-            SessionEventPayload::HookCompleted { run }
-                if run.event_name == "PostCompact" && run.status == HookRunStatus::Completed
-        )));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
-        );
-    }
-
-    #[tokio::test]
-    async fn pre_compact_hook_can_block_automatic_compaction() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
-        install_context_settings(&mut services, tiny_context_settings(None));
-        let mut registered = RegisteredHooks::default();
-        registered.register(
-            PluginId::from("internal"),
-            RegisteredHookPriority::AfterPlugins,
-            Hook::callback(HookEventName::PreCompact, |_input| async move {
-                HookResponse::block("not while the notes are open")
-            }),
-        );
-        Arc::get_mut(&mut services)
-            .expect("unique services")
-            .registered_hooks = Arc::new(registered);
-        let runtime = SessionRuntime::new(services.clone());
-        let session = new_session(&runtime, temp.path()).await;
-
-        let events = session
-            .submit_turn(Turn::user("x".repeat(150)))
-            .await
-            .expect("submit turn")
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect events");
-
-        assert!(events.iter().any(|event| matches!(
-            &event.payload,
-            SessionEventPayload::Warning { message }
-                if message.contains("blocked by a PreCompact hook")
-                    && message.contains("not while the notes are open")
-        )));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event.payload, SessionEventPayload::ContextCompacted { .. }))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
-        );
     }
 
     /// Automatic compaction is best-effort: a strategy that cannot run must
@@ -8593,11 +8622,21 @@ mod tests {
         )
     }
 
-    /// Strategy that never compacts, so the cap decides.
+    /// Strategy that never compacts and says so up front, so the cap
+    /// decides and no compaction hook fires.
     struct NoopCompaction;
 
     #[async_trait]
     impl crate::CompactionStrategy for NoopCompaction {
+        fn needs_compaction(
+            &self,
+            _state: &SessionState,
+            _capabilities: &ProviderCapabilities,
+            _trigger: CompactionTrigger<'_>,
+        ) -> bool {
+            false
+        }
+
         async fn compact(
             &self,
             _ctx: crate::CompactionContext<'_>,
@@ -9141,16 +9180,57 @@ mod tests {
         ));
     }
 
+    /// A manual pass on an empty session succeeds whatever the strategy
+    /// does, and leaves a durable answer in the log; only a rewrite fires
+    /// `PostCompact` and re-arms the compact-sourced `SessionStart` hooks.
+    /// Kills dropping the `compaction_needed` check in `run_compact` (the
+    /// built-ins see `PreCompact`), firing `PostCompact` or re-arming on
+    /// `None` again ("declines after running"), and dropping the marker.
     #[tokio::test]
-    async fn manual_compact_on_an_empty_session_is_a_noop_for_every_strategy() {
-        let strategies: [(&str, Arc<dyn CompactionStrategy>); 2] = [
-            ("model_summary", Arc::new(crate::ModelSummary)),
-            ("provider_default", Arc::new(crate::ProviderDefault)),
+    async fn manual_compact_fires_post_compact_and_rearms_only_after_a_rewrite() {
+        // (case, strategy, compaction hooks that fire, rewrote)
+        type Case = (
+            &'static str,
+            Arc<dyn CompactionStrategy>,
+            &'static [&'static str],
+            bool,
+        );
+        let cases: [Case; 4] = [
+            ("model_summary", Arc::new(crate::ModelSummary), &[], false),
+            (
+                "provider_default",
+                Arc::new(crate::ProviderDefault),
+                &[],
+                false,
+            ),
+            (
+                "declines after running",
+                Arc::new(AbandonedCompaction),
+                &["PreCompact"],
+                false,
+            ),
+            (
+                "rewrites",
+                Arc::new(WipingCompaction),
+                &["PreCompact", "PostCompact"],
+                true,
+            ),
         ];
-        for (name, strategy) in strategies {
+        for (name, strategy, fired, rewrote) in cases {
             let temp = tempfile::tempdir().expect("tempdir");
             let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
             install_compaction(&mut services, strategy);
+            let mut registered = RegisteredHooks::default();
+            for event in [HookEventName::PreCompact, HookEventName::PostCompact] {
+                registered.register(
+                    PluginId::from("internal"),
+                    RegisteredHookPriority::AfterPlugins,
+                    Hook::callback(event, |_input| async move { HookResponse::passthrough() }),
+                );
+            }
+            Arc::get_mut(&mut services)
+                .expect("unique services")
+                .registered_hooks = Arc::new(registered);
             let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
 
             session.compact("manual", None).await.expect(name);
@@ -9162,14 +9242,27 @@ mod tests {
                 .expect("load session")
                 .expect("session exists");
             assert!(stored.state.messages.is_empty(), "{name}");
-            assert!(stored.state.compacted_prefix.is_empty(), "{name}");
+            assert_eq!(
+                stored.state.pending_session_start_source == Some(HookSessionStartSource::Compact),
+                rewrote,
+                "{name}"
+            );
             let replay = session.replay().await.expect("replay");
-            assert!(
+            let hooks = replay
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    SessionEventPayload::HookCompleted { run } => Some(run.event_name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(hooks, fired, "{name}");
+            assert_eq!(
                 replay.iter().any(|event| matches!(
                     &event.payload,
                     SessionEventPayload::ContextCompacted { summary, effects: None }
                         if summary == "No compaction needed."
                 )),
+                !rewrote,
                 "{name}"
             );
         }

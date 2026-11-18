@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use halter_protocol::{
-    CompactedContext, CompactionResult, Message, ProviderCompactionRequest,
-    ProviderCompactionStrategy,
+    CompactedContext, CompactionResult, Message, ProviderCapabilities, ProviderCompactionRequest,
+    ProviderCompactionStrategy, SessionState,
 };
 
 use crate::compaction_strategy::{
@@ -28,6 +28,28 @@ pub struct ProviderDefault;
 
 #[async_trait]
 impl CompactionStrategy for ProviderDefault {
+    /// Whether any message would leave the verbatim window. When none would,
+    /// a rewrite could only re-summarize the existing prefix: worth a
+    /// provider call when a caller asks for it, never on the ledger's
+    /// trigger. A provider that cannot compact answers `true`, so
+    /// [`compact`](Self::compact) reports why.
+    fn needs_compaction(
+        &self,
+        state: &SessionState,
+        capabilities: &ProviderCapabilities,
+        trigger: CompactionTrigger<'_>,
+    ) -> bool {
+        capabilities
+            .compaction_strategy
+            .filter(|_| capabilities.supports_compaction)
+            .is_none_or(|strategy| {
+                let (_, preserved) = split_window(strategy, &state.messages);
+                state.messages.len() > preserved.len()
+                    || (!state.compacted_prefix.is_empty()
+                        && matches!(trigger, CompactionTrigger::Manual { .. }))
+            })
+    }
+
     async fn compact(
         &self,
         ctx: CompactionContext<'_>,
@@ -43,17 +65,11 @@ impl CompactionStrategy for ProviderDefault {
             );
         };
         let state = ctx.state();
-        let (eligible, preserved) = split_window(strategy, &state.messages);
-        // Messages that leave the verbatim window. Zero means a rewrite could
-        // only re-summarize the existing prefix: worth a provider call when a
-        // caller asks for it, never on the ledger's trigger.
-        let compacted_count = state.messages.len() - preserved.len();
-        if compacted_count == 0
-            && (state.compacted_prefix.is_empty()
-                || !matches!(ctx.trigger(), CompactionTrigger::Manual { .. }))
-        {
+        if !self.needs_compaction(state, &capabilities, ctx.trigger()) {
             return Ok(None);
         }
+        let (eligible, preserved) = split_window(strategy, &state.messages);
+        let compacted_count = state.messages.len() - preserved.len();
 
         let response = ctx
             .provider()
@@ -294,6 +310,118 @@ mod tests {
             if let Some(Message::Tool(_)) = got_preserved.get(1) {
                 panic!("{case}: a tool result follows the user without its call");
             }
+        }
+    }
+
+    /// The runtime asks this before any hook fires, so a `false` here is
+    /// what keeps `PreCompact`/`PostCompact` quiet at a busy boundary.
+    /// Kills dropping either clause of the `||` (the shedding and manual
+    /// prefix cases flip), dropping the `Manual` match (the automatic
+    /// prefix case flips), and answering `false` for a provider that cannot
+    /// compact (its error would turn into a silent skip).
+    #[test]
+    fn needs_compaction_when_a_message_leaves_the_window_or_a_caller_asks() {
+        use ProviderCompactionStrategy::{Dedicated, Inline};
+        let manual = CompactionTrigger::Manual {
+            custom_instructions: None,
+        };
+        let one_exchange = || vec![user("only"), assistant("large"), tool("t1")];
+        let long_turn = || vec![user("task"), assistant("a1"), tool("t1"), assistant("a2")];
+        // (case, provider strategy, transcript, has prefix, trigger, needs)
+        let cases: [(&str, _, Vec<Message>, bool, CompactionTrigger<'_>, bool); 9] = [
+            (
+                "provider cannot compact",
+                None,
+                one_exchange(),
+                false,
+                CompactionTrigger::Automatic,
+                true,
+            ),
+            (
+                "inline long turn sheds",
+                Some(Inline),
+                long_turn(),
+                false,
+                CompactionTrigger::Automatic,
+                true,
+            ),
+            (
+                "inline lone exchange, no prefix",
+                Some(Inline),
+                one_exchange(),
+                false,
+                CompactionTrigger::Automatic,
+                false,
+            ),
+            (
+                "inline lone exchange, automatic prefix-only rewrite",
+                Some(Inline),
+                one_exchange(),
+                true,
+                CompactionTrigger::Automatic,
+                false,
+            ),
+            (
+                "inline lone exchange, manual prefix-only rewrite",
+                Some(Inline),
+                one_exchange(),
+                true,
+                manual,
+                true,
+            ),
+            (
+                "inline lone exchange, manual without a prefix",
+                Some(Inline),
+                one_exchange(),
+                false,
+                manual,
+                false,
+            ),
+            (
+                "dedicated sheds before the latest assistant",
+                Some(Dedicated),
+                one_exchange(),
+                false,
+                CompactionTrigger::Automatic,
+                true,
+            ),
+            (
+                "dedicated empty transcript",
+                Some(Dedicated),
+                Vec::new(),
+                false,
+                manual,
+                false,
+            ),
+            (
+                "rollover prefix-only rewrite",
+                Some(Inline),
+                one_exchange(),
+                true,
+                CompactionTrigger::Rollover { requested: true },
+                false,
+            ),
+        ];
+        for (case, strategy, messages, has_prefix, trigger, needs) in cases {
+            let capabilities = ProviderCapabilities {
+                supports_compaction: strategy.is_some(),
+                compaction_strategy: strategy,
+                ..ProviderCapabilities::default()
+            };
+            let state = SessionState {
+                messages,
+                compacted_prefix: if has_prefix {
+                    vec![serde_json::json!({"type": "compaction", "text": "gist"})]
+                } else {
+                    Vec::new()
+                },
+                ..SessionState::default()
+            };
+            assert_eq!(
+                ProviderDefault.needs_compaction(&state, &capabilities, trigger),
+                needs,
+                "{case}"
+            );
         }
     }
 }

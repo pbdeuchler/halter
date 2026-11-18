@@ -35,6 +35,33 @@ once a `1.0.0` line is cut.
 - The detected shell is public as `halter_tools::{detected_shell, Shell, ShellKind}`.
 - `env` entries with an empty key, `=` or NUL in the key, or NUL in the value
   are rejected by `shell` and `background`.
+- **Breaking (hook contract):** `PostCompact` fires only after a compaction
+  replaced the context. Before, an automatic or manual pass that found
+  nothing to compact still ran `PostCompact` with the summary
+  `"No compaction needed."`; after the skip of automatic prefix-only passes
+  (below) that happened at every busy boundary. Now:
+  - A strategy can say up front that it has nothing to do with the new
+    `CompactionStrategy::needs_compaction(state, capabilities, trigger)`
+    (default `true`). The runtime asks before any hook. On `false` the pass
+    is skipped: no `PreCompact`, no `compact` call, no `PostCompact`, no
+    SessionStart re-arm. `ModelSummary` and `ProviderDefault` implement it.
+  - When `compact` returns `Ok(None)` after doing work, `PreCompact` has
+    already fired and `PostCompact` does not. An automatic pass backs off
+    like a failed one (see `compaction_due_after` below), so the same work
+    and its `PreCompact` are not repeated at the next boundary.
+  - A manual `compact(..)` that finds nothing to do still returns `Ok(())` and
+    still logs `ContextCompacted { summary: "No compaction needed.", effects:
+    None }`, but fires no `PostCompact` and no longer re-arms the
+    `SessionStart` hooks with source `compact`.
+  - A blocking `PreCompact` hook is unchanged: it is asked again at the next
+    due boundary.
+
+  For embedders: a `PostCompact` hook can now treat its call as proof that
+  the context was rewritten, and `compact_summary` is always a real summary.
+  A hook that used `PostCompact` as "a compaction was attempted" should move
+  to `PreCompact`, or watch the event stream for `ContextCompacted`. A custom
+  strategy whose `compact` returns `Ok(None)` without doing work should
+  implement `needs_compaction` so its hooks stay quiet.
 
 ### Removed
 
@@ -73,9 +100,10 @@ once a `1.0.0` line is cut.
   of top-level `instructions`. Behind a transcript that ended on the
   assistant, models continued the conversation and that reply became the
   summary.
-- After an automatic compaction fails, the turn waits for the ledger to grow by
-  half the threshold before trying again (`ContextSettings::compaction_due_after`).
-  Before, the same request was resent at every boundary.
+- After an automatic compaction fails, or its strategy declines after doing
+  work, the turn waits for the ledger to grow by half the threshold before
+  trying again (`ContextSettings::compaction_due_after`). Before, the same
+  request was resent at every boundary.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the

@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use halter_protocol::{
-    AssistantMessage, Message, ObservedState, PendingEvent, PromptSegment, ProviderRequest,
-    ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionEventPayload, SessionId,
-    SessionState, ToolCall, ToolSpec, TurnId, Usage,
+    AssistantMessage, Message, ObservedState, PendingEvent, PromptSegment, ProviderCapabilities,
+    ProviderRequest, ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionEventPayload,
+    SessionId, SessionState, ToolCall, ToolSpec, TurnId, Usage,
 };
 use halter_providers::Provider;
 use halter_tools::Tool;
@@ -427,8 +427,29 @@ pub trait CompactionStrategy: Send + Sync {
         Vec::new()
     }
 
-    /// Compact the session. `Ok(None)` means there was nothing to compact and
-    /// the transcript is left as the strategy found it; `Err` means
+    /// Whether a pass with `trigger` would rewrite anything in `state`, on a
+    /// provider with `capabilities`. The runtime asks before any hook fires:
+    /// `false` skips the pass outright — no `PreCompact`, no
+    /// [`compact`](Self::compact) call, no `PostCompact`, no state change.
+    /// Answer from state alone, without I/O; it runs at every due boundary.
+    /// Default `true`, for a strategy that can only tell by doing the work;
+    /// its [`compact`](Self::compact) then answers `Ok(None)`.
+    fn needs_compaction(
+        &self,
+        state: &SessionState,
+        capabilities: &ProviderCapabilities,
+        trigger: CompactionTrigger<'_>,
+    ) -> bool {
+        let _ = (state, capabilities, trigger);
+        true
+    }
+
+    /// Compact the session; called only after
+    /// [`needs_compaction`](Self::needs_compaction) and `PreCompact`.
+    /// `Ok(None)` means there was nothing to compact after all and the
+    /// transcript is left as the strategy found it: `PostCompact` does not
+    /// fire, nothing counts as a compaction, and an automatic pass backs off
+    /// as after a failure. `Err` means
     /// compaction could not run, which the runtime degrades to a warning for
     /// [`CompactionTrigger::Automatic`] and propagates for
     /// [`CompactionTrigger::Manual`]. On `Err` and `Ok(None)` the runtime
@@ -471,6 +492,29 @@ mod tests {
         let notifications = BTreeSet::new();
         let boundary = CompactionBoundary::new(&session_id, 0, 0, 5_000, 1_000, &notifications);
         assert!(NoopStrategy.context_boundary(boundary).is_empty());
+    }
+
+    /// A strategy that does not answer up front is always asked to run, so
+    /// its own `compact` decides. Kills a default of `false`, which would
+    /// silently disable every custom strategy.
+    #[test]
+    fn default_strategy_needs_compaction_on_every_trigger() {
+        for trigger in [
+            CompactionTrigger::Automatic,
+            CompactionTrigger::Rollover { requested: false },
+            CompactionTrigger::Manual {
+                custom_instructions: None,
+            },
+        ] {
+            assert!(
+                NoopStrategy.needs_compaction(
+                    &SessionState::default(),
+                    &ProviderCapabilities::default(),
+                    trigger
+                ),
+                "{trigger:?}"
+            );
+        }
     }
 
     #[test]

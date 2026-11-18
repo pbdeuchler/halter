@@ -174,6 +174,11 @@ impl SessionHandle {
     }
 
     /// Compact an idle session explicitly.
+    ///
+    /// When the strategy has nothing to rewrite this still returns `Ok(())`
+    /// and records a `ContextCompacted` event with no effects; `PostCompact`
+    /// fires only after a rewrite, and `PreCompact` only when the strategy's
+    /// `needs_compaction` did not rule the pass out.
     pub async fn compact(
         &self,
         reason: &str,
