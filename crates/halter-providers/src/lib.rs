@@ -26,6 +26,8 @@ mod openai_error;
 mod openai_rate_limit;
 mod openai_rate_limit_policy;
 mod openrouter;
+#[cfg(test)]
+mod prefix_stability_tests;
 mod registry;
 mod resilience;
 mod responses_provider;

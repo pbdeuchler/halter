@@ -494,6 +494,16 @@ pub struct HookWarning {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// System instruction message carried in the transcript.
+///
+/// Where it reaches the model depends on its position. System messages
+/// before the first other message are the session's leading system content
+/// and join the provider's system prompt. Any later one (a hook's message, a
+/// compaction reminder, a resume notice) is encoded where it sits: a
+/// `developer` item on the Responses API, a `system` message on Chat
+/// Completions, and a user turn wrapped in `<system-reminder>` tags on
+/// Anthropic Messages, which has no system role in its message list. One
+/// appended inside a tool batch moves to just after the batch's results.
+/// Appending a system message therefore never rewrites the cached prefix.
 pub struct SystemMessage {
     pub id: MessageId,
     pub created_at: Timestamp,
@@ -612,7 +622,7 @@ pub struct ToolResultMessage {
 #[serde(tag = "role", rename_all = "snake_case")]
 /// A transcript item visible to providers and session stores.
 pub enum Message {
-    /// System instructions.
+    /// System instructions. See [`SystemMessage`] for where providers put them.
     System(SystemMessage),
     /// User input.
     User(UserMessage),
@@ -855,8 +865,6 @@ pub enum SessionCommand {
     SubmitTurn { turn: Turn },
     /// Interrupt the active turn.
     InterruptTurn,
-    /// Append session-scoped system guidance.
-    AppendSystemPrompt { id: PromptId, text: SharedStr },
     /// Switch the active model role.
     SetModelRole { role: ModelRole },
     /// Switch to a concrete model id.
@@ -1775,6 +1783,11 @@ pub struct SessionState {
     pub pending_inputs: Vec<UserMessage>,
     #[serde(default)]
     pub compacted_prefix: Vec<Value>,
+    /// Append-kind segments rendered after the system prompt and skills.
+    /// The runtime no longer writes them: hook additional context is a
+    /// transcript system message instead, so it cannot rewrite the cached
+    /// prefix. Sessions recorded by earlier versions keep the segments they
+    /// hold until a rollover clears them, so they encode as they did.
     pub appended_prompt_segments: Vec<PromptSegment>,
     pub pending_tool_calls: IndexMap<ToolCallId, PendingToolCall>,
     pub usage_so_far: Usage,
@@ -2094,9 +2107,9 @@ impl AssembledPrompt {
         &self.ordered_segments[start..end]
     }
 
-    /// Slice of segments that follow both the system and skills sections —
-    /// hook-appended context, etc. These never receive a cache breakpoint
-    /// because they may change turn-to-turn.
+    /// Slice of segments that follow both the system and skills sections:
+    /// append-kind segments, such as `SessionState::appended_prompt_segments`.
+    /// These never receive a cache breakpoint.
     #[must_use]
     pub fn append_segments(&self) -> &[PromptSegment] {
         let start =

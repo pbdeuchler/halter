@@ -17,8 +17,8 @@ use tracing::warn;
 
 use crate::codec_common::{
     assistant_text, bounded_provider_id, bounded_provider_id_with_prefix, canonical_tool_name,
-    collect_system_text, data_url, document_filename, has_user_media, tool_name_for_provider,
-    user_text,
+    collect_system_text, data_url, document_filename, has_user_media, in_band_messages,
+    tool_name_for_provider, user_text,
 };
 
 // Alias the consolidated PROVIDER_ID_MAX_LEN from codec_common (finding L14).
@@ -91,17 +91,17 @@ pub(crate) fn encode_responses_request(
             "previous_response_id".to_owned(),
             Value::String(prev_id.clone()),
         );
-        let new_messages = request
-            .messages
-            .get(request.new_messages_start..)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "failed to encode openai responses request: new_messages_start {} exceeds message count {}",
-                    request.new_messages_start,
-                    request.messages.len()
-                )
-            })?;
-        let input = encode_responses_input_slice(new_messages, request)?;
+        if request.new_messages_start > request.messages.len() {
+            anyhow::bail!(
+                "failed to encode openai responses request: new_messages_start {} exceeds message count {}",
+                request.new_messages_start,
+                request.messages.len()
+            );
+        }
+        let input = encode_responses_input_slice(
+            in_band_messages(&request.messages, request.new_messages_start),
+            request,
+        )?;
         validate_responses_input_item_ids(&input)?;
         body.insert("input".to_owned(), Value::Array(input));
     } else {
@@ -283,9 +283,9 @@ fn encode_responses_compact_input(
     request: &ProviderCompactionRequest,
 ) -> anyhow::Result<Vec<Value>> {
     let mut input = request.compacted_prefix.clone();
-    for message in &request.messages {
+    for message in in_band_messages(&request.messages, 0) {
         match message {
-            Message::System(_) => {}
+            Message::System(system) => input.push(encode_responses_developer_message(&system.text)),
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
                 if let Some(message) = encode_responses_assistant_message(assistant) {
@@ -1073,9 +1073,9 @@ fn encode_responses_input(
     }
     input.extend(request.compacted_prefix.clone());
 
-    for message in &request.messages {
+    for message in in_band_messages(&request.messages, 0) {
         match message {
-            Message::System(_) => {}
+            Message::System(system) => input.push(encode_responses_developer_message(&system.text)),
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
                 input.extend(encode_responses_assistant_items(assistant, request, replay));
@@ -1087,16 +1087,16 @@ fn encode_responses_input(
     Ok(input)
 }
 
-/// Encode only the given message slice — used when chaining via `previous_response_id`.
-/// Omits the developer/system message since the server already has it.
+/// Encode only the given messages — used when chaining via `previous_response_id`.
+/// Omits the leading developer/system message since the server already has it.
 fn encode_responses_input_slice(
-    messages: &[Message],
+    messages: Vec<&Message>,
     request: &ProviderRequest,
 ) -> anyhow::Result<Vec<Value>> {
     let mut input = Vec::new();
     for message in messages {
         match message {
-            Message::System(_) => {}
+            Message::System(system) => input.push(encode_responses_developer_message(&system.text)),
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
                 // The chained response already holds its reasoning items.
@@ -1403,9 +1403,12 @@ fn encode_chat_messages(request: &ProviderRequest) -> anyhow::Result<Vec<Value>>
         }));
     }
 
-    for message in &request.messages {
+    for message in in_band_messages(&request.messages, 0) {
         match message {
-            Message::System(_) => {}
+            Message::System(system) => messages.push(json!({
+                "role": "system",
+                "content": system.text,
+            })),
             Message::User(user) => messages.push(encode_chat_user_message(user)?),
             Message::Assistant(assistant) => {
                 let text = assistant_text(assistant);

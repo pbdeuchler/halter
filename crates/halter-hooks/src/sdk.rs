@@ -120,7 +120,10 @@ impl HookResponse {
         self
     }
 
-    /// Add context to the next model request.
+    /// Add context to the next model request. The runtime appends it to the
+    /// conversation as a system message where the hook ran, before the
+    /// hook's own system message, so it does not rewrite the cached prompt
+    /// prefix.
     #[must_use]
     pub fn with_additional_context(mut self, context: impl Into<String>) -> Self {
         self.output
