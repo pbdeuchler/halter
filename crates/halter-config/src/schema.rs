@@ -24,6 +24,10 @@ pub const DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// Default maximum idle gap between provider stream items, in seconds.
 pub const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
+/// Default wall-clock timeout for one whole unary compaction request, in
+/// seconds. Longer than the request timeout because the provider writes the
+/// entire summary before it responds.
+pub const DEFAULT_PROVIDER_COMPACT_TIMEOUT_SECS: u64 = 300;
 /// Default total provider request attempts, including the initial call.
 pub const DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS: u32 = 5;
 /// Default cumulative provider retry budget, in seconds.
@@ -45,6 +49,10 @@ const fn default_provider_request_timeout_secs() -> u64 {
 
 const fn default_provider_stream_idle_timeout_secs() -> u64 {
     DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS
+}
+
+const fn default_provider_compact_timeout_secs() -> u64 {
+    DEFAULT_PROVIDER_COMPACT_TIMEOUT_SECS
 }
 
 const fn default_provider_retry_max_attempts() -> u32 {
@@ -577,6 +585,9 @@ pub struct ResilienceTimeoutsConfig {
     pub request_secs: u64,
     #[serde(default = "default_provider_stream_idle_timeout_secs")]
     pub stream_idle_secs: u64,
+    /// One whole unary compaction request, response body included.
+    #[serde(default = "default_provider_compact_timeout_secs")]
+    pub compact_secs: u64,
 }
 
 impl Default for ResilienceTimeoutsConfig {
@@ -585,6 +596,7 @@ impl Default for ResilienceTimeoutsConfig {
             connect_secs: DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS,
             request_secs: DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS,
             stream_idle_secs: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS,
+            compact_secs: DEFAULT_PROVIDER_COMPACT_TIMEOUT_SECS,
         }
     }
 }
@@ -594,14 +606,20 @@ impl ResilienceTimeoutsConfig {
         validate_positive_u64(&format!("{path}.connect_secs"), self.connect_secs)?;
         validate_positive_u64(&format!("{path}.request_secs"), self.request_secs)?;
         validate_positive_u64(&format!("{path}.stream_idle_secs"), self.stream_idle_secs)?;
-        // Both timers start at send; an equal or longer connect timeout can
-        // never fire, so the user gets the request error for a connect fault.
-        if self.connect_secs >= self.request_secs {
-            anyhow::bail!(
-                "invalid configuration: {path}.connect_secs ({}s) must be less than {path}.request_secs ({}s), which encloses it",
-                self.connect_secs,
-                self.request_secs
-            );
+        validate_positive_u64(&format!("{path}.compact_secs"), self.compact_secs)?;
+        // The connect timer runs inside both request timers and starts with
+        // them; an equal or longer connect timeout can never fire, so the user
+        // gets the enclosing timer's error for a connect fault.
+        for (name, enclosing) in [
+            ("request_secs", self.request_secs),
+            ("compact_secs", self.compact_secs),
+        ] {
+            if self.connect_secs >= enclosing {
+                anyhow::bail!(
+                    "invalid configuration: {path}.connect_secs ({}s) must be less than {path}.{name} ({enclosing}s), which encloses it",
+                    self.connect_secs,
+                );
+            }
         }
         Ok(())
     }
@@ -712,6 +730,8 @@ pub struct ResilienceTimeoutsOverrideConfig {
     pub request_secs: Option<u64>,
     #[serde(default)]
     pub stream_idle_secs: Option<u64>,
+    #[serde(default)]
+    pub compact_secs: Option<u64>,
 }
 
 impl ResilienceTimeoutsOverrideConfig {
@@ -726,6 +746,9 @@ impl ResilienceTimeoutsOverrideConfig {
         if let Some(value) = self.stream_idle_secs {
             base.stream_idle_secs = value;
         }
+        if let Some(value) = self.compact_secs {
+            base.compact_secs = value;
+        }
         base
     }
 
@@ -733,6 +756,7 @@ impl ResilienceTimeoutsOverrideConfig {
         validate_optional_positive_u64(&format!("{path}.connect_secs"), self.connect_secs)?;
         validate_optional_positive_u64(&format!("{path}.request_secs"), self.request_secs)?;
         validate_optional_positive_u64(&format!("{path}.stream_idle_secs"), self.stream_idle_secs)?;
+        validate_optional_positive_u64(&format!("{path}.compact_secs"), self.compact_secs)?;
         Ok(())
     }
 }
@@ -2088,11 +2112,12 @@ base_backoff_ms = 40000
         );
     }
 
-    /// `connect_secs` must be strictly inside `request_secs`, checked over the
-    /// defaults, user-supplied globals, and the effective provider override.
-    /// Mutations killed: deleting the check (every rejected row); `>=` to `>`
-    /// (the "equal" row); validating only the global block (the override row,
-    /// whose override alone is valid).
+    /// `connect_secs` must be strictly inside `request_secs` and
+    /// `compact_secs`, checked over the defaults, user-supplied globals, and
+    /// the effective provider override. Mutations killed: deleting the check
+    /// (every rejected row); `>=` to `>` (the "equal" rows); dropping the
+    /// `compact_secs` pair ("compact equal"); validating only the global block
+    /// (the override row, whose override alone is valid).
     #[test]
     fn connect_timeout_must_be_inside_request_timeout() {
         let cases = [
@@ -2114,6 +2139,13 @@ base_backoff_ms = 40000
                 "[resilience.timeouts]\nconnect_secs = 90\n",
                 Some(
                     "resilience.timeouts.connect_secs (90s) must be less than resilience.timeouts.request_secs (60s)",
+                ),
+            ),
+            (
+                "compact equal",
+                "[resilience.timeouts]\nconnect_secs = 30\nrequest_secs = 31\ncompact_secs = 30\n",
+                Some(
+                    "resilience.timeouts.connect_secs (30s) must be less than resilience.timeouts.compact_secs (30s)",
                 ),
             ),
             (
@@ -2223,6 +2255,7 @@ max_attempts = 2
                 connect_secs: 10,
                 request_secs: 60,
                 stream_idle_secs: 60,
+                compact_secs: 300,
             },
             request_retry: RequestRetryConfig {
                 max_attempts: 5,

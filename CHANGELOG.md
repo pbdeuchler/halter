@@ -8,6 +8,16 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Added
+
+- `[resilience.timeouts] compact_secs` (default 300, also a per-provider
+  override) and `ProviderTimeouts::compact`, which bound one whole unary
+  compaction request. Compaction used `request_secs`, which for streams covers
+  only the time to response headers, so a compaction that legitimately took
+  longer than 60s to write its summary always timed out.
+  **Breaking:** `ProviderTimeouts` struct literals must set `compact`, and
+  `ResilienceTimeoutsConfig` literals `compact_secs`.
+
 ### Changed
 
 - **Breaking:** the `shell` tool no longer runs commands in an embedded brush
@@ -87,6 +97,12 @@ once a `1.0.0` line is cut.
   request timer, so a Retry-After cooldown longer than `request_secs` timed out
   every attempt before it was sent. The timer now starts when the permit is
   granted. The wait still ends on cancellation.
+- Provider transports use one HTTP client with only a connect timeout. The
+  unary client's reqwest `timeout(request_secs)` started after, and tied
+  with, the compaction timer, so it could never fire first; the Anthropic
+  streaming send's own `request_secs` timer was likewise dominated by the
+  setup timer around it. Both are removed; `ResilientProvider`'s timers are
+  the only request bounds.
 - Provider timeout messages print the configured duration (`50ms`, `1.5s`)
   instead of whole seconds, which read "after 0s" for sub-second timeouts.
 

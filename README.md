@@ -433,13 +433,17 @@ invalid requests fail immediately — and server-supplied backoff hints
 `max_backoff_secs`; a computed delay never exceeds it. For streaming calls,
 `request_secs` bounds request setup through response headers and
 `stream_idle_secs` bounds the idle gap between stream items; it is not a total
-stream lifetime cap. `max_attempts` includes the initial request.
+stream lifetime cap. `compact_secs` bounds one whole compaction request,
+including the summary the provider writes before it responds. Client-side
+rate-limit queueing (OpenAI header-driven waits) happens before the request
+timer starts and ends on cancellation. `max_attempts` includes the initial request.
 `deadline_secs` is a backoff budget: it caps the total time slept between
 attempts, and time spent inside an attempt never counts against it, so an
 attempt that ends in a `request_secs` or `stream_idle_secs` timeout is still
 retried. A retry sequence lasts at most `max_attempts` attempts, each bounded
 by its own timeouts, plus `deadline_secs` of backoff. Validation rejects a
-`connect_secs` that is not less than `request_secs`, which encloses it.
+`connect_secs` that is not less than `request_secs` and `compact_secs`, which
+enclose it.
 
 Retries never duplicate output or tool calls. Events before an attempt's first
 content or tool-call event (`TextDelta`, `ThinkingDelta`, `ToolCallStart`,
@@ -454,6 +458,7 @@ delivered.
 connect_secs = 10
 request_secs = 60
 stream_idle_secs = 60
+compact_secs = 300
 
 [resilience.request_retry]
 max_attempts = 5

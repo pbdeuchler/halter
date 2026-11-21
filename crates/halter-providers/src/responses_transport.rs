@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, warn};
 
 use crate::header_overrides::HeaderOverrides;
-use crate::http_client::{join_url, provider_http_clients};
+use crate::http_client::{join_url, provider_http_client};
 use crate::openai_error::{
     SYNTHETIC_SERVER_ERROR_CODE, classify, openai_api_error_retry_after, parse_openai_http_error,
     parse_openai_stream_error,
@@ -194,8 +194,7 @@ pub(crate) struct ResponsesTransportRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesTransport {
-    unary_client: ReqwestClient,
-    streaming_client: ReqwestClient,
+    client: ReqwestClient,
     bearer_token: SecretString,
     base_url: String,
     endpoint_mode: ResponsesEndpointMode,
@@ -228,12 +227,9 @@ impl ResponsesTransport {
     ) -> anyhow::Result<Self> {
         let bearer_token = bearer_token.into();
         let base_url = base_url.into();
-        let (unary_client, streaming_client) = provider_http_clients(timeouts)?;
-
         Ok(Self {
             openai_rate_limiter: OpenAiRateLimiter::new(&bearer_token, &base_url),
-            unary_client,
-            streaming_client,
+            client: provider_http_client(timeouts)?,
             bearer_token,
             base_url,
             endpoint_mode,
@@ -249,7 +245,6 @@ impl ResponsesTransport {
     ) -> Result<ResponsesFrameStream, TransportError> {
         let response = self
             .send_json_request(
-                &self.streaming_client,
                 RESPONSES_PATH,
                 request,
                 request_meta.clone(),
@@ -276,7 +271,6 @@ impl ResponsesTransport {
         let provider_label = request_meta.provider_label;
         let response = self
             .send_json_request(
-                &self.unary_client,
                 RESPONSES_COMPACT_PATH,
                 request,
                 request_meta,
@@ -305,13 +299,7 @@ impl ResponsesTransport {
     ) -> anyhow::Result<Value> {
         let provider_label = request_meta.provider_label;
         let response = self
-            .send_json_request(
-                &self.unary_client,
-                RESPONSES_PATH,
-                request,
-                request_meta,
-                cancel.child_token(),
-            )
+            .send_json_request(RESPONSES_PATH, request, request_meta, cancel.child_token())
             .await
             .map_err(transport_error_to_anyhow)?;
         select! {
@@ -324,7 +312,6 @@ impl ResponsesTransport {
 
     async fn send_json_request(
         &self,
-        client: &ReqwestClient,
         path: &str,
         request: Value,
         request_meta: ResponsesTransportRequest,
@@ -375,7 +362,8 @@ impl ResponsesTransport {
                     code: None,
                 }),
             })?;
-        let request_builder = client
+        let request_builder = self
+            .client
             .post(provider_url(&self.base_url, path, self.endpoint_mode))
             .headers(headers)
             .body(body_bytes);

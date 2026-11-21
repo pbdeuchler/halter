@@ -78,11 +78,23 @@ pub(crate) async fn request_timer<F: Future>(limit: Duration, attempt: F) -> Opt
     }
 }
 
+/// Per-attempt provider timers. Every one is inside the retry loop, so each
+/// bounds one attempt and none can exhaust the backoff budget
+/// ([`RetryPolicy::deadline`]). See `docs/timeouts.md` for how they nest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderTimeouts {
+    /// TCP/TLS connect, enforced by the HTTP client. Must be less than
+    /// `request` and `compact`, which enclose it.
     pub connect: Duration,
+    /// Stream setup: from the request being sent (after any client-side
+    /// rate-limit admission) to the response headers.
     pub request: Duration,
+    /// Longest gap between two stream events.
     pub stream_idle: Duration,
+    /// A whole unary compaction request, body included. Separate from
+    /// `request` because a compaction generates its entire summary before
+    /// responding, while `request` only covers a stream's time to headers.
+    pub compact: Duration,
 }
 
 impl Default for ProviderTimeouts {
@@ -91,6 +103,7 @@ impl Default for ProviderTimeouts {
             connect: Duration::from_secs(10),
             request: Duration::from_secs(60),
             stream_idle: Duration::from_secs(60),
+            compact: Duration::from_secs(300),
         }
     }
 }
@@ -496,7 +509,7 @@ impl<P: Provider + 'static> ResilientProvider<P> {
                 biased;
                 _ = cancel.cancelled() => return Err(anyhow::Error::new(ProviderError::cancelled())),
                 attempt = request_timer(
-                    self.policy.timeouts.request,
+                    self.policy.timeouts.compact,
                     self.inner.compact(request.clone(), cancel.child_token()),
                 ) => attempt,
             };
@@ -510,7 +523,7 @@ impl<P: Provider + 'static> ResilientProvider<P> {
                 None => provider_timeout_error(
                     format!(
                         "failed to compact session: request timed out after {:?}",
-                        self.policy.timeouts.request
+                        self.policy.timeouts.compact
                     ),
                     None,
                 ),
@@ -1798,6 +1811,7 @@ mod tests {
                 connect: Duration::from_millis(10),
                 request: Duration::from_millis(30),
                 stream_idle: Duration::from_millis(30),
+                compact: Duration::from_millis(30),
             },
             request_retry: RetryPolicy {
                 max_attempts: 2,
@@ -1926,6 +1940,37 @@ mod tests {
         }
     }
 
+    /// Finding E: a unary compaction is bounded by `compact`, not `request`
+    /// (which only covers a stream's time to headers). Mutation killed:
+    /// timing `compact_with_retries` with `timeouts.request` (row 1 fails).
+    #[tokio::test]
+    async fn compaction_is_bounded_by_the_compact_timeout() {
+        let ms = Duration::from_millis;
+        for (request, compact, succeeds) in [(ms(20), ms(2_000), true), (ms(2_000), ms(20), false)]
+        {
+            let policy = ResiliencePolicy {
+                timeouts: ProviderTimeouts {
+                    request,
+                    compact,
+                    ..test_policy(1).timeouts
+                },
+                ..test_policy(1)
+            };
+            let provider = AdmissionProvider {
+                admission: Duration::ZERO,
+                work: ms(100),
+            };
+            let result = ResilientProvider::new("test", provider, policy)
+                .compact(sample_compaction_request(), CancellationToken::new())
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                succeeds,
+                "{request:?}/{compact:?}: {result:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn compact_honors_pre_cancelled_token() {
         let provider = ScriptedCompactProvider::new(vec![Ok(compaction_response())]);
@@ -2050,6 +2095,7 @@ mod tests {
                 connect: Duration::from_secs(1),
                 request: Duration::from_secs(1),
                 stream_idle: Duration::from_secs(1),
+                compact: Duration::from_secs(1),
             },
             request_retry: RetryPolicy {
                 max_attempts,
@@ -2067,6 +2113,7 @@ mod tests {
                 connect: Duration::from_millis(20),
                 request: Duration::from_millis(20),
                 stream_idle: Duration::from_millis(20),
+                compact: Duration::from_millis(20),
             },
             request_retry: RetryPolicy {
                 max_attempts: 1,

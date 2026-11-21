@@ -584,6 +584,7 @@ mod tests {
                 connect: Duration::from_secs(1),
                 request: Duration::from_secs(5),
                 stream_idle: Duration::from_secs(5),
+                compact: Duration::from_secs(5),
             },
             request_retry: RetryPolicy {
                 max_attempts,

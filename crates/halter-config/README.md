@@ -202,6 +202,7 @@ block and can override only the fields that need to differ:
 connect_secs = 10
 request_secs = 60
 stream_idle_secs = 60
+compact_secs = 300
 
 [resilience.request_retry]
 max_attempts = 5
@@ -216,11 +217,13 @@ max_attempts = 3
 
 For streaming calls, `request_secs` bounds request setup through response
 headers and `stream_idle_secs` bounds the idle gap between stream items; it is
-not a total stream lifetime cap. `max_attempts` includes the initial provider
-request. `deadline_secs` caps the total backoff slept between attempts; time
+not a total stream lifetime cap. `compact_secs` bounds one whole unary
+compaction request, response body included. `max_attempts` includes the
+initial provider request. `deadline_secs` caps the total backoff slept between attempts; time
 inside an attempt never counts, so an attempt timeout cannot spend it. Validation
 runs on the global block and on each provider's effective (merged) config, and
-rejects `connect_secs >= request_secs` with an error naming both keys.
+rejects a `connect_secs` that is not less than `request_secs` and
+`compact_secs`, with an error naming both keys.
 Timeout and retry values must be positive, and `jitter_pct` must be in
 `0..=100`.
 
