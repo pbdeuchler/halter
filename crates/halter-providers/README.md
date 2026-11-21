@@ -438,8 +438,13 @@ The first shape is an OpenAI model's, the second GLM's on Fireworks. For each
 history assistant message the input holds its reasoning items in part order,
 then its text message, then its function calls. An item is replayed only when:
 
-- the message's `replay_meta` names the request's provider and model, since
-  another model's encrypted content is rejected;
+- the message's `replay_meta` names the request's provider and upstream model
+  (`wire_model`, not the configured alias), since another model's encrypted
+  content is rejected;
+- on OpenAI with `store: false`, the item carries `encrypted_content`: OpenAI
+  stores no item to resolve an id-only reference against. OpenRouter, which is
+  stateless and reads the item's own content, and stored OpenAI requests
+  replay id-only items too;
 - the message also has text or a tool call, since the API rejects a reasoning
   item without the item that followed it;
 - the signature parses as a `reasoning` item. Anthropic signatures and the bare
@@ -449,6 +454,13 @@ The encoding depends only on the stored message and the request model, so a
 request's input stays a byte prefix of the next request's. A
 `previous_response_id` request sends no reasoning items, because the chained
 response already holds them, and compaction input omits them.
+
+Anthropic requests replay a thinking block, with its signature if it has one,
+only when the message's `replay_meta` names the request's provider. Blocks
+from another provider (a Responses reasoning item, or unsigned reasoning) are
+dropped and that turn's text and tool calls kept. The model is not compared:
+the API itself drops blocks from another Claude model. Empty user text parts
+are dropped as well, since the API rejects an empty text block.
 
 ---
 

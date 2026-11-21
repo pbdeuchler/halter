@@ -461,7 +461,15 @@ pub enum StopReason {
 /// Provider metadata preserved on assistant messages for replay and diagnostics.
 pub struct ReplayMeta {
     pub provider_name: Option<ProviderName>,
+    /// The configured model alias ([`ResolvedModel::id`]). Repointing the
+    /// alias at another upstream model keeps this value, so replay checks
+    /// compare `wire_model` instead.
     pub model: Option<ModelId>,
+    /// The model id sent upstream ([`ResolvedModel::model`]) on the request
+    /// that produced the message. Absent on messages recorded before halter
+    /// stored it, which therefore never replay model-bound reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -572,10 +580,11 @@ pub enum AssistantPart {
 /// Provider thinking block with optional replay signature.
 ///
 /// The signature is opaque provider replay state. Anthropic stores its
-/// thinking signature. The Responses providers (OpenAI, OpenRouter) store the
-/// whole `reasoning` output item as JSON (`id`, `summary`, and, when present,
-/// `encrypted_content`, `content` and `status`) and send it back as an input
-/// item on later requests to the same provider and model.
+/// thinking signature and replays the block only to the same provider. The
+/// Responses providers (OpenAI, OpenRouter) store the whole `reasoning` output
+/// item as JSON (`id`, `summary`, and, when present, `encrypted_content`,
+/// `content` and `status`) and send it back as an input item on later requests
+/// to the same provider and upstream model ([`ReplayMeta::wire_model`]).
 pub struct ThinkingBlock {
     pub text: SharedStr,
     pub signature: Option<ReplaySignature>,
@@ -2043,7 +2052,11 @@ pub struct AssembledPrompt {
     pub segments: Vec<PromptSegment>,
     pub transcript: Vec<Message>,
     pub ordered_segments: Vec<PromptSegment>,
+    /// Fingerprint of `rendered_prefix`, the compacted prefix items, and the
+    /// plan's cache boundary.
     pub prefix_cache_key: String,
+    /// The ordered segments' text. Excludes the compacted prefix, which
+    /// codecs send from [`ProviderRequest::compacted_prefix`].
     pub rendered_prefix: String,
     pub rendered_transcript: String,
     pub rendered: String,

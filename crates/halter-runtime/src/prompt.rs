@@ -128,21 +128,24 @@ impl PromptAssembler for DefaultPromptAssembler {
 
         // Raw compacted prefix items returned by the provider compaction
         // path. These sit after the last breakpoint, immediately before
-        // the active transcript window.
+        // the active transcript window. Codecs send them from
+        // `ProviderRequest::compacted_prefix`, so they are fingerprinted but
+        // not rendered: in `rendered_prefix` they would reach the upstream
+        // twice, once as instructions text and once as input items.
         for item in &plan.compacted_prefix {
             prefix_parts.push(stable_json(item));
         }
 
-        let rendered_prefix = prefix_parts.join("\n\n");
+        let rendered_prefix = prefix_parts[..ordered_segments.len()].join("\n\n");
 
         // Invariant: `prefix_cache_key` fingerprints exactly the bytes of
-        // `rendered_prefix` (plus the plan's cache boundary hash), so two
-        // assemblies share a key iff their reusable prefixes are
-        // byte-identical. Dynamic `Append` segments render into the prefix
-        // and therefore must be covered too; hashing a subset would let the
-        // prefix change under a stable fingerprint.
+        // `rendered_prefix` and the compacted prefix (plus the plan's cache
+        // boundary hash), so two assemblies share a key iff their reusable
+        // prefixes are byte-identical. Dynamic `Append` segments render into
+        // the prefix and therefore must be covered too; hashing a subset
+        // would let the prefix change under a stable fingerprint.
         let mut hasher = Sha256::new();
-        hasher.update(rendered_prefix.as_bytes());
+        hasher.update(prefix_parts.join("\n\n").as_bytes());
         hasher.update(plan.cache_boundary_hash.as_bytes());
 
         // Active conversation tail (mutable, uncached).
@@ -450,6 +453,67 @@ mod tests {
         assert_ne!(first.prefix_cache_key, changed.prefix_cache_key);
         // ...while byte-identical prefixes keep an identical key.
         assert_eq!(first.prefix_cache_key, same.prefix_cache_key);
+    }
+
+    /// Codecs send compacted prefix items from `compacted_prefix`, so
+    /// `rendered_prefix` must not repeat them; the cache key still covers
+    /// them, with the bytes it hashed before. Kills rendering the items into
+    /// `rendered_prefix` (the developer message then repeats the input
+    /// items), and hashing `rendered_prefix` alone (the key stops changing
+    /// when the compacted prefix does).
+    #[tokio::test]
+    async fn compacted_prefix_is_fingerprinted_but_not_rendered() {
+        let plan = |compacted_prefix: Vec<serde_json::Value>| ContextPlan {
+            prompt_segments: vec![system_prompt_segment("system")],
+            transcript_window: TranscriptWindow {
+                messages: Vec::new(),
+                elided_message_count: 0,
+            },
+            compacted_prefix,
+            elided_tool_results: Vec::new(),
+            memory_items: Vec::new(),
+            tool_specs: Vec::new(),
+            observed_state: ObservedState {
+                cwd: ".".into(),
+                git_branch: None,
+                git_dirty: None,
+                now_utc: Utc::now(),
+                env_facts: Default::default(),
+            },
+            projected_input_tokens: 10,
+            cache_boundary_hash: "boundary".to_owned(),
+            messages: Vec::new(),
+            estimated_tokens: 10,
+            previous_response_id: None,
+            new_messages_start: 0,
+        };
+        let item = |id: &str| serde_json::json!({"type": "compaction", "id": id});
+        let mut keys = Vec::new();
+        for (compacted, hashed) in [
+            (vec![], "system".to_owned()),
+            (
+                vec![item("a")],
+                format!("system\n\n{}", stable_json(&item("a"))),
+            ),
+            (
+                vec![item("b")],
+                format!("system\n\n{}", stable_json(&item("b"))),
+            ),
+        ] {
+            let assembled = DefaultPromptAssembler
+                .assemble(&plan(compacted))
+                .await
+                .expect("assemble");
+            let want = Sha256::new()
+                .chain_update(hashed.as_bytes())
+                .chain_update(b"boundary")
+                .finalize();
+            assert_eq!(assembled.rendered_prefix, "system", "{hashed}");
+            assert_eq!(assembled.prefix_cache_key, format!("{want:x}"), "{hashed}");
+            keys.push(assembled.prefix_cache_key);
+        }
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[1], keys[2]);
     }
 
     #[tokio::test]

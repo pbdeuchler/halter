@@ -280,6 +280,11 @@ fn collect_system_text_legacy(request: &ProviderRequest) -> Option<String> {
     if !rendered_prefix.is_empty() {
         sections.push(rendered_prefix.to_owned());
     }
+    // `rendered_prefix` excludes the compacted prefix; render it as the
+    // block path's system tail does.
+    if let Some(text) = render_compacted_prefix(&request.compacted_prefix) {
+        sections.push(text);
+    }
     for message in &request.messages {
         if let Message::System(system) = message {
             let text = system.text.trim();
@@ -462,11 +467,14 @@ fn encode_messages(request: &ProviderRequest) -> anyhow::Result<Vec<Value>> {
         match message {
             Message::System(_) => {}
             Message::User(user) => {
-                flush_tool_results(&mut encoded, &mut pending_tool_results);
-                encoded.push(json!({
-                    "role": "user",
-                    "content": encode_user_parts(&user.parts),
-                }));
+                let content = encode_user_parts(&user.parts);
+                if !content.is_empty() {
+                    flush_tool_results(&mut encoded, &mut pending_tool_results);
+                    encoded.push(json!({
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
             }
             Message::Assistant(assistant) => {
                 flush_tool_results(&mut encoded, &mut pending_tool_results);
@@ -517,9 +525,13 @@ fn attach_cache_breakpoint_to_last_user_message(messages: &mut [Value]) {
     }
 }
 
+/// Encodes a user message's parts. Anthropic rejects an empty text block, so
+/// empty text parts are dropped; a message left with no blocks is dropped by
+/// [`encode_messages`].
 fn encode_user_parts(parts: &[UserPart]) -> Vec<Value> {
     parts
         .iter()
+        .filter(|part| !matches!(part, UserPart::Text { text } if text.is_empty()))
         .map(|part| match part {
             UserPart::Text { text } => json!({
                 "type": "text",
@@ -557,7 +569,14 @@ fn encode_assistant_parts(
                 "type": "text",
                 "text": text,
             })),
-            AssistantPart::Thinking(block) => {
+            // A thinking block, signed or not, is replayed only to the
+            // provider that produced it: another provider's signature (or a
+            // Responses reasoning item) fails Anthropic's check, and its
+            // unsigned reasoning is not Claude's. Claude itself drops blocks
+            // from another Claude model, so the model is not compared.
+            AssistantPart::Thinking(block)
+                if message.replay_meta.provider_name.as_ref() == Some(&request.model.provider) =>
+            {
                 let mut encoded = Map::new();
                 encoded.insert("type".to_owned(), json!("thinking"));
                 encoded.insert("thinking".to_owned(), json!(block.text));
@@ -566,7 +585,7 @@ fn encode_assistant_parts(
                 }
                 content.push(Value::Object(encoded));
             }
-            AssistantPart::Text { .. } => {}
+            AssistantPart::Text { .. } | AssistantPart::Thinking(_) => {}
             AssistantPart::ToolCall(call) => {
                 content.push(json!({
                     "type": "tool_use",
@@ -1356,30 +1375,268 @@ mod tests {
         );
     }
 
+    /// The assembler keeps compacted items out of `rendered_prefix`, so the
+    /// legacy single-string system field renders them itself, once, after the
+    /// prefix. Kills dropping the legacy `render_compacted_prefix` call.
     #[test]
-    fn request_replays_thinking_blocks_with_signatures() {
-        let request = sample_request(vec![Message::Assistant(AssistantMessage {
-            id: MessageId::new(),
-            created_at: Utc::now(),
-            parts: vec![
-                AssistantPart::Thinking(halter_protocol::ThinkingBlock {
-                    text: "reasoned".to_owned(),
-                    signature: Some("sig-123".to_owned()),
-                }),
-                AssistantPart::Text {
-                    text: "answer".to_owned(),
-                },
-            ],
-            stop_reason: None,
-            usage: None,
-            replay_meta: Default::default(),
-        })]);
+    fn legacy_system_text_renders_compacted_prefix_once() {
+        let mut request = sample_request(Vec::new());
+        request.compacted_prefix = vec![json!({
+            "type": COMPACTED_CONTEXT_TYPE,
+            "text": "older decisions are summarized",
+        })];
 
         let body = encode_request(&request, None).expect("encode");
 
-        assert_eq!(body["messages"][0]["content"][0]["type"], "thinking");
-        assert_eq!(body["messages"][0]["content"][0]["thinking"], "reasoned");
-        assert_eq!(body["messages"][0]["content"][0]["signature"], "sig-123");
+        assert_eq!(
+            body["system"],
+            format!(
+                "follow plan\n\n{COMPACTED_CONTEXT_OPEN}\nolder decisions are summarized\n{COMPACTED_CONTEXT_CLOSE}"
+            )
+        );
+    }
+
+    /// An assistant message recorded by `provider` / `model` with `parts`.
+    fn assistant_from(provider: Option<&str>, model: &str, parts: Vec<AssistantPart>) -> Message {
+        Message::Assistant(AssistantMessage {
+            id: MessageId::new(),
+            created_at: Utc::now(),
+            parts,
+            stop_reason: None,
+            usage: None,
+            replay_meta: halter_protocol::ReplayMeta {
+                provider_name: provider.map(ProviderName::from),
+                model: Some(ModelId::from(model)),
+                wire_model: Some(model.to_owned()),
+            },
+        })
+    }
+
+    fn thinking(signature: Option<&str>) -> AssistantPart {
+        AssistantPart::Thinking(halter_protocol::ThinkingBlock {
+            text: "reasoned".to_owned(),
+            signature: signature.map(str::to_owned),
+        })
+    }
+
+    /// Which thinking blocks an assistant message replays, by origin. Each
+    /// row names the mutation it kills.
+    #[test]
+    fn request_replays_thinking_blocks_only_to_their_provider() {
+        let call = || {
+            AssistantPart::ToolCall(ToolCall {
+                id: ToolCallId::from("toolu_1"),
+                name: "read".into(),
+                arguments: json!({"path": "README.md"}),
+            })
+        };
+        let text = || AssistantPart::Text {
+            text: "answer".to_owned(),
+        };
+        let responses_item = r#"{"type":"reasoning","id":"rs_1","encrypted_content":"enc"}"#;
+        let cases = [
+            // Kills dropping the replay, or adding a model check: Claude
+            // drops blocks another Claude model cannot read.
+            (
+                "same provider, other claude model",
+                assistant_from(
+                    Some("anthropic"),
+                    "claude-opus-4-1",
+                    vec![thinking(Some("sig-123")), text()],
+                ),
+                json!([
+                    {"type": "thinking", "thinking": "reasoned", "signature": "sig-123"},
+                    {"type": "text", "text": "answer"},
+                ]),
+            ),
+            // An unsigned block from the same provider (GLM behind an
+            // Anthropic-dialect proxy) still replays, before its tool_use.
+            (
+                "same provider, unsigned, before tool_use",
+                assistant_from(
+                    Some("anthropic"),
+                    "claude-sonnet-4-5",
+                    vec![thinking(None), call()],
+                ),
+                json!([
+                    {"type": "thinking", "thinking": "reasoned"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "fs_read", "input": {"path": "README.md"}},
+                ]),
+            ),
+            // Kills dropping the provider guard: a Responses reasoning item
+            // is not an Anthropic signature.
+            (
+                "openai responses item",
+                assistant_from(
+                    Some("openai"),
+                    "gpt-5",
+                    vec![thinking(Some(responses_item)), call()],
+                ),
+                json!([
+                    {"type": "tool_use", "id": "toolu_1", "name": "fs_read", "input": {"path": "README.md"}},
+                ]),
+            ),
+            // The same guard, for another provider's unsigned reasoning.
+            (
+                "openrouter unsigned reasoning",
+                assistant_from(Some("openrouter"), "glm-5", vec![thinking(None), text()]),
+                json!([{"type": "text", "text": "answer"}]),
+            ),
+            // Kills treating an unrecorded provider as a match.
+            (
+                "no recorded provider",
+                assistant_from(
+                    None,
+                    "claude-sonnet-4-5",
+                    vec![thinking(Some("sig-123")), text()],
+                ),
+                json!([{"type": "text", "text": "answer"}]),
+            ),
+            // A message left with only a foreign thinking block is dropped
+            // rather than sent with empty content.
+            (
+                "only foreign thinking",
+                assistant_from(
+                    Some("openai"),
+                    "gpt-5",
+                    vec![thinking(Some(responses_item))],
+                ),
+                Value::Null,
+            ),
+        ];
+
+        for (name, assistant, want) in cases {
+            let request = sample_request(vec![Message::User(UserMessage::text("hi")), assistant]);
+            let body = encode_request(&request, None).expect("encode");
+            assert_eq!(body["messages"][1]["content"], want, "{name}");
+        }
+    }
+
+    /// Empty user text parts never reach the wire; a user message left empty
+    /// is dropped without splitting the tool results around it. Each row names
+    /// the mutation it kills.
+    #[test]
+    fn request_drops_empty_user_text_parts() {
+        let user = |parts: Vec<UserPart>| {
+            Message::User(UserMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts,
+            })
+        };
+        let text = |text: &str| UserPart::Text {
+            text: text.to_owned(),
+        };
+        let tool_result = |id: &str| {
+            Message::Tool(ToolResultMessage {
+                id: MessageId::new(),
+                call_id: ToolCallId::from(id),
+                content: ToolResult::Text {
+                    text: "ok".to_owned(),
+                },
+                error: None,
+                created_at: Utc::now(),
+            })
+        };
+        let result_block = |id: &str| json!({"type": "tool_result", "tool_use_id": id, "content": "ok", "is_error": false});
+        let cases = [
+            // Kills dropping the filter.
+            (
+                "empty part next to text",
+                vec![user(vec![text(""), text("hi")])],
+                json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]),
+            ),
+            // Kills dropping the empty-message check.
+            ("only an empty part", vec![user(vec![text("")])], json!([])),
+            // Kills filtering on `trim().is_empty()` or dropping non-text parts.
+            (
+                "whitespace and media are kept",
+                vec![user(vec![
+                    text(" "),
+                    UserPart::Image {
+                        media_type: "image/png".to_owned(),
+                        data: Bytes::from_static(b"png"),
+                    },
+                ])],
+                json!([{"role": "user", "content": [
+                    {"type": "text", "text": " "},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "cG5n"}},
+                ]}]),
+            ),
+            // Kills flushing before the emptiness check: an empty message
+            // between results would split them into two user messages.
+            (
+                "empty message between tool results",
+                vec![
+                    tool_result("toolu_1"),
+                    user(vec![text("")]),
+                    tool_result("toolu_2"),
+                ],
+                json!([{"role": "user", "content": [result_block("toolu_1"), result_block("toolu_2")]}]),
+            ),
+        ];
+
+        for (name, messages, want) in cases {
+            let body = encode_request(&sample_request(messages), None).expect("encode");
+            assert_eq!(body["messages"], want, "{name}");
+        }
+    }
+
+    /// Prompt caching needs each request's messages to be a prefix of the
+    /// next one's. The origin check and the empty-part filter depend only on
+    /// the message itself, so appending a turn (a foreign-provider message and
+    /// an empty user part included) leaves earlier messages unchanged. Kills
+    /// any guard that reads a message's position, such as replaying foreign
+    /// thinking only in the latest assistant message.
+    #[test]
+    fn request_messages_stay_a_prefix_as_the_transcript_grows() {
+        let first = vec![
+            Message::User(UserMessage::text("hi")),
+            assistant_from(
+                Some("openai"),
+                "gpt-5",
+                vec![
+                    thinking(None),
+                    AssistantPart::Text {
+                        text: "a".to_owned(),
+                    },
+                ],
+            ),
+            Message::User(UserMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: vec![
+                    UserPart::Text {
+                        text: String::new(),
+                    },
+                    UserPart::Text {
+                        text: "b".to_owned(),
+                    },
+                ],
+            }),
+            assistant_from(
+                Some("anthropic"),
+                "claude-sonnet-4-5",
+                vec![
+                    thinking(Some("sig")),
+                    AssistantPart::Text {
+                        text: "c".to_owned(),
+                    },
+                ],
+            ),
+        ];
+        let second = first
+            .iter()
+            .cloned()
+            .chain([Message::User(UserMessage::text("next"))])
+            .collect();
+        let first = encode_request(&sample_request(first), None).expect("encode");
+        let second = encode_request(&sample_request(second), None).expect("encode");
+        let first = first["messages"].as_array().expect("messages");
+        let second = second["messages"].as_array().expect("messages");
+
+        assert_eq!(first[1]["content"], json!([{"type": "text", "text": "a"}]));
+        assert_eq!(second[..first.len()], first[..]);
     }
 
     #[test]

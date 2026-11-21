@@ -3555,6 +3555,7 @@ async fn materialize_assistant_message_with_cancel(
             replay_meta: ReplayMeta {
                 provider_name: Some(model.provider.clone()),
                 model: Some(model.id.clone()),
+                wire_model: Some(model.model.clone()),
             },
         },
         usage,
@@ -5953,6 +5954,16 @@ mod tests {
         assert_eq!(
             tool_calls[0].arguments,
             serde_json::json!({"path": "x.txt", "content": "hi"})
+        );
+        // Codecs gate reasoning replay on the wire model, not the alias.
+        // Kills dropping or swapping the `wire_model` assignment.
+        assert_eq!(
+            materialized.message.replay_meta,
+            ReplayMeta {
+                provider_name: Some(ProviderName::from("fake")),
+                model: Some(ModelId::from("default")),
+                wire_model: Some("halter/fake".to_owned()),
+            }
         );
     }
 
