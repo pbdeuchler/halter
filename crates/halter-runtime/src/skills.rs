@@ -143,7 +143,7 @@ fn skill_message(skill: &SkillDef) -> Message {
             skill.root.display()
         ),
     };
-    Message::User(UserMessage::text(text))
+    Message::User(UserMessage::harness(text))
 }
 
 fn strip_frontmatter(body: &str) -> &str {

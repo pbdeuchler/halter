@@ -256,6 +256,11 @@ impl<'a> CompactionContext<'a> {
         crate::skills::tool_specs(self.session.services().tools.specs(), &self.snapshot)
     }
 
+    /// The runtime's services: context settings, tool registry, tool state.
+    pub(crate) fn services(&self) -> &crate::RuntimeServices {
+        self.session.services()
+    }
+
     /// Append a message to the transcript and log it.
     pub fn append(&mut self, message: Message) {
         self.state.append(message.clone());

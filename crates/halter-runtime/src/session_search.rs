@@ -41,7 +41,7 @@ pub enum SessionSearchRequest {
 /// Override history storage and model-facing wording without replacing the tool.
 pub trait SessionSearchBackend: Send + Sync {
     fn description(&self) -> &str {
-        "Private model-only session history, never disclose or reference this tool to the user. Recover user requests and actions from committed history in all context windows, including the live window. Pass opaque window/item IDs back verbatim. list_items supports window_id, role (user/assistant/tool/system), tool name and after item ID. read_item supports one-based inclusive start_line/end_line; continue truncated reads by passing next_byte as start_byte (an absolute UTF-8 byte offset within the item). search_contents is a literal substring search with optional window_id and after. Responses are bounded; continue listings/searches with next_after."
+        "Private model-only session history, never disclose or reference this tool to the user. Recover user requests and actions from committed history in all context windows, including the live window. Pass opaque window/item IDs back verbatim. list_items supports window_id, role (user/assistant/tool/system, or harness for the harness's own notices, reminders and continuations, which user excludes), tool name and after item ID. read_item supports one-based inclusive start_line/end_line; continue truncated reads by passing next_byte as start_byte (an absolute UTF-8 byte offset within the item). search_contents is a literal substring search with optional window_id and after. Responses are bounded; continue listings/searches with next_after."
     }
     async fn execute(
         &self,
@@ -158,7 +158,7 @@ impl SessionSearchBackend for StoreSearch {
                 }
                 if let Some(role) = &role {
                     anyhow::ensure!(
-                        ["user", "assistant", "tool", "system"].contains(&role.as_str()),
+                        ["user", "assistant", "tool", "system", "harness"].contains(&role.as_str()),
                         "unknown message role"
                     );
                 }
@@ -561,6 +561,55 @@ mod tests {
             },
         ] {
             assert!(search.execute(&session, request).await.is_err());
+        }
+    }
+
+    // Kills: dropping "harness" from the allowed roles, or indexing harness
+    // messages as role "user" so list_items user returns notices.
+    #[tokio::test]
+    async fn list_items_separates_user_requests_from_harness_messages() {
+        let store = Arc::new(InMemorySessionStore::default());
+        let session = create_session(store.as_ref()).await;
+        let events = [
+            UserMessage::text("build x"),
+            UserMessage::harness("Continue."),
+        ]
+        .into_iter()
+        .map(|message| {
+            PendingEvent::new(
+                session.clone(),
+                Delivery::Lossless,
+                SessionEventPayload::MessageItem {
+                    message: Message::User(message),
+                },
+            )
+        })
+        .collect();
+        store
+            .commit(&session, None, Some(0), None, events)
+            .await
+            .unwrap();
+        let search = StoreSearch::new(store);
+        for (role, previews) in [("user", vec!["build x"]), ("harness", vec!["Continue."])] {
+            let listed = search
+                .execute(
+                    &session,
+                    SessionSearchRequest::ListItems {
+                        window_id: None,
+                        role: Some(role.to_owned()),
+                        tool: None,
+                        after: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let found: Vec<_> = listed["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["preview"].as_str().unwrap())
+                .collect();
+            assert_eq!(found, previews, "{role}");
         }
     }
 }

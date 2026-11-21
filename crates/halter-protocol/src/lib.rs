@@ -492,6 +492,9 @@ pub struct SystemMessage {
     pub text: SharedStr,
 }
 
+/// Id prefix of every user-role message [`UserMessage::harness`] builds.
+const HARNESS_MESSAGE_ID_PREFIX: &str = "harness-";
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// User message, including text and optional media parts.
 pub struct UserMessage {
@@ -509,6 +512,26 @@ impl UserMessage {
             created_at: Utc::now(),
             parts: vec![UserPart::Text { text: text.into() }],
         }
+    }
+
+    /// Build a text-only user-role message that the harness wrote itself,
+    /// such as a notice, a reminder, or a hook's continuation, rather than a
+    /// request from the user. The mark lives in the id, so it survives the
+    /// event log and replay without a new field; see
+    /// [`is_harness`](Self::is_harness).
+    #[must_use]
+    pub fn harness(text: impl Into<String>) -> Self {
+        Self {
+            id: MessageId(format!("{HARNESS_MESSAGE_ID_PREFIX}{}", Uuid::new_v4())),
+            ..Self::text(text)
+        }
+    }
+
+    /// Whether the harness wrote this message ([`harness`](Self::harness)),
+    /// so it is not a user request.
+    #[must_use]
+    pub fn is_harness(&self) -> bool {
+        self.id.0.starts_with(HARNESS_MESSAGE_ID_PREFIX)
     }
 
     /// Concatenate text parts with newlines, ignoring image and document parts.
@@ -2140,6 +2163,28 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn harness_mark_survives_serialization_and_only_harness_messages_carry_it() {
+        let cases = [
+            (UserMessage::harness("Continue."), true),
+            (UserMessage::text("Continue."), false),
+            (
+                UserMessage {
+                    id: MessageId::from("harness"),
+                    ..UserMessage::text("no prefix separator")
+                },
+                false,
+            ),
+        ];
+        for (message, harness) in cases {
+            let replayed: UserMessage =
+                serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+            assert_eq!(replayed, message);
+            assert_eq!(replayed.is_harness(), harness, "{message:?}");
+            assert_eq!(replayed.plain_text(), message.plain_text());
+        }
+    }
 
     #[test]
     fn close_subagent_timeout_is_optional_and_defaults_to_unlimited() {

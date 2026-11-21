@@ -53,6 +53,9 @@ impl SessionHistory {
             };
             for (index, message) in messages.iter().enumerate() {
                 let (role, tools, text) = match message {
+                    Message::User(user) if user.is_harness() => {
+                        ("harness", vec![], user.plain_text())
+                    }
                     Message::User(user) => ("user", vec![], user.plain_text()),
                     Message::System(system) => ("system", vec![], system.text.clone()),
                     Message::Assistant(assistant) => {
@@ -123,6 +126,24 @@ mod tests {
             let items = history_items(&[event]);
             assert_eq!(items.len(), indexed, "{name}");
             assert!(items.iter().all(|item| item.text == "summarize"), "{name}");
+        }
+    }
+
+    #[test]
+    fn harness_written_user_messages_get_their_own_role() {
+        for (message, role) in [
+            (UserMessage::text("build x"), "user"),
+            (UserMessage::harness("Continue."), "harness"),
+        ] {
+            let event = PendingEvent::new(
+                SessionId::from("session"),
+                Delivery::Lossless,
+                SessionEventPayload::MessageItem {
+                    message: Message::User(message),
+                },
+            )
+            .into_committed(1);
+            assert_eq!(history_items(&[event])[0].role, role);
         }
     }
 }

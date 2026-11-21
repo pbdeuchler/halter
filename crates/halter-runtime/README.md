@@ -439,18 +439,29 @@ It does not spend another inference asking for a checkpoint.
 
 For forced rollover, the runtime asks for a checkpoint and allows at most
 four checkpoint replies. Only `notes`, `session_search`, and `new_context`
-calls execute; other calls and text remain in the event log but do not enter
-the next request. The reminder does not ask for item IDs, which the model
-cannot see; it asks for what only the model knows, and the model can use
-`session_search` to quote earlier requests exactly. A failed call, such as a
-rejected `notes` write, gets its error back and another reply, even if
-`new_context` succeeded in the same reply. The exchange ends, and the window
-is wiped, when `new_context` succeeds in a reply with no failed call, when a
-reply makes none of the three calls, when the provider request fails or the
-hard cap blocks it, when tool execution fails, or when the four replies are
-spent. Cancellation stops the turn and keeps the window for the next
-boundary. A PreCompact hook that blocks rollover fails the turn before
-another provider request. PostCompact hooks run after successful rollover.
+calls execute. Every other call gets an error result naming those three, so
+each call is answered and the model learns why it did nothing; the offered
+tools are not narrowed, because that would make the window's largest request
+miss the prompt cache. Text stays in the reply. The reminder does not ask for
+item IDs, which the model cannot see; it asks for what only the model knows,
+and the model can use `session_search` to quote earlier requests exactly. A
+failed or refused call, such as a rejected `notes` write, gets its error back
+and another reply, even if `new_context` succeeded in the same reply. The
+exchange ends, and the window is wiped, when `new_context` succeeds in a
+reply with no failed call, when a reply makes no tool call, when the provider
+request fails or the hard cap blocks it, when tool execution fails, or when
+the four replies are spent. Cancellation stops the turn and keeps the window
+for the next boundary. A PreCompact hook that blocks rollover fails the turn
+before another provider request. PostCompact hooks run after successful
+rollover.
+
+PreToolUse hooks govern the three recovery tools like any other tool; they
+are not exempt. A blocked call returns the hook's reason to the model as a
+tool error. A blocked `notes` write is not counted as saved, so the notice
+says "nothing was saved". A blocked `new_context` gets another reply, and a
+window whose `new_context` stays blocked is still wiped when the reply
+budget runs out (or, outside the exchange, by the forced rollover above
+90%), so a hook cannot strand the session in a full window.
 
 `ContextWindowRolledOver` commits the new window's opening notice, advances
 the logical window, clears the old transcript, provider response chain,
@@ -475,14 +486,35 @@ and says how the window ended, for example:
 > the notes against them, check the task list, then continue the work.
 
 The other endings are "you called new_context, so no checkpoint exchange
-ran", or "nothing was saved" with "a reply made no notes, session_search, or
-new_context call", "the model request failed", "the tool calls could not
-run", or "its reply budget ran out". The notice then quotes the session's
-first user request and the latest one before the wipe, each as a separate
-text part labelled as history and capped at 4,000 bytes with a pointer to
-`session_search`. The first request is carried verbatim from notice to
-notice, so it costs at most about 2,000 tokens per window with the latest
-one, and only when requests are long.
+ran", or "nothing was saved" with "a reply made no tool call", "the model
+request failed", "the tool calls could not run", or "its reply budget ran
+out". The notice names only tools the session offers: without `task` it
+skips the task list. It lists at most ten notes paths,
+then "and N more", and points to `notes list_files_by_prefix` for the rest.
+When background jobs, running subagents, or the PTY session outlive the
+wipe, it lists them by id under "Still running across the wipe; manage them
+by these ids:", ten at most and 200 bytes each.
+
+The notice then quotes the session's first user request and the latest one
+before the wipe, each as a separate text part labelled as history and capped
+at 4,000 bytes with a pointer to `session_search`. Messages the harness wrote
+(this notice, the checkpoint reminder, Stop-hook continuations, skill
+injections) are never quoted as requests: they carry `UserMessage::harness`
+IDs, and `session_search` indexes them under role `harness`, so `list_items`
+with role `user` returns only real requests. The first request is carried
+verbatim from notice to notice. If window 0 had no text request, a later
+window labels its first one "Earliest user request this notice can quote,
+from window N" rather than the session's first. With both quotes the notice
+costs at most about 2,000 tokens per window, and only when requests are
+long.
+
+The notice has to fit: the turn fails if the new window starts above 90% of
+the threshold. CleanWindow gives the notice half of what the static prefix
+leaves under that line and, when it does not fit, rebuilds it with quotes
+capped at 1,000 bytes, then 250, then none. Shorter quotes also list fewer
+notes paths and running items (none once quotes are 250 bytes; counts
+remain). The wipe statement, how the window ended, the `session_search`
+instructions, and the first steps never shrink.
 
 The session-scoped `task` list survives rollover. Its default store is still
 in memory; it does not survive restarting the harness process. Notes survive
@@ -495,7 +527,7 @@ can consume that room in one step, and so can a `session_search` read
 during the checkpoint. The hard cap applies to checkpoint requests too; if
 it prevents a checkpoint, CleanWindow warns and wipes, and the notice says
 the model request failed. Choose a threshold that leaves room for your tools and model.
-If the notice itself exceeds the rollover threshold, the turn fails with
+If even the bare notice exceeds the rollover threshold, the turn fails with
 an actionable configuration error instead of repeatedly wiping the window.
 
 | Tool | Actions and limits |
