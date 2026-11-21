@@ -50,9 +50,10 @@ pub struct ResponsesOptions {
     /// has a reasoning effort; `true` by default. On a stateless request
     /// (`store: false`) the encrypted content is what lets a replayed
     /// reasoning item carry the model's reasoning into the next request.
-    /// Reasoning items the upstream returns are replayed either way, with
-    /// whatever the upstream put in them; OpenAI rejects, on a stateless
-    /// request, a replayed item that has no encrypted content.
+    /// OpenRouter replays the reasoning items the upstream returns either
+    /// way, with whatever the upstream put in them. OpenAI with
+    /// `store: false` replays only items that carry encrypted content, so
+    /// turning this off there drops reasoning from later requests.
     pub include_encrypted_reasoning: bool,
 }
 

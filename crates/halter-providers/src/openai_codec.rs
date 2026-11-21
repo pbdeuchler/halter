@@ -9,8 +9,8 @@ use async_openai::types::responses::{
 };
 use halter_protocol::{
     ApiKind, AssistantPart, BlockId, Message, MessageId, OpenRouterRouting,
-    ProviderCompactionRequest, ProviderCompactionResponse, ProviderRequest, ReasoningEffort,
-    StopReason, StreamEvent, Usage, UserPart,
+    ProviderCompactionRequest, ProviderCompactionResponse, ProviderKind, ProviderRequest,
+    ReasoningEffort, StopReason, StreamEvent, Usage, UserPart,
 };
 use serde_json::{Map, Value, json};
 use tracing::warn;
@@ -109,7 +109,14 @@ pub(crate) fn encode_responses_request(
             == ResponsesInstructionMode::DeveloperMessage)
             .then_some(system_text.as_deref())
             .flatten();
-        let input = encode_responses_input(request, developer_message)?;
+        let replay = if options.store == Some(false)
+            && request.model.provider_kind != ProviderKind::OpenRouter
+        {
+            ReasoningReplay::Encrypted
+        } else {
+            ReasoningReplay::All
+        };
+        let input = encode_responses_input(request, developer_message, replay)?;
         validate_responses_input_item_ids(&input)?;
         body.insert("input".to_owned(), Value::Array(input));
     }
@@ -1046,6 +1053,7 @@ pub(crate) fn decode_chat_response(
 fn encode_responses_input(
     request: &ProviderRequest,
     developer_message: Option<&str>,
+    replay: ReasoningReplay,
 ) -> anyhow::Result<Vec<Value>> {
     let mut input = Vec::new();
     if let Some(system) = developer_message {
@@ -1058,7 +1066,7 @@ fn encode_responses_input(
             Message::System(_) => {}
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
-                input.extend(encode_responses_assistant_items(assistant, request, true));
+                input.extend(encode_responses_assistant_items(assistant, request, replay));
             }
             Message::Tool(tool) => input.push(encode_responses_tool_output(tool)),
         }
@@ -1080,7 +1088,11 @@ fn encode_responses_input_slice(
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
                 // The chained response already holds its reasoning items.
-                input.extend(encode_responses_assistant_items(assistant, request, false));
+                input.extend(encode_responses_assistant_items(
+                    assistant,
+                    request,
+                    ReasoningReplay::Off,
+                ));
             }
             Message::Tool(tool) => input.push(encode_responses_tool_output(tool)),
         }
@@ -1142,16 +1154,17 @@ fn encode_responses_user_message(message: &halter_protocol::UserMessage) -> anyh
 ///
 /// A reasoning item is the output item the stream decoder stored as the
 /// thinking block's signature, replayed verbatim. It is sent only when
-/// `replay_reasoning` is set, the message came from the request's provider
-/// and model (another model's encrypted content is rejected upstream), and
-/// the message also has text or a tool call (the Responses API rejects a
-/// reasoning item without the item that followed it). Signatures that are not
-/// a reasoning item, such as an Anthropic signature or a bare
-/// `encrypted_content` string stored by an older halter, are skipped.
+/// `replay` allows it, the message came from the request's provider and
+/// upstream model (`replay_meta.wire_model`, not the alias: another model's
+/// encrypted content is rejected upstream), and the message also has text or
+/// a tool call (the Responses API rejects a reasoning item without the item
+/// that followed it). Signatures that are not a reasoning item, such as an
+/// Anthropic signature or a bare `encrypted_content` string stored by an
+/// older halter, are skipped.
 fn encode_responses_assistant_items(
     message: &halter_protocol::AssistantMessage,
     request: &ProviderRequest,
-    replay_reasoning: bool,
+    replay: ReasoningReplay,
 ) -> Vec<Value> {
     let following: Vec<Value> = encode_responses_assistant_message(message)
         .into_iter()
@@ -1160,10 +1173,10 @@ fn encode_responses_assistant_items(
             AssistantPart::Text { .. } | AssistantPart::Thinking(_) => None,
         }))
         .collect();
-    let replayed: &[AssistantPart] = if replay_reasoning
+    let replayed: &[AssistantPart] = if replay != ReasoningReplay::Off
         && !following.is_empty()
         && message.replay_meta.provider_name.as_ref() == Some(&request.model.provider)
-        && message.replay_meta.model.as_ref() == Some(&request.model.id)
+        && message.replay_meta.wire_model.as_deref() == Some(request.model.model.as_str())
     {
         &message.parts
     } else {
@@ -1176,9 +1189,29 @@ fn encode_responses_assistant_items(
             AssistantPart::Text { .. } | AssistantPart::ToolCall(_) => None,
         })
         .filter_map(|signature| serde_json::from_str::<Value>(signature).ok())
-        .filter(|item| item["type"] == "reasoning")
+        .filter(|item| {
+            item["type"] == "reasoning"
+                && (replay == ReasoningReplay::All
+                    || item["encrypted_content"]
+                        .as_str()
+                        .is_some_and(|c| !c.is_empty()))
+        })
         .chain(following)
         .collect()
+}
+
+/// Which stored reasoning items a request sends back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningReplay {
+    /// None: a `previous_response_id` response already holds them.
+    Off,
+    /// Only items with `encrypted_content`. OpenAI does not persist items on
+    /// a `store: false` request, so an item without it is a reference to an
+    /// id the upstream cannot resolve.
+    Encrypted,
+    /// Every item: OpenAI resolves a stored item by id, and OpenRouter, which
+    /// is stateless, reads the item's own content.
+    All,
 }
 
 fn encode_responses_assistant_message(
@@ -2062,13 +2095,13 @@ mod tests {
         }
     }
 
-    /// Encodes `request`'s input with stateless options.
-    fn responses_input(request: &ProviderRequest) -> Vec<Value> {
+    /// Encodes `request`'s input with the given `store` option.
+    fn responses_input(request: &ProviderRequest, store: Option<bool>) -> Vec<Value> {
         let body = encode_responses_request(
             request,
             ResponsesRequestOptions {
                 stream: true,
-                store: Some(false),
+                store,
                 prompt_cache_key: None,
                 include_encrypted_reasoning: true,
                 strict_tools: false,
@@ -2082,8 +2115,13 @@ mod tests {
         body["input"].as_array().expect("input").clone()
     }
 
-    /// An assistant message from `sample_request`'s model with the given parts.
-    fn assistant_from(id: &str, provider: &str, model: &str, parts: Vec<AssistantPart>) -> Message {
+    /// An assistant message recorded by `provider`, alias `model` and wire
+    /// model `wire` (`sample_request` uses `provider`, `model`, `gpt-5`).
+    fn assistant_from(
+        id: &str,
+        (provider, model, wire): (&str, &str, Option<&str>),
+        parts: Vec<AssistantPart>,
+    ) -> Message {
         Message::Assistant(AssistantMessage {
             id: MessageId::from(id),
             created_at: Utc::now(),
@@ -2093,9 +2131,13 @@ mod tests {
             replay_meta: halter_protocol::ReplayMeta {
                 provider_name: Some(ProviderName::from(provider)),
                 model: Some(ModelId::from(model)),
+                wire_model: wire.map(str::to_owned),
             },
         })
     }
+
+    /// The `replay_meta` of a message `sample_request`'s model produced.
+    const SAME: (&str, &str, Option<&str>) = ("provider", "model", Some("gpt-5"));
 
     fn thinking(signature: &str) -> AssistantPart {
         AssistantPart::Thinking(halter_protocol::ThinkingBlock {
@@ -2111,8 +2153,8 @@ mod tests {
         r#"{"type":"reasoning","id":"rs_1","summary":[],"content":[],"encrypted_content":"enc_1"}"#;
     const GLM_REASONING: &str = r#"{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"Look first."}],"status":"completed"}"#;
 
-    /// Which reasoning items a history assistant message replays, and where.
-    /// Each row names the mutation it kills.
+    /// Which reasoning items a history assistant message replays, and where,
+    /// per upstream and `store` setting. Each row names the mutation it kills.
     #[test]
     fn responses_input_replays_same_model_reasoning_items_first() {
         let call = || {
@@ -2125,88 +2167,160 @@ mod tests {
         let text = || AssistantPart::Text {
             text: "checked".to_owned(),
         };
+        let router = (ProviderKind::OpenRouter, Some(false));
+        let openai_stateless = (ProviderKind::OpenAi, Some(false));
+        let openai_stored = (ProviderKind::OpenAi, None);
         let cases = [
             // Kills dropping the replay, or emitting reasoning after the
             // message or tool call.
             (
                 "gpt item before message and call",
-                assistant_from(
-                    "msg_h",
-                    "provider",
-                    "model",
-                    vec![thinking(GPT_REASONING), text(), call()],
-                ),
+                router,
+                assistant_from("msg_h", SAME, vec![thinking(GPT_REASONING), text(), call()]),
                 vec![GPT_REASONING, "message", "function_call"],
             ),
-            // Kills requiring `encrypted_content`; two blocks keep their order.
+            // Kills requiring `encrypted_content` on OpenRouter (dropping the
+            // `!= OpenRouter` arm); two blocks keep their order.
             (
-                "glm items in part order",
+                "openrouter replays id-only items in part order",
+                router,
                 assistant_from(
                     "msg_h",
-                    "provider",
-                    "model",
+                    SAME,
                     vec![thinking(GLM_REASONING), call(), thinking(GPT_REASONING)],
                 ),
                 vec![GLM_REASONING, GPT_REASONING, "function_call"],
             ),
-            // Kills dropping the model check.
+            // Kills replaying every item on `store: false` OpenAI (always
+            // `ReasoningReplay::All`): OpenAI cannot resolve `rs_2`.
             (
-                "other model",
+                "openai stateless drops id-only item",
+                openai_stateless,
                 assistant_from(
                     "msg_h",
-                    "provider",
-                    "other",
+                    SAME,
+                    vec![thinking(GLM_REASONING), call(), thinking(GPT_REASONING)],
+                ),
+                vec![GPT_REASONING, "function_call"],
+            ),
+            // Kills `is_some()` in place of the non-empty check.
+            (
+                "openai stateless drops empty encrypted content",
+                openai_stateless,
+                assistant_from(
+                    "msg_h",
+                    SAME,
+                    vec![
+                        thinking(r#"{"type":"reasoning","id":"rs_3","encrypted_content":""}"#),
+                        call(),
+                    ],
+                ),
+                vec!["function_call"],
+            ),
+            // Kills gating on the provider kind alone (ignoring `store`):
+            // stored items resolve by id.
+            (
+                "openai stored replays id-only item",
+                openai_stored,
+                assistant_from("msg_h", SAME, vec![thinking(GLM_REASONING), call()]),
+                vec![GLM_REASONING, "function_call"],
+            ),
+            // Kills comparing the alias instead of the wire model.
+            (
+                "alias repointed at another model",
+                router,
+                assistant_from(
+                    "msg_h",
+                    ("provider", "model", Some("gpt-4.1")),
                     vec![thinking(GPT_REASONING), call()],
                 ),
                 vec!["function_call"],
             ),
-            // Kills dropping the provider check.
+            // Kills keeping the alias check next to the wire-model check.
             (
-                "other provider",
+                "alias renamed, same model",
+                router,
                 assistant_from(
                     "msg_h",
-                    "other",
-                    "model",
+                    ("provider", "renamed", Some("gpt-5")),
                     vec![thinking(GPT_REASONING), call()],
                 ),
+                vec![GPT_REASONING, "function_call"],
+            ),
+            // Kills treating a missing wire model as a match.
+            (
+                "message recorded without a wire model",
+                router,
+                assistant_from(
+                    "msg_h",
+                    ("provider", "model", None),
+                    vec![thinking(GPT_REASONING), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // Kills dropping the provider check: OpenAI items reaching
+            // OpenRouter, and OpenRouter items reaching OpenAI direct.
+            (
+                "openai items on openrouter",
+                router,
+                assistant_from(
+                    "msg_h",
+                    ("openai", "model", Some("gpt-5")),
+                    vec![thinking(GPT_REASONING), call()],
+                ),
+                vec!["function_call"],
+            ),
+            (
+                "openrouter items on openai",
+                openai_stored,
+                assistant_from(
+                    "msg_h",
+                    ("openrouter", "model", Some("gpt-5")),
+                    vec![thinking(GLM_REASONING), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // An Anthropic signature is base64, not JSON, so it never reaches
+            // a Responses upstream even under the same provider name.
+            (
+                "anthropic signature",
+                openai_stored,
+                assistant_from("msg_h", SAME, vec![thinking("EqQBCkYIBxgCKkA"), call()]),
                 vec!["function_call"],
             ),
             // Kills dropping the `type == "reasoning"` filter.
             (
                 "non-reasoning JSON signature",
+                router,
                 assistant_from(
                     "msg_h",
-                    "provider",
-                    "model",
+                    SAME,
                     vec![thinking(r#"{"type":"message"}"#), call()],
                 ),
                 vec!["function_call"],
             ),
-            // A bare `encrypted_content` from an older halter, or an
-            // Anthropic signature, is not JSON and is skipped.
+            // A bare `encrypted_content` from an older halter is not JSON and
+            // is skipped.
             (
                 "legacy signature",
-                assistant_from(
-                    "msg_h",
-                    "provider",
-                    "model",
-                    vec![thinking("enc_legacy"), call()],
-                ),
+                openai_stored,
+                assistant_from("msg_h", SAME, vec![thinking("enc_legacy"), call()]),
                 vec!["function_call"],
             ),
             // Kills dropping the following-item guard: a lone reasoning item
             // is rejected upstream.
             (
                 "thinking only",
-                assistant_from("msg_h", "provider", "model", vec![thinking(GPT_REASONING)]),
+                router,
+                assistant_from("msg_h", SAME, vec![thinking(GPT_REASONING)]),
                 vec![],
             ),
         ];
 
-        for (name, assistant, want) in cases {
-            let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter);
+        for (name, (provider_kind, store), assistant, want) in cases {
+            let mut request = sample_request(ApiKind::OpenAiResponses, provider_kind);
             request.messages = vec![Message::User(UserMessage::text("hello")), assistant];
-            let input = responses_input(&request);
+            let input = responses_input(&request, store);
             // Skip the developer and user messages.
             // Reasoning rows compare the whole item, other rows the type.
             let got: Vec<Value> = input[2..]
@@ -2232,8 +2346,7 @@ mod tests {
         let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
         request.messages = vec![assistant_from(
             "msg_h",
-            "provider",
-            "model",
+            SAME,
             vec![
                 thinking(GPT_REASONING),
                 AssistantPart::Text {
@@ -2242,7 +2355,7 @@ mod tests {
             ],
         )];
         request.previous_response_id = Some("resp_1".to_owned());
-        let input = responses_input(&request);
+        let input = responses_input(&request, None);
 
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "message");
@@ -2259,8 +2372,7 @@ mod tests {
             Message::User(UserMessage::text("hello")),
             assistant_from(
                 "msg_h1",
-                "provider",
-                "model",
+                SAME,
                 vec![
                     thinking(GPT_REASONING),
                     AssistantPart::ToolCall(ToolCall {
@@ -2286,8 +2398,7 @@ mod tests {
             .chain([
                 assistant_from(
                     "msg_h2",
-                    "provider",
-                    "model",
+                    SAME,
                     vec![
                         thinking(GLM_REASONING),
                         AssistantPart::Text {
@@ -2306,8 +2417,8 @@ mod tests {
         };
 
         let serialize = |input: &[Value]| serde_json::to_string(input).expect("serialize input");
-        let first_input = responses_input(&first);
-        let second_input = responses_input(&second);
+        let first_input = responses_input(&first, Some(false));
+        let second_input = responses_input(&second, Some(false));
         let first_bytes = serialize(&first_input);
         let second_prefix = serialize(&second_input[..first_input.len()]);
 

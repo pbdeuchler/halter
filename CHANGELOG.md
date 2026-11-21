@@ -47,9 +47,23 @@ once a `1.0.0` line is cut.
   now stores the whole `reasoning` output item as JSON in
   `ThinkingBlock::signature` (before, only its `encrypted_content`). Requests
   send each stored item back ahead of that turn's text and tool calls when the
-  message came from the same provider and model, so stateless (`store: false`)
-  requests keep the model's reasoning, as pi and rig do. Signatures stored by
-  older versions are not replayed.
+  message came from the same provider and upstream model, so stateless
+  (`store: false`) requests keep the model's reasoning, as pi and rig do. On
+  OpenAI with `store: false` only items carrying `encrypted_content` are
+  replayed, since OpenAI keeps no item to resolve an id-only reference against.
+  OpenRouter, which reads the item's own content, and stored OpenAI requests
+  replay every item. Signatures stored by older versions are not replayed.
+- **Breaking:** `ReplayMeta` has a new `wire_model` field: the upstream model
+  id (`ResolvedModel::model`) of the request that produced the message, recorded
+  at materialization. Reasoning replay compares it instead of the configured
+  alias in `ReplayMeta::model`, so repointing an alias at another model stops
+  replay, and renaming an alias does not. It is optional in serialized
+  transcripts, and messages without it never replay Responses reasoning items.
+  Code that builds `ReplayMeta` with a struct literal must set it or use
+  `..Default::default()`.
+- `AssembledPrompt::rendered_prefix` (and `rendered`) no longer contain the
+  compacted prefix items; `prefix_cache_key` still covers them, over the same
+  bytes as before. Codecs send the items from `ProviderRequest::compacted_prefix`.
 - OpenRouter requests now ask for `include: ["reasoning.encrypted_content"]`
   for models with a reasoning effort. `include_encrypted_reasoning` in
   `[providers.openai]` and `[providers.openrouter]` (default `true`) and
@@ -71,6 +85,21 @@ once a `1.0.0` line is cut.
 
 ### Fixed
 
+- Anthropic requests replay a thinking block only to the provider that recorded
+  it. Before, every block was sent with its signature whatever its origin, so
+  after a switch from OpenAI or OpenRouter a Responses reasoning item reached
+  Anthropic as a thinking signature, which the API rejects. Thinking from
+  another provider is dropped; that turn's text and tool calls are kept.
+- Anthropic requests drop empty user text parts, and a user message left with
+  no content, instead of sending `{"type":"text","text":""}`, which the API
+  rejects. Tool results on either side of such a message stay in one user
+  message. Non-empty transcripts encode as before.
+- OpenAI and OpenRouter Responses requests no longer send the compacted prefix
+  twice. The assembler rendered its items as JSON into `rendered_prefix`, which
+  became the developer message (or `instructions`), while the codec also sent
+  them as input items. The Anthropic single-string `system` field, used when a
+  request has no system or skills breakpoint, now renders the compacted prefix
+  as the block path does, inside `<compacted_context>`, instead of as raw JSON.
 - `ProviderDefault` inline compaction (Anthropic, OpenRouter) can now shed a
   long tool-using turn. The window it keeps verbatim is the latest user
   message, then the current turn's latest assistant block and its tool
