@@ -1503,13 +1503,21 @@ impl SubagentControl for RuntimeSubagentControl {
         if let Some(completion) = completion {
             match deadline {
                 Some(deadline) => {
-                    match tokio::time::timeout_at(deadline, completion.result()).await {
-                        Ok(result) => result?,
-                        Err(_) => {
-                            self.force_close_session(&previous_status.session_id).await;
-                            return Err(anyhow::Error::new(crate::SessionError::TimedOut));
-                        }
+                    // Force at the caller's deadline (this close may be
+                    // bounding an earlier unbounded one), then give forced
+                    // closure the same grace as session interrupt/shutdown.
+                    if tokio::time::timeout_at(deadline, completion.result())
+                        .await
+                        .is_err()
+                    {
+                        self.force_close_session(&previous_status.session_id).await;
                     }
+                    tokio::time::timeout_at(
+                        crate::session_driver::caller_deadline(deadline),
+                        completion.result(),
+                    )
+                    .await
+                    .map_err(|_| anyhow::Error::new(crate::SessionError::TimedOut))??;
                 }
                 None => completion.result().await?,
             }
@@ -2210,28 +2218,21 @@ mod tests {
                         !initial.is_finished(),
                         "unlimited close retains ownership while waiting"
                     );
-                    let error = control
+                    // Forced closure settles inside the caller's grace.
+                    control
                         .close(CloseSubagentRequest {
                             target: agent_id.clone(),
                             timeout_ms: Some(0),
                         })
                         .await
-                        .unwrap_err();
-                    assert!(matches!(
-                        error.downcast_ref::<crate::SessionError>(),
-                        Some(crate::SessionError::TimedOut)
-                    ));
+                        .unwrap();
                     tokio::time::timeout(Duration::from_secs(5), initial)
                         .await
                         .unwrap()
                         .unwrap()
                         .unwrap();
                 } else {
-                    let error = initial.await.unwrap().unwrap_err();
-                    assert!(matches!(
-                        error.downcast_ref::<crate::SessionError>(),
-                        Some(crate::SessionError::TimedOut)
-                    ));
+                    initial.await.unwrap().unwrap();
                 }
                 tokio::time::timeout(
                     Duration::from_secs(5),

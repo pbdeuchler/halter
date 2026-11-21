@@ -118,9 +118,19 @@ once a `1.0.0` line is cut.
   and `SessionShutdownComplete` is still committed. Before, SessionEnd hooks
   got a cancellation token that never fired, so they ran on for their own
   timeout (600s for command hooks) after the caller had stopped waiting, and
-  a CLI exit killed them mid-run with nothing recorded. The wait for the
-  session lease during shutdown also ends at that deadline. `shutdown(None)`
-  is unchanged.
+  a CLI exit killed them mid-run with nothing recorded. A wait for a session
+  lease held by another writer also ends at that deadline; a free lease is
+  still taken. `shutdown(None)` is unchanged.
+- Bounded `SessionHandle::interrupt`, `SessionHandle::shutdown`, runtime
+  shutdown and `close_agent` keep waiting up to `FORCED_RECOVERY_GRACE` (5s,
+  newly public) after their deadline, where forced recovery starts, and return
+  its result. Before, the caller's timer and the driver's shared one instant,
+  so a bounded call always returned `TimedOut` even when forced recovery
+  settled at once, and the caller could not tell a recovered session from a
+  stuck one. A bounded `close_agent` that bounds an earlier unbounded close now
+  forces it at its own deadline. **Behavior change:** a bounded call can
+  return up to 5s after its timeout, and returns `Ok` where it used to return
+  `TimedOut`.
 - Provider timeout messages print the configured duration (`50ms`, `1.5s`)
   instead of whole seconds, which read "after 0s" for sub-second timeouts.
 

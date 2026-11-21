@@ -4943,7 +4943,11 @@ mod tests {
                 } else {
                     session.interrupt(Some(Duration::from_millis(25))).await
                 };
-                assert!(matches!(result, Err(crate::SessionError::TimedOut)));
+                // Finding 3: forced recovery settles inside the caller's
+                // grace, so the bounded call reports it instead of a
+                // `TimedOut` raced against the driver's own deadline.
+                // Mutation killed: `caller_deadline` returning `deadline`.
+                assert!(result.is_ok(), "close={close}: {result:?}");
                 tokio::time::timeout(Duration::from_secs(5), token.cancelled())
                     .await
                     .unwrap();
@@ -5439,10 +5443,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!services.tool_sessions.has_process_state(session.id()));
-            assert!(matches!(
-                session.shutdown(Some(Duration::ZERO)).await,
-                Err(crate::SessionError::TimedOut)
-            ));
+            // The forced deadline cancels the paused SessionEnd hook, so
+            // cleanup settles inside the caller's grace.
+            session.shutdown(Some(Duration::ZERO)).await.unwrap();
             let retry_handle = session.clone();
             let retry = tokio::spawn(async move { retry_handle.shutdown(None).await });
             assert!(matches!(
