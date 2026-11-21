@@ -423,6 +423,24 @@ is already OpenRouter's default and `false` would permit nothing. The same
 rules apply to a value handed straight to `OpenRouterProvider`, so nothing
 unchecked reaches a request body.
 
+`[providers.openai]` and `[providers.openrouter]` accept `strict_tools`
+(default `false`), sent as `strict` on every function tool. Halter always
+sends the field, because the Responses API treats an omitted `strict` as
+`true`. Strict mode requires every tool schema to list all of its properties
+in `required` and to set `additionalProperties = false`; halter sends schemas
+unchanged, so a tool that does not qualify fails the request with a
+non-retried invalid-request error. Halter's built-in tools do not qualify.
+
+Both also accept `include_encrypted_reasoning` (default `true`), which asks
+for `reasoning.encrypted_content` on requests for models with a `reasoning`
+effort. Halter stores every reasoning item the model returns and replays it on
+later requests to the same provider and upstream model, ahead of that turn's
+text and tool calls, so stateless requests keep the model's reasoning and the
+request prefix stays byte-stable for prompt caching. On OpenAI with
+`store: false`, an item without encrypted content is not replayed. Anthropic
+requests likewise replay thinking blocks only to the provider that produced
+them.
+
 Provider request resilience is configured globally under `[resilience]` and can
 be partially overridden per provider. The same retry policy applies uniformly to
 Anthropic, OpenAI, and OpenRouter, and covers both streaming turns and

@@ -61,6 +61,7 @@ pub use resilience::{
     DefaultProviderErrorClassifier, ProviderErrorClassifier, ProviderTimeouts, ResiliencePolicy,
     ResilientProvider,
 };
+pub use responses_provider::ResponsesOptions;
 pub use retry::RetryPolicy;
 pub use secret::SecretString;
 pub use unsupported::UnsupportedProvider;

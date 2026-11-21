@@ -14,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 use crate::Provider;
 use crate::resilience::{ProviderErrorClassifier, ResiliencePolicy, ResilientProvider};
 use crate::responses_provider::{
-    CompactStrategy, ResponsesProvider, ResponsesProviderConfig, ResponsesProviderRequestConfig,
+    CompactStrategy, ResponsesOptions, ResponsesProvider, ResponsesProviderConfig,
+    ResponsesProviderRequestConfig,
 };
 use crate::secret::SecretString;
 
@@ -60,13 +61,16 @@ impl OpenRouterProvider {
             header_overrides,
             temperature,
             routing,
+            ResponsesOptions::default(),
             ResiliencePolicy::default(),
             Arc::new(crate::DefaultProviderErrorClassifier),
         )
     }
 
-    /// Same as [`OpenRouterProvider::new_with_headers`] with an explicit
-    /// provider-request resilience policy and error classifier.
+    /// Same as [`OpenRouterProvider::new_with_headers`] with explicit
+    /// Responses request options, provider-request resilience policy, and
+    /// error classifier. The shorter constructors use
+    /// [`ResponsesOptions::default`].
     ///
     /// # Errors
     ///
@@ -78,6 +82,7 @@ impl OpenRouterProvider {
         header_overrides: &[(String, String)],
         temperature: Option<f32>,
         routing: Option<OpenRouterRouting>,
+        options: ResponsesOptions,
         resilience_policy: ResiliencePolicy,
         classifier: Arc<dyn ProviderErrorClassifier>,
     ) -> anyhow::Result<Self> {
@@ -88,7 +93,7 @@ impl OpenRouterProvider {
             .map(|routing| routing.normalized())
             .transpose()
             .context("failed to construct openrouter provider: invalid provider routing")?;
-        let config = config(resilience_policy, routing);
+        let config = config(resilience_policy, routing, options);
         let policy = config.resilience_policy;
         Ok(Self {
             inner: ResilientProvider::new_with_classifier(
@@ -142,6 +147,7 @@ impl Provider for OpenRouterProvider {
 fn config(
     resilience_policy: ResiliencePolicy,
     routing: Option<OpenRouterRouting>,
+    options: ResponsesOptions,
 ) -> ResponsesProviderConfig {
     ResponsesProviderConfig {
         label: "openrouter",
@@ -164,7 +170,8 @@ fn config(
         request: ResponsesProviderRequestConfig {
             store: Some(false),
             include_prompt_cache_key: true,
-            include_encrypted_reasoning: false,
+            include_encrypted_reasoning: options.include_encrypted_reasoning,
+            strict_tools: options.strict_tools,
             reasoning_summary: Some("auto"),
             instruction_mode: crate::openai_codec::ResponsesInstructionMode::DeveloperMessage,
         },
@@ -333,6 +340,32 @@ mod tests {
                 serde_json::from_slice(&captured[headers_end + 4..]).expect("parse request body");
 
             assert_eq!(body.get("provider").cloned(), expected);
+        }
+    }
+
+    /// The request config takes `strict` from the embedder's options, and the
+    /// default options send `strict: false`. Kills hardcoding `strict_tools`
+    /// in `config` (the `true` row) and a `Default` that turns strict on (the
+    /// default row).
+    #[test]
+    fn openrouter_config_carries_responses_options() {
+        let cases = [
+            (ResponsesOptions::default(), (false, true)),
+            (
+                ResponsesOptions {
+                    strict_tools: true,
+                    include_encrypted_reasoning: false,
+                },
+                (true, false),
+            ),
+        ];
+
+        for (options, expected) in cases {
+            let request = config(ResiliencePolicy::default(), None, options).request;
+            assert_eq!(
+                (request.strict_tools, request.include_encrypted_reasoning),
+                expected
+            );
         }
     }
 
