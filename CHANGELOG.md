@@ -134,6 +134,12 @@ once a `1.0.0` line is cut.
   work, the turn waits for the ledger to grow by half the threshold before
   trying again (`ContextSettings::compaction_due_after`). Before, the same
   request was resent at every boundary.
+- An automatic compaction that rewrites the context but leaves it at or over
+  the threshold now backs off like a failed pass (until the ledger grows by
+  half the threshold) and logs a `Warning`. Before, every later boundary of
+  the turn paid for another rewrite. This happens with `ModelSummary` when
+  the static prompt, tools and checkpoint alone reach the threshold, and with
+  any strategy whose kept window does.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the

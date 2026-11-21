@@ -421,7 +421,9 @@ state change, which is how `ModelSummary` skips an empty session and
 an existing prefix still runs). A strategy that
 can only tell by doing the work returns `Ok(None)` from `compact`: `PreCompact`
 has fired, `PostCompact` does not, and an automatic pass backs off as after
-a failure. Install one with `HalterBuilder::with_compaction`.
+a failure. So does a rewrite that leaves the context still at or over the
+threshold, with a `Warning`, so the turn does not pay for the same rewrite at
+every boundary. Install one with `HalterBuilder::with_compaction`.
 
 `ModelSummary` runs up to two inferences: when the `task` tool is registered,
 a nudge to persist remaining work (only that reply's `task` calls run; its text

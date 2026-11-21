@@ -2728,13 +2728,27 @@ impl SessionExecutor {
         // context. Refresh the request base before the caller enforces the
         // cap; otherwise those segments would reach the provider uncounted.
         self.prepare_token_ledger(blueprint, &snapshot, state, events);
-        ledger_at_last_boundary.tokens = state.token_ledger.effective_tokens();
-        if clean_window
-            && state.context_window != window_before_boundary
-            && settings.rollover_due(ledger_at_last_boundary.tokens)
-        {
+        let tokens = state.token_ledger.effective_tokens();
+        ledger_at_last_boundary.tokens = tokens;
+        let rewrote = state.context_window != window_before_boundary;
+        if clean_window && rewrote && settings.rollover_due(tokens) {
             anyhow::bail!(
                 "clean window bootstrap exceeds its rollover threshold; increase context.compaction_threshold or reduce prompt and tool declarations"
+            );
+        }
+        // A rewrite that leaves the context still due made no progress the
+        // next boundary could improve on: back off as after a failure,
+        // rather than paying for the same rewrite at every boundary.
+        if rewrote && settings.compaction_due(tokens) {
+            ledger_at_last_boundary.failed_compaction_at = Some(tokens);
+            self.push_event(
+                events,
+                SessionEventPayload::Warning {
+                    message: format!(
+                        "automatic compaction left the context at {tokens} tokens, still at or over its threshold of {}; not compacting again until it grows by half the threshold",
+                        settings.compaction_threshold
+                    ),
+                },
             );
         }
         Ok(())
@@ -7750,14 +7764,23 @@ mod tests {
         );
     }
 
+    /// Trigger A: the prompt alone is one token under the threshold and the
+    /// reply crosses it, so the one compaction comes after the response.
+    /// Before the no-progress guard this test leaned on the first boundary
+    /// being due too and compacting twice.
     #[tokio::test]
     async fn submit_turn_compacts_immediately_after_response_when_threshold_is_reached() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let prompt = "x".repeat(150);
+        let prompt_tokens = halter_protocol::estimate_message_tokens(&Message::User(
+            halter_protocol::UserMessage::text(prompt.clone()),
+        ));
+        let compaction_threshold = default_request_base_tokens(&services) + prompt_tokens + 1;
         install_context_settings(
             &mut services,
             ContextSettings {
-                compaction_threshold: 1_550,
+                compaction_threshold,
                 max_tokens: None,
             },
         );
@@ -7765,13 +7788,37 @@ mod tests {
 
         let session = new_session(&runtime, temp.path()).await;
 
-        session
-            .submit_turn(Turn::user("x".repeat(150)))
+        let events = session
+            .submit_turn(Turn::user(prompt))
             .await
             .expect("submit turn")
             .try_collect::<Vec<_>>()
             .await
             .expect("collect events");
+        let position = |pick: fn(&SessionEventPayload) -> bool| {
+            events.iter().position(|event| pick(&event.payload))
+        };
+        let reply = position(|payload| {
+            matches!(
+                payload,
+                SessionEventPayload::MessageItem {
+                    message: Message::Assistant(_)
+                }
+            )
+        });
+        let compacted = position(|payload| {
+            matches!(
+                payload,
+                SessionEventPayload::ContextCompacted {
+                    effects: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            reply.is_some() && compacted > reply,
+            "{reply:?} {compacted:?}"
+        );
 
         let stored = services
             .sessions
@@ -8034,6 +8081,125 @@ mod tests {
                     .iter()
                     .map(|s| Some((*s).to_owned()))
                     .collect::<Vec<_>>(),
+                "{case}"
+            );
+        }
+    }
+
+    /// A rewrite that leaves the context still due backs off like a failed
+    /// pass, with a warning, instead of paying for the same rewrite at every
+    /// boundary of the turn; one that gets under the threshold does neither.
+    /// Observed at the boundary: the number of rewrites in the turn. Kills
+    /// dropping the no-progress guard in `context_boundary`, or only its
+    /// `failed_compaction_at` assignment (either way "stands still" rewrites
+    /// at all three boundaries), and warning on every rewrite ("gets
+    /// under" warns).
+    #[tokio::test]
+    async fn automatic_rewrite_still_over_the_threshold_backs_off() {
+        /// Rewrites the window into itself: a pass that frees nothing.
+        struct StandstillCompaction;
+
+        #[async_trait]
+        impl crate::CompactionStrategy for StandstillCompaction {
+            async fn compact(
+                &self,
+                ctx: crate::CompactionContext<'_>,
+            ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+                Ok(Some(crate::CompactionEffects {
+                    messages: ctx.state().messages.clone(),
+                    compacted_context: halter_protocol::CompactedContext::default(),
+                    result: halter_protocol::CompactionResult {
+                        compacted_count: 0,
+                        summary: "kept everything".to_owned(),
+                    },
+                    usage: Usage::default(),
+                }))
+            }
+        }
+
+        /// The tool loop without usage reports, so the ledger keeps its own
+        /// estimate of the window instead of the scripted token counts.
+        struct UnmeteredToolLoop;
+
+        #[async_trait]
+        impl Provider for UnmeteredToolLoop {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn stream(
+                &self,
+                request: ProviderRequest,
+                cancel: CancellationToken,
+            ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>>
+            {
+                let inner = ToolLoopProvider.stream(request, cancel).await?;
+                Ok(inner
+                    .filter(|event| {
+                        std::future::ready(!matches!(event, Ok(StreamEvent::UsageUpdate { .. })))
+                    })
+                    .boxed())
+            }
+        }
+
+        // A 2,000-character prompt puts the first boundary over a threshold
+        // 100 tokens above the bare request; only a rewrite that drops it
+        // gets back under.
+        // (case, strategy, rewrites, warns)
+        let cases: [(&str, Arc<dyn CompactionStrategy>, usize, bool); 2] = [
+            ("stands still", Arc::new(StandstillCompaction), 1, true),
+            ("gets under", Arc::new(WipingCompaction), 1, false),
+        ];
+        for (case, strategy, rewrites, warns) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut services = configured_services(Arc::new(UnmeteredToolLoop), temp.path());
+            register_builtin_tools(&services.tools, &[]);
+            let compaction_threshold = default_request_base_tokens(&services).saturating_add(100);
+            install_context_settings(
+                &mut services,
+                ContextSettings {
+                    compaction_threshold,
+                    max_tokens: None,
+                },
+            );
+            install_compaction(&mut services, strategy);
+            let session = new_session(&SessionRuntime::new(services), temp.path()).await;
+
+            let events = session
+                .submit_turn(Turn::user("x".repeat(2_000)))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+
+            let rewrote = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.payload,
+                        SessionEventPayload::ContextCompacted {
+                            effects: Some(_),
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(rewrote, rewrites, "{case}");
+            assert_eq!(
+                events.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::Warning { message }
+                        if message.contains("still at or over its threshold")
+                )),
+                warns,
+                "{case}"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    SessionEventPayload::TurnCompleted { .. }
+                )),
                 "{case}"
             );
         }
