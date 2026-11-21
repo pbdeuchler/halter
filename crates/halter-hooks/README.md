@@ -325,7 +325,8 @@ This is useful when you want soft guidance rather than hard blocking.
 Example policy idea:
 
 - on `PreToolUse`
-- inspect `tool_name == "write"` or `tool_name == "edit"`
+- inspect `tool_name == "write"` (`input.path`) or `tool_name == "edit"`
+  (every `input.edits[].path`: one `edit` call can touch several files)
 - reject paths outside approved roots
 
 In practice, the tool policy layer already enforces filesystem scope. Hooks are best for:
