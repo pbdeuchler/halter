@@ -62,7 +62,7 @@ impl CompactionStrategy for ModelSummary {
             .iter()
             .any(|spec| spec.name.0 == TODO_TOOL_NAME)
         {
-            ctx.append(Message::User(UserMessage::text(TODO_NUDGE)));
+            ctx.append(Message::User(UserMessage::harness(TODO_NUDGE)));
             let reply = ctx.infer().await?;
             let (kept, task_calls) = keep_task_calls(reply);
             if !task_calls.is_empty() {
@@ -72,9 +72,9 @@ impl CompactionStrategy for ModelSummary {
             }
         }
 
-        ctx.append(Message::User(UserMessage::text(compaction_instructions(
-            ctx.trigger().custom_instructions(),
-        ))));
+        ctx.append(Message::User(UserMessage::harness(
+            compaction_instructions(ctx.trigger().custom_instructions()),
+        )));
         let summary = assistant_text(&ctx.infer().await?);
         if summary.trim().is_empty() {
             anyhow::bail!("failed to compact session: the model returned no checkpoint summary");
@@ -85,7 +85,7 @@ impl CompactionStrategy for ModelSummary {
             checkpoint.push_str(TODO_REMINDER);
         }
         Ok(Some(CompactionEffects {
-            messages: vec![Message::User(UserMessage::text(checkpoint))],
+            messages: vec![Message::User(UserMessage::harness(checkpoint))],
             compacted_context: CompactedContext::default(),
             result: CompactionResult {
                 compacted_count,
