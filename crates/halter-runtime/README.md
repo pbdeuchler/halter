@@ -431,7 +431,8 @@ and other calls never reach the next request, though the event log keeps the
 whole reply), then the built-in checkpoint instructions
 (`default_compaction_prompt`, plus a manual pass's custom instructions). The
 reply becomes the next window as one user-role message after the static
-prefix, with a todo reminder when the nudge ran calls. `ProviderDefault`
+prefix, with a todo reminder when the nudge ran calls. A reply that stopped
+early (`max_tokens`, a refusal, a pause) or has no text fails the pass. `ProviderDefault`
 hands `Provider::compact` the window its
 `ProviderCapabilities::compaction_strategy` allows: everything before the
 latest assistant block for a dedicated endpoint; for an inline request,

@@ -126,6 +126,11 @@ once a `1.0.0` line is cut.
   were lost. `ModelSummary`'s checkpoint inference already counted its
   usage; a stream that fails mid-reply still loses its partial usage, as any
   turn does.
+- `ModelSummary` rejects a checkpoint reply that stopped early
+  (`max_tokens`, a refusal, or a pause), as the provider adapters already
+  did for `ProviderDefault`. Before, the fragment replaced the window. The
+  pass fails like an empty summary: a warning and a backoff when automatic,
+  an error when manual; its usage is counted.
 - OpenRouter compaction sends its instructions as the last user input instead
   of top-level `instructions`. Behind a transcript that ended on the
   assistant, models continued the conversation and that reply became the

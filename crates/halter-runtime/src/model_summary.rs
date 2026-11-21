@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use halter_protocol::{
     AssistantMessage, AssistantPart, CompactedContext, CompactionResult, Message,
-    ProviderCapabilities, SessionState, ToolCall, UserMessage,
+    ProviderCapabilities, SessionState, StopReason, ToolCall, UserMessage,
 };
 
 use crate::compaction_strategy::{
@@ -87,10 +87,7 @@ impl CompactionStrategy for ModelSummary {
         ctx.append(Message::User(UserMessage::text(compaction_instructions(
             ctx.trigger().custom_instructions(),
         ))));
-        let summary = assistant_text(&ctx.infer().await?);
-        if summary.trim().is_empty() {
-            anyhow::bail!("failed to compact session: the model returned no checkpoint summary");
-        }
+        let summary = checkpoint_summary(&ctx.infer().await?)?;
 
         let mut checkpoint = format!("{CHECKPOINT_PREFIX}{summary}");
         if todo_persisted {
@@ -130,6 +127,23 @@ fn keep_task_calls(mut reply: AssistantMessage) -> (AssistantMessage, Vec<ToolCa
         AssistantPart::Thinking(_) => true,
     });
     (reply, task_calls)
+}
+
+/// The checkpoint reply's text, when it is a summary the model finished. A
+/// reply cut by `max_tokens`, refused (`Error`), or paused (`Interrupted`)
+/// still carries text, and checkpointing it would replace the window with a
+/// fragment. Its usage is already counted either way.
+fn checkpoint_summary(reply: &AssistantMessage) -> anyhow::Result<String> {
+    if let Some(reason @ (StopReason::MaxTokens | StopReason::Error | StopReason::Interrupted)) =
+        reply.stop_reason
+    {
+        anyhow::bail!("failed to compact session: the checkpoint reply stopped early ({reason:?})");
+    }
+    let summary = assistant_text(reply);
+    if summary.trim().is_empty() {
+        anyhow::bail!("failed to compact session: the model returned no checkpoint summary");
+    }
+    Ok(summary)
 }
 
 fn assistant_text(message: &AssistantMessage) -> String {
@@ -219,6 +233,59 @@ mod tests {
         ]));
         assert_eq!(text, "one\ntwo");
         assert_eq!(assistant_text(&reply(Vec::new())), "");
+    }
+
+    /// Only a finished, non-empty reply is a checkpoint. Kills dropping the
+    /// stop-reason guard (the three early stops pass), widening it to
+    /// `EndTurn` or `None` (the finished rows fail), and dropping the empty
+    /// check (the blank row passes).
+    #[test]
+    fn checkpoint_summary_accepts_only_a_finished_reply() {
+        // (case, stop reason, text, Ok(summary) or Err(message fragment))
+        let cases: [(&str, Option<StopReason>, &str, Result<&str, &str>); 7] = [
+            ("end turn", Some(StopReason::EndTurn), "gist", Ok("gist")),
+            ("tool use", Some(StopReason::ToolUse), "gist", Ok("gist")),
+            ("unreported", None, "gist", Ok("gist")),
+            (
+                "max tokens",
+                Some(StopReason::MaxTokens),
+                "gi",
+                Err("stopped early (MaxTokens)"),
+            ),
+            (
+                "refusal",
+                Some(StopReason::Error),
+                "I can't",
+                Err("stopped early (Error)"),
+            ),
+            (
+                "paused",
+                Some(StopReason::Interrupted),
+                "gi",
+                Err("stopped early (Interrupted)"),
+            ),
+            (
+                "blank",
+                Some(StopReason::EndTurn),
+                "  ",
+                Err("returned no checkpoint summary"),
+            ),
+        ];
+        for (case, stop_reason, text, expected) in cases {
+            let reply = AssistantMessage {
+                stop_reason,
+                ..reply(vec![AssistantPart::Text {
+                    text: text.to_owned(),
+                }])
+            };
+            match (checkpoint_summary(&reply), expected) {
+                (Ok(summary), Ok(want)) => assert_eq!(summary, want, "{case}"),
+                (Err(error), Err(fragment)) => {
+                    assert!(error.to_string().contains(fragment), "{case}: {error}");
+                }
+                (got, want) => panic!("{case}: got {got:?}, want {want:?}"),
+            }
+        }
     }
 
     /// Kills dropping either side of the `||`: an empty session must skip
