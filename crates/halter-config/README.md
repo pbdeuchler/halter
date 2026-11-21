@@ -217,7 +217,11 @@ max_attempts = 3
 For streaming calls, `request_secs` bounds request setup through response
 headers and `stream_idle_secs` bounds the idle gap between stream items; it is
 not a total stream lifetime cap. `max_attempts` includes the initial provider
-request. Timeout and retry values must be positive, and `jitter_pct` must be in
+request. `deadline_secs` caps the total backoff slept between attempts; time
+inside an attempt never counts, so an attempt timeout cannot spend it. Validation
+runs on the global block and on each provider's effective (merged) config, and
+rejects `connect_secs >= request_secs` with an error naming both keys.
+Timeout and retry values must be positive, and `jitter_pct` must be in
 `0..=100`.
 
 ### Resolution rules

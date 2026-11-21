@@ -1024,6 +1024,79 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
+    /// The consumer sees the events of exactly one attempt, so a retry can
+    /// never duplicate output or a tool call. Rows: a failed attempt's
+    /// pre-commit events (`MessageStart`, `ProviderWarning`) are discarded and
+    /// only the retried attempt is delivered; a tool call commits the attempt,
+    /// so a later failure is surfaced and the call is delivered once, never
+    /// re-run. Mutations killed: forwarding events before the commit boundary
+    /// (row one gains the failed attempt's events); dropping `ToolCallStart`
+    /// from `stream_event_commits_attempt` (row two retries and delivers the
+    /// second attempt's text).
+    #[tokio::test]
+    async fn retry_delivers_events_of_exactly_one_attempt() {
+        let warning = StreamEvent::ProviderWarning {
+            message: "degraded".into(),
+        };
+        let start = |id: &str| StreamEvent::MessageStart {
+            id: MessageId::from(id),
+        };
+        let tool_start = StreamEvent::ToolCallStart {
+            id: BlockId::from("tool_block"),
+            tool_call_id: halter_protocol::ToolCallId::new(),
+            name: halter_protocol::ToolName::from("shell"),
+        };
+        let ok = |events: Vec<StreamEvent>| events.into_iter().map(Ok).collect::<Script>();
+        let winning: Vec<StreamEvent> = success_events("msg_b", "done")
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let cases = [
+            (
+                "pre-commit events of the failed attempt are discarded",
+                vec![
+                    [
+                        ok(vec![start("msg_a"), warning.clone()]),
+                        vec![Err(transient_error("reset"))],
+                    ]
+                    .concat(),
+                    success_events("msg_b", "done"),
+                ],
+                winning,
+                false,
+                2,
+            ),
+            (
+                "a tool call commits the attempt and is never re-run",
+                vec![
+                    [
+                        ok(vec![start("msg_a"), tool_start.clone()]),
+                        vec![Err(transient_error("reset"))],
+                    ]
+                    .concat(),
+                    success_events("msg_b", "should not run"),
+                ],
+                vec![start("msg_a"), tool_start],
+                true,
+                1,
+            ),
+        ];
+        for (name, scripts, expected_events, expected_error, expected_attempts) in cases {
+            let provider = ScriptedProvider::new(scripts);
+            let attempts = provider.attempts();
+            let items = collect_items(
+                ResilientProvider::new("test", provider, test_policy(3)),
+                CancellationToken::new(),
+            )
+            .await;
+            let events: Vec<StreamEvent> =
+                items.iter().filter_map(|item| item.clone().ok()).collect();
+            assert_eq!(events, expected_events, "{name}");
+            assert_eq!(items.iter().any(Result::is_err), expected_error, "{name}");
+            assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts, "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn classifier_can_make_startup_errors_retryable() {
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -1612,6 +1685,100 @@ mod tests {
             .expect("typed provider error");
         assert_eq!(provider_error.kind, ProviderErrorKind::Transient);
         assert!(provider_error.message.contains("timed out"));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum HangStage {
+        Setup,
+        Idle,
+        Compact,
+    }
+
+    /// Hangs at `stage` on the first attempt and succeeds on every later one.
+    #[derive(Debug)]
+    struct HangOnceProvider {
+        stage: HangStage,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for HangOnceProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            let first = self.attempts.fetch_add(1, Ordering::SeqCst) == 0;
+            match (first, self.stage) {
+                (true, HangStage::Setup) => std::future::pending().await,
+                (true, _) => Ok(stream::pending().boxed()),
+                (false, _) => Ok(stream::iter(success_events("msg_retry", "ok")).boxed()),
+            }
+        }
+
+        async fn compact(
+            &self,
+            _request: ProviderCompactionRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<ProviderCompactionResponse> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::future::pending::<()>().await;
+            }
+            Ok(compaction_response())
+        }
+    }
+
+    /// Regression for the retry deadline being measured from before attempt
+    /// 1: an attempt timer (setup `request`, `stream_idle`, compact
+    /// `request`) at least as long as the retry budget used to exhaust it, so
+    /// the recoverable timeout was never retried. Each row's timer (30ms)
+    /// exceeds the budget (5ms) and must still get its second attempt.
+    /// Mutation killed: charging `started.elapsed()` instead of `waited` in
+    /// `RetryGate::record_failure_and_next_backoff`.
+    #[tokio::test]
+    async fn attempt_timeout_longer_than_retry_budget_is_still_retried() {
+        let policy = ResiliencePolicy {
+            timeouts: ProviderTimeouts {
+                connect: Duration::from_millis(10),
+                request: Duration::from_millis(30),
+                stream_idle: Duration::from_millis(30),
+            },
+            request_retry: RetryPolicy {
+                max_attempts: 2,
+                base_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                deadline: Duration::from_millis(5),
+                jitter_pct: 0,
+            },
+        };
+        for stage in [HangStage::Setup, HangStage::Idle, HangStage::Compact] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let provider = HangOnceProvider {
+                stage,
+                attempts: attempts.clone(),
+            };
+            let resilient = ResilientProvider::new("test", provider, policy);
+            match stage {
+                HangStage::Compact => {
+                    resilient
+                        .compact(sample_compaction_request(), CancellationToken::new())
+                        .await
+                        .expect("second compaction attempt succeeds");
+                }
+                _ => {
+                    let items = collect_items(resilient, CancellationToken::new()).await;
+                    assert!(
+                        items.iter().all(Result::is_ok),
+                        "{stage:?}: second attempt must succeed: {items:?}"
+                    );
+                }
+            }
+            assert_eq!(attempts.load(Ordering::SeqCst), 2, "{stage:?}");
+        }
     }
 
     #[tokio::test]
