@@ -2826,6 +2826,9 @@ impl SessionExecutor {
                 turn_usage.saturating_accumulate(&effects.usage);
                 let (result, payload) =
                     effects.apply_for_policy(state, self.services.compaction.window_policy());
+                // As after a manual rewrite: the next turn starts with the
+                // compact-sourced SessionStart hooks.
+                state.pending_session_start_source = Some(HookSessionStartSource::Compact);
                 info!(
                     session_id = %self.session_id,
                     compacted_messages = result.compacted_count,
@@ -7885,7 +7888,11 @@ mod tests {
     /// running" sees `PostCompact`, or a second `PreCompact` at the turn's
     /// next boundary), ignoring the
     /// block reason ("blocked" compacts), and skipping `PostCompact` after a
-    /// rewrite ("rewrites" misses it).
+    /// rewrite ("rewrites" misses it). Like a manual rewrite, an automatic
+    /// one re-arms the compact-sourced `SessionStart` hooks for the next
+    /// turn: dropping that latch in `run_automatic_compaction` leaves
+    /// "rewrites" without its second `SessionStart`, and setting it before
+    /// the rewrite gives one to every other case.
     #[tokio::test]
     async fn automatic_compaction_fires_post_compact_only_after_a_rewrite() {
         // (case, strategy, PreCompact blocks, compaction hooks that fire, compacted)
@@ -7947,6 +7954,16 @@ mod tests {
                     }),
                 );
             }
+            let sources = Arc::new(Mutex::new(Vec::new()));
+            let seen = sources.clone();
+            registered.register(
+                PluginId::from("internal"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(HookEventName::SessionStart, move |input| {
+                    seen.lock().expect("sources").push(input.matcher_value);
+                    async move { HookResponse::passthrough() }
+                }),
+            );
             Arc::get_mut(&mut services)
                 .expect("unique services")
                 .registered_hooks = Arc::new(registered);
@@ -7995,6 +8012,28 @@ mod tests {
                     event.payload,
                     SessionEventPayload::TurnCompleted { .. }
                 )),
+                "{case}"
+            );
+            session
+                .submit_turn(Turn::user("next"))
+                .await
+                .expect("submit second turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect second turn");
+            // The second turn's own latch would fire at a third.
+            let expected: &[&str] = if compacted {
+                &["startup", "compact"]
+            } else {
+                &["startup"]
+            };
+            let sources = sources.lock().expect("sources").clone();
+            assert_eq!(
+                sources,
+                expected
+                    .iter()
+                    .map(|s| Some((*s).to_owned()))
+                    .collect::<Vec<_>>(),
                 "{case}"
             );
         }

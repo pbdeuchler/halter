@@ -925,6 +925,7 @@ pub enum HookSessionStartSource {
     Startup,
     Resume,
     Clear,
+    /// The turn after a compaction rewrote the context, automatic or manual.
     Compact,
 }
 

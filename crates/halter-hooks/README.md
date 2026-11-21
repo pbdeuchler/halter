@@ -146,6 +146,10 @@ CleanWindow rollover), or the caller's string for `compact(..)`.
   the context. A skipped pass, a strategy failure, a block, or a strategy
   that declines after `PreCompact` (`compact` returns `Ok(None)`) never
   reaches it.
+- `SessionStart` with source `compact` fires at the start of the next turn
+  after any rewrite, automatic (including a rollover) or manual, once however
+  many rewrites the previous turn saw. Whatever never reaches `PostCompact`
+  does not arm it either.
 
 ---
 

@@ -298,7 +298,8 @@ propagates to the caller, who asked for compaction explicitly.
 When there is nothing to compact the call still returns `Ok(())` and logs
 `ContextCompacted { summary: "No compaction needed.", effects: None }`, a
 marker that changes no state. `PostCompact` does not fire and the
-`SessionStart` hooks are not re-armed. `PreCompact` fires only if the
+`SessionStart` hooks are not re-armed. A rewrite, manual or automatic, arms
+them with source `compact` for the next turn. `PreCompact` fires only if the
 strategy's `needs_compaction` could not rule the pass out up front.
 
 With `ProviderDefault` installed by hand on a provider that cannot compact

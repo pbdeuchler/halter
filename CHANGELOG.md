@@ -73,6 +73,17 @@ once a `1.0.0` line is cut.
   strategy whose `compact` returns `Ok(None)` without doing work should
   implement `needs_compaction` so its hooks stay quiet.
 
+- **Breaking (hook contract):** an automatic compaction that rewrites the
+  context, including a CleanWindow rollover, now arms the `SessionStart`
+  hooks with source `compact` for the next turn, as a manual rewrite always
+  did. Before, only `compact(..)` did, so a `SessionStart` hook matching
+  `compact` (the place to put back context a summary drops) never ran in
+  sessions that only compacted on the ledger's trigger. It fires once per
+  turn however many rewrites the previous turn saw, and never after a pass
+  that skipped, failed, was blocked, or declined. For embedders: a hook that
+  assumed `compact` meant "a caller asked" should read the `PostCompact`
+  `trigger` instead.
+
 ### Removed
 
 - **Breaking:** the shell command allowlist and strict mode. `policy.shell.allow`
