@@ -9642,7 +9642,21 @@ mod tests {
         let Message::User(checkpoint) = &stored.state.messages[0] else {
             panic!("the new window must start with a user message");
         };
-        let text = checkpoint.plain_text();
+        let [
+            halter_protocol::UserPart::Text { text },
+            halter_protocol::UserPart::Text { text: first },
+        ] = &checkpoint.parts[..]
+        else {
+            panic!(
+                "a summary part, then the one request: {:?}",
+                checkpoint.parts
+            );
+        };
+        // The 6,000-byte prompt is carried clipped, and only once: the latest
+        // request is the first.
+        assert!(first.starts_with(crate::FIRST_REQUEST_LABEL), "{first}");
+        assert!(first.len() <= crate::FIRST_REQUEST_LABEL.len() + crate::CARRIED_REQUEST_MAX_BYTES);
+        assert!(first.ends_with("x\n[clipped]"), "{first}");
         assert!(text.starts_with(crate::CHECKPOINT_PREFIX), "{text}");
         assert!(text.contains("SUMMARY: finish the report next"), "{text}");
         assert!(text.ends_with(crate::TODO_REMINDER), "{text}");
@@ -9770,7 +9784,10 @@ mod tests {
         assert!(matches!(
             &stored.state.messages[..],
             [Message::User(user), Message::Assistant(_)]
-                if user.plain_text() == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                if matches!(
+                    user.parts.first(),
+                    Some(halter_protocol::UserPart::Text { text }) if *text == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                )
         ));
     }
 
@@ -9815,8 +9832,80 @@ mod tests {
         assert!(matches!(
             &stored.state.messages[..],
             [Message::User(user), Message::Assistant(_)]
-                if user.plain_text() == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                if matches!(
+                    user.parts.first(),
+                    Some(halter_protocol::UserPart::Text { text }) if *text == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                )
         ));
+    }
+
+    /// Each checkpoint carries the user's first request byte for byte, and
+    /// the latest one when it differs, across repeated compactions. Kills
+    /// computing the carry after the pass appends its own requests (the
+    /// compaction instructions become the "latest request"), and building
+    /// the first request afresh instead of copying it from the previous
+    /// checkpoint (the second checkpoint has no "x" request left to find).
+    #[tokio::test]
+    async fn model_summary_carries_the_first_and_latest_requests_across_compactions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CheckpointScriptProvider::new(
+            NudgeReply::TextOnly,
+            "SUMMARY",
+        ));
+        let mut services = configured_services(provider, temp.path());
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+
+        let mut checkpoints = Vec::new();
+        for prompt in ["x".repeat(6_000), "y".repeat(6_000)] {
+            session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("exists");
+            let Some(Message::User(checkpoint)) = stored.state.messages.first() else {
+                panic!("the window opens with the checkpoint");
+            };
+            checkpoints.push(
+                checkpoint
+                    .parts
+                    .iter()
+                    .map(|part| match part {
+                        halter_protocol::UserPart::Text { text } => text.to_string(),
+                        _ => unreachable!(),
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let carried = |label: &str, byte: char| {
+            let body = format!("{}\n[clipped]", byte.to_string().repeat(4_000 - 10));
+            format!("{label}{body}")
+        };
+        let first = carried(crate::FIRST_REQUEST_LABEL, 'x');
+        assert_eq!(
+            checkpoints,
+            vec![
+                vec![
+                    format!("{}SUMMARY", crate::CHECKPOINT_PREFIX),
+                    first.clone()
+                ],
+                vec![
+                    format!("{}SUMMARY", crate::CHECKPOINT_PREFIX),
+                    first,
+                    carried(crate::LATEST_REQUEST_LABEL, 'y'),
+                ],
+            ]
+        );
     }
 
     /// An empty checkpoint is a failed compaction: automatic passes degrade

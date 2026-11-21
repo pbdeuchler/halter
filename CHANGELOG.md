@@ -84,6 +84,18 @@ once a `1.0.0` line is cut.
   assumed `compact` meant "a caller asked" should read the `PostCompact`
   `trigger` instead.
 
+- `ModelSummary`'s checkpoint now carries the user's first request and,
+  when it differs, the latest one, verbatim, as extra text parts after the
+  summary (`FIRST_REQUEST_LABEL`, `LATEST_REQUEST_LABEL`, each request
+  clipped to `CARRIED_REQUEST_MAX_BYTES` = 4,000 bytes). Before, both
+  survived only as the model's paraphrase, and after a second compaction as
+  a paraphrase of a paraphrase. The first request is copied from the
+  previous checkpoint, so it stays byte-identical however often the session
+  compacts. A checkpoint grows by at most about 8 KB. For embedders: the
+  checkpoint message may now have up to three parts, so code that compared
+  its `plain_text()` with `CHECKPOINT_PREFIX` plus the summary should read
+  its first part.
+
 ### Removed
 
 - **Breaking:** the shell command allowlist and strict mode. `policy.shell.allow`

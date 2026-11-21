@@ -431,7 +431,11 @@ and other calls never reach the next request, though the event log keeps the
 whole reply), then the built-in checkpoint instructions
 (`default_compaction_prompt`, plus a manual pass's custom instructions). The
 reply becomes the next window as one user-role message after the static
-prefix, with a todo reminder when the nudge ran calls. A reply that stopped
+prefix, with a todo reminder when the nudge ran calls. The same message
+carries the user's first request and, when it differs, the latest one,
+verbatim up to 4,000 bytes each (`CARRIED_REQUEST_MAX_BYTES`), as separate
+text parts; the first is copied from the previous checkpoint, so it stays
+byte-identical across compactions. A reply that stopped
 early (`max_tokens`, a refusal, a pause) or has no text fails the pass. `ProviderDefault`
 hands `Provider::compact` the window its
 `ProviderCapabilities::compaction_strategy` allows: everything before the
