@@ -10,6 +10,8 @@ once a `1.0.0` line is cut.
 
 ### Added
 
+- [docs/timeouts.md](docs/timeouts.md) lists every timeout and retry in the
+  harness, what encloses what, and every way each wait can end.
 - `[resilience.timeouts] compact_secs` (default 300, also a per-provider
   override) and `ProviderTimeouts::compact`, which bound one whole unary
   compaction request. Compaction used `request_secs`, which for streams covers

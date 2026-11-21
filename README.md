@@ -445,6 +445,8 @@ by its own timeouts, plus `deadline_secs` of backoff. Validation rejects a
 `connect_secs` that is not less than `request_secs` and `compact_secs`, which
 enclose it.
 
+[docs/timeouts.md](docs/timeouts.md) lists every timeout and retry in the harness and what encloses what.
+
 Retries never duplicate output or tool calls. Events before an attempt's first
 content or tool-call event (`TextDelta`, `ThinkingDelta`, `ToolCallStart`,
 `ToolArgsDelta`, `ToolCallEnd`, `MessageEnd`) are buffered and discarded if the
