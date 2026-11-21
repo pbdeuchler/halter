@@ -93,7 +93,7 @@ impl CompactionStrategy for ModelSummary {
             .iter()
             .any(|spec| spec.name.0 == TODO_TOOL_NAME)
         {
-            ctx.append(Message::User(UserMessage::text(TODO_NUDGE)));
+            ctx.append(Message::User(UserMessage::harness(TODO_NUDGE)));
             let reply = ctx.infer().await?;
             let (kept, task_calls) = keep_task_calls(reply);
             if !task_calls.is_empty() {
@@ -103,16 +103,16 @@ impl CompactionStrategy for ModelSummary {
             }
         }
 
-        ctx.append(Message::User(UserMessage::text(compaction_instructions(
-            ctx.trigger().custom_instructions(),
-        ))));
+        ctx.append(Message::User(UserMessage::harness(
+            compaction_instructions(ctx.trigger().custom_instructions()),
+        )));
         let summary = checkpoint_summary(&ctx.infer().await?)?;
 
         let mut checkpoint = format!("{CHECKPOINT_PREFIX}{summary}");
         if todo_persisted {
             checkpoint.push_str(TODO_REMINDER);
         }
-        let checkpoint = UserMessage::text(checkpoint);
+        let checkpoint = UserMessage::harness(checkpoint);
         Ok(Some(CompactionEffects {
             messages: vec![Message::User(UserMessage {
                 parts: checkpoint.parts.into_iter().chain(carried).collect(),

@@ -617,7 +617,7 @@ fn synthesis_retry_message(rank_recorded: bool) -> UserMessage {
 /// by the OneShot provider on every default call and by the runtime's FullTurn
 /// judge on the opening inference step of the turn.
 pub fn synthesis_guidance_message(synthesis: &str) -> UserMessage {
-    UserMessage::text(format!(
+    UserMessage::harness(format!(
         "The following model-judge synthesis evaluates candidate responses to \
          the most recent user message. Treat it as advisory context for your \
          answer, not as a new request from the user.\n\n\

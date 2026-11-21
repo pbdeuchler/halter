@@ -463,7 +463,9 @@ Derivation, applied by `HarnessConfig::resolved_context` (`ContextConfig::resolv
   then recovers with `session_search`. Reminders fire once per window at
   50% and 75% of the threshold. Above 90%, the runtime requests a checkpoint
   and wipes the conversation even if the model ignores it. `new_context`
-  requests an earlier wipe. The turn continues from a recovery prompt.
+  requests an earlier wipe. The next window opens with a harness notice
+  that says whether a checkpoint was saved, lists the notes written, and
+  quotes the first and latest user requests.
 
 `notes_root` is fixed when the harness is built; changing a session's working
 directory does not move its notes. With an explicit `sessions.sqlite_path`,

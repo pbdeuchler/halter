@@ -191,6 +191,35 @@ once a `1.0.0` line is cut.
   completed`.
 - `session_search` input errors start with `invalid tool input:` like other
   built-in tools. `halter_tools::parse_input` is public.
+- CleanWindow opens each new window with a harness notice instead of a fixed
+  sentence. `CLEAN_WINDOW_BOOTSTRAP` is now its fixed first line, so match it
+  with `starts_with`, not equality. The notice says how the window ended and
+  whether a checkpoint was saved, lists the notes files written in that
+  window, names the `session_search` calls that recover every user request,
+  says what to do first, and quotes the session's first user request and the
+  latest one before the wipe (each capped at 4,000 bytes). It is built once
+  per rollover, so it stays a stable cache prefix for the whole window.
+- The CleanWindow checkpoint reminder no longer asks for window and item IDs
+  the model cannot see. It asks for what only the model knows (requirements
+  from other messages, decisions, verified progress, files changed,
+  learnings, next steps), and `session_search` now runs during the checkpoint
+  exchange alongside `notes` and `new_context`. The 50% and 75% reminders no
+  longer mention stable history IDs.
+- `UserMessage::harness(text)` builds a user-role message the harness wrote,
+  marked by a `harness-` ID prefix, and `UserMessage::is_harness()` tests for
+  it. Stop-hook continuations, skill injections, the CleanWindow notice and
+  reminder, and the model-summary and judge guidance messages use it.
+  `session_search` indexes these messages under the new role `harness`, so
+  `list_items` with role `user` returns only real user requests.
+- CleanWindow's notice names only the tools the session offers, lists the
+  background jobs, running subagents, and PTY session that outlive the wipe
+  (ten at most, by id), and caps its notes-path list at ten with a pointer to
+  `notes list_files_by_prefix`. When it would start the new window above 90%
+  of the threshold it shrinks its quotes (4,000, then 1,000, then 250 bytes,
+  then none) and its lists instead of failing the turn; the wipe statement
+  and the `session_search` instructions always remain. A window after one
+  that had no text request labels its first quote "Earliest user request
+  this notice can quote" instead of the session's first.
 
 ### Removed
 
@@ -315,6 +344,23 @@ once a `1.0.0` line is cut.
   cancellation. It was reported `Completed` with no output.
 - `PolicyError::Io` no longer prints its `io::Error` twice when the chain is
   shown with `{:#}`. Its plain `Display` no longer includes the cause.
+- A rejected CleanWindow checkpoint write no longer wipes the window
+  silently. The model gets the error and another reply, up to four checkpoint
+  replies in all, and a `new_context` beside a failed call does not end the
+  exchange. The new window's notice reports whether anything was saved and
+  why the exchange ended: `new_context`, no checkpoint call, a failed or
+  over-cap model request, failed tool execution, or a spent budget.
+- A CleanWindow checkpoint call to a tool other than `notes`,
+  `session_search`, or `new_context` is answered with an error result naming
+  those three, and the model gets another reply. Before, the call and the
+  reply's text were dropped silently. An exchange whose reply makes no tool
+  call now ends with "a reply made no tool call".
+- The CleanWindow notice no longer quotes a Stop-hook continuation such as
+  "Continue." as the latest user request.
+- PreToolUse hooks that block a recovery tool during the checkpoint exchange
+  are reported accurately: the model sees the hook's reason, a blocked
+  `notes` write is not counted as saved, and a blocked `new_context` gets
+  another reply until the budget runs out, after which the window is wiped.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the

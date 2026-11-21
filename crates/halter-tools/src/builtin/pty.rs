@@ -1054,6 +1054,12 @@ mod security_tests {
         })
         .await
         .expect("PTY command publishes pid");
+        assert!(context.tool_sessions.pty_running(&context.session_id));
+        assert!(
+            !context
+                .tool_sessions
+                .pty_running(&halter_protocol::SessionId::from("other"))
+        );
         assert!(
             PtyTool
                 .execute(
@@ -1090,6 +1096,7 @@ mod security_tests {
         .await
         .expect("shutdown unblocks the PTY writer")
         .unwrap();
+        assert!(!context.tool_sessions.pty_running(&context.session_id));
         assert!(!context.tool_sessions.has_process_state(&context.session_id));
         // SAFETY: signal zero only probes the process created by this test.
         let exists = unsafe { libc::kill(pid, 0) };

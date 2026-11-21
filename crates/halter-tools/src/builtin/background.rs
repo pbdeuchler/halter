@@ -54,6 +54,18 @@ impl BackgroundRegistry {
     pub(crate) fn has_running(&self) -> bool {
         self.running.load(Ordering::Acquire) != 0
     }
+    /// The id and command of each running job, in id order.
+    pub(crate) async fn running(&self) -> Vec<(String, String)> {
+        let state = self.state.lock().await;
+        let mut jobs: Vec<_> = state
+            .jobs
+            .values()
+            .filter(|job| !job.is_finished())
+            .map(|job| (job.id.clone(), job.command.clone()))
+            .collect();
+        jobs.sort();
+        jobs
+    }
     async fn spawn(
         &self,
         context: &ToolContext,

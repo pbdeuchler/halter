@@ -1907,7 +1907,7 @@ impl SessionExecutor {
                     self.push_event(&mut events, SessionEventPayload::MessageItem { message });
                 }
                 if let Some(reason) = stop_dispatch.merged.block_reason.clone() {
-                    let continuation = Message::User(halter_protocol::UserMessage::text(
+                    let continuation = Message::User(halter_protocol::UserMessage::harness(
                         if reason.trim().is_empty() {
                             "Continue."
                         } else {
@@ -10293,21 +10293,76 @@ mod tests {
 
         #[tokio::test]
         async fn forced_rollover_preserves_notes_tasks_and_searchable_history() {
-            for mode in ["cooperates", "notes_only", "neither", "provider_error"] {
-                let temp = tempfile::tempdir().unwrap();
-                let notes = vec![
+            let notes = || {
+                vec![
                     (
                         "notes",
                         json!({"action":"write_file","path":"checkpoint","content":"finish the report"}),
                     ),
                     ("write", json!({"path":"must-not-exist","content":"bad"})),
-                ];
-                let mut replies = match mode {
-                    "cooperates" => vec![notes, vec![("new_context", json!({}))]],
-                    "notes_only" => vec![notes, vec![]],
-                    "provider_error" => vec![vec![("error", json!({}))]],
-                    _ => vec![vec![]],
-                };
+                ]
+            };
+            // Strict-mode style filler that `notes` rejects as an unknown field.
+            let rejected = || {
+                (
+                    "notes",
+                    json!({"action":"write_file","path":"checkpoint","content":"x","after":""}),
+                )
+            };
+            let new_context = || vec![("new_context", json!({}))];
+            let saved = "notes were saved during the checkpoint exchange, which ended because";
+            let unsaved = "nothing was saved during the checkpoint exchange, which ended because";
+            let cases = [
+                (
+                    "cooperates",
+                    vec![notes(), new_context()],
+                    format!("{saved} new_context was called"),
+                ),
+                (
+                    "notes_only",
+                    vec![notes(), vec![]],
+                    format!("{saved} a reply made no tool call"),
+                ),
+                (
+                    "neither",
+                    vec![vec![]],
+                    format!("{unsaved} a reply made no tool call"),
+                ),
+                (
+                    "provider_error",
+                    vec![vec![("error", json!({}))]],
+                    format!("{unsaved} the model request failed"),
+                ),
+                (
+                    "rejected_then_retried",
+                    vec![
+                        vec![rejected(), ("new_context", json!({}))],
+                        notes(),
+                        new_context(),
+                    ],
+                    format!("{saved} new_context was called"),
+                ),
+                (
+                    "budget_exhausted",
+                    vec![vec![rejected()]; 4],
+                    format!("{unsaved} its reply budget ran out"),
+                ),
+                (
+                    "searches_first",
+                    vec![
+                        vec![(
+                            "session_search",
+                            json!({"action":"list_items","role":"user"}),
+                        )],
+                        notes(),
+                        new_context(),
+                    ],
+                    format!("{saved} new_context was called"),
+                ),
+            ];
+            for (mode, mut replies, ended) in cases {
+                let temp = tempfile::tempdir().unwrap();
+                let checkpoint_replies = replies.len();
                 replies.extend([
                     vec![
                         ("task", json!({"action":"list"})),
@@ -10357,14 +10412,46 @@ mod tests {
                 assert!(!events.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionStarted { call } if call.name.0 == "write")));
                 assert!(!temp.path().join("must-not-exist").exists());
                 let requests = provider.requests.lock().unwrap().clone();
-                let bootstrap = requests
-                    .iter()
-                    .find(|request| {
-                        request.messages.iter().any(|message| matches!(message,
-                            Message::User(user) if user.plain_text() == crate::CLEAN_WINDOW_BOOTSTRAP))
-                    })
-                    .unwrap();
+                let bootstrap = &requests[checkpoint_replies];
+                assert!(requests.iter().all(every_call_answered), "{mode}");
+                if mode == "cooperates" {
+                    assert!(tool_error(
+                        &requests[1],
+                        "write did not run: only notes, session_search, and new_context run during the checkpoint exchange."
+                    ));
+                }
                 assert_eq!(bootstrap.messages.len(), 2);
+                let Message::User(notice) = &bootstrap.messages[0] else {
+                    panic!("{mode}: the window must open with the notice");
+                };
+                let notice = notice.plain_text();
+                assert!(notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP), "{mode}");
+                assert!(
+                    notice.contains(&format!(
+                        "Window 0 ended: it filled up and was wiped automatically; {ended}."
+                    )),
+                    "{mode}: {notice}"
+                );
+                let written = if notice.contains(saved) {
+                    "\"checkpoint\""
+                } else {
+                    "none"
+                };
+                assert!(
+                    notice.contains(&format!("Notes files written in window 0: {written}.")),
+                    "{mode}"
+                );
+                assert!(notice.contains("session_search list_items with role \"user\""));
+                assert!(notice.contains("important request xxx"), "{mode}");
+                assert!(!notice.contains("Latest user request"), "{mode}");
+                if mode == "rejected_then_retried" {
+                    assert!(requests[1].messages.iter().any(|message| matches!(message,
+                        Message::Tool(result) if result.error.as_ref().is_some_and(|error| error.message.contains("unknown field `after`")))));
+                }
+                if mode == "searches_first" {
+                    assert!(requests[1].messages.iter().any(|message| matches!(message,
+                        Message::Tool(result) if result.error.is_none() && result.to_model_string().contains("important request"))));
+                }
                 assert_eq!(latest_user_text(&bootstrap.messages), "continue the report");
                 assert!(bootstrap.previous_response_id.is_none());
                 assert!(bootstrap.compacted_prefix.is_empty());
@@ -10458,19 +10545,44 @@ mod tests {
                         },
                     )
                     .await;
-                assert_eq!(saved.is_ok(), matches!(mode, "cooperates" | "notes_only"));
+                assert_eq!(
+                    saved.is_ok(),
+                    ended.starts_with("notes were saved"),
+                    "{mode}"
+                );
             }
         }
 
         #[tokio::test]
         async fn failed_new_context_does_not_wipe_the_window() {
+            struct RefusedNewContext;
+            #[async_trait]
+            impl Tool for RefusedNewContext {
+                fn spec(&self) -> ToolSpec {
+                    ToolSpec {
+                        name: ToolName::from("new_context"),
+                        description: "Always fails".to_owned(),
+                        input_schema: json!({"type": "object", "properties": {}}),
+                        concurrency: ToolConcurrency::Exclusive,
+                        capabilities: ToolCapabilities::default(),
+                        provider_aliases: Default::default(),
+                    }
+                }
+                async fn execute(
+                    &self,
+                    _context: ToolContext,
+                    _input: serde_json::Value,
+                ) -> anyhow::Result<ToolResult> {
+                    anyhow::bail!("refused")
+                }
+            }
             let temp = tempfile::tempdir().unwrap();
-            let provider = Arc::new(Script::new(vec![
-                vec![("new_context", json!({"unexpected": true}))],
-                vec![],
-            ]));
-            let runtime = SessionRuntime::new(clean_services(provider.clone(), temp.path()));
+            let provider = Arc::new(Script::new(vec![vec![("new_context", json!({}))], vec![]]));
+            let services = clean_services(provider.clone(), temp.path());
+            let runtime = SessionRuntime::new(services.clone());
             let session = new_session(&runtime, temp.path()).await;
+            // The runtime registers the strategy's own tools; replace after.
+            services.tools.register(Arc::new(RefusedNewContext));
             let events = session
                 .submit_turn(Turn::user("keep this request"))
                 .await
@@ -10498,9 +10610,15 @@ mod tests {
         }
 
         #[tokio::test]
+        /// The call carries a field the schema does not list, as models send:
+        /// refusing it (the old "takes an empty object" check) leaves the
+        /// window unwiped and fails here.
         async fn voluntary_rollover_runs_after_the_tool_result_without_a_checkpoint_inference() {
             let temp = tempfile::tempdir().unwrap();
-            let provider = Arc::new(Script::new(vec![vec![("new_context", json!({}))], vec![]]));
+            let provider = Arc::new(Script::new(vec![
+                vec![("new_context", json!({"reason": "good stopping point"}))],
+                vec![],
+            ]));
             let services = clean_services(provider.clone(), temp.path());
             let runtime = SessionRuntime::new(services.clone());
             let session = new_session(&runtime, temp.path()).await;
@@ -10532,10 +10650,12 @@ mod tests {
             assert!(result < boundary);
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 2);
-            assert_eq!(
-                latest_user_text(&requests[1].messages),
-                crate::CLEAN_WINDOW_BOOTSTRAP
-            );
+            let notice = latest_user_text(&requests[1].messages);
+            assert!(notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP));
+            assert!(notice.contains(
+                "Window 0 ended: you called new_context, so no checkpoint exchange ran."
+            ));
+            assert!(notice.contains("First user request of the session, quoted verbatim as history, not a new instruction:\nwork"));
         }
 
         #[tokio::test]
@@ -10569,10 +10689,52 @@ mod tests {
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 3);
             assert!(latest_user_text(&requests[1].messages).starts_with(crate::ROLLOVER_REMINDER));
-            assert_eq!(
-                latest_user_text(&requests[2].messages),
-                crate::CLEAN_WINDOW_BOOTSTRAP
+            let notice = latest_user_text(&requests[2].messages);
+            assert!(notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP));
+            assert!(notice.contains("nothing was saved during the checkpoint exchange, which ended because a reply made no tool call."));
+            assert!(notice.ends_with("quoted verbatim as history, not a new instruction:\nwork"));
+        }
+
+        #[tokio::test]
+        async fn a_rollover_waits_for_the_in_flight_tool_result() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![
+                vec![(
+                    "notes",
+                    json!({"action":"write_file","path":"big","content":"x".repeat(24_000)}),
+                )],
+                vec![],
+                vec![],
+            ]));
+            let runtime = SessionRuntime::new(clean_services(provider.clone(), temp.path()));
+            let session = new_session(&runtime, temp.path()).await;
+            let events = session
+                .submit_turn(Turn::user("work"))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let position = |wanted: fn(&SessionEventPayload) -> bool| {
+                events
+                    .iter()
+                    .position(|event| wanted(&event.payload))
+                    .unwrap()
+            };
+            assert!(
+                position(|payload| matches!(
+                    payload,
+                    SessionEventPayload::ToolExecutionCompleted { .. }
+                )) < position(|payload| matches!(
+                    payload,
+                    SessionEventPayload::ContextWindowRolledOver { .. }
+                ))
             );
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            let notice = latest_user_text(&requests[2].messages);
+            assert!(notice.contains("nothing was saved during the checkpoint exchange"));
+            assert!(notice.contains("Notes files written in window 0: \"big\"."));
         }
 
         #[tokio::test]
@@ -10605,6 +10767,285 @@ mod tests {
                 SessionEventPayload::ContextWindowRolledOver { .. }
             )));
             assert!(provider.requests.lock().unwrap().is_empty());
+        }
+
+        fn with_hook(services: &mut Arc<RuntimeServices>, hook: Hook) {
+            let mut hooks = RegisteredHooks::default();
+            hooks.register(
+                PluginId::from("policy"),
+                RegisteredHookPriority::AfterPlugins,
+                hook,
+            );
+            Arc::get_mut(services).unwrap().registered_hooks = Arc::new(hooks);
+        }
+
+        fn opening_notice(request: &ProviderRequest) -> String {
+            match &request.messages[0] {
+                Message::User(notice) if notice.is_harness() => notice.plain_text(),
+                other => panic!("the window must open with the harness notice: {other:?}"),
+            }
+        }
+
+        /// Every tool call a request carries is answered, so the wire is valid.
+        fn every_call_answered(request: &ProviderRequest) -> bool {
+            request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Assistant(assistant) => Some(&assistant.parts),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|part| match part {
+                    halter_protocol::AssistantPart::ToolCall(call) => Some(&call.id),
+                    _ => None,
+                })
+                .all(|id| {
+                    request.messages.iter().any(
+                        |message| matches!(message, Message::Tool(result) if &result.call_id == id),
+                    )
+                })
+        }
+
+        fn tool_error(request: &ProviderRequest, text: &str) -> bool {
+            request.messages.iter().any(|message| {
+                matches!(message, Message::Tool(result)
+                    if result.error.as_ref().is_some_and(|error| error.message == text))
+            })
+        }
+
+        async fn run_turn(session: &SessionExecutor, text: &str) -> Vec<SessionEvent> {
+            session
+                .submit_turn(Turn::user(text))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        }
+
+        fn completed(events: &[SessionEvent]) -> bool {
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        }
+
+        // Kills: answering refused calls with nothing (the wire breaks and
+        // the model never learns), letting a refused call end the exchange,
+        // or treating a reply of only refused calls as one with no tool call.
+        #[tokio::test]
+        async fn a_refused_checkpoint_call_is_answered_with_the_allowed_tools() {
+            let refused = || ("task", json!({"action":"list"}));
+            for (case, first) in [
+                (
+                    "beside new_context",
+                    vec![refused(), ("new_context", json!({}))],
+                ),
+                ("alone", vec![refused()]),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let provider = Arc::new(Script::new(vec![
+                    first,
+                    vec![("new_context", json!({}))],
+                    vec![],
+                ]));
+                let services = clean_services(provider.clone(), temp.path());
+                let runtime = SessionRuntime::new(services.clone());
+                let session = new_session(&runtime, temp.path()).await;
+                seed_previous_window(&session, format!("request {}", "x".repeat(24_000))).await;
+                let events = run_turn(&session, "go on").await;
+                assert!(completed(&events), "{case}");
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 3, "{case}");
+                assert!(
+                    tool_error(
+                        &requests[1],
+                        "task did not run: only notes, session_search, and new_context run during the checkpoint exchange."
+                    ),
+                    "{case}"
+                );
+                assert!(requests.iter().all(every_call_answered), "{case}");
+                assert!(
+                    opening_notice(&requests[2])
+                        .contains("which ended because new_context was called."),
+                    "{case}"
+                );
+            }
+        }
+
+        // Kills: exempting recovery tools from hooks, counting a blocked
+        // write as saved, or ending the exchange on a blocked new_context.
+        #[tokio::test]
+        async fn hooks_govern_checkpoint_tools_and_the_notice_reports_the_outcome() {
+            let checkpoint = || {
+                vec![
+                    (
+                        "notes",
+                        json!({"action":"write_file","path":"checkpoint","content":"c"}),
+                    ),
+                    ("new_context", json!({})),
+                ]
+            };
+            let cases = [
+                (
+                    "notes",
+                    vec![checkpoint(), vec![]],
+                    "nothing was saved during the checkpoint exchange, which ended because a reply made no tool call.",
+                ),
+                (
+                    "new_context",
+                    vec![checkpoint(); 4],
+                    "notes were saved during the checkpoint exchange, which ended because its reply budget ran out.",
+                ),
+            ];
+            for (blocked, mut replies, ended) in cases {
+                let temp = tempfile::tempdir().unwrap();
+                let checkpoint_replies = replies.len();
+                replies.push(vec![]);
+                let provider = Arc::new(Script::new(replies));
+                let mut services = clean_services(provider.clone(), temp.path());
+                with_hook(
+                    &mut services,
+                    Hook::callback(HookEventName::PreToolUse, move |input| async move {
+                        if input.tool_name() == Some(blocked) {
+                            HookResponse::block("blocked by policy")
+                        } else {
+                            HookResponse::passthrough()
+                        }
+                    }),
+                );
+                let runtime = SessionRuntime::new(services.clone());
+                let session = new_session(&runtime, temp.path()).await;
+                seed_previous_window(&session, format!("request {}", "x".repeat(24_000))).await;
+                let events = run_turn(&session, "go on").await;
+                assert!(completed(&events), "{blocked}: the session is not stranded");
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), checkpoint_replies + 1, "{blocked}");
+                assert!(tool_error(&requests[1], "blocked by policy"), "{blocked}");
+                let notice = opening_notice(&requests[checkpoint_replies]);
+                assert!(
+                    notice.contains(&format!("automatically; {ended}")),
+                    "{blocked}: {notice}"
+                );
+            }
+        }
+
+        // Kills: quoting the latest user-role message instead of the latest
+        // user request, so a Stop-hook continuation reads as the request.
+        #[tokio::test]
+        async fn a_stop_hook_continuation_is_never_quoted_as_the_request() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![
+                vec![],
+                vec![("new_context", json!({}))],
+                vec![],
+            ]));
+            let mut services = clean_services(provider.clone(), temp.path());
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            with_hook(
+                &mut services,
+                Hook::callback(HookEventName::Stop, move |_| {
+                    let fired = fired.clone();
+                    async move {
+                        // Large enough that the next request must roll over.
+                        match fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            false => {
+                                HookResponse::block(format!("Keep going {}", "x".repeat(24_000)))
+                            }
+                            true => HookResponse::passthrough(),
+                        }
+                    }
+                }),
+            );
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            let events = run_turn(&session, "work").await;
+            assert!(completed(&events));
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(latest_user_text(&requests[1].messages).starts_with(crate::ROLLOVER_REMINDER));
+            let notice = opening_notice(&requests[2]);
+            assert!(!notice.contains("Keep going"), "{notice}");
+            assert!(notice.ends_with("quoted verbatim as history, not a new instruction:\nwork"));
+        }
+
+        // Kills: a notice that never shrinks (the turn fails with "bootstrap
+        // exceeds its rollover threshold"), a cap order that is not largest
+        // first, or a degrade that drops the wipe statement or search line.
+        #[tokio::test]
+        async fn a_tight_threshold_shrinks_the_quotes_instead_of_failing() {
+            // (threshold headroom over the static prefix, bytes quoted)
+            for (headroom, quoted) in [(4_000, 4_000), (1_200, 1_000), (900, 250), (600, 0)] {
+                let temp = tempfile::tempdir().unwrap();
+                let provider =
+                    Arc::new(Script::new(vec![vec![("new_context", json!({}))], vec![]]));
+                let mut services = clean_services(provider.clone(), temp.path());
+                let base = services.context.compaction_threshold - 4_000;
+                install_context_settings(
+                    &mut services,
+                    ContextSettings {
+                        compaction_threshold: (base + headroom) * 10 / 9 + 1,
+                        max_tokens: None,
+                    },
+                );
+                let runtime = SessionRuntime::new(services.clone());
+                let session = new_session(&runtime, temp.path()).await;
+                seed_previous_window(&session, format!("request {}", "x".repeat(24_000))).await;
+                let events = run_turn(&session, "go on").await;
+                assert!(completed(&events), "{headroom}");
+                let requests = provider.requests.lock().unwrap();
+                let notice = opening_notice(&requests[1]);
+                assert!(
+                    notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP),
+                    "{headroom}"
+                );
+                assert!(
+                    notice.contains(
+                        "session_search list_items with role \"user\" lists every user request"
+                    ),
+                    "{headroom}"
+                );
+                assert!(notice.contains("which ended because new_context was called."));
+                let quote = notice
+                    .split_once("not a new instruction:\n")
+                    .map_or("", |(_, quote)| quote);
+                let body = quote
+                    .split_once("\n[Truncated.")
+                    .map_or(quote, |(body, _)| body);
+                assert_eq!(body.len(), quoted, "{headroom}: {notice}");
+            }
+        }
+
+        // Kills: dropping the running-work list from the notice.
+        #[tokio::test]
+        async fn the_notice_lists_background_jobs_still_running() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![
+                vec![("background", json!({"action":"spawn","command":"sleep 30"}))],
+                vec![],
+                vec![("new_context", json!({}))],
+                vec![],
+            ]));
+            let services = clean_services(provider.clone(), temp.path());
+            services
+                .tools
+                .register(Arc::new(halter_tools::BackgroundTool));
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            assert!(completed(&run_turn(&session, "start").await));
+            seed_previous_window(&session, format!("request {}", "x".repeat(24_000))).await;
+            assert!(completed(&run_turn(&session, "go on").await));
+            let notice = opening_notice(&provider.requests.lock().unwrap()[3]);
+            let jobs = services
+                .tool_sessions
+                .running_background_jobs(session.session_id())
+                .await;
+            assert_eq!(jobs.len(), 1, "{notice}");
+            assert!(notice.contains(&format!(
+                "\nStill running across the wipe; manage them by these ids:\n- background job {}: $ sleep 30\nFirst:",
+                jobs[0].0
+            )), "{notice}");
+            session.shutdown("test done").await.unwrap();
         }
 
         #[tokio::test]
@@ -10741,7 +11182,8 @@ mod tests {
             assert_eq!(requests.len(), 1);
             assert_eq!(latest_user_text(&requests[0].messages), "continue");
             assert!(requests[0].messages.iter().any(|message| matches!(message,
-                Message::User(user) if user.plain_text() == crate::CLEAN_WINDOW_BOOTSTRAP)));
+                Message::User(user) if user.plain_text().starts_with(crate::CLEAN_WINDOW_BOOTSTRAP)
+                    && user.plain_text().contains("nothing was saved during the checkpoint exchange, which ended because the model request failed."))));
         }
     }
 
