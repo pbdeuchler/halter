@@ -298,7 +298,8 @@ propagates to the caller, who asked for compaction explicitly.
 When there is nothing to compact the call still returns `Ok(())` and logs
 `ContextCompacted { summary: "No compaction needed.", effects: None }`, a
 marker that changes no state. `PostCompact` does not fire and the
-`SessionStart` hooks are not re-armed. `PreCompact` fires only if the
+`SessionStart` hooks are not re-armed. A rewrite, manual or automatic, arms
+them with source `compact` for the next turn. `PreCompact` fires only if the
 strategy's `needs_compaction` could not rule the pass out up front.
 
 With `ProviderDefault` installed by hand on a provider that cannot compact
@@ -409,7 +410,10 @@ Each delivered reminder is logged as `CompactionNotified { id }` followed by
 its `MessageItem`, so the delivered set replays from the log.
 When a pass returns `Err` or `Ok(None)` after appending, the runtime records a
 `ContextRestored` event that puts the window back; the pass's messages, tool
-runs, and usage stay in the log and the session totals. Before any hook, the
+runs, and usage stay in the log and the session totals. An error whose chain
+holds a `ProviderCompactionRejected` was billed: the runtime first logs its
+text and usage as a `MessageRecorded` assistant reply, so that usage reaches
+the session totals and, for an automatic pass, the turn's usage. Before any hook, the
 runtime asks `needs_compaction(state, capabilities, trigger)` (default
 `true`); `false` skips the pass without `PreCompact`, `PostCompact`, or a
 state change, which is how `ModelSummary` skips an empty session and
@@ -417,7 +421,9 @@ state change, which is how `ModelSummary` skips an empty session and
 an existing prefix still runs). A strategy that
 can only tell by doing the work returns `Ok(None)` from `compact`: `PreCompact`
 has fired, `PostCompact` does not, and an automatic pass backs off as after
-a failure. Install one with `HalterBuilder::with_compaction`.
+a failure. So does a rewrite that leaves the context still at or over the
+threshold, with a `Warning`, so the turn does not pay for the same rewrite at
+every boundary. Install one with `HalterBuilder::with_compaction`.
 
 `ModelSummary` runs up to two inferences: when the `task` tool is registered,
 a nudge to persist remaining work (only that reply's `task` calls run; its text
@@ -425,7 +431,12 @@ and other calls never reach the next request, though the event log keeps the
 whole reply), then the built-in checkpoint instructions
 (`default_compaction_prompt`, plus a manual pass's custom instructions). The
 reply becomes the next window as one user-role message after the static
-prefix, with a todo reminder when the nudge ran calls. `ProviderDefault`
+prefix, with a todo reminder when the nudge ran calls. The same message
+carries the user's first request and, when it differs, the latest one,
+verbatim up to 4,000 bytes each (`CARRIED_REQUEST_MAX_BYTES`), as separate
+text parts; the first is copied from the previous checkpoint, so it stays
+byte-identical across compactions. A reply that stopped
+early (`max_tokens`, a refusal, a pause) or has no text fails the pass. `ProviderDefault`
 hands `Provider::compact` the window its
 `ProviderCapabilities::compaction_strategy` allows: everything before the
 latest assistant block for a dedicated endpoint; for an inline request,
