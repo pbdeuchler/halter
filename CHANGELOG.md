@@ -8,6 +8,16 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Added
+
+- `halter_protocol::ProviderCompactionRejected { reason, text, usage }`: the
+  error a compaction returns for a response it was billed for but cannot
+  apply. The Anthropic and OpenRouter adapters return it for a refused,
+  truncated or incomplete summary, and `ProviderDefault` for an empty one;
+  `ResilientProvider` passes it through unretried. Additive. For embedders:
+  return it from a custom `Provider::compact` or `CompactionStrategy` that
+  rejects a paid-for response, and the runtime counts its usage.
+
 ### Changed
 
 - **Breaking:** the `shell` tool no longer runs commands in an embedded brush
@@ -96,6 +106,15 @@ once a `1.0.0` line is cut.
   `end_turn` or `stop_sequence` (refusal, `max_tokens`, missing), and
   OpenRouter compaction rejects a `status` other than `completed`. Before, a
   truncated or refused summary replaced the session history.
+- Usage billed by a rejected compaction response now reaches the session's
+  `usage_so_far` and, for an automatic pass, the turn's `TurnCompleted`
+  usage. The runtime logs the rejected reply as a `MessageRecorded`
+  assistant message carrying its usage (no new event kind; the window is
+  restored as before, so the model never sees it). Before, the tokens of a
+  refused or truncated summary, and of an empty `ProviderDefault` response,
+  were lost. `ModelSummary`'s checkpoint inference already counted its
+  usage; a stream that fails mid-reply still loses its partial usage, as any
+  turn does.
 - OpenRouter compaction sends its instructions as the last user input instead
   of top-level `instructions`. Behind a transcript that ended on the
   assistant, models continued the conversation and that reply became the

@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use halter_protocol::{
-    CompactedContext, CompactionResult, Message, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionStrategy, SessionState,
+    CompactedContext, CompactionResult, Message, ProviderCapabilities, ProviderCompactionRejected,
+    ProviderCompactionRequest, ProviderCompactionStrategy, SessionState,
 };
 
 use crate::compaction_strategy::{
@@ -86,10 +86,16 @@ impl CompactionStrategy for ProviderDefault {
             )
             .await?;
         if response.output.is_empty() {
-            anyhow::bail!(
-                "failed to compact session: provider '{}' returned no compacted context",
-                ctx.model().provider
-            );
+            // Billed all the same: the runtime counts a rejection's usage.
+            return Err(ProviderCompactionRejected {
+                reason: format!(
+                    "failed to compact session: provider '{}' returned no compacted context",
+                    ctx.model().provider
+                ),
+                text: String::new(),
+                usage: response.usage,
+            }
+            .into());
         }
         let summary = format!(
             "Compacted {compacted_count} older messages into {} provider-native items; kept {} verbatim.",

@@ -9,8 +9,8 @@ use async_openai::types::responses::{
 };
 use halter_protocol::{
     ApiKind, AssistantPart, BlockId, Message, MessageId, OpenRouterRouting,
-    ProviderCompactionRequest, ProviderCompactionResponse, ProviderRequest, ReasoningEffort,
-    StopReason, StreamEvent, Usage, UserPart,
+    ProviderCompactionRejected, ProviderCompactionRequest, ProviderCompactionResponse,
+    ProviderRequest, ReasoningEffort, StopReason, StreamEvent, Usage, UserPart,
 };
 use serde_json::{Map, Value, json};
 use tracing::warn;
@@ -234,7 +234,19 @@ pub(crate) fn decode_openrouter_compact_response(
             .and_then(Value::as_str)
             .map(|reason| format!(" ({reason})"))
             .unwrap_or_default();
-        anyhow::bail!("failed to decode openrouter compaction response: status {status}{reason}");
+        let text = response
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|output| openrouter_compaction_output_text(output))
+            .unwrap_or_default();
+        return Err(ProviderCompactionRejected {
+            reason: format!(
+                "failed to decode openrouter compaction response: status {status}{reason}"
+            ),
+            text,
+            usage: decode_openai_usage(response),
+        }
+        .into());
     }
     let output = response
         .get("output")
@@ -2235,7 +2247,7 @@ mod tests {
                     "type": "message",
                     "content": [{"type": "output_text", "text": "## User Intent\n-"}],
                 }],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "usage": {"input_tokens": 7, "output_tokens": 3},
             });
             response
                 .as_object_mut()
@@ -2243,8 +2255,18 @@ mod tests {
                 .extend(status.as_object().expect("object").clone());
             match (decode_openrouter_compact_response(&response), expected) {
                 (Ok(decoded), Ok(items)) => assert_eq!(decoded.output.len(), items, "{case}"),
+                // A rejection still carries what was billed and said.
                 (Err(error), Err(fragment)) => {
-                    assert!(error.to_string().contains(fragment), "{case}: {error}");
+                    let rejected = error
+                        .downcast_ref::<ProviderCompactionRejected>()
+                        .unwrap_or_else(|| panic!("{case}: untyped {error}"));
+                    assert!(rejected.reason.contains(fragment), "{case}: {error}");
+                    assert_eq!(rejected.text, "## User Intent\n-", "{case}");
+                    assert_eq!(
+                        (rejected.usage.input_tokens, rejected.usage.output_tokens),
+                        (7, 3),
+                        "{case}"
+                    );
                 }
                 (got, want) => panic!("{case}: got {got:?}, want {want:?}"),
             }

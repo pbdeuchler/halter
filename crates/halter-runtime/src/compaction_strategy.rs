@@ -456,7 +456,10 @@ pub trait CompactionStrategy: Send + Sync {
     /// puts the transcript window back to what it was before the pass, so
     /// the model never sees a half-finished exchange; the exchange itself,
     /// its tool runs, and its usage stay in the event log and the session
-    /// totals as they happened.
+    /// totals as they happened. An `Err` whose chain holds a
+    /// [`ProviderCompactionRejected`](halter_protocol::ProviderCompactionRejected)
+    /// is a response that was billed but not applied: the runtime logs its
+    /// text and usage as a recorded assistant reply, so the usage counts.
     async fn compact(
         &self,
         ctx: CompactionContext<'_>,

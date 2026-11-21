@@ -409,7 +409,10 @@ Each delivered reminder is logged as `CompactionNotified { id }` followed by
 its `MessageItem`, so the delivered set replays from the log.
 When a pass returns `Err` or `Ok(None)` after appending, the runtime records a
 `ContextRestored` event that puts the window back; the pass's messages, tool
-runs, and usage stay in the log and the session totals. Before any hook, the
+runs, and usage stay in the log and the session totals. An error whose chain
+holds a `ProviderCompactionRejected` was billed: the runtime first logs its
+text and usage as a `MessageRecorded` assistant reply, so that usage reaches
+the session totals and, for an automatic pass, the turn's usage. Before any hook, the
 runtime asks `needs_compaction(state, capabilities, trigger)` (default
 `true`); `false` skips the pass without `PreCompact`, `PostCompact`, or a
 state change, which is how `ModelSummary` skips an empty session and

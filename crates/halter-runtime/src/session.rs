@@ -14,11 +14,11 @@ use halter_protocol::{
     AgentId, AssembledPrompt, AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash,
     ContextPlan, Delivery, HookSessionStartSource, HookWarning, Message, MessageId, ModelId,
     ObservedState, PendingEvent, PendingToolCall, PromptSegment, PromptSegmentId,
-    PromptSegmentKind, ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, ResourceSnapshot,
-    SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
-    StreamEvent, SubagentEventForwarding, SubagentRecord, SubagentState, SubagentStatus,
-    SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn,
-    TurnId, Usage, Volatility,
+    PromptSegmentKind, ProviderCompactionRejected, ProviderError, ProviderRequest, ReplayMeta,
+    ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload,
+    SessionId, SessionState, StopReason, StreamEvent, SubagentEventForwarding, SubagentRecord,
+    SubagentState, SubagentStatus, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome,
+    ToolResult, ToolResultMessage, Turn, TurnId, Usage, Volatility,
 };
 use halter_providers::{ModelRegistry, Provider};
 
@@ -2583,6 +2583,38 @@ impl SessionExecutor {
             ))
             .await;
         turn_usage.saturating_accumulate(&inference_usage);
+        // A rejected response was billed: log it as the reply it was, so
+        // the fold counts its usage like any other. One that cost and said
+        // nothing leaves the log alone.
+        if let Some(rejected) = result
+            .as_ref()
+            .err()
+            .and_then(|error| {
+                error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<ProviderCompactionRejected>())
+            })
+            .filter(|rejected| rejected.usage != Usage::default() || !rejected.text.is_empty())
+        {
+            let payload = SessionEventPayload::MessageRecorded {
+                message: Message::Assistant(AssistantMessage {
+                    id: MessageId::new(),
+                    created_at: Utc::now(),
+                    parts: (!rejected.text.is_empty())
+                        .then(|| AssistantPart::Text {
+                            text: rejected.text.clone(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    stop_reason: None,
+                    usage: Some(rejected.usage.clone()),
+                    replay_meta: Default::default(),
+                }),
+            };
+            halter_protocol::fold::apply_event(state, &payload);
+            self.push_event(events, payload);
+            turn_usage.saturating_accumulate(&rejected.usage);
+        }
         let reason = match &result {
             Ok(Some(_)) => return result,
             Ok(None) => "nothing to compact".to_owned(),
@@ -9178,6 +9210,102 @@ mod tests {
             &folded,
             &stored.state
         ));
+    }
+
+    /// A compaction response the provider billed but the strategy could not
+    /// apply still counts, automatic or manual: the log records it as an
+    /// assistant reply carrying its usage, and the session totals and the
+    /// turn's `TurnCompleted` include it. Kills dropping the rejection arm in
+    /// `compact_via_strategy` (usage and the reply vanish), dropping its
+    /// `turn_usage` accumulate (the automatic `TurnCompleted` is short), and
+    /// reverting `ProviderDefault`'s empty-output error to an untyped bail.
+    #[tokio::test]
+    async fn rejected_compaction_usage_reaches_session_and_turn_totals() {
+        let billed = Usage {
+            input_tokens: 40,
+            output_tokens: 2,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 4,
+        };
+        let one_reply = Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            ..Usage::default()
+        };
+        let mut total = billed.clone();
+        total.saturating_accumulate(&one_reply);
+        // (case, manual)
+        for (case, manual) in [("automatic", false), ("manual", true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let provider = Arc::new(NativeCompactionProvider::new(
+                halter_protocol::ProviderCompactionStrategy::Dedicated,
+                Vec::new(),
+                billed.clone(),
+            ));
+            let mut services = configured_services(provider.clone(), temp.path());
+            install_compaction(&mut services, Arc::new(crate::ProviderDefault));
+            let context_settings = model_summary_settings(&services);
+            install_context_settings(&mut services, context_settings);
+            let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+            // Only the automatic case crosses the threshold.
+            let prompt = if manual {
+                "hi".to_owned()
+            } else {
+                "x".repeat(6_000)
+            };
+
+            let events = session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+            if manual {
+                let error = session
+                    .compact("manual", None)
+                    .await
+                    .expect_err("a rejected manual pass fails");
+                assert!(
+                    error.to_string().contains("returned no compacted context"),
+                    "{case}: {error:#}"
+                );
+            }
+
+            assert_eq!(provider.compactions(), 1, "{case}");
+            let turn_usage = if manual { &one_reply } else { &total };
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::TurnCompleted { usage, .. } if usage == turn_usage
+                )),
+                "{case}"
+            );
+            let replay = session.replay().await.expect("replay");
+            assert!(
+                replay.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::MessageRecorded {
+                        message: Message::Assistant(AssistantMessage { usage: Some(usage), .. }),
+                    } if usage == &billed
+                )),
+                "{case}"
+            );
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("exists");
+            assert_eq!(stored.state.usage_so_far, total, "{case}");
+            // The rejected reply is logged, never shown to the model.
+            assert_eq!(stored.state.messages.len(), 2, "{case}");
+            let folded = halter_protocol::fold::fold_events(SessionState::default(), &replay);
+            assert!(
+                halter_protocol::fold::covered_state_matches(&folded, &stored.state),
+                "{case}"
+            );
+        }
     }
 
     /// A manual pass on an empty session succeeds whatever the strategy
