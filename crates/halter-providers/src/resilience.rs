@@ -26,6 +26,58 @@ use crate::retry::{RetryGate, RetryPolicy};
 /// consumer exerts backpressure instead of accumulating a whole stream.
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+tokio::task_local! {
+    /// Present while a [`request_timer`] runs; `true` while the attempt is
+    /// waiting for client-side admission ([`outside_request_timer`]).
+    static ADMISSION_WAIT: tokio::sync::watch::Sender<bool>;
+}
+
+/// Runs `wait` without charging it to the enclosing [`request_timer`]: the
+/// timer pauses while `wait` runs and restarts with its full limit when
+/// `wait` ends (by completion, error, or drop). Transports wrap their
+/// rate-limit admission in this so a client-side queue cannot exhaust the
+/// attempt's request budget before the request is sent. Outside a request
+/// timer it is a plain await. `wait` must observe cancellation itself.
+pub(crate) async fn outside_request_timer<F: Future>(wait: F) -> F::Output {
+    struct Resume(Option<tokio::sync::watch::Sender<bool>>);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            if let Some(admission) = &self.0 {
+                admission.send_replace(false);
+            }
+        }
+    }
+    let resume = Resume(ADMISSION_WAIT.try_with(Clone::clone).ok());
+    if let Some(admission) = &resume.0 {
+        admission.send_replace(true);
+    }
+    wait.await
+}
+
+/// `tokio::time::timeout` whose clock excludes [`outside_request_timer`]
+/// waits inside `attempt`: it fires only after `limit` elapses with no
+/// admission wait in progress, counted from the end of the last one.
+/// Returns `None` on expiry.
+pub(crate) async fn request_timer<F: Future>(limit: Duration, attempt: F) -> Option<F::Output> {
+    let (admission, mut waiting) = tokio::sync::watch::channel(false);
+    let attempt = ADMISSION_WAIT.scope(admission, attempt);
+    tokio::pin!(attempt);
+    let mut deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let paused = *waiting.borrow_and_update();
+        select! {
+            biased;
+            output = &mut attempt => return Some(output),
+            Ok(()) = waiting.changed() => {
+                if !*waiting.borrow() {
+                    deadline = tokio::time::Instant::now() + limit;
+                }
+            }
+            () = tokio::time::sleep_until(deadline), if !paused => return None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderTimeouts {
     pub connect: Duration,
@@ -180,14 +232,14 @@ where
                         send_cancelled(&mut tx).await;
                         return;
                     }
-                    setup = tokio::time::timeout(
+                    setup = request_timer(
                         policy.timeouts.request,
                         inner.stream(request.clone(), attempt_cancel.clone()),
                     ) => setup,
                 };
                 let mut attempt_stream = match setup {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(error)) => {
+                    Some(Ok(stream)) => stream,
+                    Some(Err(error)) => {
                         // Recover the typed classification when the provider
                         // attached one (deterministic setup failures are
                         // Fatal); only untyped errors default to Transient.
@@ -209,11 +261,11 @@ where
                         }
                         continue;
                     }
-                    Err(_) => {
+                    None => {
                         let error = provider_timeout_error(
                             format!(
-                                "failed to execute provider request: request timed out after {}s",
-                                policy.timeouts.request.as_secs()
+                                "failed to execute provider request: request timed out after {:?}",
+                                policy.timeouts.request
                             ),
                             None,
                         );
@@ -254,8 +306,8 @@ where
                         Err(_) => {
                             let error = provider_timeout_error(
                                 format!(
-                                    "failed to execute provider request: stream idle timeout after {}s",
-                                    policy.timeouts.stream_idle.as_secs()
+                                    "failed to execute provider request: stream idle timeout after {:?}",
+                                    policy.timeouts.stream_idle
                                 ),
                                 None,
                             );
@@ -443,22 +495,22 @@ impl<P: Provider + 'static> ResilientProvider<P> {
             let attempt = select! {
                 biased;
                 _ = cancel.cancelled() => return Err(anyhow::Error::new(ProviderError::cancelled())),
-                attempt = tokio::time::timeout(
+                attempt = request_timer(
                     self.policy.timeouts.request,
                     self.inner.compact(request.clone(), cancel.child_token()),
                 ) => attempt,
             };
             let error = match attempt {
-                Ok(Ok(response)) => return Ok(response),
+                Some(Ok(response)) => return Ok(response),
                 // Untyped errors default to Fatal here (unlike stream setup):
                 // the trait's own compact fallback rejects unsupported
                 // compaction with an untyped error, which must not be
                 // retry-looped. Built-in transports attach typed errors.
-                Ok(Err(error)) => self.classifier.classify(compact_provider_error(error)),
-                Err(_) => provider_timeout_error(
+                Some(Err(error)) => self.classifier.classify(compact_provider_error(error)),
+                None => provider_timeout_error(
                     format!(
-                        "failed to compact session: request timed out after {}s",
-                        self.policy.timeouts.request.as_secs()
+                        "failed to compact session: request timed out after {:?}",
+                        self.policy.timeouts.request
                     ),
                     None,
                 ),
@@ -1778,6 +1830,99 @@ mod tests {
                 }
             }
             assert_eq!(attempts.load(Ordering::SeqCst), 2, "{stage:?}");
+        }
+    }
+
+    /// Waits `admission` inside [`outside_request_timer`], then `work` on the
+    /// request clock, then succeeds.
+    #[derive(Debug)]
+    struct AdmissionProvider {
+        admission: Duration,
+        work: Duration,
+    }
+
+    impl AdmissionProvider {
+        async fn admit_then_work(&self) {
+            outside_request_timer(tokio::time::sleep(self.admission)).await;
+            tokio::time::sleep(self.work).await;
+        }
+    }
+
+    #[async_trait]
+    impl Provider for AdmissionProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            self.admit_then_work().await;
+            Ok(stream::iter(success_events("msg_admitted", "ok")).boxed())
+        }
+
+        async fn compact(
+            &self,
+            _request: ProviderCompactionRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<ProviderCompactionResponse> {
+            self.admit_then_work().await;
+            Ok(compaction_response())
+        }
+    }
+
+    /// Finding D: a client-side admission wait (OpenAI rate-limit permit)
+    /// used to run on the attempt's request clock, so a cooldown longer than
+    /// `request` timed every attempt out before it was sent. The clock now
+    /// starts when admission ends, and still bounds the work after it.
+    /// Mutations killed: dropping `if !paused` (row 1 times out) and not
+    /// resetting `deadline` when admission ends (row 1 times out: 150ms of
+    /// admission already exceeds the original 60ms deadline); removing the
+    /// timer entirely (row 2 hangs past its 2s guard).
+    #[tokio::test]
+    async fn request_clock_starts_after_admission_wait() {
+        let timeouts = ProviderTimeouts {
+            request: Duration::from_millis(60),
+            ..test_policy(1).timeouts
+        };
+        let policy = ResiliencePolicy {
+            timeouts,
+            ..test_policy(1)
+        };
+        for (admission_ms, work_ms, succeeds) in [(150, 0, true), (150, 5_000, false)] {
+            let provider = || AdmissionProvider {
+                admission: Duration::from_millis(admission_ms),
+                work: Duration::from_millis(work_ms),
+            };
+            let guard = Duration::from_secs(2);
+            let streamed = tokio::time::timeout(
+                guard,
+                collect_items(
+                    ResilientProvider::new("test", provider(), policy),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("request timer must still bound post-admission work");
+            assert_eq!(
+                streamed.iter().all(Result::is_ok),
+                succeeds,
+                "stream admission={admission_ms}ms work={work_ms}ms: {streamed:?}"
+            );
+            let compacted = tokio::time::timeout(
+                guard,
+                ResilientProvider::new("test", provider(), policy)
+                    .compact(sample_compaction_request(), CancellationToken::new()),
+            )
+            .await
+            .expect("request timer must still bound post-admission work");
+            assert_eq!(
+                compacted.is_ok(),
+                succeeds,
+                "compact admission={admission_ms}ms work={work_ms}ms: {compacted:?}"
+            );
         }
     }
 

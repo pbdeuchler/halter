@@ -330,22 +330,27 @@ impl ResponsesTransport {
         request_meta: ResponsesTransportRequest,
         cancel: CancellationToken,
     ) -> Result<Response, TransportError> {
-        let mut permit = self
-            .rate_limit_permit(&request_meta, cancel.child_token())
-            .await
-            .map_err(|error| {
-                if cancel.is_cancelled() {
-                    return TransportError::Cancelled;
-                }
-                TransportError::Fatal {
-                    source: OpenAIError::ApiError(ApiError {
-                        message: format!("failed to acquire rate-limit permit: {error}"),
-                        r#type: None,
-                        param: None,
-                        code: None,
-                    }),
-                }
-            })?;
+        // Admission is client-side queueing, not request latency: it pauses
+        // the resilience layer's per-attempt request timer, so a long
+        // Retry-After cooldown cannot time the attempt out before it is
+        // sent. The wait still ends on `cancel`.
+        let mut permit = crate::resilience::outside_request_timer(
+            self.rate_limit_permit(&request_meta, cancel.child_token()),
+        )
+        .await
+        .map_err(|error| {
+            if cancel.is_cancelled() {
+                return TransportError::Cancelled;
+            }
+            TransportError::Fatal {
+                source: OpenAIError::ApiError(ApiError {
+                    message: format!("failed to acquire rate-limit permit: {error}"),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                }),
+            }
+        })?;
         let body_bytes = serde_json::to_vec(&request).map_err(|error| TransportError::Fatal {
             source: OpenAIError::ApiError(ApiError {
                 message: format!(
@@ -1097,6 +1102,51 @@ mod tests {
 
         assert!(
             error
+                .downcast_ref::<ProviderError>()
+                .is_some_and(ProviderError::is_cancelled),
+            "{error:#}"
+        );
+    }
+
+    /// Finding D at the transport: the rate-limit cooldown (120ms) outlasts
+    /// the request timer (30ms), yet the attempt reaches the network (the
+    /// refused connection is the observable) instead of timing out in the
+    /// queue. Mutation killed: dropping `outside_request_timer` around
+    /// `rate_limit_permit` in `send_json_request` (the timer then fires).
+    #[tokio::test]
+    async fn rate_limit_wait_is_not_charged_to_the_request_timer() {
+        let transport = ResponsesTransport::try_new("test-key", "http://127.0.0.1:9", &[])
+            .expect("responses transport");
+        transport.openai_rate_limiter.apply_retry_after(
+            "gpt-5",
+            Some(500_000),
+            Duration::from_millis(120),
+        );
+        let request_meta = ResponsesTransportRequest {
+            provider_label: "openai",
+            model: "gpt-5".to_owned(),
+            reservation: OpenAiReservation {
+                requests: 1,
+                tokens: 1,
+            },
+            rate_limit_strategy: Some(ResponsesRateLimitStrategy::OpenAiHeaders),
+            tokens_per_minute: Some(500_000),
+        };
+
+        let outcome = crate::resilience::request_timer(
+            Duration::from_millis(30),
+            transport.responses_json(
+                json!({"model": "gpt-5", "input": []}),
+                request_meta,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("admission wait must not run on the request clock");
+
+        let error = outcome.expect_err("nothing listens on port 9");
+        assert!(
+            !error
                 .downcast_ref::<ProviderError>()
                 .is_some_and(ProviderError::is_cancelled),
             "{error:#}"

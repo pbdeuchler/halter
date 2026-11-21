@@ -82,6 +82,13 @@ once a `1.0.0` line is cut.
   less than `timeouts.request_secs`, globally and in each provider's effective
   config, with an error naming both keys. Such a connect timeout could never
   fire.
+- The OpenAI rate-limit wait (an open cooldown or a full request or token
+  window) no longer counts against `request_secs`. It ran inside the attempt's
+  request timer, so a Retry-After cooldown longer than `request_secs` timed out
+  every attempt before it was sent. The timer now starts when the permit is
+  granted. The wait still ends on cancellation.
+- Provider timeout messages print the configured duration (`50ms`, `1.5s`)
+  instead of whole seconds, which read "after 0s" for sub-second timeouts.
 
 ## [0.10.0] - 2026-11-14
 
