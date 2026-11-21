@@ -138,6 +138,13 @@ impl HarnessConfig {
         if self.policy.max_read_bytes == 0 {
             anyhow::bail!("invalid configuration: max_read_bytes must be greater than zero");
         }
+        // Zero is not "no limit" for either: the shell default became a 1s
+        // timeout, and a zero ceiling rejects every model timeout.
+        validate_positive_u64("policy.shell.timeout_secs", self.policy.shell.timeout_secs)?;
+        validate_positive_u64(
+            "policy.max_tool_timeout_secs",
+            self.policy.max_tool_timeout_secs,
+        )?;
 
         // Threshold derivation needs the default model's window. A config
         // that sets neither is still a valid partial config here; it is
@@ -2415,6 +2422,42 @@ stream_idle_secs = 0
                 error.to_string().contains(want),
                 "{name}: unexpected error: {error}"
             );
+        }
+    }
+
+    // Kills: dropping either `validate_positive_u64` call in `validate`.
+    #[test]
+    fn policy_timeouts_must_be_positive() {
+        let config = |policy: &str| {
+            format!(
+                "version = 1\n\n{policy}\n\n[models.default]\nprovider = \"openai\"\nmodel = \"gpt-5\"\n\n[providers.openai]\napi_key = \"test-key\"\n"
+            )
+        };
+        let cases = [
+            (
+                "shell zero",
+                "[policy.shell]\ntimeout_secs = 0",
+                Some("policy.shell.timeout_secs must be greater than zero"),
+            ),
+            (
+                "ceiling zero",
+                "[policy]\nmax_tool_timeout_secs = 0",
+                Some("policy.max_tool_timeout_secs must be greater than zero"),
+            ),
+            ("shell one", "[policy.shell]\ntimeout_secs = 1", None),
+            ("ceiling one", "[policy]\nmax_tool_timeout_secs = 1", None),
+        ];
+
+        for (name, policy, want) in cases {
+            let parsed: HarnessConfig = toml::from_str(&config(policy)).expect("parse config");
+            match (parsed.validate(), want) {
+                (Ok(()), None) => {}
+                (Err(error), Some(want)) => assert!(
+                    error.to_string().contains(want),
+                    "{name}: unexpected error: {error}"
+                ),
+                (outcome, want) => panic!("{name}: got {outcome:?}, wanted {want:?}"),
+            }
         }
     }
 

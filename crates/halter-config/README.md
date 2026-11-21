@@ -548,6 +548,8 @@ Defaults:
 - `max_tool_timeout_secs = 3600` — the longest `timeout_ms` a model may pass
   to `shell`, `pty`, `wait_agent` or `close_agent`. A larger value is
   rejected with the maximum named, so the model retries with a smaller one
+- `policy.shell.timeout_secs` and `max_tool_timeout_secs` must be greater
+  than zero
 - shell enabled by default
 - `[policy.shell]` takes only `enabled` and `timeout_secs`. The `allow` and
   `mode` keys were removed with the shell allowlist and are rejected as

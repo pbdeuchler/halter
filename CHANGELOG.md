@@ -156,6 +156,16 @@ once a `1.0.0` line is cut.
   effectively unbounded. **Breaking:** `PolicySettings` and `PolicyConfig`
   struct literals must set the new field; a model call above one hour that
   used to run is now rejected.
+- Zero timeouts that meant something other than what they said are refused.
+  Config validation rejects `policy.shell.timeout_secs = 0` (it silently ran
+  every command with a 1s timeout) and `policy.max_tool_timeout_secs = 0`
+  (it rejected every model timeout). A hook `timeout = 0` (or `timeout_sec`)
+  now loads with a `zero_timeout` warning and the handler's default timeout:
+  hooks fail open, so a zero timeout made a blocking hook allow everything.
+  **Breaking:** configs with either policy zero no longer load. The zeros
+  that remain, `wait_agent`/`close_agent` `timeout_ms: 0` and a
+  `Some(Duration::ZERO)` interrupt or shutdown deadline, mean "poll" or
+  "force now" and are documented in [docs/timeouts.md](docs/timeouts.md).
 - Provider timeout messages print the configured duration (`50ms`, `1.5s`)
   instead of whole seconds, which read "after 0s" for sub-second timeouts.
 
