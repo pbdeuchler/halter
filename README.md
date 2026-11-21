@@ -1371,7 +1371,9 @@ when the operation ends. All spans except
 
 `aborted` means the operation ended without reporting a result: its task was
 aborted (for example by shutdown or `close_agent`), its future was dropped, or
-it panicked. Runtime spans always close with an `outcome`.
+it panicked. Runtime spans always close with an `outcome`. A `tool_call` whose
+tool panics closes `error`, because the runtime answers the call with the panic
+message.
 
 `tool_call` and `provider_request` nest under `turn`. `provider_request` comes
 from `ResilientProvider`, which wraps every built-in provider. Custom `Provider`

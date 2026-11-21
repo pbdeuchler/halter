@@ -53,7 +53,9 @@ pub enum PolicyError {
     #[error("read size {bytes} exceeds max_read_bytes {max}")]
     ReadTooLarge { bytes: usize, max: usize },
 
-    #[error("io error resolving '{}': {source}", path.display())]
+    // The cause is `source()`, not Display, so a chain printed with `{:#}`
+    // names it once.
+    #[error("io error resolving '{}'", path.display())]
     Io {
         path: PathBuf,
         #[source]
@@ -64,5 +66,20 @@ pub enum PolicyError {
 impl PolicyError {
     pub(crate) fn io(path: PathBuf, source: std::io::Error) -> Self {
         Self::Io { path, source }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_errors_name_their_cause_once() {
+        let error = anyhow::Error::new(PolicyError::io(
+            PathBuf::from("/p"),
+            std::io::Error::other("gone"),
+        ));
+        assert_eq!(format!("{error}"), "io error resolving '/p'");
+        assert_eq!(format!("{error:#}"), "io error resolving '/p': gone");
     }
 }

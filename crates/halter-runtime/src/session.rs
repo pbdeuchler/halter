@@ -964,7 +964,7 @@ impl SessionExecutor {
                     error!(
                         session_id = %session.session_id,
                         turn_id = %turn.id,
-                        error = %error,
+                        error = %format_args!("{error:#}"),
                         retryable,
                         cancelled,
                         "turn failed"
@@ -972,7 +972,7 @@ impl SessionExecutor {
                     let failure_events =
                         vec![session.make_event(SessionEventPayload::TurnFailed {
                             turn_id: turn.id.clone(),
-                            error: error.to_string(),
+                            error: format!("{error:#}"),
                             cancelled,
                             retryable,
                         })];
@@ -2138,14 +2138,35 @@ impl SessionExecutor {
                     SessionEventPayload::ToolExecutionStarted { call: call.clone() },
                 );
 
-                if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
-                    outcome.record("blocked");
+                let rejection = match (pre_dispatch.merged.block_reason.clone(), &call.arguments) {
+                    (Some(reason), _) => {
+                        outcome.record("blocked");
+                        span.in_scope(|| {
+                            info!("tool call blocked by hook");
+                            // Hook-authored text; kept below info.
+                            debug!(reason = %reason, "tool call block reason");
+                        });
+                        Some(reason)
+                    }
+                    // Materialization keeps arguments that are not JSON as
+                    // text; the tool never sees them.
+                    (None, serde_json::Value::String(raw)) => {
+                        serde_json::from_str::<serde_json::Value>(raw)
+                            .err()
+                            .map(|error| {
+                                outcome.record("error");
+                                span.in_scope(|| {
+                                    info!(%error, "tool call arguments are not valid JSON");
+                                });
+                                format!(
+                                    "invalid tool input: the arguments are not valid JSON ({error}), so the tool did not run; send the call again with its arguments as one JSON object. Received: {raw}"
+                                )
+                            })
+                    }
+                    (None, _) => None,
+                };
+                if let Some(reason) = rejection {
                     span.record("is_error", true);
-                    span.in_scope(|| {
-                        info!("tool call blocked by hook");
-                        // Hook-authored text; kept below info.
-                        debug!(reason = %reason, "tool call block reason");
-                    });
                     let id = MessageId::new();
                     let output = &self.services.tool_output;
                     let error =
@@ -2232,14 +2253,29 @@ impl SessionExecutor {
                     let args = p.call.arguments.clone();
                     let name = p.call.name.0.clone();
                     async move {
-                        if name == crate::SKILL_TOOL_NAME {
-                            return crate::skills::load_skill(&context.snapshot, &args)
-                                .map(|(result, message)| (result, Some(message)));
-                        }
-                        tools
-                            .execute(&name, context, args)
+                        let run = async {
+                            if name == crate::SKILL_TOOL_NAME {
+                                return crate::skills::load_skill(&context.snapshot, &args)
+                                    .map(|(result, message)| (result, Some(message)));
+                            }
+                            tools
+                                .execute(&name, context, args)
+                                .await
+                                .map(|result| (result, None))
+                        };
+                        // A panicking tool fails its call, not the turn.
+                        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run))
                             .await
-                            .map(|result| (result, None))
+                            .unwrap_or_else(|panic| {
+                                let message = panic
+                                    .downcast_ref::<&str>()
+                                    .copied()
+                                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                    .unwrap_or("no message");
+                                Err(anyhow::anyhow!(
+                                    "tool '{name}' panicked: {message}; it may have partially completed"
+                                ))
+                            })
                     }
                     .instrument(p.span.clone())
                 }))
@@ -2289,11 +2325,16 @@ impl SessionExecutor {
                                 session_id = %self.session_id,
                                 tool_call_id = %call.id,
                                 tool_name = %call.name,
-                                error = %error,
+                                error = %format_args!("{error:#}"),
                                 "tool call failed"
                             );
                         });
-                        (ToolResult::Empty, Some(ToolError::new(error.to_string())))
+                        // `{:#}` keeps the context chain, so a wrapped cause
+                        // reaches the model too.
+                        (
+                            ToolResult::Empty,
+                            Some(ToolError::new(format!("{error:#}"))),
+                        )
                     }
                 };
                 if error.is_none() {
@@ -3398,30 +3439,10 @@ async fn materialize_assistant_message_with_cancel(
                 let pending = tool_call_blocks.remove(&id).with_context(|| {
                     format!("failed to materialize tool call: missing block '{}'", id)
                 })?;
-                let arguments = match parse_tool_call_arguments(&pending.arguments) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(
-                            provider = %model.provider,
-                            model = %model.model,
-                            tool_call_id = %pending.tool_call_id,
-                            block_id = %id,
-                            raw_arguments_len = pending.arguments.len(),
-                            %error,
-                            "tool call arguments failed to parse; substituting empty object"
-                        );
-                        tracing::trace!(
-                            tool_call_id = %pending.tool_call_id,
-                            raw_arguments = %pending.arguments,
-                            "unparseable tool call arguments"
-                        );
-                        serde_json::json!({})
-                    }
-                };
                 parts.push(AssistantPart::ToolCall(ToolCall {
+                    arguments: parse_tool_call_arguments(model, &pending),
                     id: pending.tool_call_id,
                     name: pending.name,
-                    arguments,
                 }));
             }
             Ok(StreamEvent::UsageUpdate { usage: updated }) => {
@@ -3475,32 +3496,12 @@ async fn materialize_assistant_message_with_cancel(
     // every output item). Treat each pending block as if a `ToolCallEnd`
     // had been received and push it as a synthetic `ToolCall` part using
     // the arguments we did accumulate. If those arguments fail to parse
-    // (e.g. truncated mid-JSON), substitute `{}` so the tool runtime can
-    // surface a tool-side error to the model rather than dropping the
-    // entire turn. Previously this branch bailed with
-    // "unterminated tool call block", which terminated the whole session
-    // even though a single bad streaming event need not be fatal.
+    // (e.g. truncated mid-JSON), the tool path answers the call with an
+    // error the model can act on rather than dropping the entire turn.
+    // Previously this branch bailed with "unterminated tool call block",
+    // which terminated the whole session even though a single bad
+    // streaming event need not be fatal.
     for (block_id, pending) in std::mem::take(&mut tool_call_blocks) {
-        let arguments = match parse_tool_call_arguments(&pending.arguments) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    provider = %model.provider,
-                    model = %model.model,
-                    tool_call_id = %pending.tool_call_id,
-                    block_id = %block_id,
-                    raw_arguments_len = pending.arguments.len(),
-                    %error,
-                    "stream ended with unterminated tool call whose arguments failed to parse; substituting empty object"
-                );
-                tracing::trace!(
-                    tool_call_id = %pending.tool_call_id,
-                    raw_arguments = %pending.arguments,
-                    "unparseable tool call arguments"
-                );
-                serde_json::json!({})
-            }
-        };
         warn!(
             provider = %model.provider,
             model = %model.model,
@@ -3510,9 +3511,9 @@ async fn materialize_assistant_message_with_cancel(
             "stream ended without ToolCallEnd; auto-closing tool call block"
         );
         parts.push(AssistantPart::ToolCall(ToolCall {
+            arguments: parse_tool_call_arguments(model, &pending),
             id: pending.tool_call_id,
             name: pending.name,
-            arguments,
         }));
     }
     debug!(
@@ -3560,13 +3561,27 @@ fn flush_text_buffer(parts: &mut Vec<AssistantPart>, text_buffer: &mut String) {
     });
 }
 
-fn parse_tool_call_arguments(arguments: &str) -> anyhow::Result<serde_json::Value> {
-    if arguments.trim().is_empty() {
-        return Ok(serde_json::json!({}));
+/// The arguments of a finished tool call block. Empty arguments read as `{}`.
+/// Text that is not JSON is kept as a JSON string of what was received, which
+/// the tool path answers with an error instead of running the tool.
+fn parse_tool_call_arguments(
+    model: &halter_protocol::ResolvedModel,
+    pending: &PendingToolCallBlock,
+) -> serde_json::Value {
+    if pending.arguments.trim().is_empty() {
+        return serde_json::json!({});
     }
-
-    serde_json::from_str(arguments)
-        .with_context(|| "failed to materialize tool call: invalid json arguments")
+    serde_json::from_str(&pending.arguments).unwrap_or_else(|error| {
+        warn!(
+            provider = %model.provider,
+            model = %model.model,
+            tool_call_id = %pending.tool_call_id,
+            raw_arguments_len = pending.arguments.len(),
+            %error,
+            "tool call arguments are not valid JSON; the call will be answered with an error"
+        );
+        serde_json::Value::String(pending.arguments.clone())
+    })
 }
 
 fn append_provider_stream_chunk(
@@ -5936,9 +5951,9 @@ mod tests {
     }
 
     /// Same recovery path but the accumulated arguments are not valid JSON
-    /// (truncated mid-string). The synthetic tool call carries `{}` so the
-    /// tool runtime can produce a structured error rather than the whole
-    /// turn aborting.
+    /// (truncated mid-string). The synthetic tool call keeps the text, so the
+    /// tool path can answer it with an error rather than the whole turn
+    /// aborting.
     #[tokio::test]
     async fn materialize_handles_unterminated_tool_call_with_invalid_json() {
         let model = ResolvedModel {
@@ -5992,7 +6007,10 @@ mod tests {
             .collect();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, tool_call_id);
-        assert_eq!(tool_calls[0].arguments, serde_json::json!({}));
+        assert_eq!(
+            tool_calls[0].arguments,
+            serde_json::Value::String(r#"{"path":"x.txt","content":"hel"#.to_owned())
+        );
     }
 
     #[tokio::test]
@@ -6041,7 +6059,10 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, tool_call_id);
         assert_eq!(tool_calls[0].name.0, "write");
-        assert_eq!(tool_calls[0].arguments, serde_json::json!({}));
+        assert_eq!(
+            tool_calls[0].arguments,
+            serde_json::Value::String(r#"{"path":"x.txt","content":"hel"#.to_owned())
+        );
     }
 
     /// Provider metadata is a passthrough: it reaches the consumer event

@@ -580,6 +580,9 @@ pub struct ThinkingBlock {
 pub struct ToolCall {
     pub id: ToolCallId,
     pub name: ToolName,
+    /// The model's arguments. Arguments that were not valid JSON are kept as
+    /// a JSON string of the text received; the runtime answers such a call
+    /// with an error and does not run the tool.
     pub arguments: Value,
 }
 
@@ -1335,12 +1338,14 @@ impl ToolResult {
 
 impl ToolResultMessage {
     /// The text a provider sends to the model for this message: the result,
-    /// with the error appended when both are present.
+    /// with the error appended when both are present. A failed call's text
+    /// always carries an `error` marker, for dialects with no error flag on a
+    /// tool result; a successful result is the result's text alone.
     #[must_use]
     pub fn to_model_string(&self) -> Cow<'_, str> {
         match (&self.content, &self.error) {
             (content, None) => content.to_model_string(),
-            (ToolResult::Empty, Some(error)) => error.message.as_str().into(),
+            (ToolResult::Empty, Some(error)) => format!("error: {}", error.message).into(),
             // Written out so the key order does not follow serde_json's
             // `preserve_order` feature.
             (ToolResult::Json { value }, Some(error)) => {
@@ -2840,7 +2845,7 @@ mod tests {
             (message(text(), None), "say \"hi\"\n"),
             (message(json(), None), r#"{"out":"a\nb"}"#),
             (message(rendered(), None), "a\nb"),
-            (message(ToolResult::Empty, Some("boom")), "boom"),
+            (message(ToolResult::Empty, Some("boom")), "error: boom"),
             (message(text(), Some("boom")), "say \"hi\"\n\n\nerror: boom"),
             (
                 message(json(), Some("boom")),
