@@ -129,6 +129,13 @@ impl Provider for ModelJudgeProvider {
         self.default.provider.capabilities()
     }
 
+    /// The default member's policy. Every panelist and synthesis call is a
+    /// separate provider request, so this is a per-request floor, not a bound
+    /// on the whole panel.
+    fn resilience_policy(&self) -> Option<crate::ResiliencePolicy> {
+        self.default.provider.resilience_policy()
+    }
+
     async fn stream(
         &self,
         request: ProviderRequest,
@@ -231,6 +238,10 @@ impl ModelJudgeProvider {
             }
         });
 
+        // No panel-level deadline: each panelist ends on its own provider's
+        // resilience timers (request, stream-idle, retry deadline), on
+        // `cancel`, or on success, so the panel takes as long as its slowest
+        // panelist. See docs/timeouts.md.
         let mut results = futures::future::join_all(futures).await;
         results.sort_by_key(|(index, _)| *index);
 

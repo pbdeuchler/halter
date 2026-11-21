@@ -207,6 +207,10 @@ impl Provider for OpenAiProvider {
         self.inner.capabilities()
     }
 
+    fn resilience_policy(&self) -> Option<crate::ResiliencePolicy> {
+        self.inner.resilience_policy()
+    }
+
     async fn stream(
         &self,
         request: ProviderRequest,
@@ -378,6 +382,7 @@ mod tests {
                 connect: Duration::from_secs(1),
                 request: Duration::from_millis(20),
                 stream_idle: Duration::from_millis(250),
+                compact: Duration::from_millis(250),
             },
             request_retry: RetryPolicy {
                 max_attempts: 1,

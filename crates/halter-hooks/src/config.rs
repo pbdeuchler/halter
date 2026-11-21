@@ -124,6 +124,10 @@ impl HookMatcherGroup {
 /// Parsed hook handler with common metadata and backend config.
 pub struct HookHandler {
     pub handler_type: HookHandlerType,
+    /// Deadline for one run of the handler. For prompt and agent handlers the
+    /// runtime raises it to the model provider's recovery window
+    /// (`ResiliencePolicy::recovery_window`), so the hook cannot time out
+    /// before the provider's own timers and one retry have run.
     pub timeout: Duration,
     pub status_message: Option<String>,
     pub if_condition: Option<String>,
@@ -143,10 +147,20 @@ impl HookHandler {
             ));
         }
 
-        let timeout_secs = raw
-            .timeout
-            .or(raw.timeout_sec)
-            .unwrap_or_else(|| default_timeout_secs(raw.handler_type));
+        // A zero timeout would time out every run, and hooks fail open, so
+        // the hook would silently never decide anything: use the default.
+        let timeout_secs = match raw.timeout.or(raw.timeout_sec) {
+            Some(0) => {
+                warnings.push(HooksLoadWarning::new(
+                    "zero_timeout",
+                    "ignoring hook timeout 0, which would time out every run; using the default"
+                        .to_owned(),
+                ));
+                None
+            }
+            secs => secs,
+        }
+        .unwrap_or_else(|| default_timeout_secs(raw.handler_type));
 
         match raw.handler_type {
             RawHookHandlerType::Command => {
@@ -635,6 +649,38 @@ mod tests {
                 .iter()
                 .all(|warning| warning.message.contains("sdk-only hook backend"))
         );
+    }
+
+    // Kills: passing `Some(0)` through instead of falling back to the default.
+    #[test]
+    fn zero_hook_timeout_warns_and_uses_the_default() {
+        let cases = [
+            ("timeout zero", r#""timeout": 0"#, Some(0), true),
+            ("timeoutSec zero", r#""timeoutSec": 0"#, Some(0), true),
+            ("explicit", r#""timeout": 5"#, Some(5), false),
+            ("absent", r#""timeout": null"#, None, false),
+        ];
+
+        for (name, field, configured, warns) in cases {
+            let json = format!(
+                r#"{{"hooks": {{"Stop": [{{"hooks": [{{"type": "command", "command": "true", {field}}}]}}]}}}}"#
+            );
+            let (parsed, warnings) =
+                HooksFile::from_json_bytes(json.as_bytes()).expect("parse hooks");
+            let hook = &parsed.hooks[&HookEventName::Stop][0].hooks[0];
+            let want = match configured {
+                Some(secs) if secs > 0 => Duration::from_secs(secs),
+                _ => Duration::from_secs(default_timeout_secs(RawHookHandlerType::Command)),
+            };
+            assert_eq!(hook.timeout, want, "{name}");
+            assert_eq!(
+                warnings
+                    .iter()
+                    .any(|w| w.message.contains("hook timeout 0")),
+                warns,
+                "{name}: {warnings:?}"
+            );
+        }
     }
 
     #[test]

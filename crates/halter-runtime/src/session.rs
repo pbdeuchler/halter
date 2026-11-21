@@ -1032,14 +1032,35 @@ impl SessionExecutor {
         self.services.sessions.replay(&self.session_id).await
     }
 
-    /// Shut down this session and run session-end hooks.
-    pub(crate) async fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
-        self.leased(self.run_shutdown(reason)).await
+    /// Shut down this session and run session-end hooks. `cancel` is the
+    /// forced-cleanup signal: it ends a wait for a held session lease and
+    /// cancels running SessionEnd hooks, which are recorded as cancelled while
+    /// shutdown still commits. With a token that never fires, the hooks'
+    /// own timeouts bound them.
+    pub(crate) async fn shutdown(
+        &self,
+        reason: &str,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        // A free lease wins over an already-fired cancel, so a forced
+        // shutdown still commits; only a wait on a held lease is cut short.
+        let lease = tokio::select! {
+            biased;
+            lease = self.acquire_lease() => lease,
+            () = cancel.cancelled() => return Err(ProviderError::cancelled().into()),
+        };
+        let outcome = self.run_shutdown(reason, cancel).await;
+        lease.release().await?;
+        outcome
     }
 
     /// Force an uncooperative executor down, then close its checkpoint under
     /// the session lease. Waiting for the actual task prevents late tool or
     /// provider commits from racing transcript repair.
+    /// Commit attempts `force_interrupt_turn` makes before returning the last
+    /// `SessionCommitConflict`.
+    const FORCE_INTERRUPT_ATTEMPTS: u64 = 8;
+
     pub(crate) async fn force_interrupt_turn(&self, turn_id: &TurnId) -> anyhow::Result<()> {
         self.services.turn_registry.abort_and_wait(turn_id).await;
         if let Some(inbox) = &self.inbox {
@@ -1047,7 +1068,9 @@ impl SessionExecutor {
         }
         self.services.sessions.synchronize(&self.session_id).await?;
         self.leased(async {
+            let mut attempt = 0;
             loop {
+                attempt += 1;
                 let Some(stored) = self
                     .services
                     .sessions
@@ -1068,13 +1091,17 @@ impl SessionExecutor {
                     cancelled: true,
                     retryable: false,
                 });
+                // A conflict means another writer moved the head; reload and
+                // retry, but a bounded number of times so a store that keeps
+                // conflicting cannot hold forced recovery (and the lease) open.
                 match self.commit_turn_failure(vec![failure], None).await {
                     Err(error)
-                        if error
-                            .downcast_ref::<halter_session::SessionCommitConflict>()
-                            .is_some() =>
+                        if attempt < Self::FORCE_INTERRUPT_ATTEMPTS
+                            && error
+                                .downcast_ref::<halter_session::SessionCommitConflict>()
+                                .is_some() =>
                     {
-                        continue;
+                        tokio::time::sleep(std::time::Duration::from_millis(10 * attempt)).await;
                     }
                     outcome => return outcome,
                 }
@@ -1083,7 +1110,11 @@ impl SessionExecutor {
         .await
     }
 
-    async fn run_shutdown(&self, reason: &str) -> anyhow::Result<()> {
+    async fn run_shutdown(
+        &self,
+        reason: &str,
+        hook_cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
         let mut stored = self
             .services
             .sessions
@@ -1101,9 +1132,8 @@ impl SessionExecutor {
         let mut events = Vec::new();
         let turn_id = TurnId::new();
         // SessionEnd hooks run after runtime shutdown has cancelled every
-        // runtime token, so they get one that never fires; their configured
-        // timeouts bound them.
-        let hook_cancel = CancellationToken::new();
+        // runtime token, so they get the caller's forced-cleanup token
+        // instead of a runtime one.
         let hook_ctx = HookInvocationContext {
             turn_id: &turn_id,
             model: &stored.blueprint.default_model,
@@ -4923,7 +4953,11 @@ mod tests {
                 } else {
                     session.interrupt(Some(Duration::from_millis(25))).await
                 };
-                assert!(matches!(result, Err(crate::SessionError::TimedOut)));
+                // Finding 3: forced recovery settles inside the caller's
+                // grace, so the bounded call reports it instead of a
+                // `TimedOut` raced against the driver's own deadline.
+                // Mutation killed: `caller_deadline` returning `deadline`.
+                assert!(result.is_ok(), "close={close}: {result:?}");
                 tokio::time::timeout(Duration::from_secs(5), token.cancelled())
                     .await
                     .unwrap();
@@ -5419,10 +5453,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!services.tool_sessions.has_process_state(session.id()));
-            assert!(matches!(
-                session.shutdown(Some(Duration::ZERO)).await,
-                Err(crate::SessionError::TimedOut)
-            ));
+            // The forced deadline cancels the paused SessionEnd hook, so
+            // cleanup settles inside the caller's grace.
+            session.shutdown(Some(Duration::ZERO)).await.unwrap();
             let retry_handle = session.clone();
             let retry = tokio::spawn(async move { retry_handle.shutdown(None).await });
             assert!(matches!(
@@ -12702,7 +12735,7 @@ mod tests {
         // while an out-of-turn hook dispatch queues and returns at once.
         let waiting_shutdown = tokio::spawn({
             let session = session.clone();
-            async move { session.shutdown("test").await }
+            async move { session.shutdown("test", CancellationToken::new()).await }
         });
         session
             .notify("info", "queued")
@@ -12762,6 +12795,58 @@ mod tests {
             order.is_sorted(),
             "turn, then queued dispatch, then shutdown: {order:?}"
         );
+    }
+
+    /// Finding 2: forced shutdown and the session lease. A free lease is
+    /// taken even when the cancel has already fired, so shutdown still
+    /// commits `SessionShutdownComplete`; a lease held by a running turn is
+    /// waited on only until the cancel. Mutations killed: putting the cancel
+    /// arm first in `shutdown`'s biased select (row "free" returns cancelled
+    /// without committing); dropping the cancel arm (row "held" hangs past
+    /// the 5s guard).
+    #[tokio::test]
+    async fn forced_shutdown_takes_a_free_lease_and_abandons_a_held_one() {
+        for (name, held) in [("free", false), ("held", true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let started = Arc::new(Notify::new());
+            let services = test_support::configured_services(
+                Arc::new(CancellableBlockingProvider {
+                    started: started.clone(),
+                }),
+                temp.path(),
+            );
+            let runtime = SessionRuntime::new(services);
+            let session = test_support::new_session(&runtime, temp.path()).await;
+            let turn_cancel = CancellationToken::new();
+            let _turn = if held {
+                let turn = session
+                    .submit_turn_with_cancel(Turn::user("blocking"), turn_cancel.clone())
+                    .await
+                    .expect("turn");
+                started.notified().await;
+                Some(turn)
+            } else {
+                None
+            };
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), session.shutdown("test", cancel))
+                    .await
+                    .expect("forced shutdown returns");
+
+            let committed =
+                session.replay().await.expect("replay").iter().any(|event| {
+                    matches!(event.payload, SessionEventPayload::SessionShutdownComplete)
+                });
+            assert_eq!(
+                (result.is_ok(), committed),
+                (!held, !held),
+                "{name}: {result:?}"
+            );
+            turn_cancel.cancel();
+        }
     }
 
     #[tokio::test]
@@ -12914,6 +12999,137 @@ mod tests {
             .expect("load")
             .expect("session");
         assert_eq!(stored.state.open_turn, None, "failed turn is closed");
+    }
+
+    /// Store whose first `conflicts` commits carrying `TurnFailed` fail with
+    /// `SessionCommitConflict`, counting every such attempt.
+    #[derive(Default)]
+    struct ConflictingFailureStore {
+        inner: halter_session::InMemorySessionStore,
+        conflicts: usize,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SessionStore for ConflictingFailureStore {
+        async fn create_session(&self, session: StoredSession) -> anyhow::Result<()> {
+            self.inner.create_session(session).await
+        }
+        async fn load_session(&self, id: &SessionId) -> anyhow::Result<Option<StoredSession>> {
+            self.inner.load_session(id).await
+        }
+        async fn commit(
+            &self,
+            id: &SessionId,
+            snapshot: Option<Arc<ResourceSnapshot>>,
+            expected: Option<u64>,
+            state: Option<SessionState>,
+            events: Vec<PendingEvent>,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
+            if events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnFailed { .. }))
+                && self
+                    .attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    < self.conflicts
+            {
+                return Err(halter_session::SessionCommitConflict {
+                    session_id: id.clone(),
+                    expected_head_sequence: expected.unwrap_or_default(),
+                    actual_head_sequence: expected.unwrap_or_default() + 1,
+                }
+                .into());
+            }
+            self.inner
+                .commit(id, snapshot, expected, state, events)
+                .await
+        }
+        async fn replay(&self, id: &SessionId) -> anyhow::Result<Vec<SessionEvent>> {
+            self.inner.replay(id).await
+        }
+        async fn replay_after(
+            &self,
+            id: &SessionId,
+            after: u64,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
+            self.inner.replay_after(id, after).await
+        }
+        async fn list_sessions(&self) -> anyhow::Result<Vec<SessionBlueprint>> {
+            self.inner.list_sessions().await
+        }
+    }
+
+    /// Finding 5: `force_interrupt_turn` retried `SessionCommitConflict`
+    /// without a cap, so a store that kept conflicting held forced recovery
+    /// and the session lease forever. Rows: conflicts that clear inside the
+    /// budget still close the turn; a store that always conflicts returns
+    /// the conflict after exactly `FORCE_INTERRUPT_ATTEMPTS` commits.
+    /// Mutation killed: dropping the `attempt < FORCE_INTERRUPT_ATTEMPTS`
+    /// guard (the second row never returns).
+    #[tokio::test]
+    async fn forced_interrupt_retries_conflicts_a_bounded_number_of_times() {
+        let cap = SessionExecutor::FORCE_INTERRUPT_ATTEMPTS as usize;
+        for (name, conflicts, closes, attempts) in [
+            ("conflicts clear", 2, true, 3),
+            ("always conflicting", usize::MAX, false, cap),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let store = Arc::new(ConflictingFailureStore {
+                conflicts,
+                ..ConflictingFailureStore::default()
+            });
+            let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+            Arc::get_mut(&mut services).expect("unique").sessions = store.clone();
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            let turn_id = TurnId::new();
+            let mut stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("session");
+            stored.state.open_turn = Some(turn_id.clone());
+            services
+                .sessions
+                .commit(
+                    session.session_id(),
+                    None,
+                    Some(stored.head_sequence),
+                    Some(stored.state),
+                    vec![session.make_event(SessionEventPayload::TurnStarted {
+                        turn_id: turn_id.clone(),
+                        default_model: None,
+                        subagent_model: None,
+                    })],
+                )
+                .await
+                .expect("open turn");
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                session.force_interrupt_turn(&turn_id),
+            )
+            .await
+            .expect("forced interrupt returns");
+
+            match (result, closes) {
+                (Ok(()), true) => {}
+                (Err(error), false) => assert!(
+                    error
+                        .downcast_ref::<halter_session::SessionCommitConflict>()
+                        .is_some(),
+                    "{name}: {error:#}"
+                ),
+                (other, _) => panic!("{name}: unexpected {other:?}"),
+            }
+            assert_eq!(
+                store.attempts.load(std::sync::atomic::Ordering::SeqCst),
+                attempts,
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -158,6 +158,8 @@ Defaults:
 - `process_tree_root = None` (Phase 2 threads the live session's root)
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
+- `max_tool_timeout_secs = 3600` (the longest `timeout_ms` a model may pass to
+  `shell`, `pty`, `wait_agent` or `close_agent`; larger values are rejected)
 
 When the high-level `halter` builder constructs policy from `PolicyConfig`, it
 also adds configured `allowed_write_roots` to the runtime read roots. This lets
@@ -681,10 +683,12 @@ Typical input:
 ```
 
 Use it to clean up control surfaces once delegated work is done.
-Omit `timeout_ms` to wait for cancellation and cleanup without a deadline. Set
-it to bound the caller's wait, for example `{ "target": "agent-uuid",
-"timeout_ms": 1000 }`. On expiry the operation returns a timeout error and
-requests forced cleanup. Storage writes or already-running blocking work may
+Omit `timeout_ms` to wait for cancellation and cleanup without a deadline;
+cancelling the tool call still ends that wait. Set it to bound the caller's
+wait, for example `{ "target": "agent-uuid", "timeout_ms": 1000 }`. At the
+deadline cleanup is forced, and the call waits up to
+`halter_runtime::FORCED_RECOVERY_GRACE` (5s) more for it to settle before
+returning a timeout error. Storage writes or already-running blocking work may
 delay final settlement; closing continues after the caller stops waiting.
 
 ---

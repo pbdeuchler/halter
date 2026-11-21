@@ -26,11 +26,75 @@ use crate::retry::{RetryGate, RetryPolicy};
 /// consumer exerts backpressure instead of accumulating a whole stream.
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+tokio::task_local! {
+    /// Present while a [`request_timer`] runs; `true` while the attempt is
+    /// waiting for client-side admission ([`outside_request_timer`]).
+    static ADMISSION_WAIT: tokio::sync::watch::Sender<bool>;
+}
+
+/// Runs `wait` without charging it to the enclosing [`request_timer`]: the
+/// timer pauses while `wait` runs and restarts with its full limit when
+/// `wait` ends (by completion, error, or drop). Transports wrap their
+/// rate-limit admission in this so a client-side queue cannot exhaust the
+/// attempt's request budget before the request is sent. Outside a request
+/// timer it is a plain await. `wait` must observe cancellation itself.
+pub(crate) async fn outside_request_timer<F: Future>(wait: F) -> F::Output {
+    struct Resume(Option<tokio::sync::watch::Sender<bool>>);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            if let Some(admission) = &self.0 {
+                admission.send_replace(false);
+            }
+        }
+    }
+    let resume = Resume(ADMISSION_WAIT.try_with(Clone::clone).ok());
+    if let Some(admission) = &resume.0 {
+        admission.send_replace(true);
+    }
+    wait.await
+}
+
+/// `tokio::time::timeout` whose clock excludes [`outside_request_timer`]
+/// waits inside `attempt`: it fires only after `limit` elapses with no
+/// admission wait in progress, counted from the end of the last one.
+/// Returns `None` on expiry.
+pub(crate) async fn request_timer<F: Future>(limit: Duration, attempt: F) -> Option<F::Output> {
+    let (admission, mut waiting) = tokio::sync::watch::channel(false);
+    let attempt = ADMISSION_WAIT.scope(admission, attempt);
+    tokio::pin!(attempt);
+    let mut deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let paused = *waiting.borrow_and_update();
+        select! {
+            biased;
+            output = &mut attempt => return Some(output),
+            Ok(()) = waiting.changed() => {
+                if !*waiting.borrow() {
+                    deadline = tokio::time::Instant::now() + limit;
+                }
+            }
+            () = tokio::time::sleep_until(deadline), if !paused => return None,
+        }
+    }
+}
+
+/// Per-attempt provider timers. Every one is inside the retry loop, so each
+/// bounds one attempt and none can exhaust the backoff budget
+/// ([`RetryPolicy::deadline`]). See `docs/timeouts.md` for how they nest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderTimeouts {
+    /// TCP/TLS connect, enforced by the HTTP client. Must be less than
+    /// `request` and `compact`, which enclose it.
     pub connect: Duration,
+    /// Stream setup: from the request being sent (after any client-side
+    /// rate-limit admission) to the response headers.
     pub request: Duration,
+    /// Longest gap between two stream events.
     pub stream_idle: Duration,
+    /// A whole unary compaction request, body included. Separate from
+    /// `request` because a compaction generates its entire summary before
+    /// responding, while `request` only covers a stream's time to headers.
+    pub compact: Duration,
 }
 
 impl Default for ProviderTimeouts {
@@ -39,6 +103,7 @@ impl Default for ProviderTimeouts {
             connect: Duration::from_secs(10),
             request: Duration::from_secs(60),
             stream_idle: Duration::from_secs(60),
+            compact: Duration::from_secs(300),
         }
     }
 }
@@ -47,6 +112,30 @@ impl Default for ProviderTimeouts {
 pub struct ResiliencePolicy {
     pub timeouts: ProviderTimeouts,
     pub request_retry: RetryPolicy,
+}
+
+impl ResiliencePolicy {
+    /// Shortest outer deadline that still lets one stalled streaming attempt
+    /// be detected by its own timer (`request` or `stream_idle`), back off
+    /// once, and run a second attempt of the same length:
+    /// `2 * max(request, stream_idle) + first backoff (with full jitter)`.
+    /// An outer timer shorter than this always fires before the provider can
+    /// recover from a stall, so the retry policy never runs. It is a floor
+    /// for one provider request; it does not include client-side rate-limit
+    /// admission, which ends only on a permit or cancellation.
+    #[must_use]
+    pub fn recovery_window(&self) -> Duration {
+        let attempt = self.timeouts.request.max(self.timeouts.stream_idle);
+        let retry = &self.request_retry;
+        let first_backoff = if retry.max_attempts > 1 {
+            (retry.base_backoff + retry.base_backoff * retry.jitter_pct / 100)
+                .min(retry.max_backoff)
+        } else {
+            Duration::ZERO
+        };
+        let attempts = if retry.max_attempts > 1 { 2 } else { 1 };
+        attempt * attempts + first_backoff
+    }
 }
 
 pub trait ProviderErrorClassifier: Send + Sync {
@@ -126,6 +215,10 @@ where
         self.inner.capabilities()
     }
 
+    fn resilience_policy(&self) -> Option<ResiliencePolicy> {
+        Some(self.policy)
+    }
+
     async fn stream(
         &self,
         request: ProviderRequest,
@@ -180,14 +273,14 @@ where
                         send_cancelled(&mut tx).await;
                         return;
                     }
-                    setup = tokio::time::timeout(
+                    setup = request_timer(
                         policy.timeouts.request,
                         inner.stream(request.clone(), attempt_cancel.clone()),
                     ) => setup,
                 };
                 let mut attempt_stream = match setup {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(error)) => {
+                    Some(Ok(stream)) => stream,
+                    Some(Err(error)) => {
                         // Recover the typed classification when the provider
                         // attached one (deterministic setup failures are
                         // Fatal); only untyped errors default to Transient.
@@ -209,11 +302,11 @@ where
                         }
                         continue;
                     }
-                    Err(_) => {
+                    None => {
                         let error = provider_timeout_error(
                             format!(
-                                "failed to execute provider request: request timed out after {}s",
-                                policy.timeouts.request.as_secs()
+                                "failed to execute provider request: request timed out after {:?}",
+                                policy.timeouts.request
                             ),
                             None,
                         );
@@ -254,8 +347,8 @@ where
                         Err(_) => {
                             let error = provider_timeout_error(
                                 format!(
-                                    "failed to execute provider request: stream idle timeout after {}s",
-                                    policy.timeouts.stream_idle.as_secs()
+                                    "failed to execute provider request: stream idle timeout after {:?}",
+                                    policy.timeouts.stream_idle
                                 ),
                                 None,
                             );
@@ -443,22 +536,22 @@ impl<P: Provider + 'static> ResilientProvider<P> {
             let attempt = select! {
                 biased;
                 _ = cancel.cancelled() => return Err(anyhow::Error::new(ProviderError::cancelled())),
-                attempt = tokio::time::timeout(
-                    self.policy.timeouts.request,
+                attempt = request_timer(
+                    self.policy.timeouts.compact,
                     self.inner.compact(request.clone(), cancel.child_token()),
                 ) => attempt,
             };
             let error = match attempt {
-                Ok(Ok(response)) => return Ok(response),
+                Some(Ok(response)) => return Ok(response),
                 // Untyped errors default to Fatal here (unlike stream setup):
                 // the trait's own compact fallback rejects unsupported
                 // compaction with an untyped error, which must not be
                 // retry-looped. Built-in transports attach typed errors.
-                Ok(Err(error)) => self.classifier.classify(compact_provider_error(error)),
-                Err(_) => provider_timeout_error(
+                Some(Err(error)) => self.classifier.classify(compact_provider_error(error)),
+                None => provider_timeout_error(
                     format!(
-                        "failed to compact session: request timed out after {}s",
-                        self.policy.timeouts.request.as_secs()
+                        "failed to compact session: request timed out after {:?}",
+                        self.policy.timeouts.compact
                     ),
                     None,
                 ),
@@ -1746,6 +1839,7 @@ mod tests {
                 connect: Duration::from_millis(10),
                 request: Duration::from_millis(30),
                 stream_idle: Duration::from_millis(30),
+                compact: Duration::from_millis(30),
             },
             request_retry: RetryPolicy {
                 max_attempts: 2,
@@ -1778,6 +1872,173 @@ mod tests {
                 }
             }
             assert_eq!(attempts.load(Ordering::SeqCst), 2, "{stage:?}");
+        }
+    }
+
+    /// Waits `admission` inside [`outside_request_timer`], then `work` on the
+    /// request clock, then succeeds.
+    #[derive(Debug)]
+    struct AdmissionProvider {
+        admission: Duration,
+        work: Duration,
+    }
+
+    impl AdmissionProvider {
+        async fn admit_then_work(&self) {
+            outside_request_timer(tokio::time::sleep(self.admission)).await;
+            tokio::time::sleep(self.work).await;
+        }
+    }
+
+    #[async_trait]
+    impl Provider for AdmissionProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            self.admit_then_work().await;
+            Ok(stream::iter(success_events("msg_admitted", "ok")).boxed())
+        }
+
+        async fn compact(
+            &self,
+            _request: ProviderCompactionRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<ProviderCompactionResponse> {
+            self.admit_then_work().await;
+            Ok(compaction_response())
+        }
+    }
+
+    /// Finding D: a client-side admission wait (OpenAI rate-limit permit)
+    /// used to run on the attempt's request clock, so a cooldown longer than
+    /// `request` timed every attempt out before it was sent. The clock now
+    /// starts when admission ends, and still bounds the work after it.
+    /// Mutations killed: dropping `if !paused` (row 1 times out) and not
+    /// resetting `deadline` when admission ends (row 1 times out: 150ms of
+    /// admission already exceeds the original 60ms deadline); removing the
+    /// timer entirely (row 2 hangs past its 2s guard).
+    #[tokio::test]
+    async fn request_clock_starts_after_admission_wait() {
+        let timeouts = ProviderTimeouts {
+            request: Duration::from_millis(60),
+            ..test_policy(1).timeouts
+        };
+        let policy = ResiliencePolicy {
+            timeouts,
+            ..test_policy(1)
+        };
+        for (admission_ms, work_ms, succeeds) in [(150, 0, true), (150, 5_000, false)] {
+            let provider = || AdmissionProvider {
+                admission: Duration::from_millis(admission_ms),
+                work: Duration::from_millis(work_ms),
+            };
+            let guard = Duration::from_secs(2);
+            let streamed = tokio::time::timeout(
+                guard,
+                collect_items(
+                    ResilientProvider::new("test", provider(), policy),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("request timer must still bound post-admission work");
+            assert_eq!(
+                streamed.iter().all(Result::is_ok),
+                succeeds,
+                "stream admission={admission_ms}ms work={work_ms}ms: {streamed:?}"
+            );
+            let compacted = tokio::time::timeout(
+                guard,
+                ResilientProvider::new("test", provider(), policy)
+                    .compact(sample_compaction_request(), CancellationToken::new()),
+            )
+            .await
+            .expect("request timer must still bound post-admission work");
+            assert_eq!(
+                compacted.is_ok(),
+                succeeds,
+                "compact admission={admission_ms}ms work={work_ms}ms: {compacted:?}"
+            );
+        }
+    }
+
+    /// Every public provider reports the policy of the `ResilientProvider` it
+    /// wraps, and a bare provider reports none. Mutation killed: any wrapper
+    /// dropping its `resilience_policy` delegation (its row reads `None`).
+    #[test]
+    fn public_providers_report_their_resilience_policy() {
+        let policy = test_policy(4);
+        let classifier: Arc<dyn ProviderErrorClassifier> = Arc::new(DefaultProviderErrorClassifier);
+        let providers: Vec<(&str, Arc<dyn Provider>, Option<ResiliencePolicy>)> = vec![
+            (
+                "anthropic",
+                Arc::new(
+                    crate::AnthropicProvider::new_with_headers_and_resilience(
+                        "key",
+                        "http://127.0.0.1:9",
+                        &[],
+                        None,
+                        policy,
+                        classifier,
+                    )
+                    .unwrap(),
+                ),
+                Some(policy),
+            ),
+            (
+                "openai",
+                Arc::new(
+                    crate::OpenAiProvider::new_with_headers("key", "http://127.0.0.1:9", &[], None)
+                        .unwrap(),
+                ),
+                Some(ResiliencePolicy::default()),
+            ),
+            (
+                "openrouter",
+                Arc::new(crate::OpenRouterProvider::new("key", "http://127.0.0.1:9").unwrap()),
+                Some(ResiliencePolicy::default()),
+            ),
+            ("fake", Arc::new(crate::FakeProvider::default()), None),
+        ];
+        for (name, provider, want) in providers {
+            assert_eq!(provider.resilience_policy(), want, "{name}");
+        }
+    }
+
+    /// Finding E: a unary compaction is bounded by `compact`, not `request`
+    /// (which only covers a stream's time to headers). Mutation killed:
+    /// timing `compact_with_retries` with `timeouts.request` (row 1 fails).
+    #[tokio::test]
+    async fn compaction_is_bounded_by_the_compact_timeout() {
+        let ms = Duration::from_millis;
+        for (request, compact, succeeds) in [(ms(20), ms(2_000), true), (ms(2_000), ms(20), false)]
+        {
+            let policy = ResiliencePolicy {
+                timeouts: ProviderTimeouts {
+                    request,
+                    compact,
+                    ..test_policy(1).timeouts
+                },
+                ..test_policy(1)
+            };
+            let provider = AdmissionProvider {
+                admission: Duration::ZERO,
+                work: ms(100),
+            };
+            let result = ResilientProvider::new("test", provider, policy)
+                .compact(sample_compaction_request(), CancellationToken::new())
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                succeeds,
+                "{request:?}/{compact:?}: {result:?}"
+            );
         }
     }
 
@@ -1905,6 +2166,7 @@ mod tests {
                 connect: Duration::from_secs(1),
                 request: Duration::from_secs(1),
                 stream_idle: Duration::from_secs(1),
+                compact: Duration::from_secs(1),
             },
             request_retry: RetryPolicy {
                 max_attempts,
@@ -1922,6 +2184,7 @@ mod tests {
                 connect: Duration::from_millis(20),
                 request: Duration::from_millis(20),
                 stream_idle: Duration::from_millis(20),
+                compact: Duration::from_millis(20),
             },
             request_retry: RetryPolicy {
                 max_attempts: 1,

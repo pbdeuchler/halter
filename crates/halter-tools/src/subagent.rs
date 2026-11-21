@@ -11,6 +11,7 @@ use halter_protocol::{
 };
 use serde_json::{Value, json};
 
+use crate::policy::check_tool_timeout;
 use crate::{
     SubagentControl, Tool, ToolContext, ToolOutput, ToolRuntime, ToolRuntimeEvent, TypedTool,
 };
@@ -292,6 +293,7 @@ impl TypedTool for WaitAgentTool {
         emit_started(&context, "wait_agent");
         let request: WaitSubagentRequest = serde_json::from_value(input)
             .context("failed to execute wait_agent tool: invalid input")?;
+        check_tool_timeout(context.policy.as_ref(), "wait_agent", request.timeout_ms)?;
         let response = self.control.wait(request, context.cancel.clone()).await?;
         emit_completed(&context, "wait_agent");
         Ok(response)
@@ -316,7 +318,7 @@ impl TypedTool for CloseAgentTool {
     fn describe(&self) -> ToolSpec {
         subagent_spec(
             "close_agent",
-            "Close an existing child session, stopping any in-progress work. Use this to cancel a running agent or clean up a finished one. Omit timeout_ms to wait for cleanup without a deadline; setting it bounds the wait and requests forced cleanup on timeout. The closed agent will no longer accept send_input calls.",
+            "Close an existing child session, stopping any in-progress work. Use this to cancel a running agent or clean up a finished one. Omit timeout_ms to wait for cleanup without a deadline (cancelling the call still ends the wait); setting it bounds the wait and requests forced cleanup on timeout. The closed agent will no longer accept send_input calls.",
             json!({
                 "type": "object",
                 "properties": {
@@ -330,10 +332,7 @@ impl TypedTool for CloseAgentTool {
                 "required": ["target"],
             }),
             ToolConcurrency::Exclusive,
-            ToolCapabilities {
-                long_running: true,
-                ..subagent_capabilities(false)
-            },
+            subagent_capabilities(true),
         )
     }
 
@@ -345,7 +344,16 @@ impl TypedTool for CloseAgentTool {
         emit_started(&context, "close_agent");
         let request: CloseSubagentRequest = serde_json::from_value(input)
             .context("failed to execute close_agent tool: invalid input")?;
-        let response = self.control.close(request).await?;
+        check_tool_timeout(context.policy.as_ref(), "close_agent", request.timeout_ms)?;
+        // Close is polled first so it is always requested; cancellation only
+        // abandons the wait, and cleanup carries on in the background.
+        let response = tokio::select! {
+            biased;
+            response = self.control.close(request) => response?,
+            () = context.cancel.cancelled() => {
+                anyhow::bail!("failed to execute close_agent tool: cancelled")
+            }
+        };
         emit_completed(&context, "close_agent");
         Ok(response)
     }
@@ -464,6 +472,8 @@ mod tests {
     struct RecordingSubagentControl {
         requests: Mutex<Vec<SpawnSubagentRequest>>,
         close_requests: Mutex<Vec<CloseSubagentRequest>>,
+        /// Record the close, then never finish it.
+        stall_close: bool,
     }
 
     #[async_trait]
@@ -524,6 +534,9 @@ mod tests {
                 .lock()
                 .expect("close requests")
                 .push(request);
+            if self.stall_close {
+                std::future::pending::<()>().await;
+            }
             Ok(CloseSubagentResponse { previous_status })
         }
     }
@@ -536,8 +549,8 @@ mod tests {
             (json!({ "target": "agent-1", "timeout_ms": 0 }), Some(0)),
             (json!({ "target": "agent-1", "timeout_ms": 25 }), Some(25)),
             (
-                json!({ "target": "agent-1", "timeout_ms": u64::MAX }),
-                Some(u64::MAX),
+                json!({ "target": "agent-1", "timeout_ms": 3_600_000 }),
+                Some(3_600_000),
             ),
         ] {
             let control = Arc::new(RecordingSubagentControl::default());
@@ -572,6 +585,80 @@ mod tests {
                 "integer"
             );
             assert_eq!(spec.input_schema["properties"]["timeout_ms"]["minimum"], 0);
+        }
+
+        // Past the policy ceiling (default 1h) the close is rejected, not sent.
+        let control = Arc::new(RecordingSubagentControl::default());
+        let context = ToolContext {
+            session_id: SessionId::new(),
+            working_dir: ".".into(),
+            path_locks: Arc::new(crate::PathLockMap::default()),
+            tool_sessions: Arc::new(crate::ToolSessionStore::default()),
+            snapshot: Arc::new(ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(NoopToolEventSink),
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default())),
+            shell_timeout_secs: 30,
+            subagent_parent: None,
+        };
+        let error = CloseAgentTool::new(control.clone())
+            .execute(
+                context,
+                json!({ "target": "agent-1", "timeout_ms": u64::MAX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the maximum"),
+            "{error:#}"
+        );
+        assert!(control.close_requests.lock().unwrap().is_empty());
+    }
+
+    /// Finding 6: an unbounded `close_agent` waited for cleanup with no way
+    /// out, so cancelling the parent turn could not end the call. Rows: a
+    /// close that settles returns its response; a close that never settles
+    /// under a cancelled call returns `cancelled`, and the close was still
+    /// requested. Mutations killed: dropping the cancel arm (row 2 hangs past
+    /// the 5s guard); polling the cancel first (row 2 records no request).
+    #[tokio::test]
+    async fn close_agent_stops_waiting_when_cancelled() {
+        for (name, stall, cancelled) in [("settles", false, false), ("stalls", true, true)] {
+            let control = Arc::new(RecordingSubagentControl {
+                stall_close: stall,
+                ..RecordingSubagentControl::default()
+            });
+            let cancel = CancellationToken::new();
+            if cancelled {
+                cancel.cancel();
+            }
+            let context = ToolContext {
+                session_id: SessionId::new(),
+                working_dir: ".".into(),
+                path_locks: Arc::new(crate::PathLockMap::default()),
+                tool_sessions: Arc::new(crate::ToolSessionStore::default()),
+                snapshot: Arc::new(ResourceSnapshot::empty()),
+                cancel,
+                emit: Arc::new(NoopToolEventSink),
+                policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default())),
+                shell_timeout_secs: 30,
+                subagent_parent: None,
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                CloseAgentTool::new(control.clone())
+                    .execute(context, json!({ "target": "agent-1" })),
+            )
+            .await
+            .expect("close_agent returns");
+            match (result, cancelled) {
+                (Ok(_), false) => {}
+                (Err(error), true) => {
+                    assert!(error.to_string().contains("cancelled"), "{name}: {error:#}")
+                }
+                (other, _) => panic!("{name}: unexpected {:?}", other.map(|_| ())),
+            }
+            assert_eq!(control.close_requests.lock().unwrap().len(), 1, "{name}");
         }
     }
 

@@ -834,6 +834,21 @@ async fn accumulate_response_body_bounded(
     Ok(body)
 }
 
+/// Deadline for a prompt or agent hook: its configured timeout, raised to the
+/// provider's [`halter_providers::ResiliencePolicy::recovery_window`]. Hooks
+/// fail open, so a hook deadline shorter than the provider's own timers would
+/// turn every provider stall into a silently dropped decision (a lost block)
+/// before the provider could detect the stall and retry. Providers that
+/// report no policy keep the configured timeout.
+fn model_hook_timeout(
+    configured: std::time::Duration,
+    policy: Option<halter_providers::ResiliencePolicy>,
+) -> std::time::Duration {
+    policy.map_or(configured, |policy| {
+        configured.max(policy.recovery_window())
+    })
+}
+
 async fn run_prompt(
     sess: &SessionExecutor,
     timeout_limit: std::time::Duration,
@@ -843,6 +858,7 @@ async fn run_prompt(
 ) -> anyhow::Result<HandlerExecution> {
     let model = resolve_prompt_model(sess, config.model.as_deref())?;
     let provider = sess.services().models.provider(&model.provider)?;
+    let timeout_limit = model_hook_timeout(timeout_limit, provider.resilience_policy());
     let payload_json = serde_json::to_string(&request.payload)?;
     let prompt_text = config.prompt.replace("$ARGUMENTS", &payload_json);
     let user_message = UserMessage::text(prompt_text.clone());
@@ -924,6 +940,15 @@ async fn run_agent(
         trace_recorder: sess.services().trace_recorder.clone(),
     });
     let model = resolve_agent_model(sess, config.model.as_deref())?;
+    // Floor for one provider request of the agent's turn; a multi-request
+    // turn still needs a configured timeout that covers its tool loop.
+    let timeout_limit = model_hook_timeout(
+        timeout_limit,
+        sess.services()
+            .models
+            .provider(&model.provider)?
+            .resilience_policy(),
+    );
     let working_dir = request
         .payload
         .get("cwd")
@@ -1411,6 +1436,10 @@ fn hash_text(text: &str) -> String {
 #[cfg(all(test, unix))]
 #[path = "hook_agent_cleanup_tests.rs"]
 mod agent_cleanup_tests;
+
+#[cfg(test)]
+#[path = "hook_timeout_tests.rs"]
+mod hook_timeout_tests;
 
 #[cfg(test)]
 mod tests {

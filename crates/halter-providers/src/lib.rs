@@ -97,4 +97,14 @@ pub trait Provider: Send + Sync {
     ) -> anyhow::Result<ProviderCompactionResponse> {
         anyhow::bail!("failed to compact session: provider does not support compaction");
     }
+
+    /// The timeout and retry policy this provider applies to each request,
+    /// if it applies one. A caller that puts its own deadline around a
+    /// request (a prompt or agent hook, for example) sizes it from
+    /// [`ResiliencePolicy::recovery_window`] so its deadline cannot pre-empt
+    /// the provider's own stall detection and retry. Wrappers delegate to the
+    /// provider they wrap. The default is `None`: no policy is known.
+    fn resilience_policy(&self) -> Option<ResiliencePolicy> {
+        None
+    }
 }

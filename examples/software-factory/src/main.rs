@@ -1128,6 +1128,7 @@ fn default_factory_config() -> HarnessConfig {
             max_read_bytes: 1_048_576,
             max_subagent_depth: 3,
             max_concurrent_subagents: 8,
+            max_tool_timeout_secs: 3_600,
             shell: ShellPolicyConfig {
                 enabled: true,
                 timeout_secs: 30,
