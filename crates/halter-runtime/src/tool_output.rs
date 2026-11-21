@@ -983,21 +983,24 @@ mod tests {
         let panicked = |message: &str| {
             format!("tool 'fixed' panicked: {message}; it may have partially completed")
         };
-        let cases: [(fn() -> anyhow::Result<ToolResult>, String); 4] = [
+        let cases = [
             (
-                || Err(anyhow::anyhow!("root cause").context("outer")),
+                Computed(|| Err(anyhow::anyhow!("root cause").context("outer"))),
                 "outer: root cause".to_owned(),
             ),
-            (|| panic!("kaboom"), panicked("kaboom")),
+            (Computed(|| panic!("kaboom")), panicked("kaboom")),
             (
-                || panic!("{}", "kaboom".repeat(2)),
+                Computed(|| panic!("{}", "kaboom".repeat(2))),
                 panicked("kaboomkaboom"),
             ),
-            (|| std::panic::panic_any(7), panicked("no message")),
+            (
+                Computed(|| std::panic::panic_any(7)),
+                panicked("no message"),
+            ),
         ];
-        for (make, expected) in cases {
+        for (tool, expected) in cases {
             let run = run("fixed", json!({}), move |services, _| {
-                services.tools.register(Arc::new(Computed(make)));
+                services.tools.register(Arc::new(tool));
                 services.tool_output.max_bytes = 0;
             })
             .await;

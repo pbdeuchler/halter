@@ -50,6 +50,26 @@ once a `1.0.0` line is cut.
   `""` or `"unused"`), and accepts one in upper case. A stale one names the
   file's current hash.
 - Calling an unknown tool returns an error that lists the available tools.
+- Tool call arguments that are not valid JSON are no longer replaced with `{}`.
+  `ToolCall::arguments` keeps the text as a JSON string, and the call is
+  answered with `invalid tool input: the arguments are not valid JSON (<serde
+  error>), so the tool did not run; send the call again with its arguments as
+  one JSON object. Received: <text>`. The tool does not run. The check follows
+  `PreToolUse` hooks, so a hook can repair the arguments. Anthropic replays such
+  a call with `input: {}`.
+- A tool error reaches the model with its whole `anyhow` cause chain, as do
+  background-job failures, subagent failures and `TurnFailed` errors.
+- On the OpenAI Responses and Chat Completions dialects, which have no error
+  flag on a tool result, a failed result with no content is sent as
+  `error: <message>` instead of the bare message. Anthropic, which has
+  `is_error`, is unchanged, and so are successful results on every dialect.
+- A panic in a tool fails that call with `tool '<name>' panicked: <payload>;
+  it may have partially completed` and the turn continues. Before, the panic
+  failed the whole turn (`session execution panicked`) and the call was
+  answered `tool call interrupted while running; it may have partially
+  completed`.
+- `session_search` input errors start with `invalid tool input:` like other
+  built-in tools. `halter_tools::parse_input` is public.
 
 ### Removed
 
@@ -67,6 +87,14 @@ once a `1.0.0` line is cut.
 
 ### Fixed
 
+- The subagent tools (`spawn_agent`, `wait_agent`, `send_input`,
+  `close_agent`) emit `ToolRuntimeEvent::Completed` on every error path, so
+  each `Started` has a matching end.
+- A subagent whose turn ends in `TurnFailed` (a provider error, for example)
+  is reported `Failed` with that error, or `Cancelled` when the failure was a
+  cancellation. It was reported `Completed` with no output.
+- `PolicyError::Io` no longer prints its `io::Error` twice when the chain is
+  shown with `{:#}`. Its plain `Display` no longer includes the cause.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the

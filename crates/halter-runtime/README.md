@@ -618,6 +618,8 @@ ignored. `SessionRuntime::resume` rebuilds the registry from that state, so
 new process. A child that was still running when its process stopped comes
 back `Cancelled`, with an error that says it was interrupted; `send_input`
 continues it.
+A child turn that fails (a provider error, for example) ends the child
+`Failed`, with the turn's error and its whole cause chain.
 
 ---
 
@@ -635,6 +637,28 @@ It is responsible for invoking hook dispatch around meaningful lifecycle boundar
 - subagent lifecycle
 
 If you're debugging why a tool call was blocked or why extra system guidance appeared in a prompt, the hook invocation path through `halter-runtime` is usually where to look.
+
+### How a failed tool call reaches the model
+
+A call fails, and the tool result carries a `ToolError`, when:
+
+- a `PreToolUse` hook blocks it (the error is the block reason);
+- its arguments are not valid JSON. The provider stream keeps the text it
+  received in `ToolCall::arguments` as a JSON string, and the runtime answers
+  `invalid tool input: the arguments are not valid JSON (<serde error>), so the
+  tool did not run; send the call again with its arguments as one JSON object.
+  Received: <text>`. The check runs after `PreToolUse` hooks, so a hook that
+  returns `updated_input` can repair the call;
+- the tool returns an error. The message is the whole `anyhow` chain (`{:#}`);
+- the tool panics. The message is `tool '<name>' panicked: <payload>; it may
+  have partially completed`, and the turn goes on.
+
+Error text is bounded like any other output (`tools.output`). Anthropic gets
+the message with `is_error: true`. The OpenAI Responses and Chat Completions
+dialects have no such flag, so a failed result with no content is sent as
+`error: <message>`, one with text as `<text>\n\nerror: <message>`, and one
+with JSON as `{"error":<message>,"result":<value>}`. Successful results are
+sent unchanged.
 
 ---
 
