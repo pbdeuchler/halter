@@ -11,10 +11,10 @@ use halter_protocol::{
 };
 use serde_json::{Value, json};
 
-use crate::builtin::common::{optional_bool, optional_string, parse_input, required_string};
-use crate::{
-    SubagentControl, Tool, ToolContext, ToolOutput, ToolRuntime, ToolRuntimeEvent, TypedTool,
+use crate::builtin::common::{
+    ToolScope, optional_bool, optional_string, parse_input, required_string,
 };
+use crate::{SubagentControl, Tool, ToolContext, ToolOutput, ToolRuntime, TypedTool};
 
 const DEFAULT_MODEL_ALIAS: &str = "default";
 const SUBAGENT_MODEL_ALIAS: &str = "subagent";
@@ -173,7 +173,7 @@ impl TypedTool for SpawnAgentTool {
     }
 
     async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<SubagentStatus> {
-        emit_started(&context, "spawn_agent");
+        let _scope = ToolScope::new(&context, "spawn_agent");
         let parent = context
             .subagent_parent
             .as_ref()
@@ -188,7 +188,6 @@ impl TypedTool for SpawnAgentTool {
             .control
             .spawn(parent, request, context.cancel.clone())
             .await?;
-        emit_completed(&context, "spawn_agent");
         Ok(status)
     }
 }
@@ -244,10 +243,9 @@ impl TypedTool for SendInputTool {
     }
 
     async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<SubagentStatus> {
-        emit_started(&context, "send_input");
+        let _scope = ToolScope::new(&context, "send_input");
         let request: SendSubagentInputRequest = parse_input(input)?;
         let status = self.control.send_input(request).await?;
-        emit_completed(&context, "send_input");
         Ok(status)
     }
 }
@@ -292,10 +290,9 @@ impl TypedTool for WaitAgentTool {
         context: ToolContext,
         input: Value,
     ) -> anyhow::Result<WaitSubagentResponse> {
-        emit_started(&context, "wait_agent");
+        let _scope = ToolScope::new(&context, "wait_agent");
         let request: WaitSubagentRequest = parse_input(input)?;
         let response = self.control.wait(request, context.cancel.clone()).await?;
-        emit_completed(&context, "wait_agent");
         Ok(response)
     }
 }
@@ -344,10 +341,9 @@ impl TypedTool for CloseAgentTool {
         context: ToolContext,
         input: Value,
     ) -> anyhow::Result<CloseSubagentResponse> {
-        emit_started(&context, "close_agent");
+        let _scope = ToolScope::new(&context, "close_agent");
         let request: CloseSubagentRequest = parse_input(input)?;
         let response = self.control.close(request).await?;
-        emit_completed(&context, "close_agent");
         Ok(response)
     }
 }
@@ -430,18 +426,6 @@ fn subagent_capabilities(long_running: bool) -> ToolCapabilities {
     }
 }
 
-fn emit_started(context: &ToolContext, tool_name: &str) {
-    context.emit.emit(ToolRuntimeEvent::Started {
-        tool_name: tool_name.to_owned(),
-    });
-}
-
-fn emit_completed(context: &ToolContext, tool_name: &str) {
-    context.emit.emit(ToolRuntimeEvent::Completed {
-        tool_name: tool_name.to_owned(),
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -457,6 +441,7 @@ mod tests {
 
     use crate::{
         DefaultToolPolicy, NoopToolEventSink, PolicySettings, SubagentParentContext, ToolPolicy,
+        ToolRuntimeEvent,
     };
 
     use super::*;
@@ -576,27 +561,44 @@ mod tests {
         }
     }
 
-    /// The model sees which field is wrong, not just "invalid input".
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<ToolRuntimeEvent>>);
+
+    impl crate::ToolEventSink for RecordingSink {
+        fn emit(&self, event: ToolRuntimeEvent) {
+            self.0.lock().expect("events").push(event);
+        }
+    }
+
+    /// The model sees which field is wrong, not just "invalid input", and a
+    /// failed call still ends the `Started` event it began with.
     #[tokio::test]
     async fn malformed_control_inputs_name_the_field() {
         let control = Arc::new(RecordingSubagentControl::default());
         for (tool, input, expected) in [
             (
-                Arc::new(SendInputTool::new(control.clone())) as Arc<dyn Tool>,
+                Arc::new(SpawnAgentTool::new(control.clone(), Vec::new(), Vec::new()))
+                    as Arc<dyn Tool>,
                 json!({ "message": "hi" }),
-                "missing field `target`",
+                "failed to execute spawn_agent tool: missing parent session context",
+            ),
+            (
+                Arc::new(SendInputTool::new(control.clone())),
+                json!({ "message": "hi" }),
+                "invalid tool input: missing field `target`",
             ),
             (
                 Arc::new(WaitAgentTool::new(control.clone())),
                 json!({ "targets": "agent-1" }),
-                "invalid type: string \"agent-1\"",
+                "invalid tool input: invalid type: string \"agent-1\"",
             ),
             (
                 Arc::new(CloseAgentTool::new(control.clone())),
                 json!({ "target": "agent-1", "timeout_ms": "soon" }),
-                "invalid type: string \"soon\"",
+                "invalid tool input: invalid type: string \"soon\"",
             ),
         ] {
+            let sink = Arc::new(RecordingSink::default());
             let context = ToolContext {
                 session_id: SessionId::new(),
                 working_dir: ".".into(),
@@ -604,14 +606,23 @@ mod tests {
                 tool_sessions: Arc::new(crate::ToolSessionStore::default()),
                 snapshot: Arc::new(ResourceSnapshot::empty()),
                 cancel: CancellationToken::new(),
-                emit: Arc::new(NoopToolEventSink),
+                emit: sink.clone(),
                 policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default())),
                 shell_timeout_secs: 30,
                 subagent_parent: None,
             };
+            let name = tool.spec().name.0;
             let error = tool.execute(context, input).await.unwrap_err().to_string();
-            assert!(error.starts_with("invalid tool input: "), "{error}");
-            assert!(error.contains(expected), "{error}");
+            assert!(error.starts_with(expected), "{error}");
+            assert_eq!(
+                *sink.0.lock().expect("events"),
+                [
+                    ToolRuntimeEvent::Started {
+                        tool_name: name.clone()
+                    },
+                    ToolRuntimeEvent::Completed { tool_name: name },
+                ],
+            );
         }
     }
 

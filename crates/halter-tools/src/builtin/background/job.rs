@@ -280,7 +280,7 @@ impl BackgroundJob {
                 {
                     Ok(status) => status,
                     Err(error) => JobStatus::Failed {
-                        error: error.to_string(),
+                        error: format!("{error:#}"),
                     },
                 };
                 status_tx.send_replace(status);

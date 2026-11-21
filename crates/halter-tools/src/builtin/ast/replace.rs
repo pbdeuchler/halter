@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use ast_grep_core::{MatchStrictness, matcher::Pattern, source::Edit, tree_sitter::LanguageExt};
 use serde::Serialize;
 use serde_json::Value;
@@ -234,9 +235,9 @@ pub(super) fn run(
             if output != source {
                 let canonical = policy
                     .check_write_path_blocking(&candidate.absolute_path)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to execute ast_grep tool: write denied for '{}': {error}",
+                    .with_context(|| {
+                        format!(
+                            "failed to execute ast_grep tool: write denied for '{}'",
                             candidate.display_path,
                         )
                     })?;

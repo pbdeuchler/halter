@@ -402,7 +402,8 @@ mod tests {
     /// results are in the conversation, then answers. Records every request.
     struct Calls {
         tool: &'static str,
-        arguments: Value,
+        /// The argument text sent, which need not be JSON.
+        arguments: String,
         calls: usize,
         requests: Mutex<Vec<ProviderRequest>>,
     }
@@ -438,7 +439,7 @@ mod tests {
                 }),
                 Ok(StreamEvent::ToolArgsDelta {
                     id: block.clone(),
-                    delta: self.arguments.to_string(),
+                    delta: self.arguments.clone(),
                 }),
                 Ok(StreamEvent::ToolCallEnd { id: block }),
                 Ok(StreamEvent::MessageEnd {
@@ -473,6 +474,24 @@ mod tests {
             _input: Value,
         ) -> anyhow::Result<ToolResult> {
             self.0.clone().map_err(anyhow::Error::msg)
+        }
+    }
+
+    /// The `fixed` tool, returning what its function makes when it runs.
+    struct Computed(fn() -> anyhow::Result<ToolResult>);
+
+    #[async_trait]
+    impl Tool for Computed {
+        fn spec(&self) -> ToolSpec {
+            Fixed(Ok(ToolResult::Empty)).spec()
+        }
+
+        async fn execute(
+            &self,
+            _context: ToolContext,
+            _input: Value,
+        ) -> anyhow::Result<ToolResult> {
+            self.0()
         }
     }
 
@@ -587,13 +606,13 @@ mod tests {
     async fn run_calls(
         calls: usize,
         tool: &'static str,
-        arguments: Value,
+        arguments: impl std::fmt::Display,
         configure: impl FnOnce(&mut RuntimeServices, &Path),
     ) -> Run {
         let temp = tempfile::tempdir().expect("tempdir");
         let provider = Arc::new(Calls {
             tool,
-            arguments,
+            arguments: arguments.to_string(),
             calls,
             requests: Mutex::new(Vec::new()),
         });
@@ -623,7 +642,7 @@ mod tests {
 
     async fn run(
         tool: &'static str,
-        arguments: Value,
+        arguments: impl std::fmt::Display,
         configure: impl FnOnce(&mut RuntimeServices, &Path),
     ) -> Run {
         run_calls(1, tool, arguments, configure).await
@@ -751,7 +770,7 @@ mod tests {
         assert!(full.contains(big().trim_end()), "{full}");
         let error = message.error.as_ref().expect("blocked call is an error");
         assert_eq!(error.message, bounded(&full, Some(&spill)));
-        assert_eq!(run.sent(), error.message);
+        assert_eq!(run.sent(), format!("error: {}", error.message));
     }
 
     #[tokio::test]
@@ -891,15 +910,99 @@ mod tests {
         let (message, outcome) = short.committed().await;
         assert_eq!(message.error, Some(ToolError::new("boom")));
         assert_eq!(outcome, Err(ToolError::new("boom")));
-        assert_eq!(short.sent(), "boom");
+        assert_eq!(short.sent(), "error: boom");
 
         let long = run("fixed", json!({}), fixed(Err(big()))).await;
         let (message, _) = long.committed().await;
         let spill = long.spill_path(&message);
         let bounded = bounded(&big(), Some(&spill));
         assert_eq!(message.error, Some(ToolError::new(bounded.as_str())));
-        assert_eq!(long.sent(), bounded);
+        assert_eq!(long.sent(), format!("error: {bounded}"));
         assert_eq!(std::fs::read_to_string(spill).expect("spill"), big());
+    }
+
+    /// Arguments that are not JSON are answered with serde's account and the
+    /// text received, and the tool never runs. A whole-call JSON string is
+    /// indistinguishable from kept text, so it is refused unless its contents
+    /// parse; other JSON reaches the tool.
+    #[tokio::test]
+    async fn arguments_that_are_not_json_are_refused_before_the_tool_runs() {
+        let ran = ToolResult::Text {
+            text: "ran".to_owned(),
+        };
+        let truncated = r#"{"path":"x.txt","content":"hel"#;
+        for (arguments, received) in [
+            (truncated, Some(truncated)),
+            ("{path: x}", Some("{path: x}")),
+            (r#""a JSON string""#, Some("a JSON string")),
+            (r#"{"path":"x.txt"}"#, None),
+            ("", None),
+            ("[1]", None),
+        ] {
+            let run = run("fixed", arguments, |services, dir| {
+                fixed(Ok(ran.clone()))(services, dir);
+                services.tool_output.max_bytes = 0;
+            })
+            .await;
+            let (_, outcome) = run.committed().await;
+            let Some(received) = received else {
+                assert_eq!(outcome, Ok(ran.clone()), "{arguments}");
+                continue;
+            };
+            let cause = serde_json::from_str::<Value>(received).unwrap_err();
+            let expected = format!(
+                "invalid tool input: the arguments are not valid JSON ({cause}), so the tool did not run; send the call again with its arguments as one JSON object. Received: {received}"
+            );
+            assert_eq!(
+                outcome,
+                Err(ToolError::new(expected.as_str())),
+                "{arguments}"
+            );
+            assert_eq!(run.sent(), format!("error: {expected}"));
+        }
+    }
+
+    /// A pre-tool-use hook sees the text and may replace it; the check runs
+    /// on the arguments the tool would get.
+    #[tokio::test]
+    async fn a_hook_can_repair_arguments_that_are_not_json() {
+        let run = run("fixed", "{bad", |services, dir| {
+            fixed(Ok(ToolResult::Empty))(services, dir);
+            services.registered_hooks = hook(HookEventName::PreToolUse, || {
+                HookResponse::passthrough().with_updated_input(json!({}))
+            });
+        })
+        .await;
+        assert_eq!(run.committed().await.1, Ok(ToolResult::Empty));
+    }
+
+    /// A tool's error keeps its context chain, and a panicking tool fails
+    /// its call with the panic message instead of taking down the turn.
+    #[tokio::test]
+    async fn failing_and_panicking_tools_report_the_whole_cause() {
+        let panicked = |message: &str| {
+            format!("tool 'fixed' panicked: {message}; it may have partially completed")
+        };
+        let cases: [(fn() -> anyhow::Result<ToolResult>, String); 4] = [
+            (
+                || Err(anyhow::anyhow!("root cause").context("outer")),
+                "outer: root cause".to_owned(),
+            ),
+            (|| panic!("kaboom"), panicked("kaboom")),
+            (
+                || panic!("{}", "kaboom".repeat(2)),
+                panicked("kaboomkaboom"),
+            ),
+            (|| std::panic::panic_any(7), panicked("no message")),
+        ];
+        for (make, expected) in cases {
+            let run = run("fixed", json!({}), move |services, _| {
+                services.tools.register(Arc::new(Computed(make)));
+                services.tool_output.max_bytes = 0;
+            })
+            .await;
+            assert_eq!(run.committed().await.1, Err(ToolError::new(expected)));
+        }
     }
 
     #[tokio::test]
