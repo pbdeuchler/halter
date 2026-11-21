@@ -131,6 +131,11 @@ once a `1.0.0` line is cut.
   forces it at its own deadline. **Behavior change:** a bounded call can
   return up to 5s after its timeout, and returns `Ok` where it used to return
   `TimedOut`.
+- Forced turn recovery (`force_interrupt_turn`, used when an interrupt,
+  shutdown or subagent close passes its deadline) retries a
+  `SessionCommitConflict` at most 8 times, with a 10ms-per-attempt backoff,
+  then returns the conflict. It retried without a cap or pause, so a store
+  that kept conflicting spun forever while holding the session lease.
 - `halter auth openai login` no longer aborts on one bad connection to its
   callback listener. A socket that closed or stalled before its headers, a
   malformed request, or a callback with a stale state (an old browser tab)
