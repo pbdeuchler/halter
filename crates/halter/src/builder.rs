@@ -1235,6 +1235,7 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
             .collect(),
         max_subagent_depth: config.max_subagent_depth,
         max_concurrent_subagents: config.max_concurrent_subagents,
+        max_tool_timeout_secs: config.max_tool_timeout_secs,
         process_tree_root: Some(std::process::id() as i32),
     }
 }
@@ -1559,6 +1560,21 @@ mod tests {
                 |settings, _| {
                     assert!(!settings.shell_enabled);
                     assert_eq!(settings.shell_timeout_secs, 7);
+                },
+            ),
+            (
+                "tool_timeout_ceiling_maps_through",
+                |config| config.max_tool_timeout_secs = 90,
+                |settings, _| assert_eq!(settings.max_tool_timeout_secs, 90),
+            ),
+            (
+                "default_tool_timeout_ceiling_matches_the_policy_default",
+                |_| {},
+                |settings, defaults| {
+                    assert_eq!(
+                        settings.max_tool_timeout_secs,
+                        defaults.max_tool_timeout_secs
+                    )
                 },
             ),
         ];

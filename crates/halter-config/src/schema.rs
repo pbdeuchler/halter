@@ -1419,6 +1419,10 @@ pub struct PolicyConfig {
     pub max_subagent_depth: u32,
     #[serde(default = "default_max_concurrent_subagents")]
     pub max_concurrent_subagents: usize,
+    /// Longest `timeout_ms` a model may pass to `shell`, `pty`, `wait_agent`
+    /// or `close_agent`; larger values are rejected with the maximum named.
+    #[serde(default = "default_max_tool_timeout_secs")]
+    pub max_tool_timeout_secs: u64,
     #[serde(default)]
     pub shell: ShellPolicyConfig,
     #[serde(default)]
@@ -1434,6 +1438,7 @@ impl Default for PolicyConfig {
             max_read_bytes: default_max_read_bytes(),
             max_subagent_depth: default_max_subagent_depth(),
             max_concurrent_subagents: default_max_concurrent_subagents(),
+            max_tool_timeout_secs: default_max_tool_timeout_secs(),
             shell: ShellPolicyConfig::default(),
             network: NetworkPolicyConfig::default(),
         }
@@ -1452,6 +1457,10 @@ const fn default_max_read_bytes() -> usize {
 
 const fn default_max_subagent_depth() -> u32 {
     3
+}
+
+const fn default_max_tool_timeout_secs() -> u64 {
+    3_600
 }
 
 const fn default_max_concurrent_subagents() -> usize {

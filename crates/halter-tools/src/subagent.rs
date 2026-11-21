@@ -11,6 +11,7 @@ use halter_protocol::{
 };
 use serde_json::{Value, json};
 
+use crate::policy::check_tool_timeout;
 use crate::{
     SubagentControl, Tool, ToolContext, ToolOutput, ToolRuntime, ToolRuntimeEvent, TypedTool,
 };
@@ -292,6 +293,7 @@ impl TypedTool for WaitAgentTool {
         emit_started(&context, "wait_agent");
         let request: WaitSubagentRequest = serde_json::from_value(input)
             .context("failed to execute wait_agent tool: invalid input")?;
+        check_tool_timeout(context.policy.as_ref(), "wait_agent", request.timeout_ms)?;
         let response = self.control.wait(request, context.cancel.clone()).await?;
         emit_completed(&context, "wait_agent");
         Ok(response)
@@ -342,6 +344,7 @@ impl TypedTool for CloseAgentTool {
         emit_started(&context, "close_agent");
         let request: CloseSubagentRequest = serde_json::from_value(input)
             .context("failed to execute close_agent tool: invalid input")?;
+        check_tool_timeout(context.policy.as_ref(), "close_agent", request.timeout_ms)?;
         // Close is polled first so it is always requested; cancellation only
         // abandons the wait, and cleanup carries on in the background.
         let response = tokio::select! {
@@ -546,8 +549,8 @@ mod tests {
             (json!({ "target": "agent-1", "timeout_ms": 0 }), Some(0)),
             (json!({ "target": "agent-1", "timeout_ms": 25 }), Some(25)),
             (
-                json!({ "target": "agent-1", "timeout_ms": u64::MAX }),
-                Some(u64::MAX),
+                json!({ "target": "agent-1", "timeout_ms": 3_600_000 }),
+                Some(3_600_000),
             ),
         ] {
             let control = Arc::new(RecordingSubagentControl::default());
@@ -583,6 +586,33 @@ mod tests {
             );
             assert_eq!(spec.input_schema["properties"]["timeout_ms"]["minimum"], 0);
         }
+
+        // Past the policy ceiling (default 1h) the close is rejected, not sent.
+        let control = Arc::new(RecordingSubagentControl::default());
+        let context = ToolContext {
+            session_id: SessionId::new(),
+            working_dir: ".".into(),
+            path_locks: Arc::new(crate::PathLockMap::default()),
+            tool_sessions: Arc::new(crate::ToolSessionStore::default()),
+            snapshot: Arc::new(ResourceSnapshot::empty()),
+            cancel: CancellationToken::new(),
+            emit: Arc::new(NoopToolEventSink),
+            policy: Arc::new(DefaultToolPolicy::new(PolicySettings::default())),
+            shell_timeout_secs: 30,
+            subagent_parent: None,
+        };
+        let error = CloseAgentTool::new(control.clone())
+            .execute(
+                context,
+                json!({ "target": "agent-1", "timeout_ms": u64::MAX }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the maximum"),
+            "{error:#}"
+        );
+        assert!(control.close_requests.lock().unwrap().is_empty());
     }
 
     /// Finding 6: an unbounded `close_agent` waited for cleanup with no way

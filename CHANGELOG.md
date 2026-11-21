@@ -147,6 +147,15 @@ once a `1.0.0` line is cut.
   each returned an error that ended the login; they now count against the
   16-request stray budget. A provider error or a missing code under the
   expected state still ends the login.
+- `policy.max_tool_timeout_secs` (default 3600) and
+  `PolicySettings::max_tool_timeout_secs` cap the `timeout_ms` a model may
+  pass to `shell`, `pty`, `wait_agent` and `close_agent`; `ToolPolicy` gains
+  `max_tool_timeout` (default one hour). A larger value is rejected with an
+  error naming the maximum, before anything runs. Before, any value was
+  accepted, so `timeout_ms: 18446744073709551615` made a command or wait
+  effectively unbounded. **Breaking:** `PolicySettings` and `PolicyConfig`
+  struct literals must set the new field; a model call above one hour that
+  used to run is now rejected.
 - Provider timeout messages print the configured duration (`50ms`, `1.5s`)
   instead of whole seconds, which read "after 0s" for sub-second timeouts.
 
