@@ -49,6 +49,11 @@ once a `1.0.0` line is cut.
   `BackgroundRegistry` are now public.
 - The vendored `halter-brush-core` and `halter-brush-builtins` crates and the
   `vendor/` directory. They are no longer published.
+- **Breaking:** `SessionCommand::AppendSystemPrompt`. Nothing handled it, and
+  editing the system prompt mid-window would invalidate the prompt cache.
+  Set system-prompt text at creation with `SessionInit::append_system_prompt`,
+  or add it later from a hook (`with_additional_context`,
+  `with_system_message`), which lands in-band.
 
 ### Fixed
 
@@ -89,6 +94,19 @@ once a `1.0.0` line is cut.
   system messages encode exactly as before.
 - Chained Responses requests (`previous_response_id`) no longer drop later
   system messages, and the Responses compaction request includes them.
+- **Behaviour change for embedders:** hook `additional_context` is appended as
+  a system message where the hook ran, just before the hook's own system
+  message, instead of being added to the system prompt. Context from a hook
+  that runs before a window's first request (SessionStart, the first
+  UserPromptSubmit, PostCompact) still joins the system prompt. Later context
+  is in-band, so it no longer rewrites the cached prefix: before, each
+  PreToolUse or PostToolUse context invalidated the cache for the next
+  request. Context now lives in the transcript, so compaction can summarize or
+  drop it, where before it stayed in the system prompt until a CleanWindow
+  rollover. It also no longer piles up in the system prompt: a
+  UserPromptSubmit hook used to add another copy every turn. Sessions recorded
+  by earlier versions keep the segments they recorded until a rollover clears
+  them, so they encode as before.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the

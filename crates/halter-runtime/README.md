@@ -537,11 +537,33 @@ A realistic prompt assembly pass can include:
 - configured prompt overrides
 - compiled resource instructions
 - the skill index (names and descriptions; bodies arrive as user messages when the model calls `skill`)
-- selected conversation history, including hook-injected system messages
+- selected conversation history, including hook system messages and hook
+  additional context
 
 System messages after the first other message stay where they are in the
 history: providers encode them in place rather than in the system prompt, so
-adding one leaves the cached prefix intact (see `SystemMessage`).
+adding one leaves the cached prefix intact (see `SystemMessage`). Hook
+additional context is appended to the history as a system message too; it no
+longer edits the system prompt.
+
+### Keeping the cached prefix stable
+
+Within one context window, each request repeats the previous request's
+system prompt, tools, cache breakpoints and messages byte for byte and only
+adds messages. Compaction and CleanWindow rollover start a new window, and
+system messages added before a window's first other message join its system
+prompt. `prefix_stability_tests` checks this over a scripted session with
+hooks on every event, tool batches, a compaction and a resume.
+
+The embedder can still change the prefix mid-window, and each of these costs
+one cache write of the whole window:
+
+- `replace_resources` with different skills changes the skill index and the
+  tool list from the next turn.
+- Registering a tool on the shared `ToolRuntime` changes the tool list from
+  the next request.
+- A turn with a different model (`Turn::default_model`) uses that model's
+  cache, and a different reasoning effort changes the request options.
 
 This is important because the final model request is not just "the last user message".
 
@@ -644,7 +666,7 @@ It is responsible for invoking hook dispatch around meaningful lifecycle boundar
 - compaction
 - subagent lifecycle
 
-If you're debugging why a tool call was blocked or why extra system guidance appeared in a prompt, the hook invocation path through `halter-runtime` is usually where to look.
+If you're debugging why a tool call was blocked or why extra system guidance appeared in the conversation, the hook invocation path through `halter-runtime` is usually where to look.
 
 ---
 
