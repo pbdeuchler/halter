@@ -24,6 +24,10 @@ pub const DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// Default maximum idle gap between provider stream items, in seconds.
 pub const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
+/// Default wall-clock timeout for one whole unary compaction request, in
+/// seconds. Longer than the request timeout because the provider writes the
+/// entire summary before it responds.
+pub const DEFAULT_PROVIDER_COMPACT_TIMEOUT_SECS: u64 = 300;
 /// Default total provider request attempts, including the initial call.
 pub const DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS: u32 = 5;
 /// Default cumulative provider retry budget, in seconds.
@@ -45,6 +49,10 @@ const fn default_provider_request_timeout_secs() -> u64 {
 
 const fn default_provider_stream_idle_timeout_secs() -> u64 {
     DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS
+}
+
+const fn default_provider_compact_timeout_secs() -> u64 {
+    DEFAULT_PROVIDER_COMPACT_TIMEOUT_SECS
 }
 
 const fn default_provider_retry_max_attempts() -> u32 {
@@ -130,6 +138,13 @@ impl HarnessConfig {
         if self.policy.max_read_bytes == 0 {
             anyhow::bail!("invalid configuration: max_read_bytes must be greater than zero");
         }
+        // Zero is not "no limit" for either: the shell default became a 1s
+        // timeout, and a zero ceiling rejects every model timeout.
+        validate_positive_u64("policy.shell.timeout_secs", self.policy.shell.timeout_secs)?;
+        validate_positive_u64(
+            "policy.max_tool_timeout_secs",
+            self.policy.max_tool_timeout_secs,
+        )?;
 
         // Threshold derivation needs the default model's window. A config
         // that sets neither is still a valid partial config here; it is
@@ -577,6 +592,9 @@ pub struct ResilienceTimeoutsConfig {
     pub request_secs: u64,
     #[serde(default = "default_provider_stream_idle_timeout_secs")]
     pub stream_idle_secs: u64,
+    /// One whole unary compaction request, response body included.
+    #[serde(default = "default_provider_compact_timeout_secs")]
+    pub compact_secs: u64,
 }
 
 impl Default for ResilienceTimeoutsConfig {
@@ -585,6 +603,7 @@ impl Default for ResilienceTimeoutsConfig {
             connect_secs: DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS,
             request_secs: DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS,
             stream_idle_secs: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS,
+            compact_secs: DEFAULT_PROVIDER_COMPACT_TIMEOUT_SECS,
         }
     }
 }
@@ -594,6 +613,21 @@ impl ResilienceTimeoutsConfig {
         validate_positive_u64(&format!("{path}.connect_secs"), self.connect_secs)?;
         validate_positive_u64(&format!("{path}.request_secs"), self.request_secs)?;
         validate_positive_u64(&format!("{path}.stream_idle_secs"), self.stream_idle_secs)?;
+        validate_positive_u64(&format!("{path}.compact_secs"), self.compact_secs)?;
+        // The connect timer runs inside both request timers and starts with
+        // them; an equal or longer connect timeout can never fire, so the user
+        // gets the enclosing timer's error for a connect fault.
+        for (name, enclosing) in [
+            ("request_secs", self.request_secs),
+            ("compact_secs", self.compact_secs),
+        ] {
+            if self.connect_secs >= enclosing {
+                anyhow::bail!(
+                    "invalid configuration: {path}.connect_secs ({}s) must be less than {path}.{name} ({enclosing}s), which encloses it",
+                    self.connect_secs,
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -601,7 +635,10 @@ impl ResilienceTimeoutsConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// Provider request retry policy. `max_attempts` includes the initial
-/// request; retries stop when either the attempt budget or deadline is spent.
+/// request; retries stop when either the attempt budget or the backoff budget
+/// `deadline_secs` is spent. `deadline_secs` caps the total time slept
+/// between attempts, not wall time: time inside an attempt (bounded by
+/// `timeouts`) never counts, so no attempt timeout can exhaust it.
 pub struct RequestRetryConfig {
     #[serde(default = "default_provider_retry_max_attempts")]
     pub max_attempts: u32,
@@ -700,6 +737,8 @@ pub struct ResilienceTimeoutsOverrideConfig {
     pub request_secs: Option<u64>,
     #[serde(default)]
     pub stream_idle_secs: Option<u64>,
+    #[serde(default)]
+    pub compact_secs: Option<u64>,
 }
 
 impl ResilienceTimeoutsOverrideConfig {
@@ -714,6 +753,9 @@ impl ResilienceTimeoutsOverrideConfig {
         if let Some(value) = self.stream_idle_secs {
             base.stream_idle_secs = value;
         }
+        if let Some(value) = self.compact_secs {
+            base.compact_secs = value;
+        }
         base
     }
 
@@ -721,6 +763,7 @@ impl ResilienceTimeoutsOverrideConfig {
         validate_optional_positive_u64(&format!("{path}.connect_secs"), self.connect_secs)?;
         validate_optional_positive_u64(&format!("{path}.request_secs"), self.request_secs)?;
         validate_optional_positive_u64(&format!("{path}.stream_idle_secs"), self.stream_idle_secs)?;
+        validate_optional_positive_u64(&format!("{path}.compact_secs"), self.compact_secs)?;
         Ok(())
     }
 }
@@ -1383,6 +1426,10 @@ pub struct PolicyConfig {
     pub max_subagent_depth: u32,
     #[serde(default = "default_max_concurrent_subagents")]
     pub max_concurrent_subagents: usize,
+    /// Longest `timeout_ms` a model may pass to `shell`, `pty`, `wait_agent`
+    /// or `close_agent`; larger values are rejected with the maximum named.
+    #[serde(default = "default_max_tool_timeout_secs")]
+    pub max_tool_timeout_secs: u64,
     #[serde(default)]
     pub shell: ShellPolicyConfig,
     #[serde(default)]
@@ -1398,6 +1445,7 @@ impl Default for PolicyConfig {
             max_read_bytes: default_max_read_bytes(),
             max_subagent_depth: default_max_subagent_depth(),
             max_concurrent_subagents: default_max_concurrent_subagents(),
+            max_tool_timeout_secs: default_max_tool_timeout_secs(),
             shell: ShellPolicyConfig::default(),
             network: NetworkPolicyConfig::default(),
         }
@@ -1416,6 +1464,10 @@ const fn default_max_read_bytes() -> usize {
 
 const fn default_max_subagent_depth() -> u32 {
     3
+}
+
+const fn default_max_tool_timeout_secs() -> u64 {
+    3_600
 }
 
 const fn default_max_concurrent_subagents() -> usize {
@@ -2076,6 +2128,67 @@ base_backoff_ms = 40000
         );
     }
 
+    /// `connect_secs` must be strictly inside `request_secs` and
+    /// `compact_secs`, checked over the defaults, user-supplied globals, and
+    /// the effective provider override. Mutations killed: deleting the check
+    /// (every rejected row); `>=` to `>` (the "equal" rows); dropping the
+    /// `compact_secs` pair ("compact equal"); validating only the global block
+    /// (the override row, whose override alone is valid).
+    #[test]
+    fn connect_timeout_must_be_inside_request_timeout() {
+        let cases = [
+            ("defaults", "", None),
+            (
+                "user global valid",
+                "[resilience.timeouts]\nconnect_secs = 5\nrequest_secs = 6\n",
+                None,
+            ),
+            (
+                "user global equal",
+                "[resilience.timeouts]\nconnect_secs = 30\nrequest_secs = 30\n",
+                Some(
+                    "resilience.timeouts.connect_secs (30s) must be less than resilience.timeouts.request_secs (30s)",
+                ),
+            ),
+            (
+                "user global inverted",
+                "[resilience.timeouts]\nconnect_secs = 90\n",
+                Some(
+                    "resilience.timeouts.connect_secs (90s) must be less than resilience.timeouts.request_secs (60s)",
+                ),
+            ),
+            (
+                "compact equal",
+                "[resilience.timeouts]\nconnect_secs = 30\nrequest_secs = 31\ncompact_secs = 30\n",
+                Some(
+                    "resilience.timeouts.connect_secs (30s) must be less than resilience.timeouts.compact_secs (30s)",
+                ),
+            ),
+            (
+                "provider override inverts the effective config",
+                "[providers.openai.resilience.timeouts]\nrequest_secs = 5\n",
+                Some(
+                    "providers.openai.resilience (effective).timeouts.connect_secs (10s) must be less than",
+                ),
+            ),
+        ];
+        for (name, extra, want_error) in cases {
+            let toml = format!(
+                "version = 1\n\n[models.default]\nprovider = \"openai\"\nmodel = \"gpt-5\"\n\n[providers.openai]\napi_key = \"test-key\"\n\n{extra}"
+            );
+            let parsed: HarnessConfig = toml::from_str(&toml).expect(name);
+            match (parsed.validate(), want_error) {
+                (Ok(()), None) => {}
+                (Err(error), Some(fragment)) => {
+                    let rendered = error.to_string();
+                    assert!(rendered.contains(fragment), "{name}: {rendered}");
+                }
+                (Ok(()), Some(_)) => panic!("{name}: expected a validation error"),
+                (Err(error), None) => panic!("{name}: {error:#}"),
+            }
+        }
+    }
+
     #[test]
     fn model_slot_inline_typo_names_offending_field() {
         let error = toml::from_str::<HarnessConfig>(
@@ -2158,6 +2271,7 @@ max_attempts = 2
                 connect_secs: 10,
                 request_secs: 60,
                 stream_idle_secs: 60,
+                compact_secs: 300,
             },
             request_retry: RequestRetryConfig {
                 max_attempts: 5,
@@ -2308,6 +2422,42 @@ stream_idle_secs = 0
                 error.to_string().contains(want),
                 "{name}: unexpected error: {error}"
             );
+        }
+    }
+
+    // Kills: dropping either `validate_positive_u64` call in `validate`.
+    #[test]
+    fn policy_timeouts_must_be_positive() {
+        let config = |policy: &str| {
+            format!(
+                "version = 1\n\n{policy}\n\n[models.default]\nprovider = \"openai\"\nmodel = \"gpt-5\"\n\n[providers.openai]\napi_key = \"test-key\"\n"
+            )
+        };
+        let cases = [
+            (
+                "shell zero",
+                "[policy.shell]\ntimeout_secs = 0",
+                Some("policy.shell.timeout_secs must be greater than zero"),
+            ),
+            (
+                "ceiling zero",
+                "[policy]\nmax_tool_timeout_secs = 0",
+                Some("policy.max_tool_timeout_secs must be greater than zero"),
+            ),
+            ("shell one", "[policy.shell]\ntimeout_secs = 1", None),
+            ("ceiling one", "[policy]\nmax_tool_timeout_secs = 1", None),
+        ];
+
+        for (name, policy, want) in cases {
+            let parsed: HarnessConfig = toml::from_str(&config(policy)).expect("parse config");
+            match (parsed.validate(), want) {
+                (Ok(()), None) => {}
+                (Err(error), Some(want)) => assert!(
+                    error.to_string().contains(want),
+                    "{name}: unexpected error: {error}"
+                ),
+                (outcome, want) => panic!("{name}: got {outcome:?}, wanted {want:?}"),
+            }
         }
     }
 

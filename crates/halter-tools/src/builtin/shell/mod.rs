@@ -15,6 +15,7 @@ use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::policy::check_tool_timeout;
 use crate::{ToolContext, ToolEventSink, ToolOutput, TypedTool};
 
 use self::streaming::{collect_output, pipe_to_files};
@@ -142,9 +143,12 @@ impl TypedTool for ShellTool {
             !lifetime.is_cancelled(),
             "failed to execute shell: session is closed"
         );
-        let timeout = optional_u64(&input, "timeout_ms")?
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_secs(context.shell_timeout_secs.max(1)));
+        let timeout = check_tool_timeout(
+            context.policy.as_ref(),
+            "shell",
+            optional_u64(&input, "timeout_ms")?,
+        )?
+        .unwrap_or_else(|| Duration::from_secs(context.shell_timeout_secs.max(1)));
         let cwd = optional_string(&input, "cwd").map_or_else(
             || context.working_dir.clone(),
             |cwd| resolve_path(&context.working_dir, cwd),
@@ -495,6 +499,54 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Finding 8: a model-supplied `timeout_ms` had no ceiling, so a huge one
+    /// left a command effectively unbounded. Rows run `shell` under a 1s
+    /// ceiling: omitted and in-range values run; the ceiling itself runs;
+    /// one past it is rejected before spawning, naming the maximum. Mutation
+    /// killed: `check_tool_timeout` passing every value through (row
+    /// "over the ceiling" runs instead of failing).
+    #[tokio::test]
+    async fn model_timeout_is_checked_against_the_policy_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, input, rejected) in [
+            ("omitted", json!({"command": "true"}), false),
+            (
+                "in range",
+                json!({"command": "true", "timeout_ms": 500}),
+                false,
+            ),
+            (
+                "at the ceiling",
+                json!({"command": "true", "timeout_ms": 1_000}),
+                false,
+            ),
+            (
+                "over the ceiling",
+                json!({"command": "true", "timeout_ms": 1_001}),
+                true,
+            ),
+        ] {
+            let context = tool_context_with(
+                root.path(),
+                PolicySettings {
+                    allowed_write_roots: vec![root.path().to_path_buf()],
+                    max_tool_timeout_secs: 1,
+                    ..PolicySettings::default()
+                },
+            );
+            match (run(context, input).await, rejected) {
+                (Ok(value), false) => assert_eq!(value["exit_code"], 0, "{name}"),
+                (Err(error), true) => assert!(
+                    error
+                        .to_string()
+                        .contains("timeout_ms 1001 exceeds the maximum of 1000"),
+                    "{name}: {error:#}"
+                ),
+                (other, _) => panic!("{name}: unexpected {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn timeout_returns_partial_output_and_kills_the_command() {
         let root = tempfile::tempdir().unwrap();

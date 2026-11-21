@@ -8,6 +8,22 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Added
+
+- [docs/timeouts.md](docs/timeouts.md) lists every timeout and retry in the
+  harness, what encloses what, and every way each wait can end.
+- `[resilience.timeouts] compact_secs` (default 300, also a per-provider
+  override) and `ProviderTimeouts::compact`, which bound one whole unary
+  compaction request. Compaction used `request_secs`, which for streams covers
+  only the time to response headers, so a compaction that legitimately took
+  longer than 60s to write its summary always timed out.
+  **Breaking:** `ProviderTimeouts` struct literals must set `compact`, and
+  `ResilienceTimeoutsConfig` literals `compact_secs`.
+- `Provider::resilience_policy` (default `None`; the built-in providers and
+  `ModelJudgeProvider` report the policy they wrap) and
+  `ResiliencePolicy::recovery_window`, the shortest outer deadline that lets
+  a provider detect one stalled attempt and retry it.
+
 ### Changed
 
 - **Breaking:** the `shell` tool no longer runs commands in an embedded brush
@@ -117,6 +133,95 @@ once a `1.0.0` line is cut.
   doesn't exist is still an error. On macOS the scratch root moves from
   `/tmp/halter` to the per-user `$TMPDIR/halter`. The starter config template no
   longer lists `allowed_write_roots` explicitly, so it keeps the default.
+- **Breaking:** `[resilience.request_retry] deadline_secs` (`RetryPolicy::deadline`)
+  is now a budget for the total backoff slept between attempts, not wall time
+  from before the first attempt. Before, any attempt that ran at least
+  `deadline_secs` exhausted the budget by itself, so at the defaults (60s
+  deadline, 60s `request_secs`, 60s `stream_idle_secs`) a stalled request or
+  stream timed out and was never retried. Time inside an attempt is bounded by
+  the timeouts; a retry sequence is bounded by `max_attempts` and this budget.
+  Configs that set a large deadline only to cover attempt time can lower it.
+- The streaming HTTP client no longer sets a reqwest `read_timeout` of
+  `stream_idle_secs`. That timer started at send, so it raced `request_secs`
+  for the response headers and won with a less specific error whenever
+  `request_secs` was the longer one. The body stays bounded by the per-event
+  `stream_idle_secs` timer.
+- **Breaking:** config validation rejects `timeouts.connect_secs` that is not
+  less than `timeouts.request_secs`, globally and in each provider's effective
+  config, with an error naming both keys. Such a connect timeout could never
+  fire.
+- The OpenAI rate-limit wait (an open cooldown or a full request or token
+  window) no longer counts against `request_secs`. It ran inside the attempt's
+  request timer, so a Retry-After cooldown longer than `request_secs` timed out
+  every attempt before it was sent. The timer now starts when the permit is
+  granted. The wait still ends on cancellation.
+- Provider transports use one HTTP client with only a connect timeout. The
+  unary client's reqwest `timeout(request_secs)` started after, and tied
+  with, the compaction timer, so it could never fire first; the Anthropic
+  streaming send's own `request_secs` timer was likewise dominated by the
+  setup timer around it. Both are removed; `ResilientProvider`'s timers are
+  the only request bounds.
+- Prompt and agent hooks wait at least the model provider's recovery window
+  (at the defaults about 121s) instead of their configured timeout alone (30s
+  and 60s by default). The hook timer fired before the provider's own 60s
+  request and idle timers could, and hooks fail open, so any provider stall
+  silently dropped the hook's decision, including a block. A longer
+  configured timeout is kept.
+- A bounded session shutdown (`shutdown(Some(timeout))`) cancels running
+  SessionEnd hooks when its deadline passes; they are recorded as cancelled
+  and `SessionShutdownComplete` is still committed. Before, SessionEnd hooks
+  got a cancellation token that never fired, so they ran on for their own
+  timeout (600s for command hooks) after the caller had stopped waiting, and
+  a CLI exit killed them mid-run with nothing recorded. A wait for a session
+  lease held by another writer also ends at that deadline; a free lease is
+  still taken. `shutdown(None)` is unchanged.
+- Bounded `SessionHandle::interrupt`, `SessionHandle::shutdown`, runtime
+  shutdown and `close_agent` keep waiting up to `FORCED_RECOVERY_GRACE` (5s,
+  newly public) after their deadline, where forced recovery starts, and return
+  its result. Before, the caller's timer and the driver's shared one instant,
+  so a bounded call always returned `TimedOut` even when forced recovery
+  settled at once, and the caller could not tell a recovered session from a
+  stuck one. A bounded `close_agent` that bounds an earlier unbounded close now
+  forces it at its own deadline. **Behavior change:** a bounded call can
+  return up to 5s after its timeout, and returns `Ok` where it used to return
+  `TimedOut`.
+- An unbounded `close_agent` (no `timeout_ms`) ends when its tool call is
+  cancelled, returning `cancelled`; the close itself is still requested and
+  cleanup continues in the background. Before, cancelling the parent turn
+  could not end the call while a child's cleanup hung. `close_agent` now
+  reports `cancellable: true`.
+- Forced turn recovery (`force_interrupt_turn`, used when an interrupt,
+  shutdown or subagent close passes its deadline) retries a
+  `SessionCommitConflict` at most 8 times, with a 10ms-per-attempt backoff,
+  then returns the conflict. It retried without a cap or pause, so a store
+  that kept conflicting spun forever while holding the session lease.
+- `halter auth openai login` no longer aborts on one bad connection to its
+  callback listener. A socket that closed or stalled before its headers, a
+  malformed request, or a callback with a stale state (an old browser tab)
+  each returned an error that ended the login; they now count against the
+  16-request stray budget. A provider error or a missing code under the
+  expected state still ends the login.
+- `policy.max_tool_timeout_secs` (default 3600) and
+  `PolicySettings::max_tool_timeout_secs` cap the `timeout_ms` a model may
+  pass to `shell`, `pty`, `wait_agent` and `close_agent`; `ToolPolicy` gains
+  `max_tool_timeout` (default one hour). A larger value is rejected with an
+  error naming the maximum, before anything runs. Before, any value was
+  accepted, so `timeout_ms: 18446744073709551615` made a command or wait
+  effectively unbounded. **Breaking:** `PolicySettings` and `PolicyConfig`
+  struct literals must set the new field; a model call above one hour that
+  used to run is now rejected.
+- Zero timeouts that meant something other than what they said are refused.
+  Config validation rejects `policy.shell.timeout_secs = 0` (it silently ran
+  every command with a 1s timeout) and `policy.max_tool_timeout_secs = 0`
+  (it rejected every model timeout). A hook `timeout = 0` (or `timeout_sec`)
+  now loads with a `zero_timeout` warning and the handler's default timeout:
+  hooks fail open, so a zero timeout made a blocking hook allow everything.
+  **Breaking:** configs with either policy zero no longer load. The zeros
+  that remain, `wait_agent`/`close_agent` `timeout_ms: 0` and a
+  `Some(Duration::ZERO)` interrupt or shutdown deadline, mean "poll" or
+  "force now" and are documented in [docs/timeouts.md](docs/timeouts.md).
+- Provider timeout messages print the configured duration (`50ms`, `1.5s`)
+  instead of whole seconds, which read "after 0s" for sub-second timeouts.
 
 ## [0.10.0] - 2026-11-14
 

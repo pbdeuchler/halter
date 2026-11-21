@@ -77,8 +77,12 @@ across provider families, server-supplied backoff hints (`Retry-After`,
 "try again in …") are honored, and jitter stays within `max_backoff`.
 Deterministic setup failures (wrong api kind, unencodable request) are fatal
 and never retried, and a stream that has already emitted content is never
-retried. Streaming transports do not use reqwest's total request timeout for
-the SSE body; request setup and stream-idle liveness are bounded separately.
+retried. The HTTP client bounds only the connect; request setup, stream-idle
+liveness and whole compactions are bounded by `ResilientProvider`'s timers,
+and OpenAI rate-limit admission runs before the setup timer starts.
+`Provider::resilience_policy` exposes a provider's policy, and
+`ResiliencePolicy::recovery_window` gives the shortest outer deadline that
+still lets the provider detect a stall and retry once.
 
 ---
 

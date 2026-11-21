@@ -1109,6 +1109,7 @@ fn resilience_policy_from_config(config: ResilienceConfig) -> ResiliencePolicy {
             connect: std::time::Duration::from_secs(config.timeouts.connect_secs),
             request: std::time::Duration::from_secs(config.timeouts.request_secs),
             stream_idle: std::time::Duration::from_secs(config.timeouts.stream_idle_secs),
+            compact: std::time::Duration::from_secs(config.timeouts.compact_secs),
         },
         request_retry: RetryPolicy {
             max_attempts: config.request_retry.max_attempts,
@@ -1234,6 +1235,7 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
             .collect(),
         max_subagent_depth: config.max_subagent_depth,
         max_concurrent_subagents: config.max_concurrent_subagents,
+        max_tool_timeout_secs: config.max_tool_timeout_secs,
         process_tree_root: Some(std::process::id() as i32),
     }
 }
@@ -1267,12 +1269,12 @@ mod tests {
     use async_trait::async_trait;
     use futures::StreamExt;
     use halter_config::{
-        DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS, DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS,
-        DEFAULT_PROVIDER_RETRY_BASE_BACKOFF_MS, DEFAULT_PROVIDER_RETRY_DEADLINE_SECS,
-        DEFAULT_PROVIDER_RETRY_JITTER_PCT, DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS,
-        DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS, DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS,
-        ModelConfig, OpenAiOAuthConfig, ProviderConfig, RequestRetryConfig, ResilienceConfig,
-        ResilienceTimeoutsConfig,
+        DEFAULT_PROVIDER_COMPACT_TIMEOUT_SECS, DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS,
+        DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECS, DEFAULT_PROVIDER_RETRY_BASE_BACKOFF_MS,
+        DEFAULT_PROVIDER_RETRY_DEADLINE_SECS, DEFAULT_PROVIDER_RETRY_JITTER_PCT,
+        DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS, DEFAULT_PROVIDER_RETRY_MAX_BACKOFF_SECS,
+        DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS, ModelConfig, OpenAiOAuthConfig, ProviderConfig,
+        RequestRetryConfig, ResilienceConfig, ResilienceTimeoutsConfig,
     };
     use halter_protocol::{Message, PluginManifest, ReasoningEffort, SessionStatus, SkillId};
     use tempfile::tempdir;
@@ -1314,6 +1316,7 @@ mod tests {
                 connect_secs: 2,
                 request_secs: 3,
                 stream_idle_secs: 4,
+                compact_secs: 5,
             },
             request_retry: RequestRetryConfig {
                 max_attempts: 7,
@@ -1327,6 +1330,7 @@ mod tests {
         assert_eq!(policy.timeouts.connect, Duration::from_secs(2));
         assert_eq!(policy.timeouts.request, Duration::from_secs(3));
         assert_eq!(policy.timeouts.stream_idle, Duration::from_secs(4));
+        assert_eq!(policy.timeouts.compact, Duration::from_secs(5));
         assert_eq!(policy.request_retry.max_attempts, 7);
         assert_eq!(policy.request_retry.deadline, Duration::from_secs(8));
         assert_eq!(
@@ -1351,6 +1355,10 @@ mod tests {
         assert_eq!(
             timeouts.stream_idle,
             Duration::from_secs(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            timeouts.compact,
+            Duration::from_secs(DEFAULT_PROVIDER_COMPACT_TIMEOUT_SECS)
         );
 
         let retry = RetryPolicy::default();
@@ -1377,6 +1385,7 @@ mod tests {
                 connect: Duration::from_secs(11),
                 request: Duration::from_secs(12),
                 stream_idle: Duration::from_secs(13),
+                compact: Duration::from_secs(14),
             },
             request_retry: RetryPolicy {
                 max_attempts: 2,
@@ -1551,6 +1560,21 @@ mod tests {
                 |settings, _| {
                     assert!(!settings.shell_enabled);
                     assert_eq!(settings.shell_timeout_secs, 7);
+                },
+            ),
+            (
+                "tool_timeout_ceiling_maps_through",
+                |config| config.max_tool_timeout_secs = 90,
+                |settings, _| assert_eq!(settings.max_tool_timeout_secs, 90),
+            ),
+            (
+                "default_tool_timeout_ceiling_matches_the_policy_default",
+                |_| {},
+                |settings, defaults| {
+                    assert_eq!(
+                        settings.max_tool_timeout_secs,
+                        defaults.max_tool_timeout_secs
+                    )
                 },
             ),
         ];

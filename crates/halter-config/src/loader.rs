@@ -157,6 +157,7 @@ roots = ["./.agent/plugins"]
 max_read_bytes = 1048576
 max_subagent_depth = 3
 max_concurrent_subagents = 8
+max_tool_timeout_secs = 3600
 
 [policy.shell]
 enabled = true

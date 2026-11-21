@@ -75,7 +75,7 @@ pub(crate) use session::SessionExecutor;
 pub use session::{
     ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit, SessionRuntime,
 };
-pub use session_driver::{SessionError, SessionHandle, Submission};
+pub use session_driver::{FORCED_RECOVERY_GRACE, SessionError, SessionHandle, Submission};
 pub use session_lease::SessionLeases;
 pub use tool_output::ToolOutputSettings;
 pub use trace_export::export_session_trace;

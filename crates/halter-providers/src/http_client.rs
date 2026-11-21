@@ -16,26 +16,19 @@ use tracing::{debug, warn};
 use crate::openai_error::classify_error_payload;
 use crate::resilience::ProviderTimeouts;
 
-/// Build the (unary, streaming) reqwest client pair shared by every provider
-/// transport. The unary client bounds the whole request with
-/// `timeouts.request`; the streaming client instead bounds only the idle gap
-/// between body reads so long-lived SSE responses are not killed mid-stream.
-pub(crate) fn provider_http_clients(
-    timeouts: ProviderTimeouts,
-) -> anyhow::Result<(Client, Client)> {
-    let unary_client = Client::builder()
+/// Build the reqwest client shared by every provider transport. It bounds
+/// only the TCP/TLS connect (`timeouts.connect`); every other phase is timed
+/// by `ResilientProvider`, which every public provider wraps it in: stream
+/// setup by `timeouts.request`, each stream event by `timeouts.stream_idle`,
+/// and a whole unary compaction by `timeouts.compact`. A reqwest `timeout` or
+/// `read_timeout` here would start at `send()`, so it could only tie with or
+/// pre-empt those timers with a less specific error.
+pub(crate) fn provider_http_client(timeouts: ProviderTimeouts) -> anyhow::Result<Client> {
+    Client::builder()
         .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(timeouts.connect)
-        .timeout(timeouts.request)
         .build()
-        .context("failed to build provider http client")?;
-    let streaming_client = Client::builder()
-        .user_agent(concat!("halter/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(timeouts.connect)
-        .read_timeout(timeouts.stream_idle)
-        .build()
-        .context("failed to build provider streaming http client")?;
-    Ok((unary_client, streaming_client))
+        .context("failed to build provider http client")
 }
 
 /// Join a provider base URL and request path, trimming a duplicate slash.
@@ -67,18 +60,13 @@ pub(crate) struct JsonRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct JsonHttpClient {
-    unary_client: Client,
-    streaming_client: Client,
-    request_timeout: Duration,
+    client: Client,
 }
 
 impl JsonHttpClient {
     pub(crate) fn try_new_with_timeouts(timeouts: ProviderTimeouts) -> anyhow::Result<Self> {
-        let (unary_client, streaming_client) = provider_http_clients(timeouts)?;
         Ok(Self {
-            unary_client,
-            streaming_client,
-            request_timeout: timeouts.request,
+            client: provider_http_client(timeouts)?,
         })
     }
 }
@@ -109,25 +97,18 @@ impl JsonHttpClient {
         );
         let header_map = request_headers(provider_label, headers)?;
         let builder = self
-            .streaming_client
+            .client
             .post(&url)
             .headers(header_map)
             .body(body_bytes_vec);
 
         let response = select! {
             _ = cancel.cancelled() => return Err(cancelled_error()),
-            result = tokio::time::timeout(self.request_timeout, builder.send()) => match result {
-                Ok(result) => result.map_err(|error| transient_error(format!(
-                    "failed to execute {provider_label} request: {error}"
-                )))?,
-                Err(_) => {
-                    return Err(transient_error(format!(
-                        "failed to execute provider request: {} request timed out after {}s",
-                        provider_label,
-                        self.request_timeout.as_secs()
-                    )));
-                }
-            },
+            // The header wait is bounded by ResilientProvider's setup timer
+            // (`timeouts.request`), which starts before this call.
+            result = builder.send() => result.map_err(|error| transient_error(format!(
+                "failed to execute {provider_label} request: {error}"
+            )))?,
         };
         let status = response.status();
         if !status.is_success() {
@@ -202,7 +183,7 @@ impl JsonHttpClient {
         );
         let header_map = request_headers(provider_label, headers)?;
         let builder = self
-            .unary_client
+            .client
             .post(&url)
             .headers(header_map)
             .body(body_bytes_vec);
@@ -625,9 +606,16 @@ mod tests {
         assert_eq!(error.backoff_hint, Some(Duration::from_secs(2)));
     }
 
+    /// The client itself puts no timer on the header wait: headers that
+    /// arrive after `stream_idle` (and after `request`) still succeed, because
+    /// both bounds belong to `ResilientProvider`, which starts its setup timer
+    /// first (`resilience::tests::request_setup_timeout_emits_retryable_error`
+    /// covers the header wait that never ends). Mutations killed: re-adding
+    /// `.read_timeout(timeouts.stream_idle)` or `.timeout(timeouts.request)`
+    /// to `provider_http_client`.
     #[tokio::test]
-    async fn post_json_event_stream_times_out_request_setup() {
-        // Server accepts the connection but never responds.
+    async fn post_json_event_stream_puts_no_timer_on_the_header_wait() {
+        let ms = Duration::from_millis;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -635,26 +623,28 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept socket");
             let _ = read_http_request(&mut socket).await;
-            std::future::pending::<()>().await;
+            tokio::time::sleep(ms(150)).await;
+            let body = "data: {\"a\":1}\n\ndata: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
         });
-
-        let timeouts = ProviderTimeouts {
-            connect: Duration::from_secs(1),
-            request: Duration::from_millis(50),
-            stream_idle: Duration::from_secs(1),
-        };
-        let client = JsonHttpClient::try_new_with_timeouts(timeouts).expect("http client");
-        let error = client
+        let client = JsonHttpClient::try_new_with_timeouts(ProviderTimeouts {
+            connect: ms(10),
+            request: ms(30),
+            stream_idle: ms(30),
+            compact: ms(30),
+        })
+        .expect("http client");
+        let _stream = client
             .post_json_event_stream(
                 request(format!("http://{address}"), Vec::new()),
                 CancellationToken::new(),
             )
             .await
-            .err()
-            .expect("setup should time out");
-        let error = provider_error_from_anyhow(error);
-        assert_eq!(error.kind, ProviderErrorKind::Transient);
-        assert!(error.message.contains("timed out"));
+            .expect("headers after every provider timer still arrive");
     }
 
     #[tokio::test]

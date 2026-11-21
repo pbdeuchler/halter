@@ -2,7 +2,7 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Bounded retry policy shared by the streaming provider pipeline. Replaces
 /// the previous unbounded `loop { ... continue; }` retry in
@@ -17,8 +17,13 @@ pub struct RetryPolicy {
     /// Upper bound for any single backoff, even if exponential growth or a
     /// server-supplied hint would exceed it.
     pub max_backoff: Duration,
-    /// Cumulative wall time budget across all attempts. Once exceeded,
-    /// further retries are denied even if `max_attempts` has not been hit.
+    /// Cumulative budget for time spent *waiting between* attempts (the sum
+    /// of every backoff). Time spent inside an attempt never counts, so no
+    /// attempt timer (setup `request`, `stream_idle`, a slow prefix) can
+    /// exhaust the budget on its own: each attempt is bounded by its own
+    /// timers, and the sequence by `max_attempts` and this budget. Once
+    /// spent, further retries are denied even if `max_attempts` has not been
+    /// hit; the last backoff is clamped to what remains.
     pub deadline: Duration,
     /// Random offset, expressed as a percentage of the computed backoff,
     /// added on top to break thundering-herd synchronization across
@@ -39,15 +44,16 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Stateful retry tracker. Combines the per-attempt counter with a cumulative
-/// deadline so callers don't have to thread `Instant` and `attempt: u32`
-/// separately. The contract is intentionally narrow: callers ask for the next
+/// Stateful retry tracker. Combines the per-attempt counter with the
+/// cumulative backoff budget so callers don't have to thread `waited` and
+/// `attempt: u32` separately. It reads no clock: the outcome depends only on
+/// the policy and the sequence of hints. The contract is intentionally narrow: callers ask for the next
 /// backoff after a failed attempt; `None` means the budget is exhausted and
 /// the failure should be propagated.
 #[derive(Debug)]
 pub(crate) struct RetryGate {
     policy: RetryPolicy,
-    started: Instant,
+    waited: Duration,
     completed_attempts: u32,
 }
 
@@ -55,7 +61,7 @@ impl RetryGate {
     pub(crate) fn new(policy: RetryPolicy) -> Self {
         Self {
             policy,
-            started: Instant::now(),
+            waited: Duration::ZERO,
             completed_attempts: 0,
         }
     }
@@ -67,8 +73,9 @@ impl RetryGate {
     }
 
     /// Records a failed attempt and returns the backoff to wait before the
-    /// next attempt, or `None` if the budget (max_attempts or deadline) is
-    /// exhausted. The optional `hint` is a server-supplied retry-after
+    /// next attempt, or `None` if the budget (`max_attempts` or the backoff
+    /// budget `deadline`) is exhausted. The returned delay is charged to the
+    /// budget before it is slept. The optional `hint` is a server-supplied retry-after
     /// duration (e.g. parsed from `Please try again in 1.25s`) which takes
     /// precedence over the computed exponential when present.
     pub(crate) fn record_failure_and_next_backoff(
@@ -76,16 +83,13 @@ impl RetryGate {
         hint: Option<Duration>,
     ) -> Option<Duration> {
         self.completed_attempts = self.completed_attempts.saturating_add(1);
-        if self.completed_attempts >= self.policy.max_attempts
-            || self.started.elapsed() >= self.policy.deadline
-        {
+        let remaining = self.policy.deadline.saturating_sub(self.waited);
+        if self.completed_attempts >= self.policy.max_attempts || remaining.is_zero() {
             return None;
         }
-        let remaining = self.policy.deadline.saturating_sub(self.started.elapsed());
-        if remaining.is_zero() {
-            return None;
-        }
-        Some(compute_backoff(&self.policy, self.completed_attempts, hint).min(remaining))
+        let delay = compute_backoff(&self.policy, self.completed_attempts, hint).min(remaining);
+        self.waited += delay;
+        Some(delay)
     }
 }
 
@@ -135,8 +139,6 @@ fn jitter_offset(capped_ms: u64, jitter_pct: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
 
     fn deterministic_policy(max_attempts: u32) -> RetryPolicy {
@@ -262,44 +264,85 @@ mod tests {
         assert!(gate.record_failure_and_next_backoff(None).is_none());
     }
 
+    /// Budget accounting over (policy, time inside attempts, hints).
+    /// Mutations killed: charging wall time spent inside attempts (the first
+    /// row sleeps past the budget before failing and must still retry);
+    /// dropping `self.waited += delay` (rows two and three keep returning full
+    /// backoffs); dropping `.min(remaining)` (the clamped 5ms and 20ms
+    /// entries); dropping `|| remaining.is_zero()` (the trailing `None`
+    /// entries of rows two and three).
     #[test]
-    fn retry_gate_clamps_backoff_to_remaining_deadline() {
-        let policy = RetryPolicy {
-            max_attempts: 100,
-            base_backoff: Duration::from_millis(80),
-            max_backoff: Duration::from_millis(80),
-            deadline: Duration::from_millis(100),
-            jitter_pct: 0,
-        };
-        let mut gate = RetryGate {
-            policy,
-            started: Instant::now() - Duration::from_millis(75),
-            completed_attempts: 0,
-        };
-
-        let backoff = gate
-            .record_failure_and_next_backoff(None)
-            .expect("deadline should have a small remaining budget");
-
-        assert!(backoff < policy.base_backoff);
-        assert!(backoff <= Duration::from_millis(25));
-    }
-
-    #[tokio::test]
-    async fn retry_gate_respects_deadline_independent_of_attempt_count() {
-        let policy = RetryPolicy {
-            max_attempts: 100,
-            base_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(10),
-            deadline: Duration::from_millis(50),
-            jitter_pct: 0,
-        };
-        let mut gate = RetryGate::new(policy);
-        assert!(gate.record_failure_and_next_backoff(None).is_some());
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        // Even though we still have 98 attempts left, the deadline budget is
-        // exhausted and we must stop.
-        assert!(gate.record_failure_and_next_backoff(None).is_none());
+    fn retry_gate_budget_counts_backoff_only() {
+        let ms = Duration::from_millis;
+        // (name, max_attempts, base, max, deadline, ms inside attempt 1, hints, expected)
+        type Case = (
+            &'static str,
+            u32,
+            u64,
+            u64,
+            u64,
+            u64,
+            &'static [Option<u64>],
+            &'static [Option<u64>],
+        );
+        let cases: [Case; 4] = [
+            (
+                "attempt longer than the budget is still retried",
+                3,
+                10,
+                10,
+                20,
+                40,
+                &[None, None, None],
+                &[Some(10), Some(10), None],
+            ),
+            (
+                "backoffs spend the budget before max_attempts",
+                100,
+                10,
+                10,
+                25,
+                0,
+                &[None, None, None, None],
+                &[Some(10), Some(10), Some(5), None],
+            ),
+            (
+                "server hint is charged and clamped to the remaining budget",
+                100,
+                1,
+                100,
+                50,
+                0,
+                &[Some(30), Some(30), Some(30)],
+                &[Some(30), Some(20), None],
+            ),
+            (
+                "single attempt never retries",
+                1,
+                10,
+                10,
+                1_000,
+                0,
+                &[None],
+                &[None],
+            ),
+        ];
+        for (name, max_attempts, base, max, deadline, inside, hints, expected) in cases {
+            let mut gate = RetryGate::new(RetryPolicy {
+                max_attempts,
+                base_backoff: ms(base),
+                max_backoff: ms(max),
+                deadline: ms(deadline),
+                jitter_pct: 0,
+            });
+            std::thread::sleep(ms(inside));
+            let observed: Vec<_> = hints
+                .iter()
+                .map(|hint| gate.record_failure_and_next_backoff(hint.map(ms)))
+                .collect();
+            let expected: Vec<_> = expected.iter().map(|value| value.map(ms)).collect();
+            assert_eq!(observed, expected, "{name}");
+        }
     }
 
     #[test]
