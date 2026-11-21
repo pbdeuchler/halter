@@ -450,10 +450,19 @@ fn check_append(base: &[Message], appended: &[Message]) {
     );
 }
 
+/// A fixed seed keeps CI reproducible. The nightly soak sets `PROPTEST_CASES`
+/// to run many more cases, and samples fresh ones.
+fn case_seed() -> proptest::test_runner::RngSeed {
+    match std::env::var_os("PROPTEST_CASES") {
+        Some(_) => proptest::test_runner::RngSeed::Random,
+        None => proptest::test_runner::RngSeed::Fixed(0x6361_6368),
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 256,
-        rng_seed: proptest::test_runner::RngSeed::Fixed(0x6361_6368),
+        rng_seed: case_seed(),
         failure_persistence: None,
         ..ProptestConfig::default()
     })]

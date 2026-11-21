@@ -160,17 +160,33 @@ A response can express:
 - a decision (`Approve` or `Block`)
 - an optional permission decision (`Allow`, `Ask`, `Deny`, `Passthrough`)
 - additional system messages
-- appended additional context
+- additional context
 - transformed input
 - transformed output
 - whether tool/output display should be suppressed
 - a stop condition
 
-A hook's system messages are added to the conversation where the hook ran,
-not to the system prompt, so they don't invalidate the provider's prompt
-cache. One from a `PreToolUse` or `PostToolUse` hook reaches the model just
-after that tool batch's results. Additional context is different: it is
-appended to the system prompt, so changing it does rewrite the cached prefix.
+A hook's additional context and system messages are added to the
+conversation where the hook ran, as system messages (context first). Neither
+is added to the system prompt, so neither invalidates the provider's prompt
+cache. System messages before a window's first other message are the
+exception: providers put them in the system prompt, which is safe because no
+request has been sent in that window yet.
+
+| Event | Runs | Output reaches the model |
+| --- | --- | --- |
+| `SessionStart` (`startup`) | before the first turn's first request | in the system prompt |
+| `SessionStart` (`resume`, `compact`) | at the next turn after a resume or a manual compaction | at the end of the conversation |
+| `UserPromptSubmit` | before each user message, including input delivered mid-turn | just before that message; in the system prompt on the first turn |
+| `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | inside a tool batch | just after the batch's results |
+| `Stop` | after the turn's last reply | at the start of the next request |
+| `PreCompact` | before a compaction pass | in the window the pass compacts; kept only if the strategy keeps it |
+| `PostCompact` | after the pass | in the new window; in its system prompt if the window has no other message |
+| `SubagentStart`, `SubagentStop` | outside the turn, queued behind it | at the end of the conversation |
+| `SessionEnd` | at shutdown | at the end of the conversation, if the session is resumed |
+
+In 0.10 and earlier, additional context was appended to the system prompt and kept
+there until a CleanWindow rollover.
 
 ---
 

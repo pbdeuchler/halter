@@ -850,8 +850,6 @@ pub enum SessionCommand {
     SubmitTurn { turn: Turn },
     /// Interrupt the active turn.
     InterruptTurn,
-    /// Append session-scoped system guidance.
-    AppendSystemPrompt { id: PromptId, text: SharedStr },
     /// Switch the active model role.
     SetModelRole { role: ModelRole },
     /// Switch to a concrete model id.
@@ -1769,6 +1767,11 @@ pub struct SessionState {
     pub pending_inputs: Vec<UserMessage>,
     #[serde(default)]
     pub compacted_prefix: Vec<Value>,
+    /// Append-kind segments rendered after the system prompt and skills.
+    /// The runtime no longer writes them: hook additional context is a
+    /// transcript system message instead, so it cannot rewrite the cached
+    /// prefix. Sessions recorded by earlier versions keep the segments they
+    /// hold until a rollover clears them, so they encode as they did.
     pub appended_prompt_segments: Vec<PromptSegment>,
     pub pending_tool_calls: IndexMap<ToolCallId, PendingToolCall>,
     pub usage_so_far: Usage,
@@ -2084,9 +2087,9 @@ impl AssembledPrompt {
         &self.ordered_segments[start..end]
     }
 
-    /// Slice of segments that follow both the system and skills sections —
-    /// hook-appended context, etc. These never receive a cache breakpoint
-    /// because they may change turn-to-turn.
+    /// Slice of segments that follow both the system and skills sections:
+    /// append-kind segments, such as `SessionState::appended_prompt_segments`.
+    /// These never receive a cache breakpoint.
     #[must_use]
     pub fn append_segments(&self) -> &[PromptSegment] {
         let start =

@@ -11,14 +11,13 @@ use futures::FutureExt;
 use futures::stream::{BoxStream, StreamExt};
 use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
-    AgentId, AssembledPrompt, AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash,
-    ContextPlan, Delivery, HookSessionStartSource, HookWarning, Message, MessageId, ModelId,
-    ObservedState, PendingEvent, PendingToolCall, PromptSegment, PromptSegmentId,
-    PromptSegmentKind, ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, ResourceSnapshot,
-    SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
-    StreamEvent, SubagentEventForwarding, SubagentRecord, SubagentState, SubagentStatus,
-    SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn,
-    TurnId, Usage, Volatility,
+    AgentId, AssembledPrompt, AssistantMessage, AssistantPart, BlockId, ContextPlan, Delivery,
+    HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState, PendingEvent,
+    PendingToolCall, PromptSegment, ProviderError, ProviderRequest, ReplayMeta, ResolvedModel,
+    ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState,
+    StopReason, StreamEvent, SubagentEventForwarding, SubagentRecord, SubagentState,
+    SubagentStatus, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult,
+    ToolResultMessage, Turn, TurnId, Usage,
 };
 use halter_providers::{ModelRegistry, Provider};
 
@@ -27,7 +26,6 @@ use halter_tools::{
     PathLockMap, SubagentControl, SubagentParentContext, TaskList, ToolEventSink, ToolPolicy,
     ToolRuntime, ToolRuntimeEvent, ToolSessionStore,
 };
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -690,6 +688,10 @@ impl SessionRuntime {
     }
 
     /// Replace resources used by future turns and resumed sessions.
+    ///
+    /// A change to the skills changes the skill index and tool list that
+    /// open sessions send from their next turn, so each one rewrites its
+    /// cached prompt prefix once.
     pub fn replace_resources(
         &self,
         snapshot: ResourceSnapshot,
@@ -3800,14 +3802,18 @@ pub(crate) fn apply_hook_side_effects(
         }
     }
 
-    for context in &dispatch.merged.additional_context {
-        state
-            .appended_prompt_segments
-            .push(build_hook_prompt_segment(context));
-    }
-
+    // Additional context is a system message where the hook ran, like the
+    // hook's own messages: editing the system prompt mid-window would
+    // invalidate the provider's prompt cache. Context that lands before a
+    // window's first other message is leading system content, which
+    // providers still put in the system prompt.
     let mut messages = Vec::new();
-    for text in &dispatch.merged.system_messages {
+    for text in dispatch
+        .merged
+        .additional_context
+        .iter()
+        .chain(&dispatch.merged.system_messages)
+    {
         let message = Message::System(SystemMessage {
             id: MessageId::new(),
             created_at: Utc::now(),
@@ -3818,23 +3824,6 @@ pub(crate) fn apply_hook_side_effects(
     }
 
     messages
-}
-
-fn build_hook_prompt_segment(text: &str) -> PromptSegment {
-    PromptSegment {
-        id: PromptSegmentId::new(),
-        text: text.to_owned(),
-        volatility: Volatility::TurnDynamic,
-        cache_scope: CacheScope::Dynamic,
-        content_hash: hash_text(text),
-        kind: PromptSegmentKind::Append,
-    }
-}
-
-fn hash_text(text: &str) -> ContentHash {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 fn tool_result_from_hook_value(value: serde_json::Value) -> ToolResult {
@@ -4394,10 +4383,11 @@ mod tests {
         Hook, HookEventName, HookResponse, HooksFile, RegisteredHookPriority, RegisteredHooks,
     };
     use halter_protocol::{
-        ApiKind, BlockId, HookHandlerType, HookRunStatus, HookSessionStartSource, Message, ModelId,
-        ModelRole, PluginId, ProviderCapabilities, ProviderError, ProviderKind, ProviderName,
-        ProviderRequest, ResolvedModel, StopReason, StreamEvent, ToolCallId, ToolCapabilities,
-        ToolConcurrency, ToolName, ToolResult, ToolSpec, Turn,
+        ApiKind, BlockId, CacheScope, HookHandlerType, HookRunStatus, HookSessionStartSource,
+        Message, ModelId, ModelRole, PluginId, PromptSegmentKind, ProviderCapabilities,
+        ProviderError, ProviderKind, ProviderName, ProviderRequest, ResolvedModel, StopReason,
+        StreamEvent, ToolCallId, ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec,
+        Turn, Volatility,
     };
     use halter_providers::{FakeProvider, Provider};
     use halter_tools::{

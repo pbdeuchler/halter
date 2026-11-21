@@ -22,6 +22,8 @@ mod hooks_runtime;
 mod model_judge;
 mod model_selection;
 mod model_summary;
+#[cfg(test)]
+mod prefix_stability_tests;
 mod prompt;
 mod provider_default;
 mod session;
