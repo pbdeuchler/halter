@@ -6,8 +6,8 @@ use base64::Engine;
 use halter_protocol::{
     ApiKind, AssistantPart, BlockId, Message, MessageId, PromptSegment, ProviderCompactionRejected,
     ProviderCompactionRequest, ProviderCompactionResponse, ProviderKind, ProviderRequest,
-    ReasoningEffort, StopReason, StreamEvent, ToolCallId, ToolName, ToolResultMessage, ToolSpec,
-    Usage, UserPart,
+    ReasoningEffort, StopReason, StreamEvent, ToolCallId, ToolName, ToolResult, ToolResultMessage,
+    ToolSpec, Usage, UserPart,
 };
 use serde_json::{Map, Value, json};
 
@@ -590,7 +590,13 @@ fn encode_assistant_parts(
                         &request.tools,
                         request.model.provider_kind,
                     ),
-                    "input": call.arguments,
+                    // Anthropic takes only an object. Arguments kept as text because
+                    // they were not JSON replay as the empty object.
+                    "input": if call.arguments.is_object() {
+                        call.arguments.clone()
+                    } else {
+                        json!({})
+                    },
                 }));
             }
         }
@@ -603,7 +609,11 @@ fn encode_tool_result(message: &ToolResultMessage) -> Value {
     json!({
         "type": "tool_result",
         "tool_use_id": normalized_tool_call_id(&message.call_id),
-        "content": message.to_model_string(),
+        // `is_error` marks a failure here, so a bare error stays unprefixed.
+        "content": match (&message.content, &message.error) {
+            (ToolResult::Empty, Some(error)) => error.message.as_str().into(),
+            _ => message.to_model_string(),
+        },
         "is_error": message.error.is_some(),
     })
 }
@@ -2197,6 +2207,55 @@ mod tests {
             messages: request.messages,
             tools: request.tools,
             instructions: "Summarize the session".to_owned(),
+        }
+    }
+
+    #[test]
+    fn tool_results_flag_failures_and_keep_successes_unchanged() {
+        let error = Some(halter_protocol::ToolError::new("boom"));
+        let text = |text: &str| ToolResult::Text {
+            text: text.to_owned(),
+        };
+        for (content, error, expected) in [
+            (ToolResult::Empty, error.clone(), json!(["boom", true])),
+            (
+                text("partial"),
+                error,
+                json!(["partial\n\nerror: boom", true]),
+            ),
+            (text("done"), None, json!(["done", false])),
+        ] {
+            let encoded = encode_tool_result(&ToolResultMessage {
+                id: MessageId::new(),
+                call_id: ToolCallId::from("call"),
+                content,
+                error,
+                created_at: Utc::now(),
+            });
+            assert_eq!(json!([encoded["content"], encoded["is_error"]]), expected);
+        }
+    }
+
+    #[test]
+    fn tool_call_arguments_that_are_not_an_object_replay_as_an_empty_object() {
+        for (arguments, expected) in [
+            (json!({"path": "README.md"}), json!({"path": "README.md"})),
+            (json!(r#"{"path":"#), json!({})),
+        ] {
+            let request = sample_request(vec![Message::Assistant(AssistantMessage {
+                id: MessageId::new(),
+                created_at: Utc::now(),
+                parts: vec![AssistantPart::ToolCall(ToolCall {
+                    id: ToolCallId::from("call"),
+                    name: "read".into(),
+                    arguments,
+                })],
+                stop_reason: None,
+                usage: None,
+                replay_meta: Default::default(),
+            })]);
+            let body = encode_request(&request, None).expect("encode request");
+            assert_eq!(body["messages"][0]["content"][0]["input"], expected);
         }
     }
 }

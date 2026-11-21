@@ -221,10 +221,7 @@ fn create_action(store: &Arc<Mutex<TaskList>>, input: &Value) -> anyhow::Result<
     if subject.is_empty() {
         anyhow::bail!("invalid tool input: field 'subject' must not be empty");
     }
-    let description = optional_string(input, "description")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+    let description = optional_string(input, "description").map(|value| value.trim().to_owned());
     let mut list = store.lock();
     let task = list.create(subject.to_owned(), description);
     let summary = list.summary();

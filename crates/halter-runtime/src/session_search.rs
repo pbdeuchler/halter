@@ -6,33 +6,41 @@ use halter_protocol::{Message, SessionId, ToolConcurrency, ToolSpec};
 use halter_session::{SessionHistory, SessionStore};
 use halter_tools::{
     LineRange, RECOVERY_RESPONSE_BYTES, RECOVERY_RESULT_LIMIT, Report, ToolContext, TypedTool,
-    recovery_lines, recovery_preview as preview,
+    parse_input, placeholder_as_default, recovery_lines, recovery_preview as preview,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum SessionSearchRequest {
     ListWindows {
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         after: Option<String>,
     },
     ListItems {
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         window_id: Option<String>,
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         role: Option<String>,
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         tool: Option<String>,
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         after: Option<String>,
     },
     ReadItem {
         item_id: String,
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         start_byte: Option<usize>,
         #[serde(flatten)]
         range: LineRange,
     },
     SearchContents {
         query: String,
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         window_id: Option<String>,
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         after: Option<String>,
     },
 }
@@ -240,7 +248,7 @@ impl<S: SessionSearchBackend> TypedTool for SessionSearchTool<S> {
     }
     async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Report> {
         anyhow::ensure!(!context.cancel.is_cancelled(), "session search cancelled");
-        let request = serde_json::from_value(input)?;
+        let request = parse_input(input)?;
         Ok(Report(self.0.execute(&context.session_id, request).await?))
     }
 }
@@ -561,6 +569,111 @@ mod tests {
             },
         ] {
             assert!(search.execute(&session, request).await.is_err());
+        }
+    }
+
+    /// Unknown fields and placeholder optionals (`""`, `null`, `0`) read as
+    /// absent; a real value of the wrong type is still an error.
+    #[test]
+    fn requests_ignore_unknown_fields_and_placeholder_optionals() {
+        let parse = |input: Value| {
+            serde_json::from_value::<SessionSearchRequest>(input)
+                .map(|request| format!("{request:?}"))
+        };
+        let read_item = |start_byte, start_line| {
+            format!(
+                "{:?}",
+                SessionSearchRequest::ReadItem {
+                    item_id: "i".to_owned(),
+                    start_byte,
+                    range: LineRange {
+                        start_line,
+                        end_line: None
+                    },
+                }
+            )
+        };
+        let list_items = format!(
+            "{:?}",
+            SessionSearchRequest::ListItems {
+                window_id: None,
+                role: None,
+                tool: None,
+                after: None
+            }
+        );
+        for (input, expected) in [
+            (
+                json!({"action":"list_items","window_id":"","role":null,"tool":" ","after":"","query":"","zz_unknown":1}),
+                Some(list_items),
+            ),
+            (
+                json!({"action":"read_item","item_id":"i","start_byte":0,"start_line":0,"end_line":null,"zz_unknown":[]}),
+                Some(read_item(None, None)),
+            ),
+            (
+                json!({"action":"read_item","item_id":"i","start_byte":3,"start_line":2}),
+                Some(read_item(Some(3), Some(2))),
+            ),
+            (
+                json!({"action":"read_item","item_id":"i","start_line":"two"}),
+                None,
+            ),
+            (json!({"action":"list_items","role":7}), None),
+        ] {
+            assert_eq!(parse(input.clone()).ok(), expected, "{input}");
+        }
+    }
+
+    struct Echo;
+
+    #[async_trait]
+    impl SessionSearchBackend for Echo {
+        async fn execute(
+            &self,
+            _session: &SessionId,
+            request: SessionSearchRequest,
+        ) -> anyhow::Result<Value> {
+            Ok(json!(format!("{request:?}")))
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_are_reported_as_invalid_tool_input() {
+        let context = halter_tools::ToolContext {
+            session_id: SessionId::new(),
+            working_dir: std::env::temp_dir(),
+            path_locks: Default::default(),
+            tool_sessions: Default::default(),
+            snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
+            cancel: Default::default(),
+            emit: Arc::new(halter_tools::NoopToolEventSink),
+            policy: Arc::new(halter_tools::DefaultToolPolicy::new(Default::default())),
+            shell_timeout_secs: 30,
+            subagent_parent: None,
+        };
+        let tool = SessionSearchTool(Arc::new(Echo));
+        for (input, expected) in [
+            (
+                json!({"action":"list_windows"}),
+                Ok("ListWindows { after: None }"),
+            ),
+            (json!({"action":"explode"}), Err("invalid tool input: ")),
+            (
+                json!({"action":"list_items","role":7}),
+                Err("invalid tool input: "),
+            ),
+        ] {
+            let outcome = tool.run(context.clone(), input.clone()).await;
+            match (outcome, expected) {
+                (Ok(Report(value)), Ok(debug)) => assert_eq!(value, json!(debug), "{input}"),
+                (Err(error), Err(prefix)) => {
+                    assert!(error.to_string().starts_with(prefix), "{input}: {error}")
+                }
+                (outcome, expected) => {
+                    panic!("{input}: {:?} vs {expected:?}", outcome.map(|r| r.0))
+                }
+            }
         }
     }
 }

@@ -380,4 +380,125 @@ mod tests {
         assert_eq!(matches[0]["path"], "visible.txt");
         assert_eq!(value["files_with_matches"], 1);
     }
+
+    /// A valid call for every tool these registries can hold. A tool missing
+    /// here fails the test below, so a new built-in gets checked too.
+    fn base_input(tool: &str) -> serde_json::Value {
+        match tool {
+            "read" => json!({"path": "a.txt"}),
+            "write" => json!({"path": "b.txt", "content": "b"}),
+            "edit" => json!({"path": "a.txt", "old_string": "a", "new_string": "b"}),
+            "glob" => json!({"pattern": "*.txt"}),
+            "grep" => json!({"pattern": "a"}),
+            "shell" => json!({"command": "echo hi"}),
+            "process" => json!({"action": "list_descendants", "pid": u32::MAX}),
+            "background" | "task" => json!({"action": "list"}),
+            "pty" => json!({"action": "kill", "session_id": "none"}),
+            "ast_grep" => json!({"action": "find", "patterns": ["fn $A() {}"], "lang": "rust"}),
+            "image" => json!({"action": "info", "path": "a.txt"}),
+            "browser" => json!({"action": "close"}),
+            "profile" => json!({}),
+            "notes" => json!({"action": "list_files_by_prefix"}),
+            "spawn_agent" => json!({"message": "hi"}),
+            "send_input" => json!({"target": "agent", "message": "hi"}),
+            "wait_agent" => json!({"targets": ["agent"]}),
+            "close_agent" => json!({"target": "agent"}),
+            other => panic!("add a base input for the new built-in tool '{other}'"),
+        }
+    }
+
+    /// No built-in tool rejects a field it does not know, and every optional
+    /// parameter the call leaves out may instead arrive as a placeholder
+    /// (`""`, `0`, `null`, `[]`, `{}`) without changing the outcome.
+    #[tokio::test]
+    async fn every_tool_ignores_unknown_fields_and_placeholder_optionals() {
+        let runtime = ToolRuntime::new();
+        register_builtin_tools(&runtime, &[]);
+        let control = Arc::new(crate::NoopSubagentControl) as Arc<dyn crate::SubagentControl>;
+        let snapshot = halter_protocol::ResourceSnapshot::empty();
+        crate::register_subagent_tools(&runtime, control, &[], &snapshot, &[]);
+        let notes_root = tempfile::tempdir().expect("tempdir");
+        let notes = crate::FsNotes::new(notes_root.path()).expect("notes");
+        runtime.register(Arc::new(crate::NotesTool(Arc::new(notes))));
+        let parent = Arc::new(crate::SubagentParentContext {
+            blueprint: halter_protocol::SessionBlueprint {
+                session_id: "parent".into(),
+                parent_session_id: None,
+                default_model: "default".into(),
+                subagent_model: "subagent".into(),
+                subagent_event_forwarding: halter_protocol::SubagentEventForwarding::Off,
+                snapshot_revision: "revision".into(),
+                working_dir: ".".into(),
+                system_prompt_seed: Vec::new(),
+                max_turns: None,
+                subagent_depth: 0,
+            },
+            state: halter_protocol::SessionState::default(),
+            snapshot: Arc::new(snapshot),
+            model: "default".into(),
+            subagent_model: "subagent".into(),
+        });
+        let run = async |name: &str, input: serde_json::Value| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp.path().join("a.txt"), "a\n").expect("write");
+            let policy: Arc<dyn ToolPolicy> = Arc::new(DefaultToolPolicy::new(PolicySettings {
+                allowed_write_roots: vec![temp.path().to_path_buf()],
+                ..PolicySettings::default()
+            }));
+            let context = ToolContext {
+                subagent_parent: Some(parent.clone()),
+                ..tool_context(temp.path(), policy)
+            };
+            runtime
+                .execute(name, context, input)
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"))
+        };
+
+        for spec in runtime.specs() {
+            let name = spec.name.0.as_str();
+            let base = base_input(name);
+            let mut sloppy = base.as_object().expect("object input").clone();
+            let properties = spec.input_schema["properties"].as_object();
+            for (key, schema) in properties.into_iter().flatten() {
+                let placeholder = match schema["type"].as_str() {
+                    Some("string") => json!(""),
+                    Some("integer" | "number") => json!(0),
+                    Some("array") => json!([]),
+                    Some("object") => json!({}),
+                    _ => json!(null),
+                };
+                sloppy.entry(key.clone()).or_insert(placeholder);
+            }
+            sloppy.insert("zz_unknown_field".to_owned(), json!("unused"));
+            let sloppy = serde_json::Value::Object(sloppy);
+
+            let expected = run(name, base).await;
+            assert_eq!(
+                run(name, sloppy.clone()).await,
+                expected,
+                "{name}: {sloppy}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_error_lists_the_available_tools() {
+        let runtime = ToolRuntime::new();
+        register_builtin_tools(&runtime, &["read".to_owned(), "glob".to_owned()]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let policy: Arc<dyn ToolPolicy> =
+            Arc::new(DefaultToolPolicy::new(PolicySettings::default()));
+
+        let error = runtime
+            .execute("Read", tool_context(temp.path(), policy), json!({}))
+            .await
+            .expect_err("unknown tool");
+
+        assert_eq!(
+            error.to_string(),
+            "failed to execute tool: unknown tool 'Read'; available tools: glob, read"
+        );
+    }
 }

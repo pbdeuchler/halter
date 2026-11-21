@@ -141,6 +141,41 @@ once a `1.0.0` line is cut.
   for models with a reasoning effort. `include_encrypted_reasoning` in
   `[providers.openai]` and `[providers.openrouter]` (default `true`) and
   `ResponsesOptions::include_encrypted_reasoning` turn it off.
+- Built-in tools read their input leniently. None rejects a field it does not
+  know (`notes` and `session_search` dropped `deny_unknown_fields`), and an
+  optional parameter given as `null`, a blank string, `0`, `[]` or `{}` counts
+  as absent, so a model that fills every schema property gets the defaults
+  instead of an error. Required fields and real values of the wrong type are
+  still errors. `halter_tools::placeholder_as_default` gives serde-typed tool
+  inputs the same rule.
+- `write` takes `create_dirs` (default `false`). When true, missing parent
+  directories are created first, each one approved by the write policy before
+  it exists. Without it, a missing parent is an error that names the directory
+  and the flag.
+- `edit` ignores an `expected_sha256` that is not a 64-digit hex sha256 (such as
+  `""` or `"unused"`), and accepts one in upper case. A stale one names the
+  file's current hash.
+- Calling an unknown tool returns an error that lists the available tools.
+- Tool call arguments that are not valid JSON are no longer replaced with `{}`.
+  `ToolCall::arguments` keeps the text as a JSON string, and the call is
+  answered with `invalid tool input: the arguments are not valid JSON (<serde
+  error>), so the tool did not run; send the call again with its arguments as
+  one JSON object. Received: <text>`. The tool does not run. The check follows
+  `PreToolUse` hooks, so a hook can repair the arguments. Anthropic replays such
+  a call with `input: {}`.
+- A tool error reaches the model with its whole `anyhow` cause chain, as do
+  background-job failures, subagent failures and `TurnFailed` errors.
+- On the OpenAI Responses and Chat Completions dialects, which have no error
+  flag on a tool result, a failed result with no content is sent as
+  `error: <message>` instead of the bare message. Anthropic, which has
+  `is_error`, is unchanged, and so are successful results on every dialect.
+- A panic in a tool fails that call with `tool '<name>' panicked: <payload>;
+  it may have partially completed` and the turn continues. Before, the panic
+  failed the whole turn (`session execution panicked`) and the call was
+  answered `tool call interrupted while running; it may have partially
+  completed`.
+- `session_search` input errors start with `invalid tool input:` like other
+  built-in tools. `halter_tools::parse_input` is public.
 
 ### Removed
 
@@ -257,6 +292,14 @@ once a `1.0.0` line is cut.
   UserPromptSubmit hook used to add another copy every turn. Sessions recorded
   by earlier versions keep the segments they recorded until a rollover clears
   them, so they encode as before.
+- The subagent tools (`spawn_agent`, `wait_agent`, `send_input`,
+  `close_agent`) emit `ToolRuntimeEvent::Completed` on every error path, so
+  each `Started` has a matching end.
+- A subagent whose turn ends in `TurnFailed` (a provider error, for example)
+  is reported `Failed` with that error, or `Cancelled` when the failure was a
+  cancellation. It was reported `Completed` with no output.
+- `PolicyError::Io` no longer prints its `io::Error` twice when the chain is
+  shown with `{:#}`. Its plain `Display` no longer includes the cause.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the
@@ -359,6 +402,9 @@ once a `1.0.0` line is cut.
   "force now" and are documented in [docs/timeouts.md](docs/timeouts.md).
 - Provider timeout messages print the configured duration (`50ms`, `1.5s`)
   instead of whole seconds, which read "after 0s" for sub-second timeouts.
+- `spawn_agent`, `send_input`, `wait_agent` and `close_agent` return serde's account
+  of what is wrong with a malformed input ("invalid tool input: missing field
+  `target`") instead of a bare "invalid input" that hid it from the model.
 
 ## [0.10.0] - 2026-11-14
 
