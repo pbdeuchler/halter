@@ -131,6 +131,12 @@ once a `1.0.0` line is cut.
   forces it at its own deadline. **Behavior change:** a bounded call can
   return up to 5s after its timeout, and returns `Ok` where it used to return
   `TimedOut`.
+- `halter auth openai login` no longer aborts on one bad connection to its
+  callback listener. A socket that closed or stalled before its headers, a
+  malformed request, or a callback with a stale state (an old browser tab)
+  each returned an error that ended the login; they now count against the
+  16-request stray budget. A provider error or a missing code under the
+  expected state still ends the login.
 - Provider timeout messages print the configured duration (`50ms`, `1.5s`)
   instead of whole seconds, which read "after 0s" for sub-second timeouts.
 
