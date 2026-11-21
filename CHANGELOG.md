@@ -113,6 +113,14 @@ once a `1.0.0` line is cut.
   request and idle timers could, and hooks fail open, so any provider stall
   silently dropped the hook's decision, including a block. A longer
   configured timeout is kept.
+- A bounded session shutdown (`shutdown(Some(timeout))`) cancels running
+  SessionEnd hooks when its deadline passes; they are recorded as cancelled
+  and `SessionShutdownComplete` is still committed. Before, SessionEnd hooks
+  got a cancellation token that never fired, so they ran on for their own
+  timeout (600s for command hooks) after the caller had stopped waiting, and
+  a CLI exit killed them mid-run with nothing recorded. The wait for the
+  session lease during shutdown also ends at that deadline. `shutdown(None)`
+  is unchanged.
 - Provider timeout messages print the configured duration (`50ms`, `1.5s`)
   instead of whole seconds, which read "after 0s" for sub-second timeouts.
 

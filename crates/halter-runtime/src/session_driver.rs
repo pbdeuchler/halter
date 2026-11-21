@@ -1344,20 +1344,21 @@ impl Driver {
         let id = self.control.id.clone();
         let deadline = stop.deadline;
         let reason = stop.intent.reason();
+        // Fired by `force_active` at the deadline, so SessionEnd hooks end
+        // (recorded as cancelled) instead of outliving the caller's wait.
+        let cancel = CancellationToken::new();
+        let hook_cancel = cancel.clone();
         let task = tokio::spawn(async move {
             let children = subagents.close_session_with_deadline(&id, deadline).await;
             let resources = sessions.shutdown_session(&id).await;
-            let hooks = executor.shutdown(reason).await;
+            let hooks = executor.shutdown(reason, hook_cancel).await;
             children
                 .and(resources)
                 .and(hooks)
                 .map(|()| TaskOutcome::Complete)
         });
         self.transition(Phase::Closing {
-            active: Active {
-                cancel: CancellationToken::new(),
-                task,
-            },
+            active: Active { cancel, task },
             stop,
         });
     }
@@ -1421,6 +1422,7 @@ impl Driver {
             }
             Phase::Closing { active, mut stop } => {
                 stop.deadline = None;
+                active.cancel.cancel();
                 let task = tokio::spawn(async move {
                     sessions.force_stop_session(&id).await;
                     subagents.force_close_session(&id).await;
@@ -1508,7 +1510,10 @@ impl Driver {
                 .tool_sessions
                 .shutdown_session(&self.control.id)
                 .await;
-            let _ = self.executor.shutdown("session_failed").await;
+            let _ = self
+                .executor
+                .shutdown("session_failed", CancellationToken::new())
+                .await;
         }
         // Fatal errors route directly to the store. Repair remaining inbox
         // metadata against its current head, never the failed actor's cursor.

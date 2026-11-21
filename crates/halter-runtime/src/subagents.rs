@@ -708,7 +708,7 @@ impl RuntimeSubagentControl {
         }) == Some(true);
         if !already_ended {
             SessionExecutor::new(self.inner.services.clone(), session_id.clone())?
-                .shutdown("parent_session_closed")
+                .shutdown("parent_session_closed", CancellationToken::new())
                 .await?;
         }
         Ok(())

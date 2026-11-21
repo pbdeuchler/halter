@@ -1032,9 +1032,26 @@ impl SessionExecutor {
         self.services.sessions.replay(&self.session_id).await
     }
 
-    /// Shut down this session and run session-end hooks.
-    pub(crate) async fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
-        self.leased(self.run_shutdown(reason)).await
+    /// Shut down this session and run session-end hooks. `cancel` is the
+    /// forced-cleanup signal: it ends a wait for a held session lease and
+    /// cancels running SessionEnd hooks, which are recorded as cancelled while
+    /// shutdown still commits. With a token that never fires, the hooks'
+    /// own timeouts bound them.
+    pub(crate) async fn shutdown(
+        &self,
+        reason: &str,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        // A free lease wins over an already-fired cancel, so a forced
+        // shutdown still commits; only a wait on a held lease is cut short.
+        let lease = tokio::select! {
+            biased;
+            lease = self.acquire_lease() => lease,
+            () = cancel.cancelled() => return Err(ProviderError::cancelled().into()),
+        };
+        let outcome = self.run_shutdown(reason, cancel).await;
+        lease.release().await?;
+        outcome
     }
 
     /// Force an uncooperative executor down, then close its checkpoint under
@@ -1083,7 +1100,11 @@ impl SessionExecutor {
         .await
     }
 
-    async fn run_shutdown(&self, reason: &str) -> anyhow::Result<()> {
+    async fn run_shutdown(
+        &self,
+        reason: &str,
+        hook_cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
         let mut stored = self
             .services
             .sessions
@@ -1101,9 +1122,8 @@ impl SessionExecutor {
         let mut events = Vec::new();
         let turn_id = TurnId::new();
         // SessionEnd hooks run after runtime shutdown has cancelled every
-        // runtime token, so they get one that never fires; their configured
-        // timeouts bound them.
-        let hook_cancel = CancellationToken::new();
+        // runtime token, so they get the caller's forced-cleanup token
+        // instead of a runtime one.
         let hook_ctx = HookInvocationContext {
             turn_id: &turn_id,
             model: &stored.blueprint.default_model,
@@ -12702,7 +12722,7 @@ mod tests {
         // while an out-of-turn hook dispatch queues and returns at once.
         let waiting_shutdown = tokio::spawn({
             let session = session.clone();
-            async move { session.shutdown("test").await }
+            async move { session.shutdown("test", CancellationToken::new()).await }
         });
         session
             .notify("info", "queued")
@@ -12762,6 +12782,58 @@ mod tests {
             order.is_sorted(),
             "turn, then queued dispatch, then shutdown: {order:?}"
         );
+    }
+
+    /// Finding 2: forced shutdown and the session lease. A free lease is
+    /// taken even when the cancel has already fired, so shutdown still
+    /// commits `SessionShutdownComplete`; a lease held by a running turn is
+    /// waited on only until the cancel. Mutations killed: putting the cancel
+    /// arm first in `shutdown`'s biased select (row "free" returns cancelled
+    /// without committing); dropping the cancel arm (row "held" hangs past
+    /// the 5s guard).
+    #[tokio::test]
+    async fn forced_shutdown_takes_a_free_lease_and_abandons_a_held_one() {
+        for (name, held) in [("free", false), ("held", true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let started = Arc::new(Notify::new());
+            let services = test_support::configured_services(
+                Arc::new(CancellableBlockingProvider {
+                    started: started.clone(),
+                }),
+                temp.path(),
+            );
+            let runtime = SessionRuntime::new(services);
+            let session = test_support::new_session(&runtime, temp.path()).await;
+            let turn_cancel = CancellationToken::new();
+            let _turn = if held {
+                let turn = session
+                    .submit_turn_with_cancel(Turn::user("blocking"), turn_cancel.clone())
+                    .await
+                    .expect("turn");
+                started.notified().await;
+                Some(turn)
+            } else {
+                None
+            };
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), session.shutdown("test", cancel))
+                    .await
+                    .expect("forced shutdown returns");
+
+            let committed =
+                session.replay().await.expect("replay").iter().any(|event| {
+                    matches!(event.payload, SessionEventPayload::SessionShutdownComplete)
+                });
+            assert_eq!(
+                (result.is_ok(), committed),
+                (!held, !held),
+                "{name}: {result:?}"
+            );
+            turn_cancel.cancel();
+        }
     }
 
     #[tokio::test]

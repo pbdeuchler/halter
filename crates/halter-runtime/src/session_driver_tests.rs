@@ -1589,3 +1589,51 @@ async fn failed_pending_retry_does_not_wake_a_deferred_input() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     session.shutdown(None).await.unwrap();
 }
+
+/// Finding 2: SessionEnd hooks used to get a cancel token that never fired,
+/// so a hook outlived a bounded shutdown (and was killed with the process)
+/// instead of ending at the forced deadline. The hook never answers; a
+/// 100ms shutdown must cancel it and still commit `SessionShutdownComplete`
+/// well inside the hook's 30s timeout.
+/// Mutation killed: removing `active.cancel.cancel()` from the `Closing` arm
+/// of `force_active` (the hook then runs on and the 5s guard fails).
+#[tokio::test]
+async fn bounded_shutdown_cancels_session_end_hooks_at_the_deadline() {
+    use halter_hooks::{Hook, HookEventName, RegisteredHookPriority, RegisteredHooks};
+
+    // The hook never answers; only the shutdown token can end it before its
+    // own 30s handler timeout.
+    let mut hooks = RegisteredHooks::default();
+    hooks.register(
+        halter_protocol::PluginId::from("slow-session-end"),
+        RegisteredHookPriority::AfterPlugins,
+        Hook::callback(HookEventName::SessionEnd, |_| {
+            std::future::pending::<halter_hooks::HookResponse>()
+        }),
+    );
+    let mut services = services(Arc::new(FakeProvider::default()));
+    Arc::get_mut(&mut services).unwrap().registered_hooks = Arc::new(hooks);
+    let runtime = SessionRuntime::new(services.clone());
+    let (session, _events) = runtime
+        .create_session(SessionInit::default())
+        .await
+        .unwrap();
+    let id = session.id().clone();
+
+    let _ = session.shutdown(Some(Duration::from_millis(100))).await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let log = services.sessions.replay(&id).await.unwrap();
+            if log
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::SessionShutdownComplete))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("SessionEnd hook must end at the forced deadline so shutdown commits");
+}
