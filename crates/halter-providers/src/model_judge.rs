@@ -238,6 +238,10 @@ impl ModelJudgeProvider {
             }
         });
 
+        // No panel-level deadline: each panelist ends on its own provider's
+        // resilience timers (request, stream-idle, retry deadline), on
+        // `cancel`, or on success, so the panel takes as long as its slowest
+        // panelist. See docs/timeouts.md.
         let mut results = futures::future::join_all(futures).await;
         results.sort_by_key(|(index, _)| *index);
 

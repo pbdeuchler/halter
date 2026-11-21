@@ -131,6 +131,11 @@ once a `1.0.0` line is cut.
   forces it at its own deadline. **Behavior change:** a bounded call can
   return up to 5s after its timeout, and returns `Ok` where it used to return
   `TimedOut`.
+- An unbounded `close_agent` (no `timeout_ms`) ends when its tool call is
+  cancelled, returning `cancelled`; the close itself is still requested and
+  cleanup continues in the background. Before, cancelling the parent turn
+  could not end the call while a child's cleanup hung. `close_agent` now
+  reports `cancellable: true`.
 - Forced turn recovery (`force_interrupt_turn`, used when an interrupt,
   shutdown or subagent close passes its deadline) retries a
   `SessionCommitConflict` at most 8 times, with a 10ms-per-attempt backoff,
