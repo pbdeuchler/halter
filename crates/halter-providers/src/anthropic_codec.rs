@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 
 use base64::Engine;
 use halter_protocol::{
-    ApiKind, AssistantPart, BlockId, Message, MessageId, PromptSegment, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderKind, ProviderRequest, ReasoningEffort, StopReason,
-    StreamEvent, ToolCallId, ToolName, ToolResultMessage, ToolSpec, Usage, UserPart,
+    ApiKind, AssistantPart, BlockId, Message, MessageId, PromptSegment, ProviderCompactionRejected,
+    ProviderCompactionRequest, ProviderCompactionResponse, ProviderKind, ProviderRequest,
+    ReasoningEffort, StopReason, StreamEvent, ToolCallId, ToolName, ToolResultMessage, ToolSpec,
+    Usage, UserPart,
 };
 use serde_json::{Map, Value, json};
 
@@ -208,20 +209,25 @@ pub(crate) fn decode_compaction_response(
 ) -> anyhow::Result<ProviderCompactionResponse> {
     // Only a summary the model finished is a summary: a refusal or a
     // `max_tokens` cut still carries text, and applying it would replace the
-    // session's history with a fragment.
+    // session's history with a fragment. It was billed all the same.
     let stop_reason = response.get("stop_reason").and_then(Value::as_str);
+    let text = response_text(response);
     if !matches!(stop_reason, Some("end_turn" | "stop_sequence")) {
         let category = response
             .pointer("/stop_details/category")
             .and_then(Value::as_str)
             .map(|category| format!(" ({category})"))
             .unwrap_or_default();
-        anyhow::bail!(
-            "failed to decode anthropic compaction response: stop_reason {}{category}",
-            stop_reason.unwrap_or("missing")
-        );
+        return Err(ProviderCompactionRejected {
+            reason: format!(
+                "failed to decode anthropic compaction response: stop_reason {}{category}",
+                stop_reason.unwrap_or("missing")
+            ),
+            text,
+            usage: decode_usage(response),
+        }
+        .into());
     }
-    let text = response_text(response);
     if text.trim().is_empty() {
         return Ok(ProviderCompactionResponse {
             output: Vec::new(),
@@ -1806,8 +1812,18 @@ mod tests {
                 .extend(stop.as_object().expect("object").clone());
             match (decode_compaction_response(&response), expected) {
                 (Ok(decoded), Ok(items)) => assert_eq!(decoded.output.len(), items, "{case}"),
+                // A rejection still carries what was billed and said.
                 (Err(error), Err(fragment)) => {
-                    assert!(error.to_string().contains(fragment), "{case}: {error}");
+                    let rejected = error
+                        .downcast_ref::<ProviderCompactionRejected>()
+                        .unwrap_or_else(|| panic!("{case}: untyped {error}"));
+                    assert!(rejected.reason.contains(fragment), "{case}: {error}");
+                    assert_eq!(rejected.text, "Summary so far:\n  -", "{case}");
+                    assert_eq!(
+                        (rejected.usage.input_tokens, rejected.usage.output_tokens),
+                        (30, 9),
+                        "{case}"
+                    );
                 }
                 (got, want) => panic!("{case}: got {got:?}, want {want:?}"),
             }

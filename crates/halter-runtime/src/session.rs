@@ -14,11 +14,11 @@ use halter_protocol::{
     AgentId, AssembledPrompt, AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash,
     ContextPlan, Delivery, HookSessionStartSource, HookWarning, Message, MessageId, ModelId,
     ObservedState, PendingEvent, PendingToolCall, PromptSegment, PromptSegmentId,
-    PromptSegmentKind, ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, ResourceSnapshot,
-    SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
-    StreamEvent, SubagentEventForwarding, SubagentRecord, SubagentState, SubagentStatus,
-    SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn,
-    TurnId, Usage, Volatility,
+    PromptSegmentKind, ProviderCompactionRejected, ProviderError, ProviderRequest, ReplayMeta,
+    ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionEvent, SessionEventPayload,
+    SessionId, SessionState, StopReason, StreamEvent, SubagentEventForwarding, SubagentRecord,
+    SubagentState, SubagentStatus, SystemMessage, ToolCall, ToolError, ToolExecutionOutcome,
+    ToolResult, ToolResultMessage, Turn, TurnId, Usage, Volatility,
 };
 use halter_providers::{ModelRegistry, Provider};
 
@@ -2613,6 +2613,38 @@ impl SessionExecutor {
             ))
             .await;
         turn_usage.saturating_accumulate(&inference_usage);
+        // A rejected response was billed: log it as the reply it was, so
+        // the fold counts its usage like any other. One that cost and said
+        // nothing leaves the log alone.
+        if let Some(rejected) = result
+            .as_ref()
+            .err()
+            .and_then(|error| {
+                error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<ProviderCompactionRejected>())
+            })
+            .filter(|rejected| rejected.usage != Usage::default() || !rejected.text.is_empty())
+        {
+            let payload = SessionEventPayload::MessageRecorded {
+                message: Message::Assistant(AssistantMessage {
+                    id: MessageId::new(),
+                    created_at: Utc::now(),
+                    parts: (!rejected.text.is_empty())
+                        .then(|| AssistantPart::Text {
+                            text: rejected.text.clone(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    stop_reason: None,
+                    usage: Some(rejected.usage.clone()),
+                    replay_meta: Default::default(),
+                }),
+            };
+            halter_protocol::fold::apply_event(state, &payload);
+            self.push_event(events, payload);
+            turn_usage.saturating_accumulate(&rejected.usage);
+        }
         let reason = match &result {
             Ok(Some(_)) => return result,
             Ok(None) => "nothing to compact".to_owned(),
@@ -2726,13 +2758,27 @@ impl SessionExecutor {
         // context. Refresh the request base before the caller enforces the
         // cap; otherwise those segments would reach the provider uncounted.
         self.prepare_token_ledger(blueprint, &snapshot, state, events);
-        ledger_at_last_boundary.tokens = state.token_ledger.effective_tokens();
-        if clean_window
-            && state.context_window != window_before_boundary
-            && settings.rollover_due(ledger_at_last_boundary.tokens)
-        {
+        let tokens = state.token_ledger.effective_tokens();
+        ledger_at_last_boundary.tokens = tokens;
+        let rewrote = state.context_window != window_before_boundary;
+        if clean_window && rewrote && settings.rollover_due(tokens) {
             anyhow::bail!(
                 "clean window bootstrap exceeds its rollover threshold; increase context.compaction_threshold or reduce prompt and tool declarations"
+            );
+        }
+        // A rewrite that leaves the context still due made no progress the
+        // next boundary could improve on: back off as after a failure,
+        // rather than paying for the same rewrite at every boundary.
+        if rewrote && settings.compaction_due(tokens) {
+            ledger_at_last_boundary.failed_compaction_at = Some(tokens);
+            self.push_event(
+                events,
+                SessionEventPayload::Warning {
+                    message: format!(
+                        "automatic compaction left the context at {tokens} tokens, still at or over its threshold of {}; not compacting again until it grows by half the threshold",
+                        settings.compaction_threshold
+                    ),
+                },
             );
         }
         Ok(())
@@ -2824,6 +2870,9 @@ impl SessionExecutor {
                 turn_usage.saturating_accumulate(&effects.usage);
                 let (result, payload) =
                     effects.apply_for_policy(state, self.services.compaction.window_policy());
+                // As after a manual rewrite: the next turn starts with the
+                // compact-sourced SessionStart hooks.
+                state.pending_session_start_source = Some(HookSessionStartSource::Compact);
                 info!(
                     session_id = %self.session_id,
                     compacted_messages = result.compacted_count,
@@ -7748,14 +7797,23 @@ mod tests {
         );
     }
 
+    /// Trigger A: the prompt alone is one token under the threshold and the
+    /// reply crosses it, so the one compaction comes after the response.
+    /// Before the no-progress guard this test leaned on the first boundary
+    /// being due too and compacting twice.
     #[tokio::test]
     async fn submit_turn_compacts_immediately_after_response_when_threshold_is_reached() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let prompt = "x".repeat(150);
+        let prompt_tokens = halter_protocol::estimate_message_tokens(&Message::User(
+            halter_protocol::UserMessage::text(prompt.clone()),
+        ));
+        let compaction_threshold = default_request_base_tokens(&services) + prompt_tokens + 1;
         install_context_settings(
             &mut services,
             ContextSettings {
-                compaction_threshold: 1_550,
+                compaction_threshold,
                 max_tokens: None,
             },
         );
@@ -7763,13 +7821,37 @@ mod tests {
 
         let session = new_session(&runtime, temp.path()).await;
 
-        session
-            .submit_turn(Turn::user("x".repeat(150)))
+        let events = session
+            .submit_turn(Turn::user(prompt))
             .await
             .expect("submit turn")
             .try_collect::<Vec<_>>()
             .await
             .expect("collect events");
+        let position = |pick: fn(&SessionEventPayload) -> bool| {
+            events.iter().position(|event| pick(&event.payload))
+        };
+        let reply = position(|payload| {
+            matches!(
+                payload,
+                SessionEventPayload::MessageItem {
+                    message: Message::Assistant(_)
+                }
+            )
+        });
+        let compacted = position(|payload| {
+            matches!(
+                payload,
+                SessionEventPayload::ContextCompacted {
+                    effects: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            reply.is_some() && compacted > reply,
+            "{reply:?} {compacted:?}"
+        );
 
         let stored = services
             .sessions
@@ -7886,7 +7968,11 @@ mod tests {
     /// running" sees `PostCompact`, or a second `PreCompact` at the turn's
     /// next boundary), ignoring the
     /// block reason ("blocked" compacts), and skipping `PostCompact` after a
-    /// rewrite ("rewrites" misses it).
+    /// rewrite ("rewrites" misses it). Like a manual rewrite, an automatic
+    /// one re-arms the compact-sourced `SessionStart` hooks for the next
+    /// turn: dropping that latch in `run_automatic_compaction` leaves
+    /// "rewrites" without its second `SessionStart`, and setting it before
+    /// the rewrite gives one to every other case.
     #[tokio::test]
     async fn automatic_compaction_fires_post_compact_only_after_a_rewrite() {
         // (case, strategy, PreCompact blocks, compaction hooks that fire, compacted)
@@ -7948,6 +8034,16 @@ mod tests {
                     }),
                 );
             }
+            let sources = Arc::new(Mutex::new(Vec::new()));
+            let seen = sources.clone();
+            registered.register(
+                PluginId::from("internal"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(HookEventName::SessionStart, move |input| {
+                    seen.lock().expect("sources").push(input.matcher_value);
+                    async move { HookResponse::passthrough() }
+                }),
+            );
             Arc::get_mut(&mut services)
                 .expect("unique services")
                 .registered_hooks = Arc::new(registered);
@@ -7989,6 +8085,147 @@ mod tests {
                             && message.contains("not while the notes are open")
                 )),
                 blocks,
+                "{case}"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    SessionEventPayload::TurnCompleted { .. }
+                )),
+                "{case}"
+            );
+            session
+                .submit_turn(Turn::user("next"))
+                .await
+                .expect("submit second turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect second turn");
+            // The second turn's own latch would fire at a third.
+            let expected: &[&str] = if compacted {
+                &["startup", "compact"]
+            } else {
+                &["startup"]
+            };
+            let sources = sources.lock().expect("sources").clone();
+            assert_eq!(
+                sources,
+                expected
+                    .iter()
+                    .map(|s| Some((*s).to_owned()))
+                    .collect::<Vec<_>>(),
+                "{case}"
+            );
+        }
+    }
+
+    /// A rewrite that leaves the context still due backs off like a failed
+    /// pass, with a warning, instead of paying for the same rewrite at every
+    /// boundary of the turn; one that gets under the threshold does neither.
+    /// Observed at the boundary: the number of rewrites in the turn. Kills
+    /// dropping the no-progress guard in `context_boundary`, or only its
+    /// `failed_compaction_at` assignment (either way "stands still" rewrites
+    /// at all three boundaries), and warning on every rewrite ("gets
+    /// under" warns).
+    #[tokio::test]
+    async fn automatic_rewrite_still_over_the_threshold_backs_off() {
+        /// Rewrites the window into itself: a pass that frees nothing.
+        struct StandstillCompaction;
+
+        #[async_trait]
+        impl crate::CompactionStrategy for StandstillCompaction {
+            async fn compact(
+                &self,
+                ctx: crate::CompactionContext<'_>,
+            ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+                Ok(Some(crate::CompactionEffects {
+                    messages: ctx.state().messages.clone(),
+                    compacted_context: halter_protocol::CompactedContext::default(),
+                    result: halter_protocol::CompactionResult {
+                        compacted_count: 0,
+                        summary: "kept everything".to_owned(),
+                    },
+                    usage: Usage::default(),
+                }))
+            }
+        }
+
+        /// The tool loop without usage reports, so the ledger keeps its own
+        /// estimate of the window instead of the scripted token counts.
+        struct UnmeteredToolLoop;
+
+        #[async_trait]
+        impl Provider for UnmeteredToolLoop {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn stream(
+                &self,
+                request: ProviderRequest,
+                cancel: CancellationToken,
+            ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>>
+            {
+                let inner = ToolLoopProvider.stream(request, cancel).await?;
+                Ok(inner
+                    .filter(|event| {
+                        std::future::ready(!matches!(event, Ok(StreamEvent::UsageUpdate { .. })))
+                    })
+                    .boxed())
+            }
+        }
+
+        // A 2,000-character prompt puts the first boundary over a threshold
+        // 100 tokens above the bare request; only a rewrite that drops it
+        // gets back under.
+        // (case, strategy, rewrites, warns)
+        let cases: [(&str, Arc<dyn CompactionStrategy>, usize, bool); 2] = [
+            ("stands still", Arc::new(StandstillCompaction), 1, true),
+            ("gets under", Arc::new(WipingCompaction), 1, false),
+        ];
+        for (case, strategy, rewrites, warns) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut services = configured_services(Arc::new(UnmeteredToolLoop), temp.path());
+            register_builtin_tools(&services.tools, &[]);
+            let compaction_threshold = default_request_base_tokens(&services).saturating_add(100);
+            install_context_settings(
+                &mut services,
+                ContextSettings {
+                    compaction_threshold,
+                    max_tokens: None,
+                },
+            );
+            install_compaction(&mut services, strategy);
+            let session = new_session(&SessionRuntime::new(services), temp.path()).await;
+
+            let events = session
+                .submit_turn(Turn::user("x".repeat(2_000)))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+
+            let rewrote = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.payload,
+                        SessionEventPayload::ContextCompacted {
+                            effects: Some(_),
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(rewrote, rewrites, "{case}");
+            assert_eq!(
+                events.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::Warning { message }
+                        if message.contains("still at or over its threshold")
+                )),
+                warns,
                 "{case}"
             );
             assert!(
@@ -9213,6 +9450,102 @@ mod tests {
         ));
     }
 
+    /// A compaction response the provider billed but the strategy could not
+    /// apply still counts, automatic or manual: the log records it as an
+    /// assistant reply carrying its usage, and the session totals and the
+    /// turn's `TurnCompleted` include it. Kills dropping the rejection arm in
+    /// `compact_via_strategy` (usage and the reply vanish), dropping its
+    /// `turn_usage` accumulate (the automatic `TurnCompleted` is short), and
+    /// reverting `ProviderDefault`'s empty-output error to an untyped bail.
+    #[tokio::test]
+    async fn rejected_compaction_usage_reaches_session_and_turn_totals() {
+        let billed = Usage {
+            input_tokens: 40,
+            output_tokens: 2,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 4,
+        };
+        let one_reply = Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            ..Usage::default()
+        };
+        let mut total = billed.clone();
+        total.saturating_accumulate(&one_reply);
+        // (case, manual)
+        for (case, manual) in [("automatic", false), ("manual", true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let provider = Arc::new(NativeCompactionProvider::new(
+                halter_protocol::ProviderCompactionStrategy::Dedicated,
+                Vec::new(),
+                billed.clone(),
+            ));
+            let mut services = configured_services(provider.clone(), temp.path());
+            install_compaction(&mut services, Arc::new(crate::ProviderDefault));
+            let context_settings = model_summary_settings(&services);
+            install_context_settings(&mut services, context_settings);
+            let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+            // Only the automatic case crosses the threshold.
+            let prompt = if manual {
+                "hi".to_owned()
+            } else {
+                "x".repeat(6_000)
+            };
+
+            let events = session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+            if manual {
+                let error = session
+                    .compact("manual", None)
+                    .await
+                    .expect_err("a rejected manual pass fails");
+                assert!(
+                    error.to_string().contains("returned no compacted context"),
+                    "{case}: {error:#}"
+                );
+            }
+
+            assert_eq!(provider.compactions(), 1, "{case}");
+            let turn_usage = if manual { &one_reply } else { &total };
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::TurnCompleted { usage, .. } if usage == turn_usage
+                )),
+                "{case}"
+            );
+            let replay = session.replay().await.expect("replay");
+            assert!(
+                replay.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::MessageRecorded {
+                        message: Message::Assistant(AssistantMessage { usage: Some(usage), .. }),
+                    } if usage == &billed
+                )),
+                "{case}"
+            );
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("exists");
+            assert_eq!(stored.state.usage_so_far, total, "{case}");
+            // The rejected reply is logged, never shown to the model.
+            assert_eq!(stored.state.messages.len(), 2, "{case}");
+            let folded = halter_protocol::fold::fold_events(SessionState::default(), &replay);
+            assert!(
+                halter_protocol::fold::covered_state_matches(&folded, &stored.state),
+                "{case}"
+            );
+        }
+    }
+
     /// A manual pass on an empty session succeeds whatever the strategy
     /// does, and leaves a durable answer in the log; only a rewrite fires
     /// `PostCompact` and re-arms the compact-sourced `SessionStart` hooks.
@@ -9342,7 +9675,21 @@ mod tests {
         let Message::User(checkpoint) = &stored.state.messages[0] else {
             panic!("the new window must start with a user message");
         };
-        let text = checkpoint.plain_text();
+        let [
+            halter_protocol::UserPart::Text { text },
+            halter_protocol::UserPart::Text { text: first },
+        ] = &checkpoint.parts[..]
+        else {
+            panic!(
+                "a summary part, then the one request: {:?}",
+                checkpoint.parts
+            );
+        };
+        // The 6,000-byte prompt is carried clipped, and only once: the latest
+        // request is the first.
+        assert!(first.starts_with(crate::FIRST_REQUEST_LABEL), "{first}");
+        assert!(first.len() <= crate::FIRST_REQUEST_LABEL.len() + crate::CARRIED_REQUEST_MAX_BYTES);
+        assert!(first.ends_with("x\n[clipped]"), "{first}");
         assert!(text.starts_with(crate::CHECKPOINT_PREFIX), "{text}");
         assert!(text.contains("SUMMARY: finish the report next"), "{text}");
         assert!(text.ends_with(crate::TODO_REMINDER), "{text}");
@@ -9470,7 +9817,10 @@ mod tests {
         assert!(matches!(
             &stored.state.messages[..],
             [Message::User(user), Message::Assistant(_)]
-                if user.plain_text() == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                if matches!(
+                    user.parts.first(),
+                    Some(halter_protocol::UserPart::Text { text }) if *text == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                )
         ));
     }
 
@@ -9515,8 +9865,80 @@ mod tests {
         assert!(matches!(
             &stored.state.messages[..],
             [Message::User(user), Message::Assistant(_)]
-                if user.plain_text() == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                if matches!(
+                    user.parts.first(),
+                    Some(halter_protocol::UserPart::Text { text }) if *text == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                )
         ));
+    }
+
+    /// Each checkpoint carries the user's first request byte for byte, and
+    /// the latest one when it differs, across repeated compactions. Kills
+    /// computing the carry after the pass appends its own requests (the
+    /// compaction instructions become the "latest request"), and building
+    /// the first request afresh instead of copying it from the previous
+    /// checkpoint (the second checkpoint has no "x" request left to find).
+    #[tokio::test]
+    async fn model_summary_carries_the_first_and_latest_requests_across_compactions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CheckpointScriptProvider::new(
+            NudgeReply::TextOnly,
+            "SUMMARY",
+        ));
+        let mut services = configured_services(provider, temp.path());
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+
+        let mut checkpoints = Vec::new();
+        for prompt in ["x".repeat(6_000), "y".repeat(6_000)] {
+            session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("exists");
+            let Some(Message::User(checkpoint)) = stored.state.messages.first() else {
+                panic!("the window opens with the checkpoint");
+            };
+            checkpoints.push(
+                checkpoint
+                    .parts
+                    .iter()
+                    .map(|part| match part {
+                        halter_protocol::UserPart::Text { text } => text.to_string(),
+                        _ => unreachable!(),
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let carried = |label: &str, byte: char| {
+            let body = format!("{}\n[clipped]", byte.to_string().repeat(4_000 - 10));
+            format!("{label}{body}")
+        };
+        let first = carried(crate::FIRST_REQUEST_LABEL, 'x');
+        assert_eq!(
+            checkpoints,
+            vec![
+                vec![
+                    format!("{}SUMMARY", crate::CHECKPOINT_PREFIX),
+                    first.clone()
+                ],
+                vec![
+                    format!("{}SUMMARY", crate::CHECKPOINT_PREFIX),
+                    first,
+                    carried(crate::LATEST_REQUEST_LABEL, 'y'),
+                ],
+            ]
+        );
     }
 
     /// An empty checkpoint is a failed compaction: automatic passes degrade

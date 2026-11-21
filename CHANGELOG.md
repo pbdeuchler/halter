@@ -23,6 +23,13 @@ once a `1.0.0` line is cut.
   `ModelJudgeProvider` report the policy they wrap) and
   `ResiliencePolicy::recovery_window`, the shortest outer deadline that lets
   a provider detect one stalled attempt and retry it.
+- `halter_protocol::ProviderCompactionRejected { reason, text, usage }`: the
+  error a compaction returns for a response it was billed for but cannot
+  apply. The Anthropic and OpenRouter adapters return it for a refused,
+  truncated or incomplete summary, and `ProviderDefault` for an empty one;
+  `ResilientProvider` passes it through unretried. Additive. For embedders:
+  return it from a custom `Provider::compact` or `CompactionStrategy` that
+  rejects a paid-for response, and the runtime counts its usage.
 
 ### Changed
 
@@ -79,6 +86,29 @@ once a `1.0.0` line is cut.
   strategy whose `compact` returns `Ok(None)` without doing work should
   implement `needs_compaction` so its hooks stay quiet.
 
+- **Breaking (hook contract):** an automatic compaction that rewrites the
+  context, including a CleanWindow rollover, now arms the `SessionStart`
+  hooks with source `compact` for the next turn, as a manual rewrite always
+  did. Before, only `compact(..)` did, so a `SessionStart` hook matching
+  `compact` (the place to put back context a summary drops) never ran in
+  sessions that only compacted on the ledger's trigger. It fires once per
+  turn however many rewrites the previous turn saw, and never after a pass
+  that skipped, failed, was blocked, or declined. For embedders: a hook that
+  assumed `compact` meant "a caller asked" should read the `PostCompact`
+  `trigger` instead.
+
+- `ModelSummary`'s checkpoint now carries the user's first request and,
+  when it differs, the latest one, verbatim, as extra text parts after the
+  summary (`FIRST_REQUEST_LABEL`, `LATEST_REQUEST_LABEL`, each request
+  clipped to `CARRIED_REQUEST_MAX_BYTES` = 4,000 bytes). Before, both
+  survived only as the model's paraphrase, and after a second compaction as
+  a paraphrase of a paraphrase. The first request is copied from the
+  previous checkpoint, so it stays byte-identical however often the session
+  compacts. A checkpoint grows by at most about 8 KB. For embedders: the
+  checkpoint message may now have up to three parts, so code that compared
+  its `plain_text()` with `CHECKPOINT_PREFIX` plus the summary should read
+  its first part.
+
 ### Removed
 
 - **Breaking:** the shell command allowlist and strict mode. `policy.shell.allow`
@@ -112,6 +142,20 @@ once a `1.0.0` line is cut.
   `end_turn` or `stop_sequence` (refusal, `max_tokens`, missing), and
   OpenRouter compaction rejects a `status` other than `completed`. Before, a
   truncated or refused summary replaced the session history.
+- Usage billed by a rejected compaction response now reaches the session's
+  `usage_so_far` and, for an automatic pass, the turn's `TurnCompleted`
+  usage. The runtime logs the rejected reply as a `MessageRecorded`
+  assistant message carrying its usage (no new event kind; the window is
+  restored as before, so the model never sees it). Before, the tokens of a
+  refused or truncated summary, and of an empty `ProviderDefault` response,
+  were lost. `ModelSummary`'s checkpoint inference already counted its
+  usage; a stream that fails mid-reply still loses its partial usage, as any
+  turn does.
+- `ModelSummary` rejects a checkpoint reply that stopped early
+  (`max_tokens`, a refusal, or a pause), as the provider adapters already
+  did for `ProviderDefault`. Before, the fragment replaced the window. The
+  pass fails like an empty summary: a warning and a backoff when automatic,
+  an error when manual; its usage is counted.
 - OpenRouter compaction sends its instructions as the last user input instead
   of top-level `instructions`. Behind a transcript that ended on the
   assistant, models continued the conversation and that reply became the
@@ -120,6 +164,12 @@ once a `1.0.0` line is cut.
   work, the turn waits for the ledger to grow by half the threshold before
   trying again (`ContextSettings::compaction_due_after`). Before, the same
   request was resent at every boundary.
+- An automatic compaction that rewrites the context but leaves it at or over
+  the threshold now backs off like a failed pass (until the ledger grows by
+  half the threshold) and logs a `Warning`. Before, every later boundary of
+  the turn paid for another rewrite. This happens with `ModelSummary` when
+  the static prompt, tools and checkpoint alone reach the threshold, and with
+  any strategy whose kept window does.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the

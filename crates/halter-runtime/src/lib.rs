@@ -52,7 +52,10 @@ pub use context::{
     CompactionEffects, ContextManager, DefaultContextManager, prompt_segments,
     resolve_response_chain,
 };
-pub use model_summary::{CHECKPOINT_PREFIX, ModelSummary, TODO_NUDGE, TODO_REMINDER};
+pub use model_summary::{
+    CARRIED_REQUEST_MAX_BYTES, CHECKPOINT_PREFIX, FIRST_REQUEST_LABEL, LATEST_REQUEST_LABEL,
+    ModelSummary, TODO_NUDGE, TODO_REMINDER,
+};
 pub use provider_default::ProviderDefault;
 
 pub use event_bus::EventBus;

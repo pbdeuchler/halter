@@ -1247,8 +1247,9 @@ happens*.
   (only `task` calls from that reply run; nothing else reaches the next
   request), then sends the built-in checkpoint instructions, and the reply
   becomes the next window as a single user-role message after the static
-  prefix. No tail of old messages is kept, which is also the one client-side
-  shape that survives preserved-thinking checks. `"provider_default"`
+  prefix, carrying the user's first and latest requests verbatim (up to
+  4,000 bytes each). No tail of old messages is kept, which is also the one
+  client-side shape that survives preserved-thinking checks. `"provider_default"`
   delegates the rewrite to the provider's native compaction (OpenAI's
   `/v1/responses/compact`; inline summarization requests for Anthropic and
   OpenRouter), and the harness fails to build if the default model's provider
@@ -1260,7 +1261,10 @@ happens*.
   The runtime alone decides when compaction runs. A strategy can drive the
   model and tools through the `CompactionContext` the runtime hands it; if
   its pass fails, the window goes back to what it was while everything the
-  pass did stays in the event log.
+  pass did, and its usage, stays in the event log and the session totals. A
+  rewrite that leaves the context still over the threshold backs off like a
+  failure, and any rewrite, automatic or manual, arms the `SessionStart`
+  hooks with source `compact` for the next turn.
 
 
 ```rust

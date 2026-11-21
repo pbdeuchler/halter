@@ -159,7 +159,11 @@ turn, with the latest user message kept verbatim at the head of the window —
 and the adapter encodes the request it is handed. Inline adapters apply only a
 summary the model finished: the Anthropic adapter rejects any `stop_reason`
 other than `end_turn` or `stop_sequence`, and the OpenRouter adapter any
-`status` other than `completed`. The Anthropic transcript leaves out thinking
+`status` other than `completed`. A rejection was still billed, so it returns a
+`halter_protocol::ProviderCompactionRejected` carrying the response's text and
+`usage`; the retry layer passes it through untouched (it is never retried) and
+the runtime counts its usage. Return the same error from a custom adapter that
+declines a response it paid for. The Anthropic transcript leaves out thinking
 blocks, and the OpenRouter request carries the instructions as the final user
 input rather than as top-level `instructions`. When it runs is decided by the runtime's
 session token ledger, never by the provider: an adapter must not enable

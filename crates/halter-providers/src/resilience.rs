@@ -10,8 +10,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt, channel::mpsc, stream::BoxStream};
 use halter_protocol::{
-    MessageId, ProviderCapabilities, ProviderCompactionRequest, ProviderCompactionResponse,
-    ProviderError, ProviderErrorKind, ProviderRequest, StreamEvent,
+    MessageId, ProviderCapabilities, ProviderCompactionRejected, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderErrorKind, ProviderRequest, StreamEvent,
 };
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -543,6 +543,13 @@ impl<P: Provider + 'static> ResilientProvider<P> {
             };
             let error = match attempt {
                 Some(Ok(response)) => return Ok(response),
+                // A billed rejection is final, and its usage must reach the
+                // runtime intact.
+                Some(Err(error))
+                    if error.downcast_ref::<ProviderCompactionRejected>().is_some() =>
+                {
+                    return Err(error);
+                }
                 // Untyped errors default to Fatal here (unlike stream setup):
                 // the trait's own compact fallback rejects unsupported
                 // compaction with an untyped error, which must not be
@@ -1736,6 +1743,39 @@ mod tests {
 
             assert_eq!(attempts.load(Ordering::SeqCst), 1, "{error:#}");
         }
+    }
+
+    /// A billed rejection is final and keeps its type, so the runtime can
+    /// count its usage. Kills: deleting the passthrough arm (the error is
+    /// rebuilt as an untyped-message `ProviderError` and the downcast fails).
+    #[tokio::test]
+    async fn compact_passes_a_billed_rejection_through_once_with_its_usage() {
+        let rejected = ProviderCompactionRejected {
+            reason: "refused".to_owned(),
+            text: "partial".to_owned(),
+            usage: halter_protocol::Usage {
+                input_tokens: 40,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        };
+        let provider = ScriptedCompactProvider::new(vec![
+            Err(anyhow::Error::new(rejected.clone())),
+            Ok(compaction_response()),
+        ]);
+        let attempts = provider.attempts.clone();
+        let resilient = ResilientProvider::new("test", provider, test_policy(3));
+
+        let error = resilient
+            .compact(sample_compaction_request(), CancellationToken::new())
+            .await
+            .expect_err("a rejection is final");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            error.downcast_ref::<ProviderCompactionRejected>(),
+            Some(&rejected)
+        );
     }
 
     #[derive(Debug)]

@@ -925,6 +925,7 @@ pub enum HookSessionStartSource {
     Startup,
     Resume,
     Clear,
+    /// The turn after a compaction rewrote the context, automatic or manual.
     Compact,
 }
 
@@ -2123,6 +2124,24 @@ pub struct ProviderCompactionRequest {
 /// Provider response containing compacted context items.
 pub struct ProviderCompactionResponse {
     pub output: Vec<Value>,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{reason}")]
+/// A compaction response the provider returned, and billed, that cannot be
+/// applied: refused, truncated, incomplete, or empty. A provider's `compact`
+/// returns it as its error (through `anyhow`) instead of a bare message so
+/// the tokens are not lost: the runtime finds it anywhere in the error's
+/// chain, logs `text` and `usage` as a `MessageRecorded` assistant reply,
+/// and counts `usage` in the session and turn totals. It is not retried, as
+/// the provider did answer.
+pub struct ProviderCompactionRejected {
+    /// Why the response cannot be applied.
+    pub reason: String,
+    /// Whatever text the response carried, empty when it had none.
+    pub text: String,
+    /// What the provider reported for the request.
     pub usage: Usage,
 }
 

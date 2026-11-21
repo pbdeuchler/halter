@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use halter_protocol::{
-    CompactedContext, CompactionResult, Message, ProviderCapabilities, ProviderCompactionRequest,
-    ProviderCompactionStrategy, SessionState,
+    CompactedContext, CompactionResult, Message, ProviderCapabilities, ProviderCompactionRejected,
+    ProviderCompactionRequest, ProviderCompactionStrategy, SessionState,
 };
 
 use crate::compaction_strategy::{
@@ -43,8 +43,8 @@ impl CompactionStrategy for ProviderDefault {
             .compaction_strategy
             .filter(|_| capabilities.supports_compaction)
             .is_none_or(|strategy| {
-                let (_, preserved) = split_window(strategy, &state.messages);
-                state.messages.len() > preserved.len()
+                let (_, kept_user, tail) = split_window(strategy, &state.messages);
+                state.messages.len() > usize::from(kept_user.is_some()) + tail.len()
                     || (!state.compacted_prefix.is_empty()
                         && matches!(trigger, CompactionTrigger::Manual { .. }))
             })
@@ -68,7 +68,8 @@ impl CompactionStrategy for ProviderDefault {
         if !self.needs_compaction(state, &capabilities, ctx.trigger()) {
             return Ok(None);
         }
-        let (eligible, preserved) = split_window(strategy, &state.messages);
+        let (eligible, kept_user, tail) = split_window(strategy, &state.messages);
+        let preserved: Vec<Message> = kept_user.into_iter().chain(tail).cloned().collect();
         let compacted_count = state.messages.len() - preserved.len();
 
         let response = ctx
@@ -78,7 +79,7 @@ impl CompactionStrategy for ProviderDefault {
                     session_id: ctx.blueprint().session_id.clone(),
                     model: ctx.model().clone(),
                     compacted_prefix: state.compacted_prefix.clone(),
-                    messages: eligible.clone(),
+                    messages: eligible.to_vec(),
                     tools: ctx.tool_specs(),
                     instructions: compaction_instructions(ctx.trigger().custom_instructions()),
                 },
@@ -86,10 +87,16 @@ impl CompactionStrategy for ProviderDefault {
             )
             .await?;
         if response.output.is_empty() {
-            anyhow::bail!(
-                "failed to compact session: provider '{}' returned no compacted context",
-                ctx.model().provider
-            );
+            // Billed all the same: the runtime counts a rejection's usage.
+            return Err(ProviderCompactionRejected {
+                reason: format!(
+                    "failed to compact session: provider '{}' returned no compacted context",
+                    ctx.model().provider
+                ),
+                text: String::new(),
+                usage: response.usage,
+            }
+            .into());
         }
         let summary = format!(
             "Compacted {compacted_count} older messages into {} provider-native items; kept {} verbatim.",
@@ -109,7 +116,9 @@ impl CompactionStrategy for ProviderDefault {
     }
 }
 
-/// Which messages a rewrite may replace, as `(eligible, preserved)`.
+/// Which messages a rewrite may replace, as `(eligible, kept user, tail)`,
+/// borrowed: the verbatim window is the kept user message, when there is
+/// one, followed by the tail.
 ///
 /// A dedicated endpoint restores compacted context as provider-native items,
 /// so everything before the latest assistant block is eligible and that
@@ -128,27 +137,25 @@ impl CompactionStrategy for ProviderDefault {
 pub(crate) fn split_window(
     strategy: ProviderCompactionStrategy,
     messages: &[Message],
-) -> (Vec<Message>, Vec<Message>) {
+) -> (&[Message], Option<&Message>, &[Message]) {
     let last = |pick: fn(&Message) -> bool| messages.iter().rposition(pick);
     match strategy {
         ProviderCompactionStrategy::Dedicated => {
             let pivot =
                 last(|message| matches!(message, Message::Assistant(_))).unwrap_or(messages.len());
-            (messages[..pivot].to_vec(), messages[pivot..].to_vec())
+            (&messages[..pivot], None, &messages[pivot..])
         }
         ProviderCompactionStrategy::Inline => {
             let Some(user) = last(|message| matches!(message, Message::User(_))) else {
-                return (messages.to_vec(), Vec::new());
+                return (messages, None, &[]);
             };
             match last(|message| matches!(message, Message::Assistant(_))) {
                 Some(block) if block > user => (
-                    messages[..block].to_vec(),
-                    std::iter::once(&messages[user])
-                        .chain(&messages[block..])
-                        .cloned()
-                        .collect(),
+                    &messages[..block],
+                    Some(&messages[user]),
+                    &messages[block..],
                 ),
-                _ => (messages[..user].to_vec(), messages[user..].to_vec()),
+                _ => (&messages[..user], None, &messages[user..]),
             }
         }
     }
@@ -295,8 +302,9 @@ mod tests {
         ];
 
         for (case, strategy, messages, eligible, preserved) in cases {
-            let (got_eligible, got_preserved) = split_window(strategy, &messages);
-            assert_eq!(labels(&got_eligible), eligible, "{case}: eligible");
+            let (got_eligible, kept_user, tail) = split_window(strategy, &messages);
+            let got_preserved: Vec<Message> = kept_user.into_iter().chain(tail).cloned().collect();
+            assert_eq!(labels(got_eligible), eligible, "{case}: eligible");
             assert_eq!(labels(&got_preserved), preserved, "{case}: preserved");
             // The verbatim window replays on its own after the summary, so it
             // must open with a user message when one exists and never hold a
