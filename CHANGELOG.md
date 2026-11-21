@@ -33,6 +33,21 @@ once a `1.0.0` line is cut.
 
 ### Changed
 
+- **Breaking:** the `edit` tool takes a list of edits. Its input is now
+  `{"edits": [{"path", "old_string", "new_string", "replace_all"}, ...],
+  "expected_sha256"}`; the top-level `path`, `old_string`, `new_string` and
+  `replace_all` are gone, with no single-edit shorthand. A call in the old
+  shape, or with an empty `edits`, is refused with an error that shows the new
+  shape. Edits apply in order, a later edit to a file matching the text the
+  earlier ones left, and they may span files. If any edit fails (no match, an
+  ambiguous match, a denied path, a stale hash, an unreadable file), no file is
+  written and the error names the edit by index and path. Each file then gets
+  one atomic write; a failed write restores the files written before it, but a
+  crash between two writes can still leave some files edited. `expected_sha256`
+  is refused when the edits touch more than one file. The output is now
+  `{files: [{path, file_hash_before, file_hash_after}], edits: [{path,
+  occurrences_in_file, replacements_applied}]}`, and the model sees one line per
+  file. Hooks that read an `edit` call's `path` must read `edits[].path`.
 - **Breaking:** the `shell` tool no longer runs commands in an embedded brush
   shell. Each call now starts a fresh `<shell> -c <command>` (Codex/pi style),
   so `cd`, `export`, and shell variables don't carry over between calls. Pass

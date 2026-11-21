@@ -387,7 +387,7 @@ mod tests {
         match tool {
             "read" => json!({"path": "a.txt"}),
             "write" => json!({"path": "b.txt", "content": "b"}),
-            "edit" => json!({"path": "a.txt", "old_string": "a", "new_string": "b"}),
+            "edit" => json!({"edits": [{"path": "a.txt", "old_string": "a", "new_string": "b"}]}),
             "glob" => json!({"pattern": "*.txt"}),
             "grep" => json!({"pattern": "a"}),
             "shell" => json!({"command": "echo hi"}),
