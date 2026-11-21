@@ -124,6 +124,10 @@ impl HookMatcherGroup {
 /// Parsed hook handler with common metadata and backend config.
 pub struct HookHandler {
     pub handler_type: HookHandlerType,
+    /// Deadline for one run of the handler. For prompt and agent handlers the
+    /// runtime raises it to the model provider's recovery window
+    /// (`ResiliencePolicy::recovery_window`), so the hook cannot time out
+    /// before the provider's own timers and one retry have run.
     pub timeout: Duration,
     pub status_message: Option<String>,
     pub if_condition: Option<String>,

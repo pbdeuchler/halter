@@ -114,6 +114,30 @@ pub struct ResiliencePolicy {
     pub request_retry: RetryPolicy,
 }
 
+impl ResiliencePolicy {
+    /// Shortest outer deadline that still lets one stalled streaming attempt
+    /// be detected by its own timer (`request` or `stream_idle`), back off
+    /// once, and run a second attempt of the same length:
+    /// `2 * max(request, stream_idle) + first backoff (with full jitter)`.
+    /// An outer timer shorter than this always fires before the provider can
+    /// recover from a stall, so the retry policy never runs. It is a floor
+    /// for one provider request; it does not include client-side rate-limit
+    /// admission, which ends only on a permit or cancellation.
+    #[must_use]
+    pub fn recovery_window(&self) -> Duration {
+        let attempt = self.timeouts.request.max(self.timeouts.stream_idle);
+        let retry = &self.request_retry;
+        let first_backoff = if retry.max_attempts > 1 {
+            (retry.base_backoff + retry.base_backoff * retry.jitter_pct / 100)
+                .min(retry.max_backoff)
+        } else {
+            Duration::ZERO
+        };
+        let attempts = if retry.max_attempts > 1 { 2 } else { 1 };
+        attempt * attempts + first_backoff
+    }
+}
+
 pub trait ProviderErrorClassifier: Send + Sync {
     fn classify(&self, error: ProviderError) -> ProviderError;
 }
@@ -189,6 +213,10 @@ where
 {
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
+    }
+
+    fn resilience_policy(&self) -> Option<ResiliencePolicy> {
+        Some(self.policy)
     }
 
     async fn stream(
@@ -1937,6 +1965,49 @@ mod tests {
                 succeeds,
                 "compact admission={admission_ms}ms work={work_ms}ms: {compacted:?}"
             );
+        }
+    }
+
+    /// Every public provider reports the policy of the `ResilientProvider` it
+    /// wraps, and a bare provider reports none. Mutation killed: any wrapper
+    /// dropping its `resilience_policy` delegation (its row reads `None`).
+    #[test]
+    fn public_providers_report_their_resilience_policy() {
+        let policy = test_policy(4);
+        let classifier: Arc<dyn ProviderErrorClassifier> = Arc::new(DefaultProviderErrorClassifier);
+        let providers: Vec<(&str, Arc<dyn Provider>, Option<ResiliencePolicy>)> = vec![
+            (
+                "anthropic",
+                Arc::new(
+                    crate::AnthropicProvider::new_with_headers_and_resilience(
+                        "key",
+                        "http://127.0.0.1:9",
+                        &[],
+                        None,
+                        policy,
+                        classifier,
+                    )
+                    .unwrap(),
+                ),
+                Some(policy),
+            ),
+            (
+                "openai",
+                Arc::new(
+                    crate::OpenAiProvider::new_with_headers("key", "http://127.0.0.1:9", &[], None)
+                        .unwrap(),
+                ),
+                Some(ResiliencePolicy::default()),
+            ),
+            (
+                "openrouter",
+                Arc::new(crate::OpenRouterProvider::new("key", "http://127.0.0.1:9").unwrap()),
+                Some(ResiliencePolicy::default()),
+            ),
+            ("fake", Arc::new(crate::FakeProvider::default()), None),
+        ];
+        for (name, provider, want) in providers {
+            assert_eq!(provider.resilience_policy(), want, "{name}");
         }
     }
 

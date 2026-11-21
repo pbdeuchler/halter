@@ -17,6 +17,10 @@ once a `1.0.0` line is cut.
   longer than 60s to write its summary always timed out.
   **Breaking:** `ProviderTimeouts` struct literals must set `compact`, and
   `ResilienceTimeoutsConfig` literals `compact_secs`.
+- `Provider::resilience_policy` (default `None`; the built-in providers and
+  `ModelJudgeProvider` report the policy they wrap) and
+  `ResiliencePolicy::recovery_window`, the shortest outer deadline that lets
+  a provider detect one stalled attempt and retry it.
 
 ### Changed
 
@@ -103,6 +107,12 @@ once a `1.0.0` line is cut.
   streaming send's own `request_secs` timer was likewise dominated by the
   setup timer around it. Both are removed; `ResilientProvider`'s timers are
   the only request bounds.
+- Prompt and agent hooks wait at least the model provider's recovery window
+  (at the defaults about 121s) instead of their configured timeout alone (30s
+  and 60s by default). The hook timer fired before the provider's own 60s
+  request and idle timers could, and hooks fail open, so any provider stall
+  silently dropped the hook's decision, including a block. A longer
+  configured timeout is kept.
 - Provider timeout messages print the configured duration (`50ms`, `1.5s`)
   instead of whole seconds, which read "after 0s" for sub-second timeouts.
 

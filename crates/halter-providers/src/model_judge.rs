@@ -129,6 +129,13 @@ impl Provider for ModelJudgeProvider {
         self.default.provider.capabilities()
     }
 
+    /// The default member's policy. Every panelist and synthesis call is a
+    /// separate provider request, so this is a per-request floor, not a bound
+    /// on the whole panel.
+    fn resilience_policy(&self) -> Option<crate::ResiliencePolicy> {
+        self.default.provider.resilience_policy()
+    }
+
     async fn stream(
         &self,
         request: ProviderRequest,

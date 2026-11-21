@@ -207,6 +207,10 @@ impl Provider for OpenAiProvider {
         self.inner.capabilities()
     }
 
+    fn resilience_policy(&self) -> Option<crate::ResiliencePolicy> {
+        self.inner.resilience_policy()
+    }
+
     async fn stream(
         &self,
         request: ProviderRequest,
