@@ -181,6 +181,33 @@ async fn ac1_8_shell_enabled_follows_the_policy_switch() {
     assert!(matches!(err, PolicyError::ShellDisabled));
 }
 
+#[tokio::test]
+async fn shell_commands_need_the_switch_and_a_matching_allow_pattern() {
+    let policy = |shell_enabled| {
+        DefaultToolPolicy::new(PolicySettings {
+            shell_enabled,
+            ..PolicySettings::default()
+        })
+    };
+    policy(true)
+        .check_shell_command("git status && cargo test -p x | rg ok")
+        .await
+        .expect("the default allowlist covers git, cargo and rg");
+    for (enabled, command, disabled) in [
+        (false, "git status", true),
+        (true, "git status; rm -rf x", false),
+    ] {
+        match policy(enabled).check_shell_command(command).await {
+            Err(PolicyError::ShellDisabled) => assert!(disabled, "{command}"),
+            Err(PolicyError::ShellCommandRejected { fragment, .. }) => {
+                assert!(!disabled, "{command}");
+                assert_eq!(fragment, "rm -rf x");
+            }
+            other => panic!("{command}: unexpected {other:?}"),
+        }
+    }
+}
+
 // ------------- AC1.12: loopback IP denied unless allowlisted
 
 #[tokio::test]

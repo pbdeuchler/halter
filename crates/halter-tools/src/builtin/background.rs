@@ -214,7 +214,7 @@ impl TypedTool for BackgroundTool {
                     !command.trim().is_empty(),
                     "invalid tool input: command must not be empty"
                 );
-                context.policy.check_shell_enabled().await?;
+                context.policy.check_shell_command(command).await?;
                 let cwd = match provided(&input, "cwd") {
                     None => context.working_dir.clone(),
                     Some(Value::String(cwd)) => resolve_path(&context.working_dir, cwd),

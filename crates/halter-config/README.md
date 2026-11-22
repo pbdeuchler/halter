@@ -551,6 +551,7 @@ max_concurrent_subagents = 8
 
 [policy.shell]
 enabled = true
+allow = ["git *", "cargo *", "rg *", "ls *", "find *", "true", "cd *"]
 timeout_secs = 30
 
 [policy.network]
@@ -580,9 +581,10 @@ Defaults:
 - `policy.shell.timeout_secs` and `max_tool_timeout_secs` must be greater
   than zero
 - shell enabled by default
-- `[policy.shell]` takes only `enabled` and `timeout_secs`. The `allow` and
-  `mode` keys were removed with the shell allowlist and are rejected as
-  unknown fields
+- `[policy.shell] allow = ["git *", "cargo *", "rg *", "ls *", "find *", "true", "cd *"]`:
+  every command a shell line runs must match a pattern (see the `shell` tool in
+  `crates/halter-tools/README.md`). `["*"]` allows anything and `[]` denies
+  everything. The `mode` key was removed and is rejected as an unknown field
 - network disabled by default
 
 Validation rules include:
@@ -719,6 +721,7 @@ Currently supported:
 
 - `HALTER_SESSION_BACKEND`
 - `HALTER_POLICY_SHELL_ENABLED`
+- `HALTER_POLICY_SHELL_ALLOW` (comma-separated patterns)
 - `HALTER_POLICY_NETWORK_ENABLED`
 - `HALTER_SKILL_ROOTS`
 - `HALTER_PLUGIN_ROOTS`

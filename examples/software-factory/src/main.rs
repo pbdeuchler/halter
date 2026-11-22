@@ -1131,6 +1131,12 @@ fn default_factory_config() -> HarnessConfig {
             max_tool_timeout_secs: 3_600,
             shell: ShellPolicyConfig {
                 enabled: true,
+                allow: [
+                    "git", "cargo", "rg", "ls", "find", "true", "cd", "python", "python3", "pwd",
+                    "echo", "date", "gh", "which", "sort", "nl", "sed", "wc", "head",
+                ]
+                .map(|program| format!("{program} *"))
+                .to_vec(),
                 timeout_secs: 30,
             },
             network: NetworkPolicyConfig {

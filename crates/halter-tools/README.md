@@ -157,7 +157,8 @@ Defaults:
 - `allowed_read_roots = [".", std::env::temp_dir()]` (`$TMPDIR` or `/tmp` on Unix, `%TEMP%` on Windows)
 - `sensitive_path_patterns = ["**/.ssh/**", "**/.aws/**", "**/.secrets", "/etc/shadow", "/etc/shadow.*"]`
 - `max_read_bytes = 1_048_576`
-- shell enabled = `true` (the only shell restriction; there is no command allowlist)
+- shell enabled = `true`
+- `allowed_shell_commands = ["git *", "cargo *", "rg *", "ls *", "find *", "true", "cd *"]` (`default_shell_allow()`; see [`shell`](#shell))
 - shell timeout = `30`
 - network enabled = `false`
 - `allowed_loopback = []` (loopback addresses require an explicit entry to be reached)
@@ -183,7 +184,7 @@ without changing the observable error surface.
 
 `ToolPolicy` exposes a capability-oriented surface
 (`check_read_path`, `check_write_path`, `check_process_signal`,
-`check_shell_enabled`, `check_network`, `check_subagent_spawn_typed`)
+`check_shell_enabled`, `check_shell_command`, `check_network`, `check_subagent_spawn_typed`)
 that returns `PolicyError`
 and binds resolved paths to a parent-directory fd via `CanonicalPath`.
 Name-based bypass methods (`check_shell("shell")`,
@@ -203,6 +204,7 @@ That separation is essential.
 You will commonly see errors like:
 
 - `failed to execute shell tool: shell usage is disabled by policy`
+- `shell command rejected: no policy.shell.allow pattern matches (fragment: "rm -rf target")`
 - `failed to execute write tool: path '{}' is outside allowed_write_roots`
 - `failed to execute spawn_agent tool: subagent depth {} exceeds max_subagent_depth {}`
 - `failed to execute spawn_agent tool: active subagents {} exceed max_concurrent_subagents {}`
@@ -425,9 +427,51 @@ Typical input:
   call; use `background` for long-running processes.
 - Output is stdout and stderr, streamed as `ToolOutput` events and capped at
   1 MiB each. A timeout or cancellation returns the output so far.
-- Gated by `policy.shell.enabled`; runtime defaults to `policy.shell.timeout_secs`.
-- There is no command allowlist. Approval hooks and `policy.shell.enabled` are
-  the controls.
+- Gated by `policy.shell.enabled` and the command allowlist below; runtime
+  defaults to `policy.shell.timeout_secs`.
+
+### Command allowlist
+
+`shell`, `background` `spawn` and `pty` `start` check the command line against
+`policy.shell.allow` (`PolicySettings::allowed_shell_commands`) before
+anything runs. tree-sitter-bash parses the line, and **every** command it would
+run must match a pattern, or none of it runs:
+
+- each stage of a pipeline or `&&` / `||` / `;` list, and commands in
+  subshells, `$(…)`, backquotes, `<(…)`, heredocs, loops and function bodies
+- the script of a literal `sh|bash|zsh|dash|ksh -c '…'` or `eval '…'`, parsed
+  the same way (up to 8 levels deep)
+- the command run by a wrapper (`sudo`, `env`, `timeout`, `nice`, `nohup`,
+  `time`, `exec`, `command`, `builtin`), in addition to the wrapper itself:
+  `sudo rm x` needs both `sudo *` and `rm *`
+
+A pattern is whitespace-separated globs, one per argv word, compared after
+quotes and escapes are removed. A trailing `*` matches any remaining words,
+including none:
+
+```toml
+[policy.shell]
+allow = ["git status", "git diff *", "cargo test *", "ls *", "npm run test:*"]
+```
+
+- `"git status"` allows exactly `git status`; `"git diff *"` allows `git diff`
+  with any arguments.
+- A word only known at run time (`$VAR`, `*.rs`, `{a,b}`, `$(…)`) is matched
+  only by the trailing `*`. A command name only known at run time never
+  matches.
+- A command line that doesn't parse is rejected, and so is everything under a
+  detected PowerShell, unless the list is `["*"]`, which turns the check off.
+  `[]` rejects every command.
+- Names are compared literally: `git *` does not allow `/usr/bin/git`.
+- `[ … ]` and `[[ … ]]` are test syntax, not commands; substitutions inside
+  them are still checked. Variable assignments (`A=1 cmd`) and redirections
+  are not checked.
+
+An allowlist bounds which programs the model asks for, not what an allowed
+program does. Allowing a shell, interpreter or anything that runs commands
+(`bash *`, `python *`, `xargs *`, `find *` with `-exec`, `cargo *` via build
+scripts, `git *` via aliases or `-c core.pager=…`) allows arbitrary code. Use
+the filesystem roots and an OS sandbox for containment.
 
 ---
 
@@ -446,7 +490,8 @@ such as a development server. It has five actions:
 
 Jobs run in the same detected shell as `shell`, each started fresh. `cwd`
 defaults to the session working directory; relative paths resolve against it.
-Spawning requires `policy.shell.enabled` and authorizes the working directory
+Spawning requires `policy.shell.enabled` and an allowlisted command (see
+[`shell`](#command-allowlist)), and authorizes the working directory
 through the read policy. The environment is the same scrubbed set as `shell`
 plus explicit overrides.
 
@@ -508,7 +553,9 @@ Actions:
 Use this for interactive terminal workflows where a plain shell command is not enough.
 
 The command runs under the same detected shell, non-login `-c` invocation, and
-scrubbed environment as `shell`, inside a pseudo-terminal.
+scrubbed environment as `shell`, inside a pseudo-terminal. `start` checks the
+command against the same [allowlist](#command-allowlist); keystrokes sent with
+`write` are not checked.
 
 Examples:
 

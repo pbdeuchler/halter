@@ -220,17 +220,32 @@ once a `1.0.0` line is cut.
   and the `session_search` instructions always remain. A window after one
   that had no text request labels its first quote "Earliest user request
   this notice can quote" instead of the session's first.
+- **Breaking:** the shell allowlist (`policy.shell.allow`,
+  `HALTER_POLICY_SHELL_ALLOW`, `PolicySettings::allowed_shell_commands`) now
+  holds argv patterns instead of program names, and covers `shell`,
+  `background` and `pty`. tree-sitter-bash parses each command line, and
+  every command it would run must match a pattern. That includes each stage
+  of a pipeline or list, subshells, `$(…)` and backquotes, function bodies,
+  literal `sh -c` / `eval` scripts, and the commands that `sudo`, `env`,
+  `timeout`, `nice`, `nohup`, `time`, `exec`, `command` and `builtin` run.
+  A pattern is whitespace-separated globs, one per argv word, and a trailing
+  `*` matches the remaining words: `"git diff *"`, `"cargo test *"`. A run-time
+  word (`$VAR`, a glob, a substitution) matches only that trailing `*`, a
+  command line that doesn't parse is rejected, and under PowerShell only
+  `["*"]` permits commands. The default is `["git *", "cargo *", "rg *",
+  "ls *", "find *", "true", "cd *"]`; `["*"]` turns the check off. An old
+  entry such as `"git"` now allows only a bare `git`, so append ` *`.
+  `ToolPolicy::check_shell_command` (defaulting to `check_shell_enabled`) and
+  `PolicyError::ShellCommandRejected` carry the check;
+  `halter_tools::default_shell_allow()` is the default list.
 
 ### Removed
 
-- **Breaking:** the shell command allowlist and strict mode. `policy.shell.allow`
-  and `policy.shell.mode` are gone from the config (and now fail as unknown
-  fields), along with the `HALTER_POLICY_SHELL_ALLOW` override.
-  `policy.shell.enabled` and `timeout_secs` remain.
-- **Breaking:** `ShellMode`, `PolicySettings::{shell_mode, allowed_shell_commands}`,
-  `ToolPolicy::{shell_mode, check_shell_command_strict}`,
-  `PolicyError::ShellCommandRejected`, `ShellModeConfig`, and
-  `ToolSessionStore::shell_session`. `ToolSessionStore::background_session` and
+- **Breaking:** shell strict mode. `policy.shell.mode` is gone from the config
+  (and now fails as an unknown field).
+- **Breaking:** `ShellMode`, `PolicySettings::shell_mode`,
+  `ToolPolicy::{shell_mode, check_shell_command_strict}`, `ShellModeConfig`,
+  and `ToolSessionStore::shell_session`. `ToolSessionStore::background_session` and
   `BackgroundRegistry` are now public.
 - The vendored `halter-brush-core` and `halter-brush-builtins` crates and the
   `vendor/` directory. They are no longer published.

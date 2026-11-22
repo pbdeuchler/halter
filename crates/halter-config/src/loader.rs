@@ -161,6 +161,9 @@ max_tool_timeout_secs = 3600
 
 [policy.shell]
 enabled = true
+# Every command a shell line runs must match one pattern: globs per argv word,
+# a trailing `*` matches the remaining words. `["*"]` disables the check.
+allow = ["git *", "cargo *", "rg *", "ls *", "find *", "true", "cd *"]
 timeout_secs = 30
 
 [policy.network]
@@ -292,6 +295,11 @@ fn env_override_specs() -> &'static [EnvOverrideSpec] {
             env_var: "HALTER_PLUGIN_ROOTS",
             path: &["resources", "plugins", "roots"],
             parse: parse_colon_list,
+        },
+        EnvOverrideSpec {
+            env_var: "HALTER_POLICY_SHELL_ALLOW",
+            path: &["policy", "shell", "allow"],
+            parse: parse_comma_list,
         },
         EnvOverrideSpec {
             env_var: "HALTER_POLICY_ALLOWED_HOSTS",
@@ -643,6 +651,7 @@ api_key = "openai-key"
         let overrides = BTreeMap::from([
             ("HALTER_SESSION_BACKEND", "memory"),
             ("HALTER_POLICY_SHELL_ENABLED", "false"),
+            ("HALTER_POLICY_SHELL_ALLOW", "git status *,just *"),
             ("HALTER_SKILL_ROOTS", "./skills:./vendor/skills"),
             ("HALTER_POLICY_ALLOWED_HOSTS", "example.com,api.example.com"),
             ("HALTER_TOOLS_ENABLED", "read,glob"),
@@ -657,6 +666,7 @@ api_key = "openai-key"
             crate::schema::SessionBackend::Memory
         );
         assert!(!decoded.policy.shell.enabled);
+        assert_eq!(decoded.policy.shell.allow, vec!["git status *", "just *"]);
         assert_eq!(
             decoded.resources.skills.roots,
             vec![PathBuf::from("./skills"), PathBuf::from("./vendor/skills")]

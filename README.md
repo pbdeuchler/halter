@@ -656,6 +656,7 @@ allowed_hosts = []
 
 [policy.shell]
 enabled = true
+allow = ["git *", "cargo *", "rg *", "ls *", "find *", "true", "cd *"]
 timeout_secs = 30
 
 [sessions]
@@ -1035,7 +1036,7 @@ Subagent tools include:
 
 This crate also enforces policy boundaries such as:
 
-- the shell on/off switch
+- the shell on/off switch and command allowlist
 - write-root restrictions
 - network host and loopback restrictions
 - read/output size limits
@@ -1342,7 +1343,7 @@ Halter does its best to operate in a sane and safe way, but does not provide har
 Enforced mechanically, best effort, by tool policy:
 
 - where writes may occur
-- whether the shell tool may run at all (there is no per-command allowlist)
+- whether the shell tools may run, and which commands (an argv-pattern allowlist checked against a tree-sitter-bash parse of every command line)
 - which network hosts may be reached; loopback requires a separate allowlist
 - how much can be read or emitted
 - how many subagents may be active

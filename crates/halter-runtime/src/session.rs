@@ -6967,6 +6967,7 @@ mod tests {
             services.models = Arc::new(models);
             services.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
                 allowed_write_roots: vec![working_dir.to_path_buf()],
+                allowed_shell_commands: vec!["sleep *".to_owned()],
                 ..PolicySettings::default()
             }));
             services.subagent_event_forwarding = subagent_event_forwarding;
