@@ -36,6 +36,12 @@ impl ShellKind {
         }
     }
 
+    /// Whether this shell speaks the POSIX dialect the allowlist parser reads.
+    #[must_use]
+    pub const fn is_posix(self) -> bool {
+        !matches!(self, Self::PowerShell)
+    }
+
     /// Arguments that run `command` once, non-interactively.
     #[must_use]
     pub fn argv(self, command: &str) -> Vec<String> {

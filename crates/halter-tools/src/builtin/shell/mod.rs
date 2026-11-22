@@ -136,7 +136,8 @@ impl TypedTool for ShellTool {
     async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Self::Output> {
         let _scope = ToolScope::new(&context, "shell");
         ensure_not_cancelled(&context.cancel)?;
-        context.policy.check_shell_enabled().await?;
+        let command = required_string(&input, "command")?;
+        context.policy.check_shell_command(command).await?;
         // Session shutdown cancels this lifetime and with it any running command.
         let lifetime = context.tool_sessions.process_lifetime(&context.session_id);
         anyhow::ensure!(
@@ -153,7 +154,7 @@ impl TypedTool for ShellTool {
             || context.working_dir.clone(),
             |cwd| resolve_path(&context.working_dir, cwd),
         );
-        let mut command = shell_command(required_string(&input, "command")?);
+        let mut command = shell_command(command);
         command
             .current_dir(cwd)
             .envs(parse_env_map(input.get("env"))?.unwrap_or_default());
@@ -386,6 +387,7 @@ mod tests {
             root,
             PolicySettings {
                 allowed_write_roots: vec![root.to_path_buf()],
+                allowed_shell_commands: vec!["*".to_owned()],
                 ..PolicySettings::default()
             },
         )
@@ -496,6 +498,33 @@ mod tests {
         ] {
             assert!(run(tool_context(root.path()), input).await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn shell_runs_only_allowlisted_command_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let context = || {
+            tool_context_with(
+                root.path(),
+                PolicySettings {
+                    allowed_shell_commands: vec!["echo *".to_owned()],
+                    ..PolicySettings::default()
+                },
+            )
+        };
+        let value = run(context(), json!({"command": "echo ok"})).await.unwrap();
+        assert_eq!(value["stdout"], "ok\n");
+        let error = run(
+            context(),
+            json!({"command": "echo ok > marker && touch other"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("\"touch other\""), "{error}");
+        assert!(
+            !root.path().join("marker").exists(),
+            "no part of a rejected command line runs"
+        );
     }
 
     #[cfg(unix)]

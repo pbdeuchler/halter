@@ -1228,6 +1228,7 @@ fn policy_from_config(config: &PolicyConfig) -> PolicySettings {
             .unwrap_or_else(|| defaults.sensitive_path_patterns.clone()),
         max_read_bytes: config.max_read_bytes,
         shell_enabled: config.shell.enabled,
+        allowed_shell_commands: config.shell.allow.clone(),
         shell_timeout_secs: config.shell.timeout_secs,
         network_enabled: config.network.enabled,
         allowed_hosts,
@@ -1583,6 +1584,21 @@ mod tests {
                         defaults.max_tool_timeout_secs
                     )
                 },
+            ),
+            (
+                "default_shell_allowlist_matches_the_tools_default",
+                |_| {},
+                |settings, defaults| {
+                    assert_eq!(
+                        settings.allowed_shell_commands,
+                        defaults.allowed_shell_commands
+                    );
+                },
+            ),
+            (
+                "configured_shell_allowlist_maps_through",
+                |config| config.shell.allow = vec!["*".to_owned()],
+                |settings, _| assert_eq!(settings.allowed_shell_commands, vec!["*"]),
             ),
         ];
 

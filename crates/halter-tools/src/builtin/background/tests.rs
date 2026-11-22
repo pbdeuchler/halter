@@ -29,6 +29,7 @@ fn context(root: &Path) -> ToolContext {
         emit: Arc::new(NoopToolEventSink),
         policy: Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_read_roots: vec![root.to_owned()],
+            allowed_shell_commands: vec!["*".to_owned()],
             ..PolicySettings::default()
         })),
         shell_timeout_secs: 30,
@@ -533,6 +534,22 @@ async fn spawn_preserves_explicit_cwd_and_env_and_checks_policy() {
             .unwrap_err()
             .to_string()
             .contains("disabled")
+    );
+    let mut restricted = context.clone();
+    restricted.policy = Arc::new(DefaultToolPolicy::new(PolicySettings {
+        allowed_shell_commands: vec!["true".to_owned()],
+        ..PolicySettings::default()
+    })) as Arc<dyn ToolPolicy>;
+    assert!(
+        BackgroundTool
+            .execute(
+                restricted,
+                json!({"action": "spawn", "command": "true; printf denied"})
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("\"printf denied\"")
     );
     let mut cancelled = context.clone();
     cancelled.cancel = CancellationToken::new();

@@ -157,6 +157,10 @@ impl TypedTool for PtyTool {
 
         match action {
             "start" => {
+                context
+                    .policy
+                    .check_shell_command(required_string(&input, "command")?)
+                    .await?;
                 let config = PtyConfig {
                     command: required_string(&input, "command")?.to_owned(),
                     cwd: optional_string(&input, "cwd").map(ToOwned::to_owned),
@@ -1025,12 +1029,29 @@ mod security_tests {
         );
     }
 
+    #[tokio::test]
+    async fn pty_start_is_denied_for_commands_outside_the_allowlist() {
+        let policy: Arc<dyn ToolPolicy> = Arc::new(DefaultToolPolicy::new(PolicySettings {
+            allowed_shell_commands: vec!["ls *".to_owned()],
+            ..PolicySettings::default()
+        }));
+        let err = PtyTool
+            .execute(
+                tool_context_with(policy),
+                json!({"action": "start", "command": "ls | vim -"}),
+            )
+            .await
+            .expect_err("PTY start must check the allowlist");
+        assert!(err.to_string().contains("\"vim -\""), "{err}");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn session_shutdown_unblocks_pty_input_and_waits_for_process_and_worker() {
         let root = tempfile::tempdir().unwrap();
         let policy: Arc<dyn ToolPolicy> = Arc::new(DefaultToolPolicy::new(PolicySettings {
             allowed_read_roots: vec![root.path().to_owned()],
+            allowed_shell_commands: vec!["*".to_owned()],
             ..PolicySettings::default()
         }));
         let mut context = tool_context_with(policy);

@@ -5,7 +5,7 @@
 //
 // The trait surface is intentionally small and capability-typed:
 // `check_read_path`, `check_write_path`, `check_process_signal`,
-// `check_shell_enabled`, `check_network`,
+// `check_shell_enabled`, `check_shell_command`, `check_network`,
 // `check_subagent_spawn_typed`. Each call returns either `()` or a
 // `CanonicalPath` (a path + parent dir fd), and errors are `PolicyError`
 // variants — no name-based bypass surface and no anyhow erasure.
@@ -19,6 +19,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 
 mod canonical;
 mod errors;
+mod shell_rules;
 
 #[cfg(test)]
 mod security_tests;
@@ -44,6 +45,10 @@ pub struct PolicySettings {
     pub sensitive_path_patterns: Vec<String>,
     pub max_read_bytes: usize,
     pub shell_enabled: bool,
+    /// Allow patterns every command run by the `shell`, `background` and `pty`
+    /// tools must match: whitespace-separated globs over argv words, with a
+    /// trailing `*` matching any remaining words. A lone `*` allows anything.
+    pub allowed_shell_commands: Vec<String>,
     pub shell_timeout_secs: u64,
     pub network_enabled: bool,
     /// Remote-host allowlist. Default is `vec!["*"]` (allow any non-loopback
@@ -97,6 +102,7 @@ impl Default for PolicySettings {
             sensitive_path_patterns: default_sensitive_patterns(),
             max_read_bytes: 1_048_576,
             shell_enabled: true,
+            allowed_shell_commands: default_shell_allow(),
             shell_timeout_secs: 30,
             network_enabled: false,
             allowed_hosts: vec!["*".to_owned()],
@@ -114,6 +120,15 @@ impl Default for PolicySettings {
 #[must_use]
 pub fn default_write_root() -> PathBuf {
     std::env::temp_dir().join("halter")
+}
+
+/// The built-in shell allowlist. An allowlist bounds which programs run, not
+/// what they do: `cargo` runs build scripts and `find -exec` runs anything.
+#[must_use]
+pub fn default_shell_allow() -> Vec<String> {
+    ["git *", "cargo *", "rg *", "ls *", "find *", "true", "cd *"]
+        .map(str::to_owned)
+        .to_vec()
 }
 
 fn default_read_roots() -> Vec<PathBuf> {
@@ -160,8 +175,8 @@ pub trait ToolPolicy: Send + Sync {
     /// process-tree boundary when configured.
     async fn check_process_signal(&self, pid: Pid) -> Result<(), PolicyError>;
 
-    /// Authorize running shell commands (the `shell`, `background` and `pty`
-    /// tools). This is a kill switch only; commands are not inspected.
+    /// Authorize using the `shell`, `background` and `pty` tools at all. This
+    /// is the kill switch; [`Self::check_shell_command`] inspects commands.
     async fn check_shell_enabled(&self) -> Result<(), PolicyError>;
 
     /// Longest timeout a model may request for one tool call (`timeout_ms`
@@ -169,6 +184,13 @@ pub trait ToolPolicy: Send + Sync {
     /// rejected; omitting `timeout_ms` keeps each tool's own default.
     fn max_tool_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(DEFAULT_MAX_TOOL_TIMEOUT_SECS)
+    }
+
+    /// Authorize running `command` in the detected shell. The default applies
+    /// only [`Self::check_shell_enabled`].
+    async fn check_shell_command(&self, command: &str) -> Result<(), PolicyError> {
+        let _ = command;
+        self.check_shell_enabled().await
     }
 
     /// Authorize a network request to `url`. Loopback addresses are denied
@@ -334,6 +356,15 @@ impl ToolPolicy for DefaultToolPolicy {
         } else {
             Err(PolicyError::ShellDisabled)
         }
+    }
+
+    async fn check_shell_command(&self, command: &str) -> Result<(), PolicyError> {
+        self.check_shell_enabled().await?;
+        shell_rules::check(
+            &self.settings.allowed_shell_commands,
+            command,
+            crate::builtin::shell::detect::detected().kind.is_posix(),
+        )
     }
 
     async fn check_network(&self, url: &str) -> Result<(), PolicyError> {

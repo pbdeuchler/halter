@@ -35,7 +35,7 @@ pub use notes::{
 };
 pub use policy::{
     CanonicalPath, DEFAULT_MAX_TOOL_TIMEOUT_SECS, DefaultToolPolicy, LoopbackAllow, Pid,
-    PolicyError, PolicySettings, ToolPolicy, default_write_root,
+    PolicyError, PolicySettings, ToolPolicy, default_shell_allow, default_write_root,
 };
 pub use runtime::{
     NoopSubagentControl, NoopToolEventSink, SubagentControl, SubagentParentContext, Tool,

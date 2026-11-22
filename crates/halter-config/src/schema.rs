@@ -1518,6 +1518,11 @@ const fn default_max_concurrent_subagents() -> usize {
 pub struct ShellPolicyConfig {
     #[serde(default = "default_shell_enabled")]
     pub enabled: bool,
+    /// Allow patterns every command the shell tools run must match:
+    /// whitespace-separated globs over argv words, a trailing `*` matching any
+    /// remaining words. `["*"]` allows anything; `[]` denies every command.
+    #[serde(default = "default_shell_allow")]
+    pub allow: Vec<String>,
     #[serde(default = "default_shell_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -1526,6 +1531,7 @@ impl Default for ShellPolicyConfig {
     fn default() -> Self {
         Self {
             enabled: default_shell_enabled(),
+            allow: default_shell_allow(),
             timeout_secs: default_shell_timeout_secs(),
         }
     }
@@ -1533,6 +1539,14 @@ impl Default for ShellPolicyConfig {
 
 const fn default_shell_enabled() -> bool {
     true
+}
+
+/// Mirrors `halter_tools::default_shell_allow` (this crate does not depend on
+/// halter-tools).
+fn default_shell_allow() -> Vec<String> {
+    ["git *", "cargo *", "rg *", "ls *", "find *", "true", "cd *"]
+        .map(str::to_owned)
+        .to_vec()
 }
 
 const fn default_shell_timeout_secs() -> u64 {
