@@ -26,6 +26,8 @@ mod openai_error;
 mod openai_rate_limit;
 mod openai_rate_limit_policy;
 mod openrouter;
+#[cfg(test)]
+mod prefix_stability_tests;
 mod registry;
 mod resilience;
 mod responses_provider;
@@ -61,6 +63,7 @@ pub use resilience::{
     DefaultProviderErrorClassifier, ProviderErrorClassifier, ProviderTimeouts, ResiliencePolicy,
     ResilientProvider,
 };
+pub use responses_provider::ResponsesOptions;
 pub use retry::RetryPolicy;
 pub use secret::SecretString;
 pub use unsupported::UnsupportedProvider;
@@ -96,5 +99,15 @@ pub trait Provider: Send + Sync {
         _cancel: CancellationToken,
     ) -> anyhow::Result<ProviderCompactionResponse> {
         anyhow::bail!("failed to compact session: provider does not support compaction");
+    }
+
+    /// The timeout and retry policy this provider applies to each request,
+    /// if it applies one. A caller that puts its own deadline around a
+    /// request (a prompt or agent hook, for example) sizes it from
+    /// [`ResiliencePolicy::recovery_window`] so its deadline cannot pre-empt
+    /// the provider's own stall detection and retry. Wrappers delegate to the
+    /// provider they wrap. The default is `None`: no policy is known.
+    fn resilience_policy(&self) -> Option<ResiliencePolicy> {
+        None
     }
 }

@@ -129,6 +129,13 @@ impl Provider for ModelJudgeProvider {
         self.default.provider.capabilities()
     }
 
+    /// The default member's policy. Every panelist and synthesis call is a
+    /// separate provider request, so this is a per-request floor, not a bound
+    /// on the whole panel.
+    fn resilience_policy(&self) -> Option<crate::ResiliencePolicy> {
+        self.default.provider.resilience_policy()
+    }
+
     async fn stream(
         &self,
         request: ProviderRequest,
@@ -231,6 +238,10 @@ impl ModelJudgeProvider {
             }
         });
 
+        // No panel-level deadline: each panelist ends on its own provider's
+        // resilience timers (request, stream-idle, retry deadline), on
+        // `cancel`, or on success, so the panel takes as long as its slowest
+        // panelist. See docs/timeouts.md.
         let mut results = futures::future::join_all(futures).await;
         results.sort_by_key(|(index, _)| *index);
 
@@ -606,7 +617,7 @@ fn synthesis_retry_message(rank_recorded: bool) -> UserMessage {
 /// by the OneShot provider on every default call and by the runtime's FullTurn
 /// judge on the opening inference step of the turn.
 pub fn synthesis_guidance_message(synthesis: &str) -> UserMessage {
-    UserMessage::text(format!(
+    UserMessage::harness(format!(
         "The following model-judge synthesis evaluates candidate responses to \
          the most recent user message. Treat it as advisory context for your \
          answer, not as a new request from the user.\n\n\

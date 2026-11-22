@@ -58,6 +58,35 @@ pub struct PolicySettings {
     pub process_tree_root: Option<Pid>,
     pub max_subagent_depth: u32,
     pub max_concurrent_subagents: usize,
+    /// Longest `timeout_ms` a model may pass to `shell`, `pty`, `wait_agent`
+    /// or `close_agent`. Default [`DEFAULT_MAX_TOOL_TIMEOUT_SECS`].
+    pub max_tool_timeout_secs: u64,
+}
+
+/// Default ceiling, in seconds, for a model-supplied tool `timeout_ms`.
+pub const DEFAULT_MAX_TOOL_TIMEOUT_SECS: u64 = 3_600;
+
+/// Check a model-supplied `timeout_ms` against the policy's ceiling. A value
+/// over it is rejected with a message naming the maximum, so the model can
+/// retry with a value it chose rather than run under one it did not.
+pub(crate) fn check_tool_timeout(
+    policy: &dyn ToolPolicy,
+    tool: &str,
+    timeout_ms: Option<u64>,
+) -> anyhow::Result<Option<std::time::Duration>> {
+    let max = policy.max_tool_timeout();
+    timeout_ms
+        .map(std::time::Duration::from_millis)
+        .map(|timeout| {
+            anyhow::ensure!(
+                timeout <= max,
+                "failed to execute {tool}: timeout_ms {} exceeds the maximum of {}; pass a smaller timeout_ms",
+                timeout.as_millis(),
+                max.as_millis()
+            );
+            Ok(timeout)
+        })
+        .transpose()
 }
 
 impl Default for PolicySettings {
@@ -75,6 +104,7 @@ impl Default for PolicySettings {
             process_tree_root: None,
             max_subagent_depth: 3,
             max_concurrent_subagents: 8,
+            max_tool_timeout_secs: DEFAULT_MAX_TOOL_TIMEOUT_SECS,
         }
     }
 }
@@ -133,6 +163,13 @@ pub trait ToolPolicy: Send + Sync {
     /// Authorize running shell commands (the `shell`, `background` and `pty`
     /// tools). This is a kill switch only; commands are not inspected.
     async fn check_shell_enabled(&self) -> Result<(), PolicyError>;
+
+    /// Longest timeout a model may request for one tool call (`timeout_ms`
+    /// on `shell`, `pty`, `wait_agent` and `close_agent`). Larger values are
+    /// rejected; omitting `timeout_ms` keeps each tool's own default.
+    fn max_tool_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(DEFAULT_MAX_TOOL_TIMEOUT_SECS)
+    }
 
     /// Authorize a network request to `url`. Loopback addresses are denied
     /// unless an entry in `allowed_loopback` matches; other hosts must match
@@ -285,6 +322,10 @@ impl ToolPolicy for DefaultToolPolicy {
             }
         }
         Ok(())
+    }
+
+    fn max_tool_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.settings.max_tool_timeout_secs)
     }
 
     async fn check_shell_enabled(&self) -> Result<(), PolicyError> {

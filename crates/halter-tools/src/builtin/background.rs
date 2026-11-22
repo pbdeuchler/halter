@@ -15,7 +15,8 @@ use tokio::sync::Mutex;
 use crate::{CanonicalPath, ToolContext, ToolOutput, TypedTool};
 
 use super::common::{
-    ToolScope, ensure_not_cancelled, optional_u64, parse_env_map, required_string, resolve_path,
+    ToolScope, ensure_not_cancelled, optional_u64, parse_env_map, provided, required_string,
+    resolve_path,
 };
 use job::{BackgroundJob, JobOutput, JobSummary};
 
@@ -52,6 +53,18 @@ impl BackgroundRegistry {
     }
     pub(crate) fn has_running(&self) -> bool {
         self.running.load(Ordering::Acquire) != 0
+    }
+    /// The id and command of each running job, in id order.
+    pub(crate) async fn running(&self) -> Vec<(String, String)> {
+        let state = self.state.lock().await;
+        let mut jobs: Vec<_> = state
+            .jobs
+            .values()
+            .filter(|job| !job.is_finished())
+            .map(|job| (job.id.clone(), job.command.clone()))
+            .collect();
+        jobs.sort();
+        jobs
     }
     async fn spawn(
         &self,
@@ -202,8 +215,8 @@ impl TypedTool for BackgroundTool {
                     "invalid tool input: command must not be empty"
                 );
                 context.policy.check_shell_enabled().await?;
-                let cwd = match input.get("cwd") {
-                    None | Some(Value::Null) => context.working_dir.clone(),
+                let cwd = match provided(&input, "cwd") {
+                    None => context.working_dir.clone(),
                     Some(Value::String(cwd)) => resolve_path(&context.working_dir, cwd),
                     Some(_) => anyhow::bail!("invalid tool input: cwd must be a string"),
                 };

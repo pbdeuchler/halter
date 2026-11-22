@@ -12,6 +12,7 @@ use portable_pty::{Child, ChildKiller, CommandBuilder, PtySize, native_pty_syste
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::policy::check_tool_timeout;
 use crate::{ToolContext, ToolOutput, ToolRuntimeEvent, TypedTool};
 
 use super::common::{
@@ -160,7 +161,11 @@ impl TypedTool for PtyTool {
                     command: required_string(&input, "command")?.to_owned(),
                     cwd: optional_string(&input, "cwd").map(ToOwned::to_owned),
                     env: parse_env_map(input.get("env"))?,
-                    timeout: optional_u64(&input, "timeout_ms")?.map(Duration::from_millis),
+                    timeout: check_tool_timeout(
+                        context.policy.as_ref(),
+                        "pty",
+                        optional_u64(&input, "timeout_ms")?,
+                    )?,
                     cols: checked_u16(&input, "cols", 120)?,
                     rows: checked_u16(&input, "rows", 40)?,
                 };
@@ -1049,6 +1054,12 @@ mod security_tests {
         })
         .await
         .expect("PTY command publishes pid");
+        assert!(context.tool_sessions.pty_running(&context.session_id));
+        assert!(
+            !context
+                .tool_sessions
+                .pty_running(&halter_protocol::SessionId::from("other"))
+        );
         assert!(
             PtyTool
                 .execute(
@@ -1085,6 +1096,7 @@ mod security_tests {
         .await
         .expect("shutdown unblocks the PTY writer")
         .unwrap();
+        assert!(!context.tool_sessions.pty_running(&context.session_id));
         assert!(!context.tool_sessions.has_process_state(&context.session_id));
         // SAFETY: signal zero only probes the process created by this test.
         let exists = unsafe { libc::kill(pid, 0) };

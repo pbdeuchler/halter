@@ -88,7 +88,9 @@ impl TypedTool for ReadTool {
         let path = resolve_path(&context.working_dir, required_string(&input, "path")?);
         let offset = optional_u64(&input, "offset")?.unwrap_or(1);
         let limit = parse_limit(&input)?;
-        let timeout = parse_timeout(&input)?;
+        let timeout = Duration::from_secs(
+            optional_u64(&input, "timeout_secs")?.unwrap_or(DEFAULT_READ_TIMEOUT_SECS),
+        );
         let line_numbers = optional_bool(&input, "line_numbers")?.unwrap_or(false);
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -207,14 +209,6 @@ fn parse_limit(input: &Value) -> anyhow::Result<u64> {
         anyhow::bail!("invalid tool input: field 'limit' must be between 1 and {MAX_READ_LIMIT}");
     }
     Ok(limit)
-}
-
-fn parse_timeout(input: &Value) -> anyhow::Result<Duration> {
-    let timeout_secs = optional_u64(input, "timeout_secs")?.unwrap_or(DEFAULT_READ_TIMEOUT_SECS);
-    if timeout_secs == 0 {
-        anyhow::bail!("invalid tool input: field 'timeout_secs' must be at least 1");
-    }
-    Ok(Duration::from_secs(timeout_secs))
 }
 
 fn read_window_from_reader<R: BufRead>(

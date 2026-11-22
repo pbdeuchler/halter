@@ -52,6 +52,9 @@ impl<'a> CompactionTrigger<'a> {
 /// One exactly-once message a strategy wants delivered in the current
 /// logical window. The runtime persists delivered ids per window, so a
 /// stateless strategy can provide milestone reminders that fire once.
+/// The message is appended to the transcript; a
+/// [`Message::System`](halter_protocol::Message::System) is encoded in place
+/// there, so a reminder does not invalidate the prompt cache.
 #[derive(Debug, Clone)]
 pub struct CompactionNotification {
     pub id: String,
@@ -256,6 +259,11 @@ impl<'a> CompactionContext<'a> {
         crate::skills::tool_specs(self.session.services().tools.specs(), &self.snapshot)
     }
 
+    /// The runtime's services: context settings, tool registry, tool state.
+    pub(crate) fn services(&self) -> &crate::RuntimeServices {
+        self.session.services()
+    }
+
     /// Append a message to the transcript and log it.
     pub fn append(&mut self, message: Message) {
         self.state.append(message.clone());
@@ -456,7 +464,10 @@ pub trait CompactionStrategy: Send + Sync {
     /// puts the transcript window back to what it was before the pass, so
     /// the model never sees a half-finished exchange; the exchange itself,
     /// its tool runs, and its usage stay in the event log and the session
-    /// totals as they happened.
+    /// totals as they happened. An `Err` whose chain holds a
+    /// [`ProviderCompactionRejected`](halter_protocol::ProviderCompactionRejected)
+    /// is a response that was billed but not applied: the runtime logs its
+    /// text and usage as a recorded assistant reply, so the usage counts.
     async fn compact(
         &self,
         ctx: CompactionContext<'_>,

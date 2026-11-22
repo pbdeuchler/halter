@@ -461,7 +461,15 @@ pub enum StopReason {
 /// Provider metadata preserved on assistant messages for replay and diagnostics.
 pub struct ReplayMeta {
     pub provider_name: Option<ProviderName>,
+    /// The configured model alias ([`ResolvedModel::id`]). Repointing the
+    /// alias at another upstream model keeps this value, so replay checks
+    /// compare `wire_model` instead.
     pub model: Option<ModelId>,
+    /// The model id sent upstream ([`ResolvedModel::model`]) on the request
+    /// that produced the message. Absent on messages recorded before halter
+    /// stored it, which therefore never replay model-bound reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -486,11 +494,24 @@ pub struct HookWarning {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// System instruction message carried in the transcript.
+///
+/// Where it reaches the model depends on its position. System messages
+/// before the first other message are the session's leading system content
+/// and join the provider's system prompt. Any later one (a hook's message, a
+/// compaction reminder, a resume notice) is encoded where it sits: a
+/// `developer` item on the Responses API, a `system` message on Chat
+/// Completions, and a user turn wrapped in `<system-reminder>` tags on
+/// Anthropic Messages, which has no system role in its message list. One
+/// appended inside a tool batch moves to just after the batch's results.
+/// Appending a system message therefore never rewrites the cached prefix.
 pub struct SystemMessage {
     pub id: MessageId,
     pub created_at: Timestamp,
     pub text: SharedStr,
 }
+
+/// Id prefix of every user-role message [`UserMessage::harness`] builds.
+const HARNESS_MESSAGE_ID_PREFIX: &str = "harness-";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// User message, including text and optional media parts.
@@ -509,6 +530,26 @@ impl UserMessage {
             created_at: Utc::now(),
             parts: vec![UserPart::Text { text: text.into() }],
         }
+    }
+
+    /// Build a text-only user-role message that the harness wrote itself,
+    /// such as a notice, a reminder, or a hook's continuation, rather than a
+    /// request from the user. The mark lives in the id, so it survives the
+    /// event log and replay without a new field; see
+    /// [`is_harness`](Self::is_harness).
+    #[must_use]
+    pub fn harness(text: impl Into<String>) -> Self {
+        Self {
+            id: MessageId(format!("{HARNESS_MESSAGE_ID_PREFIX}{}", Uuid::new_v4())),
+            ..Self::text(text)
+        }
+    }
+
+    /// Whether the harness wrote this message ([`harness`](Self::harness)),
+    /// so it is not a user request.
+    #[must_use]
+    pub fn is_harness(&self) -> bool {
+        self.id.0.starts_with(HARNESS_MESSAGE_ID_PREFIX)
     }
 
     /// Concatenate text parts with newlines, ignoring image and document parts.
@@ -570,6 +611,13 @@ pub enum AssistantPart {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// Provider thinking block with optional replay signature.
+///
+/// The signature is opaque provider replay state. Anthropic stores its
+/// thinking signature and replays the block only to the same provider. The
+/// Responses providers (OpenAI, OpenRouter) store the whole `reasoning` output
+/// item as JSON (`id`, `summary`, and, when present, `encrypted_content`,
+/// `content` and `status`) and send it back as an input item on later requests
+/// to the same provider and upstream model ([`ReplayMeta::wire_model`]).
 pub struct ThinkingBlock {
     pub text: SharedStr,
     pub signature: Option<ReplaySignature>,
@@ -580,6 +628,9 @@ pub struct ThinkingBlock {
 pub struct ToolCall {
     pub id: ToolCallId,
     pub name: ToolName,
+    /// The model's arguments. Arguments that were not valid JSON are kept as
+    /// a JSON string of the text received; the runtime answers such a call
+    /// with an error and does not run the tool.
     pub arguments: Value,
 }
 
@@ -597,7 +648,7 @@ pub struct ToolResultMessage {
 #[serde(tag = "role", rename_all = "snake_case")]
 /// A transcript item visible to providers and session stores.
 pub enum Message {
-    /// System instructions.
+    /// System instructions. See [`SystemMessage`] for where providers put them.
     System(SystemMessage),
     /// User input.
     User(UserMessage),
@@ -840,8 +891,6 @@ pub enum SessionCommand {
     SubmitTurn { turn: Turn },
     /// Interrupt the active turn.
     InterruptTurn,
-    /// Append session-scoped system guidance.
-    AppendSystemPrompt { id: PromptId, text: SharedStr },
     /// Switch the active model role.
     SetModelRole { role: ModelRole },
     /// Switch to a concrete model id.
@@ -925,6 +974,7 @@ pub enum HookSessionStartSource {
     Startup,
     Resume,
     Clear,
+    /// The turn after a compaction rewrote the context, automatic or manual.
     Compact,
 }
 
@@ -1335,12 +1385,14 @@ impl ToolResult {
 
 impl ToolResultMessage {
     /// The text a provider sends to the model for this message: the result,
-    /// with the error appended when both are present.
+    /// with the error appended when both are present. A failed call's text
+    /// always carries an `error` marker, for dialects with no error flag on a
+    /// tool result; a successful result is the result's text alone.
     #[must_use]
     pub fn to_model_string(&self) -> Cow<'_, str> {
         match (&self.content, &self.error) {
             (content, None) => content.to_model_string(),
-            (ToolResult::Empty, Some(error)) => error.message.as_str().into(),
+            (ToolResult::Empty, Some(error)) => format!("error: {}", error.message).into(),
             // Written out so the key order does not follow serde_json's
             // `preserve_order` feature.
             (ToolResult::Json { value }, Some(error)) => {
@@ -1759,6 +1811,11 @@ pub struct SessionState {
     pub pending_inputs: Vec<UserMessage>,
     #[serde(default)]
     pub compacted_prefix: Vec<Value>,
+    /// Append-kind segments rendered after the system prompt and skills.
+    /// The runtime no longer writes them: hook additional context is a
+    /// transcript system message instead, so it cannot rewrite the cached
+    /// prefix. Sessions recorded by earlier versions keep the segments they
+    /// hold until a rollover clears them, so they encode as they did.
     pub appended_prompt_segments: Vec<PromptSegment>,
     pub pending_tool_calls: IndexMap<ToolCallId, PendingToolCall>,
     pub usage_so_far: Usage,
@@ -2037,7 +2094,11 @@ pub struct AssembledPrompt {
     pub segments: Vec<PromptSegment>,
     pub transcript: Vec<Message>,
     pub ordered_segments: Vec<PromptSegment>,
+    /// Fingerprint of `rendered_prefix`, the compacted prefix items, and the
+    /// plan's cache boundary.
     pub prefix_cache_key: String,
+    /// The ordered segments' text. Excludes the compacted prefix, which
+    /// codecs send from [`ProviderRequest::compacted_prefix`].
     pub rendered_prefix: String,
     pub rendered_transcript: String,
     pub rendered: String,
@@ -2074,9 +2135,9 @@ impl AssembledPrompt {
         &self.ordered_segments[start..end]
     }
 
-    /// Slice of segments that follow both the system and skills sections —
-    /// hook-appended context, etc. These never receive a cache breakpoint
-    /// because they may change turn-to-turn.
+    /// Slice of segments that follow both the system and skills sections:
+    /// append-kind segments, such as `SessionState::appended_prompt_segments`.
+    /// These never receive a cache breakpoint.
     #[must_use]
     pub fn append_segments(&self) -> &[PromptSegment] {
         let start =
@@ -2126,6 +2187,24 @@ pub struct ProviderCompactionResponse {
     pub usage: Usage,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{reason}")]
+/// A compaction response the provider returned, and billed, that cannot be
+/// applied: refused, truncated, incomplete, or empty. A provider's `compact`
+/// returns it as its error (through `anyhow`) instead of a bare message so
+/// the tokens are not lost: the runtime finds it anywhere in the error's
+/// chain, logs `text` and `usage` as a `MessageRecorded` assistant reply,
+/// and counts `usage` in the session and turn totals. It is not retried, as
+/// the provider did answer.
+pub struct ProviderCompactionRejected {
+    /// Why the response cannot be applied.
+    pub reason: String,
+    /// Whatever text the response carried, empty when it had none.
+    pub text: String,
+    /// What the provider reported for the request.
+    pub usage: Usage,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 /// Final output returned from a completed subagent.
 pub struct SubagentResult {
@@ -2140,6 +2219,28 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn harness_mark_survives_serialization_and_only_harness_messages_carry_it() {
+        let cases = [
+            (UserMessage::harness("Continue."), true),
+            (UserMessage::text("Continue."), false),
+            (
+                UserMessage {
+                    id: MessageId::from("harness"),
+                    ..UserMessage::text("no prefix separator")
+                },
+                false,
+            ),
+        ];
+        for (message, harness) in cases {
+            let replayed: UserMessage =
+                serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+            assert_eq!(replayed, message);
+            assert_eq!(replayed.is_harness(), harness, "{message:?}");
+            assert_eq!(replayed.plain_text(), message.plain_text());
+        }
+    }
 
     #[test]
     fn close_subagent_timeout_is_optional_and_defaults_to_unlimited() {
@@ -2841,7 +2942,7 @@ mod tests {
             (message(text(), None), "say \"hi\"\n"),
             (message(json(), None), r#"{"out":"a\nb"}"#),
             (message(rendered(), None), "a\nb"),
-            (message(ToolResult::Empty, Some("boom")), "boom"),
+            (message(ToolResult::Empty, Some("boom")), "error: boom"),
             (message(text(), Some("boom")), "say \"hi\"\n\n\nerror: boom"),
             (
                 message(json(), Some("boom")),

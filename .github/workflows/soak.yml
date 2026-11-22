@@ -1,9 +1,11 @@
 name: soak
 
-# Long runs of the randomized session-driver tests, against both the in-memory
-# and SQLite stores. Every PR already runs 128 and 32 cases respectively
-# through the normal suite; this samples far more interleavings. A failure
-# prints the shrunk operation sequence in the log.
+# Long runs of the randomized tests. The session-driver model tests run
+# against both the in-memory and SQLite stores; every PR already runs 128 and
+# 32 cases respectively through the normal suite, and this samples far more
+# interleavings. The codec prefix-stability property runs 256 cases per PR;
+# this samples far more histories on every dialect. A failure prints the
+# shrunk case in the log.
 on:
   schedule:
     - cron: "17 9 * * *"
@@ -28,3 +30,16 @@ jobs:
       - run: >-
           cargo test -p halter-runtime --lib
           session_driver_model_tests::session_driver_model
+
+  codec-prefix-stability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PROPTEST_CASES: ${{ inputs.cases || '5000' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: >-
+          cargo test -p halter-providers --lib
+          prefix_stability_tests::appending_a_step_never_rewrites_the_encoded_prefix

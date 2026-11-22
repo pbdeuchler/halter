@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{PathLockMap, Report, ToolContext, TypedTool};
+use crate::{PathLockMap, Report, ToolContext, TypedTool, placeholder_as_default};
 
 pub const MAX_NOTE_BYTES: usize = 1_000_000;
 pub const RECOVERY_RESPONSE_BYTES: usize = 32_000;
@@ -28,9 +28,10 @@ pub fn recovery_preview(text: &str, limit: usize) -> &str {
 
 /// One-based inclusive line range. Omitted bounds mean the beginning/end.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LineRange {
+    #[serde(default, deserialize_with = "placeholder_as_default")]
     pub start_line: Option<usize>,
+    #[serde(default, deserialize_with = "placeholder_as_default")]
     pub end_line: Option<usize>,
 }
 
@@ -91,7 +92,7 @@ pub fn recovery_lines(text: &str, range: &LineRange, start_byte: usize) -> anyho
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum NotesRequest {
     WriteFile {
         path: String,
@@ -103,19 +104,22 @@ pub enum NotesRequest {
     },
     ReadFile {
         path: String,
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         start_byte: Option<usize>,
         #[serde(flatten)]
         range: LineRange,
     },
     ListFilesByPrefix {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         prefix: String,
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         after: Option<String>,
     },
     SearchContents {
         query: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         prefix: String,
+        #[serde(default, deserialize_with = "placeholder_as_default")]
         after: Option<String>,
     },
 }
@@ -488,7 +492,7 @@ impl<N: NotesBackend> TypedTool for NotesTool<N> {
     }
     async fn run(&self, context: ToolContext, input: Value) -> anyhow::Result<Report> {
         anyhow::ensure!(!context.cancel.is_cancelled(), "notes operation cancelled");
-        let request = serde_json::from_value(input)?;
+        let request = crate::builtin::common::parse_input(input)?;
         Ok(Report(self.0.execute(&context.session_id, request).await?))
     }
 }
@@ -661,7 +665,7 @@ mod tests {
             json!({"action":"append_to_file","path":"plan","content":"x".repeat(MAX_NOTE_BYTES - 1)}),
             json!({"action":"write_file","path":"plan","content":"x".repeat(MAX_NOTE_BYTES + 1)}),
             json!({"action":"read_file","path":"missing"}),
-            json!({"action":"read_file","path":"plan","start_line":0}),
+            json!({"action":"read_file","path":"plan","start_line":"one"}),
             json!({"action":"read_file","path":"plan","start_line":3,"end_line":1}),
             json!({"action":"search_contents","query":""}),
         ] {

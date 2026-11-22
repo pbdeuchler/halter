@@ -11,7 +11,8 @@ use sha2::{Digest, Sha256};
 use crate::skills::skill_index;
 
 /// Prompt segments the next request carries: the session's system-prompt
-/// seed, the skill index, and hook-appended context, in that order.
+/// seed, the skill index, and any appended segments a session recorded by an
+/// earlier version still holds, in that order.
 #[must_use]
 pub fn prompt_segments(
     blueprint: &SessionBlueprint,

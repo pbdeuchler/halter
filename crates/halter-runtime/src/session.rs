@@ -11,14 +11,13 @@ use futures::FutureExt;
 use futures::stream::{BoxStream, StreamExt};
 use halter_hooks::{Hooks, RegisteredHooks};
 use halter_protocol::{
-    AgentId, AssembledPrompt, AssistantMessage, AssistantPart, BlockId, CacheScope, ContentHash,
-    ContextPlan, Delivery, HookSessionStartSource, HookWarning, Message, MessageId, ModelId,
-    ObservedState, PendingEvent, PendingToolCall, PromptSegment, PromptSegmentId,
-    PromptSegmentKind, ProviderError, ProviderRequest, ReplayMeta, ResolvedModel, ResourceSnapshot,
-    SessionBlueprint, SessionEvent, SessionEventPayload, SessionId, SessionState, StopReason,
-    StreamEvent, SubagentEventForwarding, SubagentRecord, SubagentState, SubagentStatus,
-    SystemMessage, ToolCall, ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn,
-    TurnId, Usage, Volatility,
+    AgentId, AssembledPrompt, AssistantMessage, AssistantPart, BlockId, ContextPlan, Delivery,
+    HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState, PendingEvent,
+    PendingToolCall, PromptSegment, ProviderCompactionRejected, ProviderError, ProviderRequest,
+    ReplayMeta, ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionEvent,
+    SessionEventPayload, SessionId, SessionState, StopReason, StreamEvent, SubagentEventForwarding,
+    SubagentRecord, SubagentState, SubagentStatus, SystemMessage, ToolCall, ToolError,
+    ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn, TurnId, Usage,
 };
 use halter_providers::{ModelRegistry, Provider};
 
@@ -27,7 +26,6 @@ use halter_tools::{
     PathLockMap, SubagentControl, SubagentParentContext, TaskList, ToolEventSink, ToolPolicy,
     ToolRuntime, ToolRuntimeEvent, ToolSessionStore,
 };
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -691,6 +689,10 @@ impl SessionRuntime {
     }
 
     /// Replace resources used by future turns and resumed sessions.
+    ///
+    /// A change to the skills changes the skill index and tool list that
+    /// open sessions send from their next turn, so each one rewrites its
+    /// cached prompt prefix once.
     pub fn replace_resources(
         &self,
         snapshot: ResourceSnapshot,
@@ -974,7 +976,7 @@ impl SessionExecutor {
                     error!(
                         session_id = %session.session_id,
                         turn_id = %turn.id,
-                        error = %error,
+                        error = %format_args!("{error:#}"),
                         retryable,
                         cancelled,
                         "turn failed"
@@ -982,7 +984,7 @@ impl SessionExecutor {
                     let failure_events =
                         vec![session.make_event(SessionEventPayload::TurnFailed {
                             turn_id: turn.id.clone(),
-                            error: error.to_string(),
+                            error: format!("{error:#}"),
                             cancelled,
                             retryable,
                         })];
@@ -1042,14 +1044,35 @@ impl SessionExecutor {
         self.services.sessions.replay(&self.session_id).await
     }
 
-    /// Shut down this session and run session-end hooks.
-    pub(crate) async fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
-        self.leased(self.run_shutdown(reason)).await
+    /// Shut down this session and run session-end hooks. `cancel` is the
+    /// forced-cleanup signal: it ends a wait for a held session lease and
+    /// cancels running SessionEnd hooks, which are recorded as cancelled while
+    /// shutdown still commits. With a token that never fires, the hooks'
+    /// own timeouts bound them.
+    pub(crate) async fn shutdown(
+        &self,
+        reason: &str,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        // A free lease wins over an already-fired cancel, so a forced
+        // shutdown still commits; only a wait on a held lease is cut short.
+        let lease = tokio::select! {
+            biased;
+            lease = self.acquire_lease() => lease,
+            () = cancel.cancelled() => return Err(ProviderError::cancelled().into()),
+        };
+        let outcome = self.run_shutdown(reason, cancel).await;
+        lease.release().await?;
+        outcome
     }
 
     /// Force an uncooperative executor down, then close its checkpoint under
     /// the session lease. Waiting for the actual task prevents late tool or
     /// provider commits from racing transcript repair.
+    /// Commit attempts `force_interrupt_turn` makes before returning the last
+    /// `SessionCommitConflict`.
+    const FORCE_INTERRUPT_ATTEMPTS: u64 = 8;
+
     pub(crate) async fn force_interrupt_turn(&self, turn_id: &TurnId) -> anyhow::Result<()> {
         self.services.turn_registry.abort_and_wait(turn_id).await;
         if let Some(inbox) = &self.inbox {
@@ -1057,7 +1080,9 @@ impl SessionExecutor {
         }
         self.services.sessions.synchronize(&self.session_id).await?;
         self.leased(async {
+            let mut attempt = 0;
             loop {
+                attempt += 1;
                 let Some(stored) = self
                     .services
                     .sessions
@@ -1078,13 +1103,17 @@ impl SessionExecutor {
                     cancelled: true,
                     retryable: false,
                 });
+                // A conflict means another writer moved the head; reload and
+                // retry, but a bounded number of times so a store that keeps
+                // conflicting cannot hold forced recovery (and the lease) open.
                 match self.commit_turn_failure(vec![failure], None).await {
                     Err(error)
-                        if error
-                            .downcast_ref::<halter_session::SessionCommitConflict>()
-                            .is_some() =>
+                        if attempt < Self::FORCE_INTERRUPT_ATTEMPTS
+                            && error
+                                .downcast_ref::<halter_session::SessionCommitConflict>()
+                                .is_some() =>
                     {
-                        continue;
+                        tokio::time::sleep(std::time::Duration::from_millis(10 * attempt)).await;
                     }
                     outcome => return outcome,
                 }
@@ -1093,7 +1122,11 @@ impl SessionExecutor {
         .await
     }
 
-    async fn run_shutdown(&self, reason: &str) -> anyhow::Result<()> {
+    async fn run_shutdown(
+        &self,
+        reason: &str,
+        hook_cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
         let mut stored = self
             .services
             .sessions
@@ -1111,9 +1144,8 @@ impl SessionExecutor {
         let mut events = Vec::new();
         let turn_id = TurnId::new();
         // SessionEnd hooks run after runtime shutdown has cancelled every
-        // runtime token, so they get one that never fires; their configured
-        // timeouts bound them.
-        let hook_cancel = CancellationToken::new();
+        // runtime token, so they get the caller's forced-cleanup token
+        // instead of a runtime one.
         let hook_ctx = HookInvocationContext {
             turn_id: &turn_id,
             model: &stored.blueprint.default_model,
@@ -1875,7 +1907,7 @@ impl SessionExecutor {
                     self.push_event(&mut events, SessionEventPayload::MessageItem { message });
                 }
                 if let Some(reason) = stop_dispatch.merged.block_reason.clone() {
-                    let continuation = Message::User(halter_protocol::UserMessage::text(
+                    let continuation = Message::User(halter_protocol::UserMessage::harness(
                         if reason.trim().is_empty() {
                             "Continue."
                         } else {
@@ -2152,14 +2184,35 @@ impl SessionExecutor {
                     SessionEventPayload::ToolExecutionStarted { call: call.clone() },
                 );
 
-                if let Some(reason) = pre_dispatch.merged.block_reason.clone() {
-                    outcome.record("blocked");
+                let rejection = match (pre_dispatch.merged.block_reason.clone(), &call.arguments) {
+                    (Some(reason), _) => {
+                        outcome.record("blocked");
+                        span.in_scope(|| {
+                            info!("tool call blocked by hook");
+                            // Hook-authored text; kept below info.
+                            debug!(reason = %reason, "tool call block reason");
+                        });
+                        Some(reason)
+                    }
+                    // Materialization keeps arguments that are not JSON as
+                    // text; the tool never sees them.
+                    (None, serde_json::Value::String(raw)) => {
+                        serde_json::from_str::<serde_json::Value>(raw)
+                            .err()
+                            .map(|error| {
+                                outcome.record("error");
+                                span.in_scope(|| {
+                                    info!(%error, "tool call arguments are not valid JSON");
+                                });
+                                format!(
+                                    "invalid tool input: the arguments are not valid JSON ({error}), so the tool did not run; send the call again with its arguments as one JSON object. Received: {raw}"
+                                )
+                            })
+                    }
+                    (None, _) => None,
+                };
+                if let Some(reason) = rejection {
                     span.record("is_error", true);
-                    span.in_scope(|| {
-                        info!("tool call blocked by hook");
-                        // Hook-authored text; kept below info.
-                        debug!(reason = %reason, "tool call block reason");
-                    });
                     let id = MessageId::new();
                     let output = &self.services.tool_output;
                     let error =
@@ -2246,14 +2299,29 @@ impl SessionExecutor {
                     let args = p.call.arguments.clone();
                     let name = p.call.name.0.clone();
                     async move {
-                        if name == crate::SKILL_TOOL_NAME {
-                            return crate::skills::load_skill(&context.snapshot, &args)
-                                .map(|(result, message)| (result, Some(message)));
-                        }
-                        tools
-                            .execute(&name, context, args)
+                        let run = async {
+                            if name == crate::SKILL_TOOL_NAME {
+                                return crate::skills::load_skill(&context.snapshot, &args)
+                                    .map(|(result, message)| (result, Some(message)));
+                            }
+                            tools
+                                .execute(&name, context, args)
+                                .await
+                                .map(|result| (result, None))
+                        };
+                        // A panicking tool fails its call, not the turn.
+                        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run))
                             .await
-                            .map(|result| (result, None))
+                            .unwrap_or_else(|panic| {
+                                let message = panic
+                                    .downcast_ref::<&str>()
+                                    .copied()
+                                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                    .unwrap_or("no message");
+                                Err(anyhow::anyhow!(
+                                    "tool '{name}' panicked: {message}; it may have partially completed"
+                                ))
+                            })
                     }
                     .instrument(p.span.clone())
                 }))
@@ -2303,11 +2371,16 @@ impl SessionExecutor {
                                 session_id = %self.session_id,
                                 tool_call_id = %call.id,
                                 tool_name = %call.name,
-                                error = %error,
+                                error = %format_args!("{error:#}"),
                                 "tool call failed"
                             );
                         });
-                        (ToolResult::Empty, Some(ToolError::new(error.to_string())))
+                        // `{:#}` keeps the context chain, so a wrapped cause
+                        // reaches the model too.
+                        (
+                            ToolResult::Empty,
+                            Some(ToolError::new(format!("{error:#}"))),
+                        )
                     }
                 };
                 if error.is_none() {
@@ -2583,6 +2656,38 @@ impl SessionExecutor {
             ))
             .await;
         turn_usage.saturating_accumulate(&inference_usage);
+        // A rejected response was billed: log it as the reply it was, so
+        // the fold counts its usage like any other. One that cost and said
+        // nothing leaves the log alone.
+        if let Some(rejected) = result
+            .as_ref()
+            .err()
+            .and_then(|error| {
+                error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<ProviderCompactionRejected>())
+            })
+            .filter(|rejected| rejected.usage != Usage::default() || !rejected.text.is_empty())
+        {
+            let payload = SessionEventPayload::MessageRecorded {
+                message: Message::Assistant(AssistantMessage {
+                    id: MessageId::new(),
+                    created_at: Utc::now(),
+                    parts: (!rejected.text.is_empty())
+                        .then(|| AssistantPart::Text {
+                            text: rejected.text.clone(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    stop_reason: None,
+                    usage: Some(rejected.usage.clone()),
+                    replay_meta: Default::default(),
+                }),
+            };
+            halter_protocol::fold::apply_event(state, &payload);
+            self.push_event(events, payload);
+            turn_usage.saturating_accumulate(&rejected.usage);
+        }
         let reason = match &result {
             Ok(Some(_)) => return result,
             Ok(None) => "nothing to compact".to_owned(),
@@ -2696,13 +2801,27 @@ impl SessionExecutor {
         // context. Refresh the request base before the caller enforces the
         // cap; otherwise those segments would reach the provider uncounted.
         self.prepare_token_ledger(blueprint, &snapshot, state, events);
-        ledger_at_last_boundary.tokens = state.token_ledger.effective_tokens();
-        if clean_window
-            && state.context_window != window_before_boundary
-            && settings.rollover_due(ledger_at_last_boundary.tokens)
-        {
+        let tokens = state.token_ledger.effective_tokens();
+        ledger_at_last_boundary.tokens = tokens;
+        let rewrote = state.context_window != window_before_boundary;
+        if clean_window && rewrote && settings.rollover_due(tokens) {
             anyhow::bail!(
                 "clean window bootstrap exceeds its rollover threshold; increase context.compaction_threshold or reduce prompt and tool declarations"
+            );
+        }
+        // A rewrite that leaves the context still due made no progress the
+        // next boundary could improve on: back off as after a failure,
+        // rather than paying for the same rewrite at every boundary.
+        if rewrote && settings.compaction_due(tokens) {
+            ledger_at_last_boundary.failed_compaction_at = Some(tokens);
+            self.push_event(
+                events,
+                SessionEventPayload::Warning {
+                    message: format!(
+                        "automatic compaction left the context at {tokens} tokens, still at or over its threshold of {}; not compacting again until it grows by half the threshold",
+                        settings.compaction_threshold
+                    ),
+                },
             );
         }
         Ok(())
@@ -2794,6 +2913,9 @@ impl SessionExecutor {
                 turn_usage.saturating_accumulate(&effects.usage);
                 let (result, payload) =
                     effects.apply_for_policy(state, self.services.compaction.window_policy());
+                // As after a manual rewrite: the next turn starts with the
+                // compact-sourced SessionStart hooks.
+                state.pending_session_start_source = Some(HookSessionStartSource::Compact);
                 info!(
                     session_id = %self.session_id,
                     compacted_messages = result.compacted_count,
@@ -3453,30 +3575,10 @@ async fn materialize_assistant_message_with_cancel(
                 let pending = tool_call_blocks.remove(&id).with_context(|| {
                     format!("failed to materialize tool call: missing block '{}'", id)
                 })?;
-                let arguments = match parse_tool_call_arguments(&pending.arguments) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(
-                            provider = %model.provider,
-                            model = %model.model,
-                            tool_call_id = %pending.tool_call_id,
-                            block_id = %id,
-                            raw_arguments_len = pending.arguments.len(),
-                            %error,
-                            "tool call arguments failed to parse; substituting empty object"
-                        );
-                        tracing::trace!(
-                            tool_call_id = %pending.tool_call_id,
-                            raw_arguments = %pending.arguments,
-                            "unparseable tool call arguments"
-                        );
-                        serde_json::json!({})
-                    }
-                };
                 parts.push(AssistantPart::ToolCall(ToolCall {
+                    arguments: parse_tool_call_arguments(model, &pending),
                     id: pending.tool_call_id,
                     name: pending.name,
-                    arguments,
                 }));
             }
             Ok(StreamEvent::UsageUpdate { usage: updated }) => {
@@ -3530,32 +3632,12 @@ async fn materialize_assistant_message_with_cancel(
     // every output item). Treat each pending block as if a `ToolCallEnd`
     // had been received and push it as a synthetic `ToolCall` part using
     // the arguments we did accumulate. If those arguments fail to parse
-    // (e.g. truncated mid-JSON), substitute `{}` so the tool runtime can
-    // surface a tool-side error to the model rather than dropping the
-    // entire turn. Previously this branch bailed with
-    // "unterminated tool call block", which terminated the whole session
-    // even though a single bad streaming event need not be fatal.
+    // (e.g. truncated mid-JSON), the tool path answers the call with an
+    // error the model can act on rather than dropping the entire turn.
+    // Previously this branch bailed with "unterminated tool call block",
+    // which terminated the whole session even though a single bad
+    // streaming event need not be fatal.
     for (block_id, pending) in std::mem::take(&mut tool_call_blocks) {
-        let arguments = match parse_tool_call_arguments(&pending.arguments) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    provider = %model.provider,
-                    model = %model.model,
-                    tool_call_id = %pending.tool_call_id,
-                    block_id = %block_id,
-                    raw_arguments_len = pending.arguments.len(),
-                    %error,
-                    "stream ended with unterminated tool call whose arguments failed to parse; substituting empty object"
-                );
-                tracing::trace!(
-                    tool_call_id = %pending.tool_call_id,
-                    raw_arguments = %pending.arguments,
-                    "unparseable tool call arguments"
-                );
-                serde_json::json!({})
-            }
-        };
         warn!(
             provider = %model.provider,
             model = %model.model,
@@ -3565,9 +3647,9 @@ async fn materialize_assistant_message_with_cancel(
             "stream ended without ToolCallEnd; auto-closing tool call block"
         );
         parts.push(AssistantPart::ToolCall(ToolCall {
+            arguments: parse_tool_call_arguments(model, &pending),
             id: pending.tool_call_id,
             name: pending.name,
-            arguments,
         }));
     }
     debug!(
@@ -3589,6 +3671,7 @@ async fn materialize_assistant_message_with_cancel(
             replay_meta: ReplayMeta {
                 provider_name: Some(model.provider.clone()),
                 model: Some(model.id.clone()),
+                wire_model: Some(model.model.clone()),
             },
         },
         usage,
@@ -3615,13 +3698,27 @@ fn flush_text_buffer(parts: &mut Vec<AssistantPart>, text_buffer: &mut String) {
     });
 }
 
-fn parse_tool_call_arguments(arguments: &str) -> anyhow::Result<serde_json::Value> {
-    if arguments.trim().is_empty() {
-        return Ok(serde_json::json!({}));
+/// The arguments of a finished tool call block. Empty arguments read as `{}`.
+/// Text that is not JSON is kept as a JSON string of what was received, which
+/// the tool path answers with an error instead of running the tool.
+fn parse_tool_call_arguments(
+    model: &halter_protocol::ResolvedModel,
+    pending: &PendingToolCallBlock,
+) -> serde_json::Value {
+    if pending.arguments.trim().is_empty() {
+        return serde_json::json!({});
     }
-
-    serde_json::from_str(arguments)
-        .with_context(|| "failed to materialize tool call: invalid json arguments")
+    serde_json::from_str(&pending.arguments).unwrap_or_else(|error| {
+        warn!(
+            provider = %model.provider,
+            model = %model.model,
+            tool_call_id = %pending.tool_call_id,
+            raw_arguments_len = pending.arguments.len(),
+            %error,
+            "tool call arguments are not valid JSON; the call will be answered with an error"
+        );
+        serde_json::Value::String(pending.arguments.clone())
+    })
 }
 
 fn append_provider_stream_chunk(
@@ -3834,14 +3931,18 @@ pub(crate) fn apply_hook_side_effects(
         }
     }
 
-    for context in &dispatch.merged.additional_context {
-        state
-            .appended_prompt_segments
-            .push(build_hook_prompt_segment(context));
-    }
-
+    // Additional context is a system message where the hook ran, like the
+    // hook's own messages: editing the system prompt mid-window would
+    // invalidate the provider's prompt cache. Context that lands before a
+    // window's first other message is leading system content, which
+    // providers still put in the system prompt.
     let mut messages = Vec::new();
-    for text in &dispatch.merged.system_messages {
+    for text in dispatch
+        .merged
+        .additional_context
+        .iter()
+        .chain(&dispatch.merged.system_messages)
+    {
         let message = Message::System(SystemMessage {
             id: MessageId::new(),
             created_at: Utc::now(),
@@ -3852,23 +3953,6 @@ pub(crate) fn apply_hook_side_effects(
     }
 
     messages
-}
-
-fn build_hook_prompt_segment(text: &str) -> PromptSegment {
-    PromptSegment {
-        id: PromptSegmentId::new(),
-        text: text.to_owned(),
-        volatility: Volatility::TurnDynamic,
-        cache_scope: CacheScope::Dynamic,
-        content_hash: hash_text(text),
-        kind: PromptSegmentKind::Append,
-    }
-}
-
-fn hash_text(text: &str) -> ContentHash {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 fn tool_result_from_hook_value(value: serde_json::Value) -> ToolResult {
@@ -4428,10 +4512,11 @@ mod tests {
         Hook, HookEventName, HookResponse, HooksFile, RegisteredHookPriority, RegisteredHooks,
     };
     use halter_protocol::{
-        ApiKind, BlockId, HookHandlerType, HookRunStatus, HookSessionStartSource, Message, ModelId,
-        ModelRole, PluginId, ProviderCapabilities, ProviderError, ProviderKind, ProviderName,
-        ProviderRequest, ResolvedModel, StopReason, StreamEvent, ToolCallId, ToolCapabilities,
-        ToolConcurrency, ToolName, ToolResult, ToolSpec, Turn,
+        ApiKind, BlockId, CacheScope, HookHandlerType, HookRunStatus, HookSessionStartSource,
+        Message, ModelId, ModelRole, PluginId, PromptSegmentKind, ProviderCapabilities,
+        ProviderError, ProviderKind, ProviderName, ProviderRequest, ResolvedModel, StopReason,
+        StreamEvent, ToolCallId, ToolCapabilities, ToolConcurrency, ToolName, ToolResult, ToolSpec,
+        Turn, Volatility,
     };
     use halter_providers::{FakeProvider, Provider};
     use halter_tools::{
@@ -4978,7 +5063,11 @@ mod tests {
                 } else {
                     session.interrupt(Some(Duration::from_millis(25))).await
                 };
-                assert!(matches!(result, Err(crate::SessionError::TimedOut)));
+                // Finding 3: forced recovery settles inside the caller's
+                // grace, so the bounded call reports it instead of a
+                // `TimedOut` raced against the driver's own deadline.
+                // Mutation killed: `caller_deadline` returning `deadline`.
+                assert!(result.is_ok(), "close={close}: {result:?}");
                 tokio::time::timeout(Duration::from_secs(5), token.cancelled())
                     .await
                     .unwrap();
@@ -5474,10 +5563,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!services.tool_sessions.has_process_state(session.id()));
-            assert!(matches!(
-                session.shutdown(Some(Duration::ZERO)).await,
-                Err(crate::SessionError::TimedOut)
-            ));
+            // The forced deadline cancels the paused SessionEnd hook, so
+            // cleanup settles inside the caller's grace.
+            session.shutdown(Some(Duration::ZERO)).await.unwrap();
             let retry_handle = session.clone();
             let retry = tokio::spawn(async move { retry_handle.shutdown(None).await });
             assert!(matches!(
@@ -5988,12 +6076,22 @@ mod tests {
             tool_calls[0].arguments,
             serde_json::json!({"path": "x.txt", "content": "hi"})
         );
+        // Codecs gate reasoning replay on the wire model, not the alias.
+        // Kills dropping or swapping the `wire_model` assignment.
+        assert_eq!(
+            materialized.message.replay_meta,
+            ReplayMeta {
+                provider_name: Some(ProviderName::from("fake")),
+                model: Some(ModelId::from("default")),
+                wire_model: Some("halter/fake".to_owned()),
+            }
+        );
     }
 
     /// Same recovery path but the accumulated arguments are not valid JSON
-    /// (truncated mid-string). The synthetic tool call carries `{}` so the
-    /// tool runtime can produce a structured error rather than the whole
-    /// turn aborting.
+    /// (truncated mid-string). The synthetic tool call keeps the text, so the
+    /// tool path can answer it with an error rather than the whole turn
+    /// aborting.
     #[tokio::test]
     async fn materialize_handles_unterminated_tool_call_with_invalid_json() {
         let model = ResolvedModel {
@@ -6047,7 +6145,10 @@ mod tests {
             .collect();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, tool_call_id);
-        assert_eq!(tool_calls[0].arguments, serde_json::json!({}));
+        assert_eq!(
+            tool_calls[0].arguments,
+            serde_json::Value::String(r#"{"path":"x.txt","content":"hel"#.to_owned())
+        );
     }
 
     #[tokio::test]
@@ -6096,7 +6197,10 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, tool_call_id);
         assert_eq!(tool_calls[0].name.0, "write");
-        assert_eq!(tool_calls[0].arguments, serde_json::json!({}));
+        assert_eq!(
+            tool_calls[0].arguments,
+            serde_json::Value::String(r#"{"path":"x.txt","content":"hel"#.to_owned())
+        );
     }
 
     /// Provider metadata is a passthrough: it reaches the consumer event
@@ -7715,14 +7819,23 @@ mod tests {
         );
     }
 
+    /// Trigger A: the prompt alone is one token under the threshold and the
+    /// reply crosses it, so the one compaction comes after the response.
+    /// Before the no-progress guard this test leaned on the first boundary
+    /// being due too and compacting twice.
     #[tokio::test]
     async fn submit_turn_compacts_immediately_after_response_when_threshold_is_reached() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+        let prompt = "x".repeat(150);
+        let prompt_tokens = halter_protocol::estimate_message_tokens(&Message::User(
+            halter_protocol::UserMessage::text(prompt.clone()),
+        ));
+        let compaction_threshold = default_request_base_tokens(&services) + prompt_tokens + 1;
         install_context_settings(
             &mut services,
             ContextSettings {
-                compaction_threshold: 1_550,
+                compaction_threshold,
                 max_tokens: None,
             },
         );
@@ -7730,13 +7843,37 @@ mod tests {
 
         let session = new_session(&runtime, temp.path()).await;
 
-        session
-            .submit_turn(Turn::user("x".repeat(150)))
+        let events = session
+            .submit_turn(Turn::user(prompt))
             .await
             .expect("submit turn")
             .try_collect::<Vec<_>>()
             .await
             .expect("collect events");
+        let position = |pick: fn(&SessionEventPayload) -> bool| {
+            events.iter().position(|event| pick(&event.payload))
+        };
+        let reply = position(|payload| {
+            matches!(
+                payload,
+                SessionEventPayload::MessageItem {
+                    message: Message::Assistant(_)
+                }
+            )
+        });
+        let compacted = position(|payload| {
+            matches!(
+                payload,
+                SessionEventPayload::ContextCompacted {
+                    effects: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            reply.is_some() && compacted > reply,
+            "{reply:?} {compacted:?}"
+        );
 
         let stored = services
             .sessions
@@ -7853,7 +7990,11 @@ mod tests {
     /// running" sees `PostCompact`, or a second `PreCompact` at the turn's
     /// next boundary), ignoring the
     /// block reason ("blocked" compacts), and skipping `PostCompact` after a
-    /// rewrite ("rewrites" misses it).
+    /// rewrite ("rewrites" misses it). Like a manual rewrite, an automatic
+    /// one re-arms the compact-sourced `SessionStart` hooks for the next
+    /// turn: dropping that latch in `run_automatic_compaction` leaves
+    /// "rewrites" without its second `SessionStart`, and setting it before
+    /// the rewrite gives one to every other case.
     #[tokio::test]
     async fn automatic_compaction_fires_post_compact_only_after_a_rewrite() {
         // (case, strategy, PreCompact blocks, compaction hooks that fire, compacted)
@@ -7915,6 +8056,16 @@ mod tests {
                     }),
                 );
             }
+            let sources = Arc::new(Mutex::new(Vec::new()));
+            let seen = sources.clone();
+            registered.register(
+                PluginId::from("internal"),
+                RegisteredHookPriority::AfterPlugins,
+                Hook::callback(HookEventName::SessionStart, move |input| {
+                    seen.lock().expect("sources").push(input.matcher_value);
+                    async move { HookResponse::passthrough() }
+                }),
+            );
             Arc::get_mut(&mut services)
                 .expect("unique services")
                 .registered_hooks = Arc::new(registered);
@@ -7956,6 +8107,147 @@ mod tests {
                             && message.contains("not while the notes are open")
                 )),
                 blocks,
+                "{case}"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.payload,
+                    SessionEventPayload::TurnCompleted { .. }
+                )),
+                "{case}"
+            );
+            session
+                .submit_turn(Turn::user("next"))
+                .await
+                .expect("submit second turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect second turn");
+            // The second turn's own latch would fire at a third.
+            let expected: &[&str] = if compacted {
+                &["startup", "compact"]
+            } else {
+                &["startup"]
+            };
+            let sources = sources.lock().expect("sources").clone();
+            assert_eq!(
+                sources,
+                expected
+                    .iter()
+                    .map(|s| Some((*s).to_owned()))
+                    .collect::<Vec<_>>(),
+                "{case}"
+            );
+        }
+    }
+
+    /// A rewrite that leaves the context still due backs off like a failed
+    /// pass, with a warning, instead of paying for the same rewrite at every
+    /// boundary of the turn; one that gets under the threshold does neither.
+    /// Observed at the boundary: the number of rewrites in the turn. Kills
+    /// dropping the no-progress guard in `context_boundary`, or only its
+    /// `failed_compaction_at` assignment (either way "stands still" rewrites
+    /// at all three boundaries), and warning on every rewrite ("gets
+    /// under" warns).
+    #[tokio::test]
+    async fn automatic_rewrite_still_over_the_threshold_backs_off() {
+        /// Rewrites the window into itself: a pass that frees nothing.
+        struct StandstillCompaction;
+
+        #[async_trait]
+        impl crate::CompactionStrategy for StandstillCompaction {
+            async fn compact(
+                &self,
+                ctx: crate::CompactionContext<'_>,
+            ) -> anyhow::Result<Option<crate::CompactionEffects>> {
+                Ok(Some(crate::CompactionEffects {
+                    messages: ctx.state().messages.clone(),
+                    compacted_context: halter_protocol::CompactedContext::default(),
+                    result: halter_protocol::CompactionResult {
+                        compacted_count: 0,
+                        summary: "kept everything".to_owned(),
+                    },
+                    usage: Usage::default(),
+                }))
+            }
+        }
+
+        /// The tool loop without usage reports, so the ledger keeps its own
+        /// estimate of the window instead of the scripted token counts.
+        struct UnmeteredToolLoop;
+
+        #[async_trait]
+        impl Provider for UnmeteredToolLoop {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn stream(
+                &self,
+                request: ProviderRequest,
+                cancel: CancellationToken,
+            ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>>
+            {
+                let inner = ToolLoopProvider.stream(request, cancel).await?;
+                Ok(inner
+                    .filter(|event| {
+                        std::future::ready(!matches!(event, Ok(StreamEvent::UsageUpdate { .. })))
+                    })
+                    .boxed())
+            }
+        }
+
+        // A 2,000-character prompt puts the first boundary over a threshold
+        // 100 tokens above the bare request; only a rewrite that drops it
+        // gets back under.
+        // (case, strategy, rewrites, warns)
+        let cases: [(&str, Arc<dyn CompactionStrategy>, usize, bool); 2] = [
+            ("stands still", Arc::new(StandstillCompaction), 1, true),
+            ("gets under", Arc::new(WipingCompaction), 1, false),
+        ];
+        for (case, strategy, rewrites, warns) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut services = configured_services(Arc::new(UnmeteredToolLoop), temp.path());
+            register_builtin_tools(&services.tools, &[]);
+            let compaction_threshold = default_request_base_tokens(&services).saturating_add(100);
+            install_context_settings(
+                &mut services,
+                ContextSettings {
+                    compaction_threshold,
+                    max_tokens: None,
+                },
+            );
+            install_compaction(&mut services, strategy);
+            let session = new_session(&SessionRuntime::new(services), temp.path()).await;
+
+            let events = session
+                .submit_turn(Turn::user("x".repeat(2_000)))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+
+            let rewrote = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.payload,
+                        SessionEventPayload::ContextCompacted {
+                            effects: Some(_),
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(rewrote, rewrites, "{case}");
+            assert_eq!(
+                events.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::Warning { message }
+                        if message.contains("still at or over its threshold")
+                )),
+                warns,
                 "{case}"
             );
             assert!(
@@ -9180,6 +9472,102 @@ mod tests {
         ));
     }
 
+    /// A compaction response the provider billed but the strategy could not
+    /// apply still counts, automatic or manual: the log records it as an
+    /// assistant reply carrying its usage, and the session totals and the
+    /// turn's `TurnCompleted` include it. Kills dropping the rejection arm in
+    /// `compact_via_strategy` (usage and the reply vanish), dropping its
+    /// `turn_usage` accumulate (the automatic `TurnCompleted` is short), and
+    /// reverting `ProviderDefault`'s empty-output error to an untyped bail.
+    #[tokio::test]
+    async fn rejected_compaction_usage_reaches_session_and_turn_totals() {
+        let billed = Usage {
+            input_tokens: 40,
+            output_tokens: 2,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 4,
+        };
+        let one_reply = Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            ..Usage::default()
+        };
+        let mut total = billed.clone();
+        total.saturating_accumulate(&one_reply);
+        // (case, manual)
+        for (case, manual) in [("automatic", false), ("manual", true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let provider = Arc::new(NativeCompactionProvider::new(
+                halter_protocol::ProviderCompactionStrategy::Dedicated,
+                Vec::new(),
+                billed.clone(),
+            ));
+            let mut services = configured_services(provider.clone(), temp.path());
+            install_compaction(&mut services, Arc::new(crate::ProviderDefault));
+            let context_settings = model_summary_settings(&services);
+            install_context_settings(&mut services, context_settings);
+            let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+            // Only the automatic case crosses the threshold.
+            let prompt = if manual {
+                "hi".to_owned()
+            } else {
+                "x".repeat(6_000)
+            };
+
+            let events = session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+            if manual {
+                let error = session
+                    .compact("manual", None)
+                    .await
+                    .expect_err("a rejected manual pass fails");
+                assert!(
+                    error.to_string().contains("returned no compacted context"),
+                    "{case}: {error:#}"
+                );
+            }
+
+            assert_eq!(provider.compactions(), 1, "{case}");
+            let turn_usage = if manual { &one_reply } else { &total };
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::TurnCompleted { usage, .. } if usage == turn_usage
+                )),
+                "{case}"
+            );
+            let replay = session.replay().await.expect("replay");
+            assert!(
+                replay.iter().any(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::MessageRecorded {
+                        message: Message::Assistant(AssistantMessage { usage: Some(usage), .. }),
+                    } if usage == &billed
+                )),
+                "{case}"
+            );
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("exists");
+            assert_eq!(stored.state.usage_so_far, total, "{case}");
+            // The rejected reply is logged, never shown to the model.
+            assert_eq!(stored.state.messages.len(), 2, "{case}");
+            let folded = halter_protocol::fold::fold_events(SessionState::default(), &replay);
+            assert!(
+                halter_protocol::fold::covered_state_matches(&folded, &stored.state),
+                "{case}"
+            );
+        }
+    }
+
     /// A manual pass on an empty session succeeds whatever the strategy
     /// does, and leaves a durable answer in the log; only a rewrite fires
     /// `PostCompact` and re-arms the compact-sourced `SessionStart` hooks.
@@ -9309,7 +9697,21 @@ mod tests {
         let Message::User(checkpoint) = &stored.state.messages[0] else {
             panic!("the new window must start with a user message");
         };
-        let text = checkpoint.plain_text();
+        let [
+            halter_protocol::UserPart::Text { text },
+            halter_protocol::UserPart::Text { text: first },
+        ] = &checkpoint.parts[..]
+        else {
+            panic!(
+                "a summary part, then the one request: {:?}",
+                checkpoint.parts
+            );
+        };
+        // The 6,000-byte prompt is carried clipped, and only once: the latest
+        // request is the first.
+        assert!(first.starts_with(crate::FIRST_REQUEST_LABEL), "{first}");
+        assert!(first.len() <= crate::FIRST_REQUEST_LABEL.len() + crate::CARRIED_REQUEST_MAX_BYTES);
+        assert!(first.ends_with("x\n[clipped]"), "{first}");
         assert!(text.starts_with(crate::CHECKPOINT_PREFIX), "{text}");
         assert!(text.contains("SUMMARY: finish the report next"), "{text}");
         assert!(text.ends_with(crate::TODO_REMINDER), "{text}");
@@ -9437,7 +9839,10 @@ mod tests {
         assert!(matches!(
             &stored.state.messages[..],
             [Message::User(user), Message::Assistant(_)]
-                if user.plain_text() == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                if matches!(
+                    user.parts.first(),
+                    Some(halter_protocol::UserPart::Text { text }) if *text == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                )
         ));
     }
 
@@ -9482,8 +9887,80 @@ mod tests {
         assert!(matches!(
             &stored.state.messages[..],
             [Message::User(user), Message::Assistant(_)]
-                if user.plain_text() == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                if matches!(
+                    user.parts.first(),
+                    Some(halter_protocol::UserPart::Text { text }) if *text == format!("{}SUMMARY", crate::CHECKPOINT_PREFIX)
+                )
         ));
+    }
+
+    /// Each checkpoint carries the user's first request byte for byte, and
+    /// the latest one when it differs, across repeated compactions. Kills
+    /// computing the carry after the pass appends its own requests (the
+    /// compaction instructions become the "latest request"), and building
+    /// the first request afresh instead of copying it from the previous
+    /// checkpoint (the second checkpoint has no "x" request left to find).
+    #[tokio::test]
+    async fn model_summary_carries_the_first_and_latest_requests_across_compactions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CheckpointScriptProvider::new(
+            NudgeReply::TextOnly,
+            "SUMMARY",
+        ));
+        let mut services = configured_services(provider, temp.path());
+        let context_settings = model_summary_settings(&services);
+        install_context_settings(&mut services, context_settings);
+        let session = new_session(&SessionRuntime::new(services.clone()), temp.path()).await;
+
+        let mut checkpoints = Vec::new();
+        for prompt in ["x".repeat(6_000), "y".repeat(6_000)] {
+            session
+                .submit_turn(Turn::user(prompt))
+                .await
+                .expect("submit turn")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect events");
+            let stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("exists");
+            let Some(Message::User(checkpoint)) = stored.state.messages.first() else {
+                panic!("the window opens with the checkpoint");
+            };
+            checkpoints.push(
+                checkpoint
+                    .parts
+                    .iter()
+                    .map(|part| match part {
+                        halter_protocol::UserPart::Text { text } => text.to_string(),
+                        _ => unreachable!(),
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let carried = |label: &str, byte: char| {
+            let body = format!("{}\n[clipped]", byte.to_string().repeat(4_000 - 10));
+            format!("{label}{body}")
+        };
+        let first = carried(crate::FIRST_REQUEST_LABEL, 'x');
+        assert_eq!(
+            checkpoints,
+            vec![
+                vec![
+                    format!("{}SUMMARY", crate::CHECKPOINT_PREFIX),
+                    first.clone()
+                ],
+                vec![
+                    format!("{}SUMMARY", crate::CHECKPOINT_PREFIX),
+                    first,
+                    carried(crate::LATEST_REQUEST_LABEL, 'y'),
+                ],
+            ]
+        );
     }
 
     /// An empty checkpoint is a failed compaction: automatic passes degrade
@@ -9816,21 +10293,76 @@ mod tests {
 
         #[tokio::test]
         async fn forced_rollover_preserves_notes_tasks_and_searchable_history() {
-            for mode in ["cooperates", "notes_only", "neither", "provider_error"] {
-                let temp = tempfile::tempdir().unwrap();
-                let notes = vec![
+            let notes = || {
+                vec![
                     (
                         "notes",
                         json!({"action":"write_file","path":"checkpoint","content":"finish the report"}),
                     ),
                     ("write", json!({"path":"must-not-exist","content":"bad"})),
-                ];
-                let mut replies = match mode {
-                    "cooperates" => vec![notes, vec![("new_context", json!({}))]],
-                    "notes_only" => vec![notes, vec![]],
-                    "provider_error" => vec![vec![("error", json!({}))]],
-                    _ => vec![vec![]],
-                };
+                ]
+            };
+            // A wrong-typed required field, which `notes` rejects even with lenient input.
+            let rejected = || {
+                (
+                    "notes",
+                    json!({"action":"write_file","path":"checkpoint","content":7}),
+                )
+            };
+            let new_context = || vec![("new_context", json!({}))];
+            let saved = "notes were saved during the checkpoint exchange, which ended because";
+            let unsaved = "nothing was saved during the checkpoint exchange, which ended because";
+            let cases = [
+                (
+                    "cooperates",
+                    vec![notes(), new_context()],
+                    format!("{saved} new_context was called"),
+                ),
+                (
+                    "notes_only",
+                    vec![notes(), vec![]],
+                    format!("{saved} a reply made no tool call"),
+                ),
+                (
+                    "neither",
+                    vec![vec![]],
+                    format!("{unsaved} a reply made no tool call"),
+                ),
+                (
+                    "provider_error",
+                    vec![vec![("error", json!({}))]],
+                    format!("{unsaved} the model request failed"),
+                ),
+                (
+                    "rejected_then_retried",
+                    vec![
+                        vec![rejected(), ("new_context", json!({}))],
+                        notes(),
+                        new_context(),
+                    ],
+                    format!("{saved} new_context was called"),
+                ),
+                (
+                    "budget_exhausted",
+                    vec![vec![rejected()]; 4],
+                    format!("{unsaved} its reply budget ran out"),
+                ),
+                (
+                    "searches_first",
+                    vec![
+                        vec![(
+                            "session_search",
+                            json!({"action":"list_items","role":"user"}),
+                        )],
+                        notes(),
+                        new_context(),
+                    ],
+                    format!("{saved} new_context was called"),
+                ),
+            ];
+            for (mode, mut replies, ended) in cases {
+                let temp = tempfile::tempdir().unwrap();
+                let checkpoint_replies = replies.len();
                 replies.extend([
                     vec![
                         ("task", json!({"action":"list"})),
@@ -9880,14 +10412,46 @@ mod tests {
                 assert!(!events.iter().any(|event| matches!(&event.payload, SessionEventPayload::ToolExecutionStarted { call } if call.name.0 == "write")));
                 assert!(!temp.path().join("must-not-exist").exists());
                 let requests = provider.requests.lock().unwrap().clone();
-                let bootstrap = requests
-                    .iter()
-                    .find(|request| {
-                        request.messages.iter().any(|message| matches!(message,
-                            Message::User(user) if user.plain_text() == crate::CLEAN_WINDOW_BOOTSTRAP))
-                    })
-                    .unwrap();
+                let bootstrap = &requests[checkpoint_replies];
+                assert!(requests.iter().all(every_call_answered), "{mode}");
+                if mode == "cooperates" {
+                    assert!(tool_error(
+                        &requests[1],
+                        "write did not run: only notes, session_search, and new_context run during the checkpoint exchange."
+                    ));
+                }
                 assert_eq!(bootstrap.messages.len(), 2);
+                let Message::User(notice) = &bootstrap.messages[0] else {
+                    panic!("{mode}: the window must open with the notice");
+                };
+                let notice = notice.plain_text();
+                assert!(notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP), "{mode}");
+                assert!(
+                    notice.contains(&format!(
+                        "Window 0 ended: it filled up and was wiped automatically; {ended}."
+                    )),
+                    "{mode}: {notice}"
+                );
+                let written = if notice.contains(saved) {
+                    "\"checkpoint\""
+                } else {
+                    "none"
+                };
+                assert!(
+                    notice.contains(&format!("Notes files written in window 0: {written}.")),
+                    "{mode}"
+                );
+                assert!(notice.contains("session_search list_items with role \"user\""));
+                assert!(notice.contains("important request xxx"), "{mode}");
+                assert!(!notice.contains("Latest user request"), "{mode}");
+                if mode == "rejected_then_retried" {
+                    assert!(requests[1].messages.iter().any(|message| matches!(message,
+                        Message::Tool(result) if result.error.as_ref().is_some_and(|error| error.message.contains("invalid type")))));
+                }
+                if mode == "searches_first" {
+                    assert!(requests[1].messages.iter().any(|message| matches!(message,
+                        Message::Tool(result) if result.error.is_none() && result.to_model_string().contains("important request"))));
+                }
                 assert_eq!(latest_user_text(&bootstrap.messages), "continue the report");
                 assert!(bootstrap.previous_response_id.is_none());
                 assert!(bootstrap.compacted_prefix.is_empty());
@@ -9981,19 +10545,44 @@ mod tests {
                         },
                     )
                     .await;
-                assert_eq!(saved.is_ok(), matches!(mode, "cooperates" | "notes_only"));
+                assert_eq!(
+                    saved.is_ok(),
+                    ended.starts_with("notes were saved"),
+                    "{mode}"
+                );
             }
         }
 
         #[tokio::test]
         async fn failed_new_context_does_not_wipe_the_window() {
+            struct RefusedNewContext;
+            #[async_trait]
+            impl Tool for RefusedNewContext {
+                fn spec(&self) -> ToolSpec {
+                    ToolSpec {
+                        name: ToolName::from("new_context"),
+                        description: "Always fails".to_owned(),
+                        input_schema: json!({"type": "object", "properties": {}}),
+                        concurrency: ToolConcurrency::Exclusive,
+                        capabilities: ToolCapabilities::default(),
+                        provider_aliases: Default::default(),
+                    }
+                }
+                async fn execute(
+                    &self,
+                    _context: ToolContext,
+                    _input: serde_json::Value,
+                ) -> anyhow::Result<ToolResult> {
+                    anyhow::bail!("refused")
+                }
+            }
             let temp = tempfile::tempdir().unwrap();
-            let provider = Arc::new(Script::new(vec![
-                vec![("new_context", json!({"unexpected": true}))],
-                vec![],
-            ]));
-            let runtime = SessionRuntime::new(clean_services(provider.clone(), temp.path()));
+            let provider = Arc::new(Script::new(vec![vec![("new_context", json!({}))], vec![]]));
+            let services = clean_services(provider.clone(), temp.path());
+            let runtime = SessionRuntime::new(services.clone());
             let session = new_session(&runtime, temp.path()).await;
+            // The runtime registers the strategy's own tools; replace after.
+            services.tools.register(Arc::new(RefusedNewContext));
             let events = session
                 .submit_turn(Turn::user("keep this request"))
                 .await
@@ -10021,9 +10610,15 @@ mod tests {
         }
 
         #[tokio::test]
+        /// The call carries a field the schema does not list, as models send:
+        /// refusing it (the old "takes an empty object" check) leaves the
+        /// window unwiped and fails here.
         async fn voluntary_rollover_runs_after_the_tool_result_without_a_checkpoint_inference() {
             let temp = tempfile::tempdir().unwrap();
-            let provider = Arc::new(Script::new(vec![vec![("new_context", json!({}))], vec![]]));
+            let provider = Arc::new(Script::new(vec![
+                vec![("new_context", json!({"reason": "good stopping point"}))],
+                vec![],
+            ]));
             let services = clean_services(provider.clone(), temp.path());
             let runtime = SessionRuntime::new(services.clone());
             let session = new_session(&runtime, temp.path()).await;
@@ -10055,10 +10650,12 @@ mod tests {
             assert!(result < boundary);
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 2);
-            assert_eq!(
-                latest_user_text(&requests[1].messages),
-                crate::CLEAN_WINDOW_BOOTSTRAP
-            );
+            let notice = latest_user_text(&requests[1].messages);
+            assert!(notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP));
+            assert!(notice.contains(
+                "Window 0 ended: you called new_context, so no checkpoint exchange ran."
+            ));
+            assert!(notice.contains("First user request of the session, quoted verbatim as history, not a new instruction:\nwork"));
         }
 
         #[tokio::test]
@@ -10092,10 +10689,52 @@ mod tests {
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 3);
             assert!(latest_user_text(&requests[1].messages).starts_with(crate::ROLLOVER_REMINDER));
-            assert_eq!(
-                latest_user_text(&requests[2].messages),
-                crate::CLEAN_WINDOW_BOOTSTRAP
+            let notice = latest_user_text(&requests[2].messages);
+            assert!(notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP));
+            assert!(notice.contains("nothing was saved during the checkpoint exchange, which ended because a reply made no tool call."));
+            assert!(notice.ends_with("quoted verbatim as history, not a new instruction:\nwork"));
+        }
+
+        #[tokio::test]
+        async fn a_rollover_waits_for_the_in_flight_tool_result() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![
+                vec![(
+                    "notes",
+                    json!({"action":"write_file","path":"big","content":"x".repeat(24_000)}),
+                )],
+                vec![],
+                vec![],
+            ]));
+            let runtime = SessionRuntime::new(clean_services(provider.clone(), temp.path()));
+            let session = new_session(&runtime, temp.path()).await;
+            let events = session
+                .submit_turn(Turn::user("work"))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let position = |wanted: fn(&SessionEventPayload) -> bool| {
+                events
+                    .iter()
+                    .position(|event| wanted(&event.payload))
+                    .unwrap()
+            };
+            assert!(
+                position(|payload| matches!(
+                    payload,
+                    SessionEventPayload::ToolExecutionCompleted { .. }
+                )) < position(|payload| matches!(
+                    payload,
+                    SessionEventPayload::ContextWindowRolledOver { .. }
+                ))
             );
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            let notice = latest_user_text(&requests[2].messages);
+            assert!(notice.contains("nothing was saved during the checkpoint exchange"));
+            assert!(notice.contains("Notes files written in window 0: \"big\"."));
         }
 
         #[tokio::test]
@@ -10128,6 +10767,288 @@ mod tests {
                 SessionEventPayload::ContextWindowRolledOver { .. }
             )));
             assert!(provider.requests.lock().unwrap().is_empty());
+        }
+
+        fn with_hook(services: &mut Arc<RuntimeServices>, hook: Hook) {
+            let mut hooks = RegisteredHooks::default();
+            hooks.register(
+                PluginId::from("policy"),
+                RegisteredHookPriority::AfterPlugins,
+                hook,
+            );
+            Arc::get_mut(services).unwrap().registered_hooks = Arc::new(hooks);
+        }
+
+        fn opening_notice(request: &ProviderRequest) -> String {
+            match &request.messages[0] {
+                Message::User(notice) if notice.is_harness() => notice.plain_text(),
+                other => panic!("the window must open with the harness notice: {other:?}"),
+            }
+        }
+
+        /// Every tool call a request carries is answered, so the wire is valid.
+        fn every_call_answered(request: &ProviderRequest) -> bool {
+            request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Assistant(assistant) => Some(&assistant.parts),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|part| match part {
+                    halter_protocol::AssistantPart::ToolCall(call) => Some(&call.id),
+                    _ => None,
+                })
+                .all(|id| {
+                    request.messages.iter().any(
+                        |message| matches!(message, Message::Tool(result) if &result.call_id == id),
+                    )
+                })
+        }
+
+        fn tool_error(request: &ProviderRequest, text: &str) -> bool {
+            request.messages.iter().any(|message| {
+                matches!(message, Message::Tool(result)
+                    if result.error.as_ref().is_some_and(|error| error.message == text))
+            })
+        }
+
+        async fn run_turn(session: &SessionExecutor, text: &str) -> Vec<SessionEvent> {
+            session
+                .submit_turn(Turn::user(text))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        }
+
+        fn completed(events: &[SessionEvent]) -> bool {
+            events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnCompleted { .. }))
+        }
+
+        // Kills: answering refused calls with nothing (the wire breaks and
+        // the model never learns), letting a refused call end the exchange,
+        // or treating a reply of only refused calls as one with no tool call.
+        #[tokio::test]
+        async fn a_refused_checkpoint_call_is_answered_with_the_allowed_tools() {
+            let refused = || ("task", json!({"action":"list"}));
+            for (case, first) in [
+                (
+                    "beside new_context",
+                    vec![refused(), ("new_context", json!({}))],
+                ),
+                ("alone", vec![refused()]),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let provider = Arc::new(Script::new(vec![
+                    first,
+                    vec![("new_context", json!({}))],
+                    vec![],
+                ]));
+                let services = clean_services(provider.clone(), temp.path());
+                let runtime = SessionRuntime::new(services.clone());
+                let session = new_session(&runtime, temp.path()).await;
+                seed_previous_window(&session, format!("request {}", "x".repeat(24_000))).await;
+                let events = run_turn(&session, "go on").await;
+                assert!(completed(&events), "{case}");
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 3, "{case}");
+                assert!(
+                    tool_error(
+                        &requests[1],
+                        "task did not run: only notes, session_search, and new_context run during the checkpoint exchange."
+                    ),
+                    "{case}"
+                );
+                assert!(requests.iter().all(every_call_answered), "{case}");
+                assert!(
+                    opening_notice(&requests[2])
+                        .contains("which ended because new_context was called."),
+                    "{case}"
+                );
+            }
+        }
+
+        // Kills: exempting recovery tools from hooks, counting a blocked
+        // write as saved, or ending the exchange on a blocked new_context.
+        #[tokio::test]
+        async fn hooks_govern_checkpoint_tools_and_the_notice_reports_the_outcome() {
+            let checkpoint = || {
+                vec![
+                    (
+                        "notes",
+                        json!({"action":"write_file","path":"checkpoint","content":"c"}),
+                    ),
+                    ("new_context", json!({})),
+                ]
+            };
+            let cases = [
+                (
+                    "notes",
+                    vec![checkpoint(), vec![]],
+                    "nothing was saved during the checkpoint exchange, which ended because a reply made no tool call.",
+                ),
+                (
+                    "new_context",
+                    vec![checkpoint(); 4],
+                    "notes were saved during the checkpoint exchange, which ended because its reply budget ran out.",
+                ),
+            ];
+            for (blocked, mut replies, ended) in cases {
+                let temp = tempfile::tempdir().unwrap();
+                let checkpoint_replies = replies.len();
+                replies.push(vec![]);
+                let provider = Arc::new(Script::new(replies));
+                let mut services = clean_services(provider.clone(), temp.path());
+                with_hook(
+                    &mut services,
+                    Hook::callback(HookEventName::PreToolUse, move |input| async move {
+                        if input.tool_name() == Some(blocked) {
+                            HookResponse::block("blocked by policy")
+                        } else {
+                            HookResponse::passthrough()
+                        }
+                    }),
+                );
+                let runtime = SessionRuntime::new(services.clone());
+                let session = new_session(&runtime, temp.path()).await;
+                seed_previous_window(&session, format!("request {}", "x".repeat(24_000))).await;
+                let events = run_turn(&session, "go on").await;
+                assert!(completed(&events), "{blocked}: the session is not stranded");
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), checkpoint_replies + 1, "{blocked}");
+                assert!(tool_error(&requests[1], "blocked by policy"), "{blocked}");
+                let notice = opening_notice(&requests[checkpoint_replies]);
+                assert!(
+                    notice.contains(&format!("automatically; {ended}")),
+                    "{blocked}: {notice}"
+                );
+            }
+        }
+
+        // Kills: quoting the latest user-role message instead of the latest
+        // user request, so a Stop-hook continuation reads as the request.
+        #[tokio::test]
+        async fn a_stop_hook_continuation_is_never_quoted_as_the_request() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![
+                vec![],
+                vec![("new_context", json!({}))],
+                vec![],
+            ]));
+            let mut services = clean_services(provider.clone(), temp.path());
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            with_hook(
+                &mut services,
+                Hook::callback(HookEventName::Stop, move |_| {
+                    let fired = fired.clone();
+                    async move {
+                        // Large enough that the next request must roll over.
+                        match fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            false => {
+                                HookResponse::block(format!("Keep going {}", "x".repeat(24_000)))
+                            }
+                            true => HookResponse::passthrough(),
+                        }
+                    }
+                }),
+            );
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            let events = run_turn(&session, "work").await;
+            assert!(completed(&events));
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(latest_user_text(&requests[1].messages).starts_with(crate::ROLLOVER_REMINDER));
+            let notice = opening_notice(&requests[2]);
+            assert!(!notice.contains("Keep going"), "{notice}");
+            assert!(notice.ends_with("quoted verbatim as history, not a new instruction:\nwork"));
+        }
+
+        // Kills: a notice that never shrinks (the turn fails with "bootstrap
+        // exceeds its rollover threshold"), a cap order that is not largest
+        // first, or a degrade that drops the wipe statement or search line.
+        #[tokio::test]
+        async fn a_tight_threshold_shrinks_the_quotes_instead_of_failing() {
+            // (threshold headroom over the static prefix, bytes quoted)
+            for (headroom, quoted) in [(4_000, 4_000), (1_200, 1_000), (900, 250), (600, 0)] {
+                let temp = tempfile::tempdir().unwrap();
+                let provider =
+                    Arc::new(Script::new(vec![vec![("new_context", json!({}))], vec![]]));
+                let mut services = clean_services(provider.clone(), temp.path());
+                let base = services.context.compaction_threshold - 4_000;
+                install_context_settings(
+                    &mut services,
+                    ContextSettings {
+                        compaction_threshold: (base + headroom) * 10 / 9 + 1,
+                        max_tokens: None,
+                    },
+                );
+                let runtime = SessionRuntime::new(services.clone());
+                let session = new_session(&runtime, temp.path()).await;
+                seed_previous_window(&session, format!("request {}", "x".repeat(24_000))).await;
+                let events = run_turn(&session, "go on").await;
+                assert!(completed(&events), "{headroom}");
+                let requests = provider.requests.lock().unwrap();
+                let notice = opening_notice(&requests[1]);
+                assert!(
+                    notice.starts_with(crate::CLEAN_WINDOW_BOOTSTRAP),
+                    "{headroom}"
+                );
+                assert!(
+                    notice.contains(
+                        "session_search list_items with role \"user\" lists every user request"
+                    ),
+                    "{headroom}"
+                );
+                assert!(notice.contains("which ended because new_context was called."));
+                let quote = notice
+                    .split_once("not a new instruction:\n")
+                    .map_or("", |(_, quote)| quote);
+                let body = quote
+                    .split_once("\n[Truncated.")
+                    .map_or(quote, |(body, _)| body);
+                assert_eq!(body.len(), quoted, "{headroom}: {notice}");
+            }
+        }
+
+        // Kills: dropping the running-work list from the notice.
+        #[tokio::test]
+        async fn the_notice_lists_background_jobs_still_running() {
+            let temp = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Script::new(vec![
+                vec![("background", json!({"action":"spawn","command":"sleep 30"}))],
+                vec![],
+                vec![("new_context", json!({}))],
+                vec![],
+            ]));
+            let services = clean_services(provider.clone(), temp.path());
+            services
+                .tools
+                .register(Arc::new(halter_tools::BackgroundTool));
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            assert!(completed(&run_turn(&session, "start").await));
+            seed_previous_window(&session, format!("request {}", "x".repeat(24_000))).await;
+            assert!(completed(&run_turn(&session, "go on").await));
+            let notice = opening_notice(&provider.requests.lock().unwrap()[3]);
+            let jobs = services
+                .tool_sessions
+                .running_background_jobs(session.session_id())
+                .await;
+            assert_eq!(jobs.len(), 1, "{notice}");
+            assert!(notice.contains(&format!(
+                "\nStill running across the wipe; manage them by these ids:\n- background job {}: $ sleep 30\nFirst:",
+                jobs[0].0
+            )), "{notice}");
+            session
+                .shutdown("test done", CancellationToken::new())
+                .await
+                .unwrap();
         }
 
         #[tokio::test]
@@ -10264,7 +11185,8 @@ mod tests {
             assert_eq!(requests.len(), 1);
             assert_eq!(latest_user_text(&requests[0].messages), "continue");
             assert!(requests[0].messages.iter().any(|message| matches!(message,
-                Message::User(user) if user.plain_text() == crate::CLEAN_WINDOW_BOOTSTRAP)));
+                Message::User(user) if user.plain_text().starts_with(crate::CLEAN_WINDOW_BOOTSTRAP)
+                    && user.plain_text().contains("nothing was saved during the checkpoint exchange, which ended because the model request failed."))));
         }
     }
 
@@ -12995,7 +13917,7 @@ mod tests {
         // while an out-of-turn hook dispatch queues and returns at once.
         let waiting_shutdown = tokio::spawn({
             let session = session.clone();
-            async move { session.shutdown("test").await }
+            async move { session.shutdown("test", CancellationToken::new()).await }
         });
         session
             .notify("info", "queued")
@@ -13055,6 +13977,58 @@ mod tests {
             order.is_sorted(),
             "turn, then queued dispatch, then shutdown: {order:?}"
         );
+    }
+
+    /// Finding 2: forced shutdown and the session lease. A free lease is
+    /// taken even when the cancel has already fired, so shutdown still
+    /// commits `SessionShutdownComplete`; a lease held by a running turn is
+    /// waited on only until the cancel. Mutations killed: putting the cancel
+    /// arm first in `shutdown`'s biased select (row "free" returns cancelled
+    /// without committing); dropping the cancel arm (row "held" hangs past
+    /// the 5s guard).
+    #[tokio::test]
+    async fn forced_shutdown_takes_a_free_lease_and_abandons_a_held_one() {
+        for (name, held) in [("free", false), ("held", true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let started = Arc::new(Notify::new());
+            let services = test_support::configured_services(
+                Arc::new(CancellableBlockingProvider {
+                    started: started.clone(),
+                }),
+                temp.path(),
+            );
+            let runtime = SessionRuntime::new(services);
+            let session = test_support::new_session(&runtime, temp.path()).await;
+            let turn_cancel = CancellationToken::new();
+            let _turn = if held {
+                let turn = session
+                    .submit_turn_with_cancel(Turn::user("blocking"), turn_cancel.clone())
+                    .await
+                    .expect("turn");
+                started.notified().await;
+                Some(turn)
+            } else {
+                None
+            };
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), session.shutdown("test", cancel))
+                    .await
+                    .expect("forced shutdown returns");
+
+            let committed =
+                session.replay().await.expect("replay").iter().any(|event| {
+                    matches!(event.payload, SessionEventPayload::SessionShutdownComplete)
+                });
+            assert_eq!(
+                (result.is_ok(), committed),
+                (!held, !held),
+                "{name}: {result:?}"
+            );
+            turn_cancel.cancel();
+        }
     }
 
     #[tokio::test]
@@ -13207,6 +14181,137 @@ mod tests {
             .expect("load")
             .expect("session");
         assert_eq!(stored.state.open_turn, None, "failed turn is closed");
+    }
+
+    /// Store whose first `conflicts` commits carrying `TurnFailed` fail with
+    /// `SessionCommitConflict`, counting every such attempt.
+    #[derive(Default)]
+    struct ConflictingFailureStore {
+        inner: halter_session::InMemorySessionStore,
+        conflicts: usize,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SessionStore for ConflictingFailureStore {
+        async fn create_session(&self, session: StoredSession) -> anyhow::Result<()> {
+            self.inner.create_session(session).await
+        }
+        async fn load_session(&self, id: &SessionId) -> anyhow::Result<Option<StoredSession>> {
+            self.inner.load_session(id).await
+        }
+        async fn commit(
+            &self,
+            id: &SessionId,
+            snapshot: Option<Arc<ResourceSnapshot>>,
+            expected: Option<u64>,
+            state: Option<SessionState>,
+            events: Vec<PendingEvent>,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
+            if events
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TurnFailed { .. }))
+                && self
+                    .attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    < self.conflicts
+            {
+                return Err(halter_session::SessionCommitConflict {
+                    session_id: id.clone(),
+                    expected_head_sequence: expected.unwrap_or_default(),
+                    actual_head_sequence: expected.unwrap_or_default() + 1,
+                }
+                .into());
+            }
+            self.inner
+                .commit(id, snapshot, expected, state, events)
+                .await
+        }
+        async fn replay(&self, id: &SessionId) -> anyhow::Result<Vec<SessionEvent>> {
+            self.inner.replay(id).await
+        }
+        async fn replay_after(
+            &self,
+            id: &SessionId,
+            after: u64,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
+            self.inner.replay_after(id, after).await
+        }
+        async fn list_sessions(&self) -> anyhow::Result<Vec<SessionBlueprint>> {
+            self.inner.list_sessions().await
+        }
+    }
+
+    /// Finding 5: `force_interrupt_turn` retried `SessionCommitConflict`
+    /// without a cap, so a store that kept conflicting held forced recovery
+    /// and the session lease forever. Rows: conflicts that clear inside the
+    /// budget still close the turn; a store that always conflicts returns
+    /// the conflict after exactly `FORCE_INTERRUPT_ATTEMPTS` commits.
+    /// Mutation killed: dropping the `attempt < FORCE_INTERRUPT_ATTEMPTS`
+    /// guard (the second row never returns).
+    #[tokio::test]
+    async fn forced_interrupt_retries_conflicts_a_bounded_number_of_times() {
+        let cap = SessionExecutor::FORCE_INTERRUPT_ATTEMPTS as usize;
+        for (name, conflicts, closes, attempts) in [
+            ("conflicts clear", 2, true, 3),
+            ("always conflicting", usize::MAX, false, cap),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let store = Arc::new(ConflictingFailureStore {
+                conflicts,
+                ..ConflictingFailureStore::default()
+            });
+            let mut services = configured_services(Arc::new(FakeProvider::default()), temp.path());
+            Arc::get_mut(&mut services).expect("unique").sessions = store.clone();
+            let runtime = SessionRuntime::new(services.clone());
+            let session = new_session(&runtime, temp.path()).await;
+            let turn_id = TurnId::new();
+            let mut stored = services
+                .sessions
+                .load_session(session.session_id())
+                .await
+                .expect("load")
+                .expect("session");
+            stored.state.open_turn = Some(turn_id.clone());
+            services
+                .sessions
+                .commit(
+                    session.session_id(),
+                    None,
+                    Some(stored.head_sequence),
+                    Some(stored.state),
+                    vec![session.make_event(SessionEventPayload::TurnStarted {
+                        turn_id: turn_id.clone(),
+                        default_model: None,
+                        subagent_model: None,
+                    })],
+                )
+                .await
+                .expect("open turn");
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                session.force_interrupt_turn(&turn_id),
+            )
+            .await
+            .expect("forced interrupt returns");
+
+            match (result, closes) {
+                (Ok(()), true) => {}
+                (Err(error), false) => assert!(
+                    error
+                        .downcast_ref::<halter_session::SessionCommitConflict>()
+                        .is_some(),
+                    "{name}: {error:#}"
+                ),
+                (other, _) => panic!("{name}: unexpected {other:?}"),
+            }
+            assert_eq!(
+                store.attempts.load(std::sync::atomic::Ordering::SeqCst),
+                attempts,
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -15,9 +15,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::openai_oauth_core::{
-    ApiKeyExchangeReadiness, AuthorizeUrlParams, DEFAULT_CLIENT_ID, DEFAULT_FALLBACK_PORT,
-    DEFAULT_ISSUER, DEFAULT_ORIGINATOR, DEFAULT_PORT, DEFAULT_SCOPE, DEFAULT_TIMEOUT_SECS,
-    OpenAiOAuthOutput, OpenAiOAuthOutputFormat, ParsedCallback, PkceCodes,
+    ApiKeyExchangeReadiness, AuthorizeUrlParams, CallbackError, DEFAULT_CLIENT_ID,
+    DEFAULT_FALLBACK_PORT, DEFAULT_ISSUER, DEFAULT_ORIGINATOR, DEFAULT_PORT, DEFAULT_SCOPE,
+    DEFAULT_TIMEOUT_SECS, OpenAiOAuthOutput, OpenAiOAuthOutputFormat, ParsedCallback, PkceCodes,
     api_key_exchange_readiness, base64_url_no_pad, build_authorize_url, parse_callback_target,
     parse_token_endpoint_error, pkce_from_verifier, render_oauth_output,
 };
@@ -295,16 +295,26 @@ async fn await_callback(
                 .await
                 .context("failed to accept OAuth callback connection")?;
             debug!(%peer_addr, "accepted OAuth callback connection");
-            match handle_callback_connection(stream, expected_state).await? {
-                Some(code) => return Ok(code),
-                None => {
-                    stray_count += 1;
-                    if stray_count >= MAX_STRAY_CALLBACK_REQUESTS {
-                        anyhow::bail!(
-                            "OAuth callback listener closed after {MAX_STRAY_CALLBACK_REQUESTS} stray requests without receiving the expected callback"
-                        );
+            // Only the provider's answer to this login (an OAuth error or a
+            // missing code under the expected state) ends it. A connection
+            // that fails on its own (a dropped or slow socket, a malformed
+            // request, a stale tab's state) counts as a stray instead, so one
+            // bad connection cannot abort a login still in progress.
+            match handle_callback_connection(stream, expected_state).await {
+                Ok(Some(code)) => return Ok(code),
+                Ok(None) => {}
+                Err(error) => match error.downcast_ref::<CallbackError>() {
+                    Some(CallbackError::OAuth { .. } | CallbackError::MissingAuthorizationCode) => {
+                        return Err(error);
                     }
-                }
+                    _ => debug!(%peer_addr, error = %format!("{error:#}"), "ignoring OAuth callback connection"),
+                },
+            }
+            stray_count += 1;
+            if stray_count >= MAX_STRAY_CALLBACK_REQUESTS {
+                anyhow::bail!(
+                    "OAuth callback listener closed after {MAX_STRAY_CALLBACK_REQUESTS} stray requests without receiving the expected callback"
+                );
             }
         }
     })
@@ -354,7 +364,7 @@ async fn handle_callback_connection(
         Err(error) => {
             let (status, reason) = error.http_status();
             write_http_response(&mut stream, status, reason, &error.user_message()).await?;
-            Err(anyhow::anyhow!(error.user_message()))
+            Err(error.into())
         }
     }
 }
@@ -753,6 +763,64 @@ mod tests {
 
         assert_eq!(code, expected_code);
         assert!(callback_response.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    /// Finding 4: one bad connection used to abort the whole login. Rows send
+    /// one connection, then the real callback: noise (a socket closed before
+    /// its headers, a malformed request line, a stale tab's state) is a stray
+    /// and the login completes; the provider's own answer for this state (an
+    /// OAuth error, a missing code) still ends it. Mutation killed: restoring
+    /// `handle_callback_connection(..).await?` (the noise rows fail).
+    #[tokio::test]
+    async fn await_callback_survives_bad_connections_but_not_provider_errors() {
+        let state = "expected-state";
+        let callback =
+            format!("GET /auth/callback?code=the-code&state={state} HTTP/1.1\r\nHost: x\r\n\r\n");
+        for (name, first, completes) in [
+            ("closed before headers", "GET /auth/cal".to_owned(), true),
+            (
+                "malformed request line",
+                "BREW / HTCPCP\r\n\r\n".to_owned(),
+                true,
+            ),
+            (
+                "stale state",
+                "GET /auth/callback?code=old&state=stale HTTP/1.1\r\n\r\n".to_owned(),
+                true,
+            ),
+            (
+                "provider error",
+                format!("GET /auth/callback?error=access_denied&state={state} HTTP/1.1\r\n\r\n"),
+                false,
+            ),
+            (
+                "missing code",
+                format!("GET /auth/callback?state={state} HTTP/1.1\r\n\r\n"),
+                false,
+            ),
+        ] {
+            let listener = TcpListener::bind(callback_addr(0)).await.expect("listener");
+            let addr = listener.local_addr().expect("addr");
+            let server = tokio::spawn(await_callback(listener, state, Duration::from_secs(10)));
+            send_callback_request(addr, &first).await;
+            if completes {
+                send_callback_request(addr, &callback).await;
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("await_callback returns")
+                .expect("server task");
+            match (result, completes) {
+                (Ok(code), true) => assert_eq!(code, "the-code", "{name}"),
+                (Err(error), false) => {
+                    assert!(
+                        error.to_string().contains("OAuth callback"),
+                        "{name}: {error:#}"
+                    )
+                }
+                (other, _) => panic!("{name}: unexpected {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

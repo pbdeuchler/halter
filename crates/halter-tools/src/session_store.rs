@@ -44,22 +44,40 @@ impl ToolSessionStore {
     /// Whether background jobs or PTY processes still own work. Empty
     /// persistent tool slots and completed job records do not count.
     pub fn has_running_jobs(&self, session_id: &SessionId) -> bool {
-        if self
-            .background_sessions
+        self.background_sessions
             .get(&session_id.0)
             .is_some_and(|jobs| jobs.has_running())
-        {
-            return true;
+            || self.pty_running(session_id)
+    }
+
+    /// The id and command of each of this session's running background jobs,
+    /// in id order. Unlike [`Self::background_session`], it creates no slot.
+    pub async fn running_background_jobs(&self, session_id: &SessionId) -> Vec<(String, String)> {
+        let jobs = self
+            .background_sessions
+            .get(&session_id.0)
+            .map(|entry| entry.clone());
+        match jobs {
+            Some(jobs) => jobs.running().await,
+            None => Vec::new(),
         }
+    }
+
+    /// Whether this session's PTY process is running. Always false without
+    /// the `pty` feature.
+    pub fn pty_running(&self, session_id: &SessionId) -> bool {
         #[cfg(feature = "pty")]
-        if self.pty_sessions.get(&session_id.0).is_some_and(|pty| {
+        let running = self.pty_sessions.get(&session_id.0).is_some_and(|pty| {
             pty.lock()
                 .as_ref()
                 .is_some_and(PtySessionHandle::is_running)
-        }) {
-            return true;
-        }
-        false
+        });
+        #[cfg(not(feature = "pty"))]
+        let running = {
+            let _ = session_id;
+            false
+        };
+        running
     }
     /// Admit tools for a fresh incarnation after the previous owner has settled.
     pub fn open_session(&self, session_id: &SessionId) {
@@ -372,6 +390,10 @@ mod tests {
                 _ => {}
             }
             assert_eq!(store.has_process_state(&session), held, "{slot}");
+            assert!(
+                !store.pty_running(&session),
+                "{slot}: an empty slot runs no pty"
+            );
             assert!(
                 !store.has_running_jobs(&session),
                 "{slot}: an empty slot holds no work"

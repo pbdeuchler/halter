@@ -423,6 +423,24 @@ is already OpenRouter's default and `false` would permit nothing. The same
 rules apply to a value handed straight to `OpenRouterProvider`, so nothing
 unchecked reaches a request body.
 
+`[providers.openai]` and `[providers.openrouter]` accept `strict_tools`
+(default `false`), sent as `strict` on every function tool. Halter always
+sends the field, because the Responses API treats an omitted `strict` as
+`true`. Strict mode requires every tool schema to list all of its properties
+in `required` and to set `additionalProperties = false`; halter sends schemas
+unchanged, so a tool that does not qualify fails the request with a
+non-retried invalid-request error. Halter's built-in tools do not qualify.
+
+Both also accept `include_encrypted_reasoning` (default `true`), which asks
+for `reasoning.encrypted_content` on requests for models with a `reasoning`
+effort. Halter stores every reasoning item the model returns and replays it on
+later requests to the same provider and upstream model, ahead of that turn's
+text and tool calls, so stateless requests keep the model's reasoning and the
+request prefix stays byte-stable for prompt caching. On OpenAI with
+`store: false`, an item without encrypted content is not replayed. Anthropic
+requests likewise replay thinking blocks only to the provider that produced
+them.
+
 Provider request resilience is configured globally under `[resilience]` and can
 be partially overridden per provider. The same retry policy applies uniformly to
 Anthropic, OpenAI, and OpenRouter, and covers both streaming turns and
@@ -433,14 +451,34 @@ invalid requests fail immediately — and server-supplied backoff hints
 `max_backoff_secs`; a computed delay never exceeds it. For streaming calls,
 `request_secs` bounds request setup through response headers and
 `stream_idle_secs` bounds the idle gap between stream items; it is not a total
-stream lifetime cap. Once a stream has emitted content, that request is never
-retried. `max_attempts` includes the initial request:
+stream lifetime cap. `compact_secs` bounds one whole compaction request,
+including the summary the provider writes before it responds. Client-side
+rate-limit queueing (OpenAI header-driven waits) happens before the request
+timer starts and ends on cancellation. `max_attempts` includes the initial request.
+`deadline_secs` is a backoff budget: it caps the total time slept between
+attempts, and time spent inside an attempt never counts against it, so an
+attempt that ends in a `request_secs` or `stream_idle_secs` timeout is still
+retried. A retry sequence lasts at most `max_attempts` attempts, each bounded
+by its own timeouts, plus `deadline_secs` of backoff. Validation rejects a
+`connect_secs` that is not less than `request_secs` and `compact_secs`, which
+enclose it.
+
+[docs/timeouts.md](docs/timeouts.md) lists every timeout and retry in the harness and what encloses what.
+
+Retries never duplicate output or tool calls. Events before an attempt's first
+content or tool-call event (`TextDelta`, `ThinkingDelta`, `ToolCallStart`,
+`ToolArgsDelta`, `ToolCallEnd`, `MessageEnd`) are buffered and discarded if the
+attempt is retried, and once that event is delivered the request is never
+retried, so the consumer sees the events of exactly one attempt. A failure
+after that point ends the turn with an error; output already delivered stays
+delivered.
 
 ```toml
 [resilience.timeouts]
 connect_secs = 10
 request_secs = 60
 stream_idle_secs = 60
+compact_secs = 300
 
 [resilience.request_retry]
 max_attempts = 5
@@ -1227,8 +1265,9 @@ happens*.
   (only `task` calls from that reply run; nothing else reaches the next
   request), then sends the built-in checkpoint instructions, and the reply
   becomes the next window as a single user-role message after the static
-  prefix. No tail of old messages is kept, which is also the one client-side
-  shape that survives preserved-thinking checks. `"provider_default"`
+  prefix, carrying the user's first and latest requests verbatim (up to
+  4,000 bytes each). No tail of old messages is kept, which is also the one
+  client-side shape that survives preserved-thinking checks. `"provider_default"`
   delegates the rewrite to the provider's native compaction (OpenAI's
   `/v1/responses/compact`; inline summarization requests for Anthropic and
   OpenRouter), and the harness fails to build if the default model's provider
@@ -1240,7 +1279,10 @@ happens*.
   The runtime alone decides when compaction runs. A strategy can drive the
   model and tools through the `CompactionContext` the runtime hands it; if
   its pass fails, the window goes back to what it was while everything the
-  pass did stays in the event log.
+  pass did, and its usage, stays in the event log and the session totals. A
+  rewrite that leaves the context still over the threshold backs off like a
+  failure, and any rewrite, automatic or manual, arms the `SessionStart`
+  hooks with source `compact` for the next turn.
 
 
 ```rust
@@ -1390,7 +1432,9 @@ when the operation ends. All spans except
 
 `aborted` means the operation ended without reporting a result: its task was
 aborted (for example by shutdown or `close_agent`), its future was dropped, or
-it panicked. Runtime spans always close with an `outcome`.
+it panicked. Runtime spans always close with an `outcome`. A `tool_call` whose
+tool panics closes `error`, because the runtime answers the call with the panic
+message.
 
 `tool_call` and `provider_request` nest under `turn`. `provider_request` comes
 from `ResilientProvider`, which wraps every built-in provider. Custom `Provider`

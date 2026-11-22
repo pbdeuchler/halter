@@ -8,8 +8,46 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+### Added
+
+- [docs/timeouts.md](docs/timeouts.md) lists every timeout and retry in the
+  harness, what encloses what, and every way each wait can end.
+- `[resilience.timeouts] compact_secs` (default 300, also a per-provider
+  override) and `ProviderTimeouts::compact`, which bound one whole unary
+  compaction request. Compaction used `request_secs`, which for streams covers
+  only the time to response headers, so a compaction that legitimately took
+  longer than 60s to write its summary always timed out.
+  **Breaking:** `ProviderTimeouts` struct literals must set `compact`, and
+  `ResilienceTimeoutsConfig` literals `compact_secs`.
+- `Provider::resilience_policy` (default `None`; the built-in providers and
+  `ModelJudgeProvider` report the policy they wrap) and
+  `ResiliencePolicy::recovery_window`, the shortest outer deadline that lets
+  a provider detect one stalled attempt and retry it.
+- `halter_protocol::ProviderCompactionRejected { reason, text, usage }`: the
+  error a compaction returns for a response it was billed for but cannot
+  apply. The Anthropic and OpenRouter adapters return it for a refused,
+  truncated or incomplete summary, and `ProviderDefault` for an empty one;
+  `ResilientProvider` passes it through unretried. Additive. For embedders:
+  return it from a custom `Provider::compact` or `CompactionStrategy` that
+  rejects a paid-for response, and the runtime counts its usage.
+
 ### Changed
 
+- **Breaking:** the `edit` tool takes a list of edits. Its input is now
+  `{"edits": [{"path", "old_string", "new_string", "replace_all"}, ...],
+  "expected_sha256"}`; the top-level `path`, `old_string`, `new_string` and
+  `replace_all` are gone, with no single-edit shorthand. A call in the old
+  shape, or with an empty `edits`, is refused with an error that shows the new
+  shape. Edits apply in order, a later edit to a file matching the text the
+  earlier ones left, and they may span files. If any edit fails (no match, an
+  ambiguous match, a denied path, a stale hash, an unreadable file), no file is
+  written and the error names the edit by index and path. Each file then gets
+  one atomic write; a failed write restores the files written before it, but a
+  crash between two writes can still leave some files edited. `expected_sha256`
+  is refused when the edits touch more than one file. The output is now
+  `{files: [{path, file_hash_before, file_hash_after}], edits: [{path,
+  occurrences_in_file, replacements_applied}]}`, and the model sees one line per
+  file. Hooks that read an `edit` call's `path` must read `edits[].path`.
 - **Breaking:** the `shell` tool no longer runs commands in an embedded brush
   shell. Each call now starts a fresh `<shell> -c <command>` (Codex/pi style),
   so `cd`, `export`, and shell variables don't carry over between calls. Pass
@@ -63,6 +101,126 @@ once a `1.0.0` line is cut.
   strategy whose `compact` returns `Ok(None)` without doing work should
   implement `needs_compaction` so its hooks stay quiet.
 
+- **Breaking (hook contract):** an automatic compaction that rewrites the
+  context, including a CleanWindow rollover, now arms the `SessionStart`
+  hooks with source `compact` for the next turn, as a manual rewrite always
+  did. Before, only `compact(..)` did, so a `SessionStart` hook matching
+  `compact` (the place to put back context a summary drops) never ran in
+  sessions that only compacted on the ledger's trigger. It fires once per
+  turn however many rewrites the previous turn saw, and never after a pass
+  that skipped, failed, was blocked, or declined. For embedders: a hook that
+  assumed `compact` meant "a caller asked" should read the `PostCompact`
+  `trigger` instead.
+
+- `ModelSummary`'s checkpoint now carries the user's first request and,
+  when it differs, the latest one, verbatim, as extra text parts after the
+  summary (`FIRST_REQUEST_LABEL`, `LATEST_REQUEST_LABEL`, each request
+  clipped to `CARRIED_REQUEST_MAX_BYTES` = 4,000 bytes). Before, both
+  survived only as the model's paraphrase, and after a second compaction as
+  a paraphrase of a paraphrase. The first request is copied from the
+  previous checkpoint, so it stays byte-identical however often the session
+  compacts. A checkpoint grows by at most about 8 KB. For embedders: the
+  checkpoint message may now have up to three parts, so code that compared
+  its `plain_text()` with `CHECKPOINT_PREFIX` plus the summary should read
+  its first part.
+- **Breaking:** `OpenAiProvider::new_with_headers_and_resilience`,
+  `OpenAiProvider::new_with_oauth_headers_and_resilience`, and
+  `OpenRouterProvider::new_with_headers_and_resilience` take a new
+  `halter_providers::ResponsesOptions` argument before the resilience policy.
+  The shorter constructors use `ResponsesOptions::default()`.
+- `[providers.openai]` and `[providers.openrouter]` accept `strict_tools`
+  (default `false`), the `strict` value sent on every Responses function tool.
+  Setting it for `[providers.anthropic]` fails validation.
+- OpenAI and OpenRouter replay reasoning items. The Responses stream decoder
+  now stores the whole `reasoning` output item as JSON in
+  `ThinkingBlock::signature` (before, only its `encrypted_content`). Requests
+  send each stored item back ahead of that turn's text and tool calls when the
+  message came from the same provider and upstream model, so stateless
+  (`store: false`) requests keep the model's reasoning, as pi and rig do. On
+  OpenAI with `store: false` only items carrying `encrypted_content` are
+  replayed, since OpenAI keeps no item to resolve an id-only reference against.
+  OpenRouter, which reads the item's own content, and stored OpenAI requests
+  replay every item. Signatures stored by older versions are not replayed.
+- **Breaking:** `ReplayMeta` has a new `wire_model` field: the upstream model
+  id (`ResolvedModel::model`) of the request that produced the message, recorded
+  at materialization. Reasoning replay compares it instead of the configured
+  alias in `ReplayMeta::model`, so repointing an alias at another model stops
+  replay, and renaming an alias does not. It is optional in serialized
+  transcripts, and messages without it never replay Responses reasoning items.
+  Code that builds `ReplayMeta` with a struct literal must set it or use
+  `..Default::default()`.
+- `AssembledPrompt::rendered_prefix` (and `rendered`) no longer contain the
+  compacted prefix items; `prefix_cache_key` still covers them, over the same
+  bytes as before. Codecs send the items from `ProviderRequest::compacted_prefix`.
+- OpenRouter requests now ask for `include: ["reasoning.encrypted_content"]`
+  for models with a reasoning effort. `include_encrypted_reasoning` in
+  `[providers.openai]` and `[providers.openrouter]` (default `true`) and
+  `ResponsesOptions::include_encrypted_reasoning` turn it off.
+- Built-in tools read their input leniently. None rejects a field it does not
+  know (`notes` and `session_search` dropped `deny_unknown_fields`), and an
+  optional parameter given as `null`, a blank string, `0`, `[]` or `{}` counts
+  as absent, so a model that fills every schema property gets the defaults
+  instead of an error. Required fields and real values of the wrong type are
+  still errors. `halter_tools::placeholder_as_default` gives serde-typed tool
+  inputs the same rule.
+- `write` takes `create_dirs` (default `false`). When true, missing parent
+  directories are created first, each one approved by the write policy before
+  it exists. Without it, a missing parent is an error that names the directory
+  and the flag.
+- `edit` ignores an `expected_sha256` that is not a 64-digit hex sha256 (such as
+  `""` or `"unused"`), and accepts one in upper case. A stale one names the
+  file's current hash.
+- Calling an unknown tool returns an error that lists the available tools.
+- Tool call arguments that are not valid JSON are no longer replaced with `{}`.
+  `ToolCall::arguments` keeps the text as a JSON string, and the call is
+  answered with `invalid tool input: the arguments are not valid JSON (<serde
+  error>), so the tool did not run; send the call again with its arguments as
+  one JSON object. Received: <text>`. The tool does not run. The check follows
+  `PreToolUse` hooks, so a hook can repair the arguments. Anthropic replays such
+  a call with `input: {}`.
+- A tool error reaches the model with its whole `anyhow` cause chain, as do
+  background-job failures, subagent failures and `TurnFailed` errors.
+- On the OpenAI Responses and Chat Completions dialects, which have no error
+  flag on a tool result, a failed result with no content is sent as
+  `error: <message>` instead of the bare message. Anthropic, which has
+  `is_error`, is unchanged, and so are successful results on every dialect.
+- A panic in a tool fails that call with `tool '<name>' panicked: <payload>;
+  it may have partially completed` and the turn continues. Before, the panic
+  failed the whole turn (`session execution panicked`) and the call was
+  answered `tool call interrupted while running; it may have partially
+  completed`.
+- `session_search` input errors start with `invalid tool input:` like other
+  built-in tools. `halter_tools::parse_input` is public.
+- CleanWindow opens each new window with a harness notice instead of a fixed
+  sentence. `CLEAN_WINDOW_BOOTSTRAP` is now its fixed first line, so match it
+  with `starts_with`, not equality. The notice says how the window ended and
+  whether a checkpoint was saved, lists the notes files written in that
+  window, names the `session_search` calls that recover every user request,
+  says what to do first, and quotes the session's first user request and the
+  latest one before the wipe (each capped at 4,000 bytes). It is built once
+  per rollover, so it stays a stable cache prefix for the whole window.
+- The CleanWindow checkpoint reminder no longer asks for window and item IDs
+  the model cannot see. It asks for what only the model knows (requirements
+  from other messages, decisions, verified progress, files changed,
+  learnings, next steps), and `session_search` now runs during the checkpoint
+  exchange alongside `notes` and `new_context`. The 50% and 75% reminders no
+  longer mention stable history IDs.
+- `UserMessage::harness(text)` builds a user-role message the harness wrote,
+  marked by a `harness-` ID prefix, and `UserMessage::is_harness()` tests for
+  it. Stop-hook continuations, skill injections, the CleanWindow notice and
+  reminder, and the model-summary and judge guidance messages use it.
+  `session_search` indexes these messages under the new role `harness`, so
+  `list_items` with role `user` returns only real user requests.
+- CleanWindow's notice names only the tools the session offers, lists the
+  background jobs, running subagents, and PTY session that outlive the wipe
+  (ten at most, by id), and caps its notes-path list at ten with a pointer to
+  `notes list_files_by_prefix`. When it would start the new window above 90%
+  of the threshold it shrinks its quotes (4,000, then 1,000, then 250 bytes,
+  then none) and its lists instead of failing the turn; the wipe statement
+  and the `session_search` instructions always remain. A window after one
+  that had no text request labels its first quote "Earliest user request
+  this notice can quote" instead of the session's first.
+
 ### Removed
 
 - **Breaking:** the shell command allowlist and strict mode. `policy.shell.allow`
@@ -76,9 +234,29 @@ once a `1.0.0` line is cut.
   `BackgroundRegistry` are now public.
 - The vendored `halter-brush-core` and `halter-brush-builtins` crates and the
   `vendor/` directory. They are no longer published.
+- **Breaking:** `SessionCommand::AppendSystemPrompt`. Nothing handled it, and
+  editing the system prompt mid-window would invalidate the prompt cache.
+  Set system-prompt text at creation with `SessionInit::append_system_prompt`,
+  or add it later from a hook (`with_additional_context`,
+  `with_system_message`), which lands in-band.
 
 ### Fixed
 
+- Anthropic requests replay a thinking block only to the provider that recorded
+  it. Before, every block was sent with its signature whatever its origin, so
+  after a switch from OpenAI or OpenRouter a Responses reasoning item reached
+  Anthropic as a thinking signature, which the API rejects. Thinking from
+  another provider is dropped; that turn's text and tool calls are kept.
+- Anthropic requests drop empty user text parts, and a user message left with
+  no content, instead of sending `{"type":"text","text":""}`, which the API
+  rejects. Tool results on either side of such a message stay in one user
+  message. Non-empty transcripts encode as before.
+- OpenAI and OpenRouter Responses requests no longer send the compacted prefix
+  twice. The assembler rendered its items as JSON into `rendered_prefix`, which
+  became the developer message (or `instructions`), while the codec also sent
+  them as input items. The Anthropic single-string `system` field, used when a
+  request has no system or skills breakpoint, now renders the compacted prefix
+  as the block path does, inside `<compacted_context>`, instead of as raw JSON.
 - `ProviderDefault` inline compaction (Anthropic, OpenRouter) can now shed a
   long tool-using turn. The window it keeps verbatim is the latest user
   message, then the current turn's latest assistant block and its tool
@@ -96,6 +274,20 @@ once a `1.0.0` line is cut.
   `end_turn` or `stop_sequence` (refusal, `max_tokens`, missing), and
   OpenRouter compaction rejects a `status` other than `completed`. Before, a
   truncated or refused summary replaced the session history.
+- Usage billed by a rejected compaction response now reaches the session's
+  `usage_so_far` and, for an automatic pass, the turn's `TurnCompleted`
+  usage. The runtime logs the rejected reply as a `MessageRecorded`
+  assistant message carrying its usage (no new event kind; the window is
+  restored as before, so the model never sees it). Before, the tokens of a
+  refused or truncated summary, and of an empty `ProviderDefault` response,
+  were lost. `ModelSummary`'s checkpoint inference already counted its
+  usage; a stream that fails mid-reply still loses its partial usage, as any
+  turn does.
+- `ModelSummary` rejects a checkpoint reply that stopped early
+  (`max_tokens`, a refusal, or a pause), as the provider adapters already
+  did for `ProviderDefault`. Before, the fragment replaced the window. The
+  pass fails like an empty summary: a warning and a backoff when automatic,
+  an error when manual; its usage is counted.
 - OpenRouter compaction sends its instructions as the last user input instead
   of top-level `instructions`. Behind a transcript that ended on the
   assistant, models continued the conversation and that reply became the
@@ -104,6 +296,71 @@ once a `1.0.0` line is cut.
   work, the turn waits for the ledger to grow by half the threshold before
   trying again (`ContextSettings::compaction_due_after`). Before, the same
   request was resent at every boundary.
+- An automatic compaction that rewrites the context but leaves it at or over
+  the threshold now backs off like a failed pass (until the ledger grows by
+  half the threshold) and logs a `Warning`. Before, every later boundary of
+  the turn paid for another rewrite. This happens with `ModelSummary` when
+  the static prompt, tools and checkpoint alone reach the threshold, and with
+  any strategy whose kept window does.
+- After an automatic compaction fails, the turn waits for the ledger to grow by
+  half the threshold before trying again (`ContextSettings::compaction_due_after`).
+  Before, the same request was resent at every boundary.
+- OpenAI and OpenRouter Responses requests send `"strict": false` on every
+  function tool. Before, `strict` was omitted, which the Responses API defines
+  as `true`, so whether tool schemas were enforced depended on the upstream.
+  Halter's built-in tools have optional properties and do not meet strict
+  mode's schema rules.
+- A system message after the first other message is encoded in place
+  instead of in the system prompt, so it no longer invalidates the prompt
+  cache. On Anthropic it is a user turn wrapped in `<system-reminder>` tags,
+  on Responses a `developer` item, and on Chat Completions a `system`
+  message. This covers CleanWindow's 50% and 75% reminders, hook system
+  messages, rejected-input reasons and the resume notice. Each CleanWindow
+  reminder used to re-write the whole window to the cache: about 113-121k
+  extra cache-write tokens per Opus eval run. One a hook appends inside a
+  tool batch follows the batch's results. System messages before the first
+  other message still join the system prompt, so sessions without later
+  system messages encode exactly as before.
+- Chained Responses requests (`previous_response_id`) no longer drop later
+  system messages, and the Responses compaction request includes them.
+- **Behaviour change for embedders:** hook `additional_context` is appended as
+  a system message where the hook ran, just before the hook's own system
+  message, instead of being added to the system prompt. Context from a hook
+  that runs before a window's first request (SessionStart, the first
+  UserPromptSubmit, PostCompact) still joins the system prompt. Later context
+  is in-band, so it no longer rewrites the cached prefix: before, each
+  PreToolUse or PostToolUse context invalidated the cache for the next
+  request. Context now lives in the transcript, so compaction can summarize or
+  drop it, where before it stayed in the system prompt until a CleanWindow
+  rollover. It also no longer piles up in the system prompt: a
+  UserPromptSubmit hook used to add another copy every turn. Sessions recorded
+  by earlier versions keep the segments they recorded until a rollover clears
+  them, so they encode as before.
+- The subagent tools (`spawn_agent`, `wait_agent`, `send_input`,
+  `close_agent`) emit `ToolRuntimeEvent::Completed` on every error path, so
+  each `Started` has a matching end.
+- A subagent whose turn ends in `TurnFailed` (a provider error, for example)
+  is reported `Failed` with that error, or `Cancelled` when the failure was a
+  cancellation. It was reported `Completed` with no output.
+- `PolicyError::Io` no longer prints its `io::Error` twice when the chain is
+  shown with `{:#}`. Its plain `Display` no longer includes the cause.
+- A rejected CleanWindow checkpoint write no longer wipes the window
+  silently. The model gets the error and another reply, up to four checkpoint
+  replies in all, and a `new_context` beside a failed call does not end the
+  exchange. The new window's notice reports whether anything was saved and
+  why the exchange ended: `new_context`, no checkpoint call, a failed or
+  over-cap model request, failed tool execution, or a spent budget.
+- A CleanWindow checkpoint call to a tool other than `notes`,
+  `session_search`, or `new_context` is answered with an error result naming
+  those three, and the model gets another reply. Before, the call and the
+  reply's text were dropped silently. An exchange whose reply makes no tool
+  call now ends with "a reply made no tool call".
+- The CleanWindow notice no longer quotes a Stop-hook continuation such as
+  "Continue." as the latest user request.
+- PreToolUse hooks that block a recovery tool during the checkpoint exchange
+  are reported accurately: the model sees the hook's reason, a blocked
+  `notes` write is not counted as saved, and a blocked `new_context` gets
+  another reply until the budget runs out, after which the window is wiped.
 - The default read roots use the system temp dir (`std::env::temp_dir()`)
   instead of `$TMPDIR` falling back to `/tmp`. On Windows, where `TMPDIR` is
   unset, `/tmp` resolved to a missing `<drive>:\tmp`, so every read under the
@@ -117,6 +374,98 @@ once a `1.0.0` line is cut.
   doesn't exist is still an error. On macOS the scratch root moves from
   `/tmp/halter` to the per-user `$TMPDIR/halter`. The starter config template no
   longer lists `allowed_write_roots` explicitly, so it keeps the default.
+- **Breaking:** `[resilience.request_retry] deadline_secs` (`RetryPolicy::deadline`)
+  is now a budget for the total backoff slept between attempts, not wall time
+  from before the first attempt. Before, any attempt that ran at least
+  `deadline_secs` exhausted the budget by itself, so at the defaults (60s
+  deadline, 60s `request_secs`, 60s `stream_idle_secs`) a stalled request or
+  stream timed out and was never retried. Time inside an attempt is bounded by
+  the timeouts; a retry sequence is bounded by `max_attempts` and this budget.
+  Configs that set a large deadline only to cover attempt time can lower it.
+- The streaming HTTP client no longer sets a reqwest `read_timeout` of
+  `stream_idle_secs`. That timer started at send, so it raced `request_secs`
+  for the response headers and won with a less specific error whenever
+  `request_secs` was the longer one. The body stays bounded by the per-event
+  `stream_idle_secs` timer.
+- **Breaking:** config validation rejects `timeouts.connect_secs` that is not
+  less than `timeouts.request_secs`, globally and in each provider's effective
+  config, with an error naming both keys. Such a connect timeout could never
+  fire.
+- The OpenAI rate-limit wait (an open cooldown or a full request or token
+  window) no longer counts against `request_secs`. It ran inside the attempt's
+  request timer, so a Retry-After cooldown longer than `request_secs` timed out
+  every attempt before it was sent. The timer now starts when the permit is
+  granted. The wait still ends on cancellation.
+- Provider transports use one HTTP client with only a connect timeout. The
+  unary client's reqwest `timeout(request_secs)` started after, and tied
+  with, the compaction timer, so it could never fire first; the Anthropic
+  streaming send's own `request_secs` timer was likewise dominated by the
+  setup timer around it. Both are removed; `ResilientProvider`'s timers are
+  the only request bounds.
+- Prompt and agent hooks wait at least the model provider's recovery window
+  (at the defaults about 121s) instead of their configured timeout alone (30s
+  and 60s by default). The hook timer fired before the provider's own 60s
+  request and idle timers could, and hooks fail open, so any provider stall
+  silently dropped the hook's decision, including a block. A longer
+  configured timeout is kept.
+- A bounded session shutdown (`shutdown(Some(timeout))`) cancels running
+  SessionEnd hooks when its deadline passes; they are recorded as cancelled
+  and `SessionShutdownComplete` is still committed. Before, SessionEnd hooks
+  got a cancellation token that never fired, so they ran on for their own
+  timeout (600s for command hooks) after the caller had stopped waiting, and
+  a CLI exit killed them mid-run with nothing recorded. A wait for a session
+  lease held by another writer also ends at that deadline; a free lease is
+  still taken. `shutdown(None)` is unchanged.
+- Bounded `SessionHandle::interrupt`, `SessionHandle::shutdown`, runtime
+  shutdown and `close_agent` keep waiting up to `FORCED_RECOVERY_GRACE` (5s,
+  newly public) after their deadline, where forced recovery starts, and return
+  its result. Before, the caller's timer and the driver's shared one instant,
+  so a bounded call always returned `TimedOut` even when forced recovery
+  settled at once, and the caller could not tell a recovered session from a
+  stuck one. A bounded `close_agent` that bounds an earlier unbounded close now
+  forces it at its own deadline. **Behavior change:** a bounded call can
+  return up to 5s after its timeout, and returns `Ok` where it used to return
+  `TimedOut`.
+- An unbounded `close_agent` (no `timeout_ms`) ends when its tool call is
+  cancelled, returning `cancelled`; the close itself is still requested and
+  cleanup continues in the background. Before, cancelling the parent turn
+  could not end the call while a child's cleanup hung. `close_agent` now
+  reports `cancellable: true`.
+- Forced turn recovery (`force_interrupt_turn`, used when an interrupt,
+  shutdown or subagent close passes its deadline) retries a
+  `SessionCommitConflict` at most 8 times, with a 10ms-per-attempt backoff,
+  then returns the conflict. It retried without a cap or pause, so a store
+  that kept conflicting spun forever while holding the session lease.
+- `halter auth openai login` no longer aborts on one bad connection to its
+  callback listener. A socket that closed or stalled before its headers, a
+  malformed request, or a callback with a stale state (an old browser tab)
+  each returned an error that ended the login; they now count against the
+  16-request stray budget. A provider error or a missing code under the
+  expected state still ends the login.
+- `policy.max_tool_timeout_secs` (default 3600) and
+  `PolicySettings::max_tool_timeout_secs` cap the `timeout_ms` a model may
+  pass to `shell`, `pty`, `wait_agent` and `close_agent`; `ToolPolicy` gains
+  `max_tool_timeout` (default one hour). A larger value is rejected with an
+  error naming the maximum, before anything runs. Before, any value was
+  accepted, so `timeout_ms: 18446744073709551615` made a command or wait
+  effectively unbounded. **Breaking:** `PolicySettings` and `PolicyConfig`
+  struct literals must set the new field; a model call above one hour that
+  used to run is now rejected.
+- Zero timeouts that meant something other than what they said are refused.
+  Config validation rejects `policy.shell.timeout_secs = 0` (it silently ran
+  every command with a 1s timeout) and `policy.max_tool_timeout_secs = 0`
+  (it rejected every model timeout). A hook `timeout = 0` (or `timeout_sec`)
+  now loads with a `zero_timeout` warning and the handler's default timeout:
+  hooks fail open, so a zero timeout made a blocking hook allow everything.
+  **Breaking:** configs with either policy zero no longer load. The zeros
+  that remain, `wait_agent`/`close_agent` `timeout_ms: 0` and a
+  `Some(Duration::ZERO)` interrupt or shutdown deadline, mean "poll" or
+  "force now" and are documented in [docs/timeouts.md](docs/timeouts.md).
+- Provider timeout messages print the configured duration (`50ms`, `1.5s`)
+  instead of whole seconds, which read "after 0s" for sub-second timeouts.
+- `spawn_agent`, `send_input`, `wait_agent` and `close_agent` return serde's account
+  of what is wrong with a malformed input ("invalid tool input: missing field
+  `target`") instead of a bare "invalid input" that hid it from the model.
 
 ## [0.10.0] - 2026-11-14
 

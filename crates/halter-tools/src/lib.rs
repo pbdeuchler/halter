@@ -21,7 +21,7 @@ pub use builtin::ImageTool;
 pub use builtin::ProfilingTool;
 #[cfg(feature = "pty")]
 pub use builtin::PtyTool;
-pub use builtin::common::Report;
+pub use builtin::common::{Report, parse_input, placeholder_as_default};
 pub use builtin::fs_lock::PathLockMap;
 pub use builtin::shell::detect::{Shell, ShellKind, detected as detected_shell};
 pub use builtin::{
@@ -34,8 +34,8 @@ pub use notes::{
     RECOVERY_RESPONSE_BYTES, RECOVERY_RESULT_LIMIT, recovery_lines, recovery_preview,
 };
 pub use policy::{
-    CanonicalPath, DefaultToolPolicy, LoopbackAllow, Pid, PolicyError, PolicySettings, ToolPolicy,
-    default_write_root,
+    CanonicalPath, DEFAULT_MAX_TOOL_TIMEOUT_SECS, DefaultToolPolicy, LoopbackAllow, Pid,
+    PolicyError, PolicySettings, ToolPolicy, default_write_root,
 };
 pub use runtime::{
     NoopSubagentControl, NoopToolEventSink, SubagentControl, SubagentParentContext, Tool,

@@ -150,8 +150,10 @@ impl SessionHandle {
 
     /// Stop foreground execution, await cleanup and commit its final state.
     /// Earlier pending inputs remain recorded but do not restart execution.
-    /// `None` waits without a deadline. A timeout requests forced recovery;
-    /// call with `None` to await its settlement.
+    /// `None` waits without a deadline. At the timeout the driver forces
+    /// recovery, and this call waits up to [`FORCED_RECOVERY_GRACE`] more for
+    /// it to settle before returning `TimedOut`; after that, call with `None`
+    /// to await settlement.
     pub async fn interrupt(&self, timeout: Option<Duration>) -> Result<(), SessionError> {
         let deadline = timeout_deadline(timeout)?;
         let response = self
@@ -159,7 +161,7 @@ impl SessionHandle {
             .enqueue_stop(|reply| Command::Interrupt { deadline, reply })?;
         let request = async { response.await.map_err(|_| SessionError::Closed)? };
         match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, request)
+            Some(deadline) => tokio::time::timeout_at(caller_deadline(deadline), request)
                 .await
                 .unwrap_or(Err(SessionError::TimedOut)),
             None => request.await,
@@ -167,8 +169,10 @@ impl SessionHandle {
     }
 
     /// Close this incarnation and await cleanup of its session resources.
-    /// `None` waits without a deadline. A timeout requests forced cleanup and
-    /// returns `TimedOut`; the session stays fenced until cleanup settles.
+    /// `None` waits without a deadline. At the timeout the driver forces
+    /// cleanup, and this call waits up to [`FORCED_RECOVERY_GRACE`] more for
+    /// it to settle before returning `TimedOut`; the session stays fenced
+    /// until cleanup settles.
     pub async fn shutdown(&self, timeout: Option<Duration>) -> Result<(), SessionError> {
         self.control.shutdown(timeout).await
     }
@@ -233,7 +237,7 @@ impl DriverControl {
         };
         let cleanup = self.shutdown_until(response);
         match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, cleanup)
+            Some(deadline) => tokio::time::timeout_at(caller_deadline(deadline), cleanup)
                 .await
                 .unwrap_or(Err(SessionError::TimedOut)),
             None => cleanup.await,
@@ -1349,20 +1353,21 @@ impl Driver {
         let id = self.control.id.clone();
         let deadline = stop.deadline;
         let reason = stop.intent.reason();
+        // Fired by `force_active` at the deadline, so SessionEnd hooks end
+        // (recorded as cancelled) instead of outliving the caller's wait.
+        let cancel = CancellationToken::new();
+        let hook_cancel = cancel.clone();
         let task = tokio::spawn(async move {
             let children = subagents.close_session_with_deadline(&id, deadline).await;
             let resources = sessions.shutdown_session(&id).await;
-            let hooks = executor.shutdown(reason).await;
+            let hooks = executor.shutdown(reason, hook_cancel).await;
             children
                 .and(resources)
                 .and(hooks)
                 .map(|()| TaskOutcome::Complete)
         });
         self.transition(Phase::Closing {
-            active: Active {
-                cancel: CancellationToken::new(),
-                task,
-            },
+            active: Active { cancel, task },
             stop,
         });
     }
@@ -1426,6 +1431,7 @@ impl Driver {
             }
             Phase::Closing { active, mut stop } => {
                 stop.deadline = None;
+                active.cancel.cancel();
                 let task = tokio::spawn(async move {
                     sessions.force_stop_session(&id).await;
                     subagents.force_close_session(&id).await;
@@ -1513,7 +1519,10 @@ impl Driver {
                 .tool_sessions
                 .shutdown_session(&self.control.id)
                 .await;
-            let _ = self.executor.shutdown("session_failed").await;
+            let _ = self
+                .executor
+                .shutdown("session_failed", CancellationToken::new())
+                .await;
         }
         // Fatal errors route directly to the store. Repair remaining inbox
         // metadata against its current head, never the failed actor's cursor.
@@ -1739,6 +1748,19 @@ async fn wait_deadline(deadline: Option<Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
+}
+
+/// How long a bounded `interrupt`, `shutdown` or subagent close keeps
+/// waiting after its deadline, where the driver forces recovery. Without it
+/// the caller's timer and the driver's share one instant, so the caller
+/// always saw `TimedOut` even when forced recovery settled at once.
+pub const FORCED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
+
+/// The instant a caller stops waiting for work forced at `deadline`.
+pub(crate) fn caller_deadline(deadline: Instant) -> Instant {
+    deadline
+        .checked_add(FORCED_RECOVERY_GRACE)
+        .unwrap_or(deadline)
 }
 
 fn timeout_deadline(timeout: Option<Duration>) -> Result<Option<Instant>, SessionError> {

@@ -719,7 +719,7 @@ mod tests {
             (tool(rendered, None), "abcdefgh"),
             (
                 tool(ToolResult::Empty, Some("abcdefghijkl")),
-                "abcdefghijkl",
+                "error: abcdefghijkl",
             ),
             (tool(text, Some("boom")), "abcd\n\nerror: boom"),
         ] {

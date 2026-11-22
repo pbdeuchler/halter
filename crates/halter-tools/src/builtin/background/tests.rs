@@ -595,3 +595,34 @@ async fn background_output_renders_each_action_as_text() {
         .await
         .unwrap();
 }
+
+// Kills: listing finished jobs as running, or reading the wrong session.
+#[tokio::test]
+async fn running_background_jobs_lists_only_live_jobs_of_the_session() {
+    let root = tempfile::tempdir().unwrap();
+    let context = context(root.path());
+    let store = &context.tool_sessions;
+    let session = &context.session_id;
+    assert!(store.running_background_jobs(session).await.is_empty());
+    assert!(!store.has_process_state(session), "reading creates no slot");
+    let finished = execute(&context, json!({"action": "spawn", "command": "true"})).await;
+    wait_for(&context, finished["id"].as_str().unwrap(), |output| {
+        output["status"]["state"] == "exited"
+    })
+    .await;
+    let running = execute(&context, json!({"action": "spawn", "command": "sleep 30"})).await;
+    let running_id = running["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        store.running_background_jobs(session).await,
+        vec![(running_id.clone(), "sleep 30".to_owned())]
+    );
+    assert!(
+        store
+            .running_background_jobs(&SessionId::from("other"))
+            .await
+            .is_empty()
+    );
+    execute(&context, json!({"action": "kill", "id": running_id})).await;
+    assert!(store.running_background_jobs(session).await.is_empty());
+    store.shutdown_session(session).await.unwrap();
+}

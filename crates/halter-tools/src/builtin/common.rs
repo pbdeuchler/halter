@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ToolOutput;
-use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -59,36 +60,80 @@ pub fn required_string<'a>(input: &'a Value, key: &str) -> anyhow::Result<&'a st
         .ok_or_else(|| anyhow::anyhow!("invalid tool input: missing string field '{key}'"))
 }
 
+/// Whether a supplied value says nothing: `null`, a blank string, `0`, `[]`
+/// or `{}`. Models fill the optional parameters they don't use with these
+/// (strict schemas make them send every property), so built-in tools read
+/// them as absent. No built-in optional parameter gives one of them a
+/// meaning of its own: optional integers default to 0 or start at 1, and
+/// `false` is never a placeholder.
+fn is_placeholder(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Bool(_) => false,
+        Value::Number(number) => number.as_u64() == Some(0),
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+    }
+}
+
+/// `input[key]`, unless it is missing or a placeholder (`null`, a blank
+/// string, `0`, `[]` or `{}`). Every `optional_*` helper reads through this.
+pub fn provided<'a>(input: &'a Value, key: &str) -> Option<&'a Value> {
+    input.get(key).filter(|value| !is_placeholder(value))
+}
+
+/// Serde `deserialize_with` for an optional tool-input field, paired with
+/// `#[serde(default)]`: a placeholder (`null`, a blank string, `0`, `[]` or
+/// `{}`) deserializes as `T::default()`, as [`provided`] reads it.
+///
+/// # Errors
+///
+/// Fails when a value that is not a placeholder does not deserialize as `T`.
+pub fn placeholder_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned + Default,
+{
+    let value = Value::deserialize(deserializer)?;
+    if is_placeholder(&value) {
+        return Ok(T::default());
+    }
+    T::deserialize(value).map_err(serde::de::Error::custom)
+}
+
+/// Deserialize a whole tool input. The error keeps serde's account of which
+/// field is wrong and why, for the model to correct its call.
+pub fn parse_input<T: DeserializeOwned>(input: Value) -> anyhow::Result<T> {
+    serde_json::from_value(input).map_err(|error| anyhow::anyhow!("invalid tool input: {error}"))
+}
+
 pub fn optional_string<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
-    input.get(key).and_then(Value::as_str)
+    provided(input, key).and_then(Value::as_str)
 }
 
 pub fn optional_bool(input: &Value, key: &str) -> anyhow::Result<Option<bool>> {
-    match input.get(key) {
-        None | Some(Value::Null) => Ok(None),
+    match provided(input, key) {
+        None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(_) => anyhow::bail!("invalid tool input: field '{key}' must be a boolean"),
     }
 }
 
 pub fn optional_u64(input: &Value, key: &str) -> anyhow::Result<Option<u64>> {
-    match input.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("invalid tool input: field '{key}' must be a u64")),
-        Some(_) => anyhow::bail!("invalid tool input: field '{key}' must be a u64"),
-    }
+    provided(input, key)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("invalid tool input: field '{key}' must be a u64"))
+        })
+        .transpose()
 }
 
 pub fn parse_env_map(value: Option<&Value>) -> anyhow::Result<Option<HashMap<String, String>>> {
-    let Some(value) = value else {
+    let Some(value) = value.filter(|value| !is_placeholder(value)) else {
         return Ok(None);
     };
-    if value.is_null() {
-        return Ok(None);
-    }
     let object = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid tool input: env must be an object"))?;
@@ -213,9 +258,70 @@ mod tests {
     }
 
     #[test]
+    fn placeholders_read_as_absent_and_other_values_as_given() {
+        for (value, placeholder) in [
+            (json!(null), true),
+            (json!(""), true),
+            (json!(" \n"), true),
+            (json!(0), true),
+            (json!([]), true),
+            (json!({}), true),
+            (json!(false), false),
+            (json!(true), false),
+            (json!(1), false),
+            (json!(-1), false),
+            (json!(0.5), false),
+            (json!("x"), false),
+            (json!([0]), false),
+            (json!({"a": 1}), false),
+        ] {
+            let input = json!({ "k": value });
+            assert_eq!(provided(&input, "k").is_none(), placeholder, "{value}");
+            let parsed: Option<Value> = placeholder_as_default(value.clone()).expect("any value");
+            assert_eq!(parsed.is_none(), placeholder, "{value}");
+        }
+        assert_eq!(provided(&json!({}), "k"), None);
+    }
+
+    #[test]
+    fn optional_helpers_skip_placeholders_and_reject_wrong_types() {
+        let input = json!({
+            "blank": "", "zero": 0, "null": null, "no": false, "n": 7, "s": "x", "list": []
+        });
+        for key in ["blank", "zero", "null", "list", "missing"] {
+            assert_eq!(optional_string(&input, key), None, "{key}");
+            assert_eq!(optional_bool(&input, key).unwrap(), None, "{key}");
+            assert_eq!(optional_u64(&input, key).unwrap(), None, "{key}");
+        }
+        assert_eq!(optional_bool(&input, "no").unwrap(), Some(false));
+        assert_eq!(optional_u64(&input, "n").unwrap(), Some(7));
+        assert_eq!(optional_string(&input, "s"), Some("x"));
+        assert_eq!(optional_string(&input, "n"), None);
+        assert!(optional_bool(&input, "s").is_err());
+        assert!(optional_u64(&input, "s").is_err());
+        let typed: Result<Option<u64>, _> = placeholder_as_default(json!("x"));
+        assert!(typed.is_err());
+    }
+
+    #[test]
+    fn parse_input_names_the_field_serde_rejected() {
+        #[derive(Debug, Deserialize)]
+        struct Input {
+            id: u64,
+        }
+        assert_eq!(parse_input::<Input>(json!({"id": 3})).unwrap().id, 3);
+        let error = parse_input::<Input>(json!({"id": "3"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("invalid tool input: "), "{error}");
+        assert!(error.contains("invalid type"), "{error}");
+    }
+
+    #[test]
     fn parse_env_map_accepts_string_maps_and_rejects_malformed_entries() {
         assert_eq!(parse_env_map(None).unwrap(), None);
         assert_eq!(parse_env_map(Some(&json!(null))).unwrap(), None);
+        assert_eq!(parse_env_map(Some(&json!({}))).unwrap(), None);
         assert_eq!(
             parse_env_map(Some(&json!({"A": "1"}))).unwrap(),
             Some(HashMap::from([("A".to_owned(), "1".to_owned())]))

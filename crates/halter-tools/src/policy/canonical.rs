@@ -42,6 +42,18 @@ impl CanonicalPath {
         write_leaf_atomic(self, bytes)
     }
 
+    /// Create the authorized leaf as a directory under the pinned parent. A
+    /// leaf that already exists is left alone; whatever then uses it as a
+    /// directory fails if it is not one.
+    pub fn create_dir_blocking(&self) -> Result<(), PolicyError> {
+        match create_leaf_dir(self) {
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                Err(PolicyError::io(self.path.clone(), error))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Borrow the pinned parent directory file descriptor.
     #[cfg(unix)]
     pub fn parent_dir_fd(&self) -> std::os::fd::BorrowedFd<'_> {
@@ -187,6 +199,24 @@ fn write_leaf_atomic(path: &CanonicalPath, bytes: &[u8]) -> Result<(), PolicyErr
     temp.persist(&path.path)
         .map(|_| ())
         .map_err(|error| PolicyError::io(path.path.clone(), error.error))
+}
+
+#[cfg(unix)]
+fn create_leaf_dir(path: &CanonicalPath) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let leaf = leaf_c_string(path).map_err(std::io::Error::other)?;
+    // SAFETY: `leaf` is a NUL-terminated name and the fd is owned by `path`.
+    let created = unsafe { libc::mkdirat(path.parent_dir_fd.as_raw_fd(), leaf.as_ptr(), 0o777) };
+    if created < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_leaf_dir(path: &CanonicalPath) -> std::io::Result<()> {
+    std::fs::create_dir(&path.path)
 }
 
 #[cfg(unix)]

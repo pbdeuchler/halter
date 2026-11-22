@@ -256,16 +256,21 @@ impl ToolRuntime {
         context: ToolContext,
         input: Value,
     ) -> anyhow::Result<ToolResult> {
-        let tool = self
-            .tools
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
+        let tool = {
+            let tools = self
+                .tools
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tools.get(name).cloned().ok_or_else(|| {
                 warn!(tool_name = name, "attempted to execute unknown tool");
-                anyhow::anyhow!("failed to execute tool: unknown tool '{}'", name)
-            })?;
+                let mut available = tools.keys().map(String::as_str).collect::<Vec<_>>();
+                available.sort_unstable();
+                anyhow::anyhow!(
+                    "failed to execute tool: unknown tool '{name}'; available tools: {}",
+                    available.join(", ")
+                )
+            })?
+        };
 
         debug!(session_id = %context.session_id, tool_name = name, "dispatching tool execution");
         tool.execute(context, input).await

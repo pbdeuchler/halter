@@ -264,6 +264,14 @@ impl CallbackError {
     }
 }
 
+impl std::fmt::Display for CallbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.user_message())
+    }
+}
+
+impl std::error::Error for CallbackError {}
+
 pub(crate) fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
     let trimmed = body.trim();
     if trimmed.is_empty() {

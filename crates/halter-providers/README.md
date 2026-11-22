@@ -71,14 +71,19 @@ OpenAI, OpenRouter, and Anthropic all wrap their transport core in
 `new(...)` — yields bounded retries with exponential backoff for transient
 failures (rate limits, 5xx/overload, network faults) on both `stream(...)` and
 `compact(...)`. Pass a custom policy and classifier with
-`new_with_headers_and_resilience(...)`; the higher-level builder only supplies
-the policy from config. Retryability is decided by one shared classifier
+`new_with_headers_and_resilience(...)`, which for OpenAI and OpenRouter also
+takes [`ResponsesOptions`](#responses-request-options); the higher-level
+builder only supplies the options and the policy from config. Retryability is decided by one shared classifier
 across provider families, server-supplied backoff hints (`Retry-After`,
 "try again in …") are honored, and jitter stays within `max_backoff`.
 Deterministic setup failures (wrong api kind, unencodable request) are fatal
 and never retried, and a stream that has already emitted content is never
-retried. Streaming transports do not use reqwest's total request timeout for
-the SSE body; request setup and stream-idle liveness are bounded separately.
+retried. The HTTP client bounds only the connect; request setup, stream-idle
+liveness and whole compactions are bounded by `ResilientProvider`'s timers,
+and OpenAI rate-limit admission runs before the setup timer starts.
+`Provider::resilience_policy` exposes a provider's policy, and
+`ResiliencePolicy::recovery_window` gives the shortest outer deadline that
+still lets the provider detect a stall and retry once.
 
 ---
 
@@ -155,7 +160,11 @@ turn, with the latest user message kept verbatim at the head of the window —
 and the adapter encodes the request it is handed. Inline adapters apply only a
 summary the model finished: the Anthropic adapter rejects any `stop_reason`
 other than `end_turn` or `stop_sequence`, and the OpenRouter adapter any
-`status` other than `completed`. The Anthropic transcript leaves out thinking
+`status` other than `completed`. A rejection was still billed, so it returns a
+`halter_protocol::ProviderCompactionRejected` carrying the response's text and
+`usage`; the retry layer passes it through untouched (it is never retried) and
+the runtime counts its usage. Return the same error from a custom adapter that
+declines a response it paid for. The Anthropic transcript leaves out thinking
 blocks, and the OpenRouter request carries the instructions as the final user
 input rather than as top-level `instructions`. When it runs is decided by the runtime's
 session token ledger, never by the provider: an adapter must not enable
@@ -398,6 +407,71 @@ Config-driven use goes through `[providers.openrouter.routing]` in
 
 ---
 
+## Responses request options
+
+`ResponsesOptions` carries the Responses-request settings that
+`OpenAiProvider::new_with_headers_and_resilience`,
+`OpenAiProvider::new_with_oauth_headers_and_resilience`, and
+`OpenRouterProvider::new_with_headers_and_resilience` take; the shorter
+constructors use `ResponsesOptions::default()`.
+
+- `strict_tools` (default `false`) is sent as `strict` on every function tool.
+  It is always sent, because the Responses API treats an omitted `strict` as
+  `true`. `true` makes the upstream enforce each schema, which requires every
+  object to list all of its properties in `required` (optional ones become
+  nullable) and to set `"additionalProperties": false`. Halter does not rewrite
+  schemas: one that does not qualify fails the request with the upstream's
+  invalid-request error, which is not retried. Halter's built-in tools have
+  optional properties and do not qualify.
+- `include_encrypted_reasoning` (default `true`) adds
+  `include: ["reasoning.encrypted_content"]` to requests for models with a
+  reasoning effort.
+
+Config-driven use goes through the same keys in `[providers.openai]` and
+`[providers.openrouter]`.
+
+### Reasoning replay
+
+The Responses stream decoder stores each `reasoning` output item, serialized
+whole, as the signature of the thinking block it produces. Request encoding
+sends those items back as input items, so a stateless request (`store: false`)
+still carries the model's earlier reasoning, as pi and rig do:
+
+```json
+{"type":"reasoning","id":"rs_…","summary":[],"content":[],"encrypted_content":"…"}
+{"type":"reasoning","id":"rs_…","summary":[{"type":"summary_text","text":"…"}],"status":"completed"}
+```
+
+The first shape is an OpenAI model's, the second GLM's on Fireworks. For each
+history assistant message the input holds its reasoning items in part order,
+then its text message, then its function calls. An item is replayed only when:
+
+- the message's `replay_meta` names the request's provider and upstream model
+  (`wire_model`, not the configured alias), since another model's encrypted
+  content is rejected;
+- on OpenAI with `store: false`, the item carries `encrypted_content`: OpenAI
+  stores no item to resolve an id-only reference against. OpenRouter, which is
+  stateless and reads the item's own content, and stored OpenAI requests
+  replay id-only items too;
+- the message also has text or a tool call, since the API rejects a reasoning
+  item without the item that followed it;
+- the signature parses as a `reasoning` item. Anthropic signatures and the bare
+  `encrypted_content` strings older halter versions stored are skipped.
+
+The encoding depends only on the stored message and the request model, so a
+request's input stays a byte prefix of the next request's. A
+`previous_response_id` request sends no reasoning items, because the chained
+response already holds them, and compaction input omits them.
+
+Anthropic requests replay a thinking block, with its signature if it has one,
+only when the message's `replay_meta` names the request's provider. Blocks
+from another provider (a Responses reasoning item, or unsigned reasoning) are
+dropped and that turn's text and tool calls kept. The model is not compared:
+the API itself drops blocks from another Claude model. Empty user text parts
+are dropped as well, since the API rejects an empty text block.
+
+---
+
 ## Fake provider
 
 `FakeProvider` is for tests and local verification.
@@ -451,6 +525,26 @@ Providers may have different tool-call ID expectations. The `tool_call_id_policy
 ### Assistant content constraints
 
 Some providers require non-empty assistant content. The runtime and protocol layers normalize accordingly.
+
+### System messages and the prompt cache
+
+Every codec keeps appends cache-friendly: adding a message to the history
+never changes the encoded tools, system prompt, or earlier messages. System
+messages before the first other message join the system prompt. A later one
+(a hook's message, a compaction reminder, a resume notice) is encoded in
+place:
+
+| API | Later system message |
+| --- | --- |
+| Responses | `developer` input item, also when chaining with `previous_response_id` |
+| Chat Completions | `system` message |
+| Anthropic Messages | user turn, text wrapped in `<system-reminder>` tags |
+
+One appended inside a tool batch (by a `PreToolUse` or `PostToolUse` hook)
+moves to just after the batch's results, since no API accepts other content
+between tool calls and their results. Empty system messages are dropped. The
+property test in `src/prefix_stability_tests.rs` checks this for every
+codec; a new codec should join it.
 
 ---
 
@@ -507,6 +601,7 @@ If you want to add a provider backend, the rough checklist is:
 5. handle cancellation correctly
 6. decide whether compaction is supported
 7. add tests for streaming, tool calls, failures, and replay behavior
+8. add the codec to the prefix-stability property test
 
 ### Design advice
 

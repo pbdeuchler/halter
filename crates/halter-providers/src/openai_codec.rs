@@ -9,16 +9,16 @@ use async_openai::types::responses::{
 };
 use halter_protocol::{
     ApiKind, AssistantPart, BlockId, Message, MessageId, OpenRouterRouting,
-    ProviderCompactionRequest, ProviderCompactionResponse, ProviderRequest, ReasoningEffort,
-    StopReason, StreamEvent, Usage, UserPart,
+    ProviderCompactionRejected, ProviderCompactionRequest, ProviderCompactionResponse,
+    ProviderKind, ProviderRequest, ReasoningEffort, StopReason, StreamEvent, Usage, UserPart,
 };
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
 use crate::codec_common::{
     assistant_text, bounded_provider_id, bounded_provider_id_with_prefix, canonical_tool_name,
-    collect_system_text, data_url, document_filename, has_user_media, tool_name_for_provider,
-    user_text,
+    collect_system_text, data_url, document_filename, has_user_media, in_band_messages,
+    tool_name_for_provider, user_text,
 };
 
 // Alias the consolidated PROVIDER_ID_MAX_LEN from codec_common (finding L14).
@@ -45,6 +45,9 @@ pub(crate) struct ResponsesRequestOptions<'a> {
     pub store: Option<bool>,
     pub prompt_cache_key: Option<&'a str>,
     pub include_encrypted_reasoning: bool,
+    /// Value of every function tool's `strict` field. Always sent, because
+    /// the Responses API defaults an omitted `strict` to `true`.
+    pub strict_tools: bool,
     pub reasoning_summary: Option<&'a str>,
     pub instruction_mode: ResponsesInstructionMode,
     /// Sampling temperature forwarded to the Responses API when configured.
@@ -88,17 +91,17 @@ pub(crate) fn encode_responses_request(
             "previous_response_id".to_owned(),
             Value::String(prev_id.clone()),
         );
-        let new_messages = request
-            .messages
-            .get(request.new_messages_start..)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "failed to encode openai responses request: new_messages_start {} exceeds message count {}",
-                    request.new_messages_start,
-                    request.messages.len()
-                )
-            })?;
-        let input = encode_responses_input_slice(new_messages, request)?;
+        if request.new_messages_start > request.messages.len() {
+            anyhow::bail!(
+                "failed to encode openai responses request: new_messages_start {} exceeds message count {}",
+                request.new_messages_start,
+                request.messages.len()
+            );
+        }
+        let input = encode_responses_input_slice(
+            in_band_messages(&request.messages, request.new_messages_start),
+            request,
+        )?;
         validate_responses_input_item_ids(&input)?;
         body.insert("input".to_owned(), Value::Array(input));
     } else {
@@ -106,7 +109,14 @@ pub(crate) fn encode_responses_request(
             == ResponsesInstructionMode::DeveloperMessage)
             .then_some(system_text.as_deref())
             .flatten();
-        let input = encode_responses_input(request, developer_message)?;
+        let replay = if options.store == Some(false)
+            && request.model.provider_kind != ProviderKind::OpenRouter
+        {
+            ReasoningReplay::Encrypted
+        } else {
+            ReasoningReplay::All
+        };
+        let input = encode_responses_input(request, developer_message, replay)?;
         validate_responses_input_item_ids(&input)?;
         body.insert("input".to_owned(), Value::Array(input));
     }
@@ -142,7 +152,7 @@ pub(crate) fn encode_responses_request(
     if !request.tools.is_empty() {
         body.insert(
             "tools".to_owned(),
-            Value::Array(encode_responses_tools(request)),
+            Value::Array(encode_responses_tools(request, options.strict_tools)),
         );
     }
 
@@ -234,7 +244,19 @@ pub(crate) fn decode_openrouter_compact_response(
             .and_then(Value::as_str)
             .map(|reason| format!(" ({reason})"))
             .unwrap_or_default();
-        anyhow::bail!("failed to decode openrouter compaction response: status {status}{reason}");
+        let text = response
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|output| openrouter_compaction_output_text(output))
+            .unwrap_or_default();
+        return Err(ProviderCompactionRejected {
+            reason: format!(
+                "failed to decode openrouter compaction response: status {status}{reason}"
+            ),
+            text,
+            usage: decode_openai_usage(response),
+        }
+        .into());
     }
     let output = response
         .get("output")
@@ -261,9 +283,9 @@ fn encode_responses_compact_input(
     request: &ProviderCompactionRequest,
 ) -> anyhow::Result<Vec<Value>> {
     let mut input = request.compacted_prefix.clone();
-    for message in &request.messages {
+    for message in in_band_messages(&request.messages, 0) {
         match message {
-            Message::System(_) => {}
+            Message::System(system) => input.push(encode_responses_developer_message(&system.text)),
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
                 if let Some(message) = encode_responses_assistant_message(assistant) {
@@ -345,10 +367,7 @@ pub(crate) fn decode_responses_response(
                     });
                     events.push(StreamEvent::ThinkingEnd {
                         id: block_id,
-                        signature: item
-                            .get("encrypted_content")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
+                        signature: Some(item.to_string()),
                     });
                 }
             }
@@ -548,11 +567,11 @@ impl ResponsesStreamDecoder {
                     self.finish_text_block(Some(&output_message_text(&message)), &mut events);
                 }
                 OutputItem::Reasoning(reasoning) => {
-                    self.finish_reasoning_block(
-                        Some(&reasoning_item_text(&reasoning)),
-                        reasoning.encrypted_content,
-                        &mut events,
-                    );
+                    let text = reasoning_item_text(&reasoning);
+                    // The whole item is the replay signature, so the next
+                    // stateless request can send it back verbatim.
+                    let item = serde_json::to_string(&OutputItem::Reasoning(reasoning)).ok();
+                    self.finish_reasoning_block(Some(&text), item, &mut events);
                 }
                 OutputItem::FunctionCall(call) => {
                     self.finish_tool_call(
@@ -1046,6 +1065,7 @@ pub(crate) fn decode_chat_response(
 fn encode_responses_input(
     request: &ProviderRequest,
     developer_message: Option<&str>,
+    replay: ReasoningReplay,
 ) -> anyhow::Result<Vec<Value>> {
     let mut input = Vec::new();
     if let Some(system) = developer_message {
@@ -1053,19 +1073,12 @@ fn encode_responses_input(
     }
     input.extend(request.compacted_prefix.clone());
 
-    for message in &request.messages {
+    for message in in_band_messages(&request.messages, 0) {
         match message {
-            Message::System(_) => {}
+            Message::System(system) => input.push(encode_responses_developer_message(&system.text)),
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
-                if let Some(message) = encode_responses_assistant_message(assistant) {
-                    input.push(message);
-                }
-                for part in &assistant.parts {
-                    if let AssistantPart::ToolCall(call) = part {
-                        input.push(encode_responses_tool_call(call, request));
-                    }
-                }
+                input.extend(encode_responses_assistant_items(assistant, request, replay));
             }
             Message::Tool(tool) => input.push(encode_responses_tool_output(tool)),
         }
@@ -1074,26 +1087,24 @@ fn encode_responses_input(
     Ok(input)
 }
 
-/// Encode only the given message slice — used when chaining via `previous_response_id`.
-/// Omits the developer/system message since the server already has it.
+/// Encode only the given messages — used when chaining via `previous_response_id`.
+/// Omits the leading developer/system message since the server already has it.
 fn encode_responses_input_slice(
-    messages: &[Message],
+    messages: Vec<&Message>,
     request: &ProviderRequest,
 ) -> anyhow::Result<Vec<Value>> {
     let mut input = Vec::new();
     for message in messages {
         match message {
-            Message::System(_) => {}
+            Message::System(system) => input.push(encode_responses_developer_message(&system.text)),
             Message::User(user) => input.push(encode_responses_user_message(user)?),
             Message::Assistant(assistant) => {
-                if let Some(message) = encode_responses_assistant_message(assistant) {
-                    input.push(message);
-                }
-                for part in &assistant.parts {
-                    if let AssistantPart::ToolCall(call) = part {
-                        input.push(encode_responses_tool_call(call, request));
-                    }
-                }
+                // The chained response already holds its reasoning items.
+                input.extend(encode_responses_assistant_items(
+                    assistant,
+                    request,
+                    ReasoningReplay::Off,
+                ));
             }
             Message::Tool(tool) => input.push(encode_responses_tool_output(tool)),
         }
@@ -1146,6 +1157,73 @@ fn encode_responses_user_message(message: &halter_protocol::UserMessage) -> anyh
         "role": "user",
         "content": content,
     }))
+}
+
+/// Input items for one assistant message: its reasoning items, then its text,
+/// then its tool calls. The items depend only on the stored message and the
+/// request model, so a transcript prefix encodes to the same bytes on every
+/// later request.
+///
+/// A reasoning item is the output item the stream decoder stored as the
+/// thinking block's signature, replayed verbatim. It is sent only when
+/// `replay` allows it, the message came from the request's provider and
+/// upstream model (`replay_meta.wire_model`, not the alias: another model's
+/// encrypted content is rejected upstream), and the message also has text or
+/// a tool call (the Responses API rejects a reasoning item without the item
+/// that followed it). Signatures that are not a reasoning item, such as an
+/// Anthropic signature or a bare `encrypted_content` string stored by an
+/// older halter, are skipped.
+fn encode_responses_assistant_items(
+    message: &halter_protocol::AssistantMessage,
+    request: &ProviderRequest,
+    replay: ReasoningReplay,
+) -> Vec<Value> {
+    let following: Vec<Value> = encode_responses_assistant_message(message)
+        .into_iter()
+        .chain(message.parts.iter().filter_map(|part| match part {
+            AssistantPart::ToolCall(call) => Some(encode_responses_tool_call(call, request)),
+            AssistantPart::Text { .. } | AssistantPart::Thinking(_) => None,
+        }))
+        .collect();
+    let replayed: &[AssistantPart] = if replay != ReasoningReplay::Off
+        && !following.is_empty()
+        && message.replay_meta.provider_name.as_ref() == Some(&request.model.provider)
+        && message.replay_meta.wire_model.as_deref() == Some(request.model.model.as_str())
+    {
+        &message.parts
+    } else {
+        &[]
+    };
+    replayed
+        .iter()
+        .filter_map(|part| match part {
+            AssistantPart::Thinking(block) => block.signature.as_deref(),
+            AssistantPart::Text { .. } | AssistantPart::ToolCall(_) => None,
+        })
+        .filter_map(|signature| serde_json::from_str::<Value>(signature).ok())
+        .filter(|item| {
+            item["type"] == "reasoning"
+                && (replay == ReasoningReplay::All
+                    || item["encrypted_content"]
+                        .as_str()
+                        .is_some_and(|c| !c.is_empty()))
+        })
+        .chain(following)
+        .collect()
+}
+
+/// Which stored reasoning items a request sends back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningReplay {
+    /// None: a `previous_response_id` response already holds them.
+    Off,
+    /// Only items with `encrypted_content`. OpenAI does not persist items on
+    /// a `store: false` request, so an item without it is a reference to an
+    /// id the upstream cannot resolve.
+    Encrypted,
+    /// Every item: OpenAI resolves a stored item by id, and OpenRouter, which
+    /// is stateless, reads the item's own content.
+    All,
 }
 
 fn encode_responses_assistant_message(
@@ -1299,7 +1377,7 @@ fn validate_responses_input_item_ids(input: &[Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn encode_responses_tools(request: &ProviderRequest) -> Vec<Value> {
+fn encode_responses_tools(request: &ProviderRequest, strict: bool) -> Vec<Value> {
     request
         .tools
         .iter()
@@ -1309,6 +1387,7 @@ fn encode_responses_tools(request: &ProviderRequest) -> Vec<Value> {
                 "name": tool_name_for_provider(&tool.name, &request.tools, request.model.provider_kind),
                 "description": tool.description,
                 "parameters": tool.input_schema,
+                "strict": strict,
             })
         })
         .collect()
@@ -1324,9 +1403,12 @@ fn encode_chat_messages(request: &ProviderRequest) -> anyhow::Result<Vec<Value>>
         }));
     }
 
-    for message in &request.messages {
+    for message in in_band_messages(&request.messages, 0) {
         match message {
-            Message::System(_) => {}
+            Message::System(system) => messages.push(json!({
+                "role": "system",
+                "content": system.text,
+            })),
             Message::User(user) => messages.push(encode_chat_user_message(user)?),
             Message::Assistant(assistant) => {
                 let text = assistant_text(assistant);
@@ -1761,6 +1843,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: Some(request.prompt.prefix_cache_key.as_str()),
                 include_encrypted_reasoning: true,
+                strict_tools: false,
                 reasoning_summary: Some("auto"),
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: Some(0.5),
@@ -1816,6 +1899,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::TopLevelRequired,
                 temperature: None,
@@ -1849,6 +1933,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::TopLevelRequired,
                 temperature: None,
@@ -1881,6 +1966,7 @@ mod tests {
                 store: None,
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::TopLevelRequired,
                 temperature: None,
@@ -1911,6 +1997,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -1941,6 +2028,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -1962,6 +2050,7 @@ mod tests {
                 store: None,
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -1987,6 +2076,373 @@ mod tests {
                 && item["call_id"] == "call_123"
         }));
         assert!(body.get("temperature").is_none());
+    }
+
+    /// `strict` is always on the wire, because the Responses API reads an
+    /// omitted `strict` as `true` and then rejects calls that leave optional
+    /// properties out. Kills dropping the `"strict"` key from
+    /// `encode_responses_tools` (the `false` row) and hardcoding it (both).
+    #[test]
+    fn responses_tools_always_carry_the_configured_strict_flag() {
+        for strict_tools in [false, true] {
+            let request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter);
+            let body = encode_responses_request(
+                &request,
+                ResponsesRequestOptions {
+                    stream: true,
+                    store: Some(false),
+                    prompt_cache_key: None,
+                    include_encrypted_reasoning: false,
+                    strict_tools,
+                    reasoning_summary: None,
+                    instruction_mode: ResponsesInstructionMode::DeveloperMessage,
+                    temperature: None,
+                    routing: None,
+                },
+            )
+            .expect("encode request");
+
+            let tools = body["tools"].as_array().expect("tools");
+            assert!(!tools.is_empty());
+            for tool in tools {
+                assert_eq!(tool["strict"], json!(strict_tools), "strict={strict_tools}");
+            }
+        }
+    }
+
+    /// Encodes `request`'s input with the given `store` option.
+    fn responses_input(request: &ProviderRequest, store: Option<bool>) -> Vec<Value> {
+        let body = encode_responses_request(
+            request,
+            ResponsesRequestOptions {
+                stream: true,
+                store,
+                prompt_cache_key: None,
+                include_encrypted_reasoning: true,
+                strict_tools: false,
+                reasoning_summary: Some("auto"),
+                instruction_mode: ResponsesInstructionMode::DeveloperMessage,
+                temperature: None,
+                routing: None,
+            },
+        )
+        .expect("encode request");
+        body["input"].as_array().expect("input").clone()
+    }
+
+    /// An assistant message recorded by `provider`, alias `model` and wire
+    /// model `wire` (`sample_request` uses `provider`, `model`, `gpt-5`).
+    fn assistant_from(
+        id: &str,
+        (provider, model, wire): (&str, &str, Option<&str>),
+        parts: Vec<AssistantPart>,
+    ) -> Message {
+        Message::Assistant(AssistantMessage {
+            id: MessageId::from(id),
+            created_at: Utc::now(),
+            parts,
+            stop_reason: None,
+            usage: None,
+            replay_meta: halter_protocol::ReplayMeta {
+                provider_name: Some(ProviderName::from(provider)),
+                model: Some(ModelId::from(model)),
+                wire_model: wire.map(str::to_owned),
+            },
+        })
+    }
+
+    /// The `replay_meta` of a message `sample_request`'s model produced.
+    const SAME: (&str, &str, Option<&str>) = ("provider", "model", Some("gpt-5"));
+
+    fn thinking(signature: &str) -> AssistantPart {
+        AssistantPart::Thinking(halter_protocol::ThinkingBlock {
+            text: "thought".to_owned(),
+            signature: Some(signature.to_owned()),
+        })
+    }
+
+    /// Item shapes taken from the pi and rig captures: OpenAI models return
+    /// `encrypted_content` and an empty `content`; GLM on Fireworks returns
+    /// `status` and the reasoning as a summary part, with no encrypted content.
+    const GPT_REASONING: &str =
+        r#"{"type":"reasoning","id":"rs_1","summary":[],"content":[],"encrypted_content":"enc_1"}"#;
+    const GLM_REASONING: &str = r#"{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"Look first."}],"status":"completed"}"#;
+
+    /// Which reasoning items a history assistant message replays, and where,
+    /// per upstream and `store` setting. Each row names the mutation it kills.
+    #[test]
+    fn responses_input_replays_same_model_reasoning_items_first() {
+        let call = || {
+            AssistantPart::ToolCall(ToolCall {
+                id: ToolCallId::from("call_123"),
+                name: "read".into(),
+                arguments: json!({"path": "README.md"}),
+            })
+        };
+        let text = || AssistantPart::Text {
+            text: "checked".to_owned(),
+        };
+        let router = (ProviderKind::OpenRouter, Some(false));
+        let openai_stateless = (ProviderKind::OpenAi, Some(false));
+        let openai_stored = (ProviderKind::OpenAi, None);
+        let cases = [
+            // Kills dropping the replay, or emitting reasoning after the
+            // message or tool call.
+            (
+                "gpt item before message and call",
+                router,
+                assistant_from("msg_h", SAME, vec![thinking(GPT_REASONING), text(), call()]),
+                vec![GPT_REASONING, "message", "function_call"],
+            ),
+            // Kills requiring `encrypted_content` on OpenRouter (dropping the
+            // `!= OpenRouter` arm); two blocks keep their order.
+            (
+                "openrouter replays id-only items in part order",
+                router,
+                assistant_from(
+                    "msg_h",
+                    SAME,
+                    vec![thinking(GLM_REASONING), call(), thinking(GPT_REASONING)],
+                ),
+                vec![GLM_REASONING, GPT_REASONING, "function_call"],
+            ),
+            // Kills replaying every item on `store: false` OpenAI (always
+            // `ReasoningReplay::All`): OpenAI cannot resolve `rs_2`.
+            (
+                "openai stateless drops id-only item",
+                openai_stateless,
+                assistant_from(
+                    "msg_h",
+                    SAME,
+                    vec![thinking(GLM_REASONING), call(), thinking(GPT_REASONING)],
+                ),
+                vec![GPT_REASONING, "function_call"],
+            ),
+            // Kills `is_some()` in place of the non-empty check.
+            (
+                "openai stateless drops empty encrypted content",
+                openai_stateless,
+                assistant_from(
+                    "msg_h",
+                    SAME,
+                    vec![
+                        thinking(r#"{"type":"reasoning","id":"rs_3","encrypted_content":""}"#),
+                        call(),
+                    ],
+                ),
+                vec!["function_call"],
+            ),
+            // Kills gating on the provider kind alone (ignoring `store`):
+            // stored items resolve by id.
+            (
+                "openai stored replays id-only item",
+                openai_stored,
+                assistant_from("msg_h", SAME, vec![thinking(GLM_REASONING), call()]),
+                vec![GLM_REASONING, "function_call"],
+            ),
+            // Kills comparing the alias instead of the wire model.
+            (
+                "alias repointed at another model",
+                router,
+                assistant_from(
+                    "msg_h",
+                    ("provider", "model", Some("gpt-4.1")),
+                    vec![thinking(GPT_REASONING), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // Kills keeping the alias check next to the wire-model check.
+            (
+                "alias renamed, same model",
+                router,
+                assistant_from(
+                    "msg_h",
+                    ("provider", "renamed", Some("gpt-5")),
+                    vec![thinking(GPT_REASONING), call()],
+                ),
+                vec![GPT_REASONING, "function_call"],
+            ),
+            // Kills treating a missing wire model as a match.
+            (
+                "message recorded without a wire model",
+                router,
+                assistant_from(
+                    "msg_h",
+                    ("provider", "model", None),
+                    vec![thinking(GPT_REASONING), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // Kills dropping the provider check: OpenAI items reaching
+            // OpenRouter, and OpenRouter items reaching OpenAI direct.
+            (
+                "openai items on openrouter",
+                router,
+                assistant_from(
+                    "msg_h",
+                    ("openai", "model", Some("gpt-5")),
+                    vec![thinking(GPT_REASONING), call()],
+                ),
+                vec!["function_call"],
+            ),
+            (
+                "openrouter items on openai",
+                openai_stored,
+                assistant_from(
+                    "msg_h",
+                    ("openrouter", "model", Some("gpt-5")),
+                    vec![thinking(GLM_REASONING), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // An Anthropic signature is base64, not JSON, so it never reaches
+            // a Responses upstream even under the same provider name.
+            (
+                "anthropic signature",
+                openai_stored,
+                assistant_from("msg_h", SAME, vec![thinking("EqQBCkYIBxgCKkA"), call()]),
+                vec!["function_call"],
+            ),
+            // Kills dropping the `type == "reasoning"` filter.
+            (
+                "non-reasoning JSON signature",
+                router,
+                assistant_from(
+                    "msg_h",
+                    SAME,
+                    vec![thinking(r#"{"type":"message"}"#), call()],
+                ),
+                vec!["function_call"],
+            ),
+            // A bare `encrypted_content` from an older halter is not JSON and
+            // is skipped.
+            (
+                "legacy signature",
+                openai_stored,
+                assistant_from("msg_h", SAME, vec![thinking("enc_legacy"), call()]),
+                vec!["function_call"],
+            ),
+            // Kills dropping the following-item guard: a lone reasoning item
+            // is rejected upstream.
+            (
+                "thinking only",
+                router,
+                assistant_from("msg_h", SAME, vec![thinking(GPT_REASONING)]),
+                vec![],
+            ),
+        ];
+
+        for (name, (provider_kind, store), assistant, want) in cases {
+            let mut request = sample_request(ApiKind::OpenAiResponses, provider_kind);
+            request.messages = vec![Message::User(UserMessage::text("hello")), assistant];
+            let input = responses_input(&request, store);
+            // Skip the developer and user messages.
+            // Reasoning rows compare the whole item, other rows the type.
+            let got: Vec<Value> = input[2..]
+                .iter()
+                .map(|item| match item["type"].as_str() {
+                    Some("reasoning") => item.clone(),
+                    other => json!(other),
+                })
+                .collect();
+            let want: Vec<Value> = want
+                .into_iter()
+                .map(|row| serde_json::from_str(row).unwrap_or_else(|_| json!(row)))
+                .collect();
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// A `previous_response_id` request sends only the new slice; the
+    /// chained response already holds its reasoning items, so re-sending them
+    /// would duplicate ids. Kills passing `true` on the slice path.
+    #[test]
+    fn chained_responses_input_does_not_replay_reasoning() {
+        let mut request = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenAi);
+        request.messages = vec![assistant_from(
+            "msg_h",
+            SAME,
+            vec![
+                thinking(GPT_REASONING),
+                AssistantPart::Text {
+                    text: "ok".to_owned(),
+                },
+            ],
+        )];
+        request.previous_response_id = Some("resp_1".to_owned());
+        let input = responses_input(&request, None);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+    }
+
+    /// Prompt caching needs request N's input to be a byte prefix of request
+    /// N+1's. A reasoning item replayed on request N must still be there,
+    /// unchanged and in place, after the transcript grows. Kills replaying
+    /// reasoning only for the latest assistant message, and any encoding that
+    /// depends on a message's position in the transcript.
+    #[test]
+    fn responses_input_with_reasoning_is_a_byte_prefix_of_the_next_request() {
+        let first_turn = vec![
+            Message::User(UserMessage::text("hello")),
+            assistant_from(
+                "msg_h1",
+                SAME,
+                vec![
+                    thinking(GPT_REASONING),
+                    AssistantPart::ToolCall(ToolCall {
+                        id: ToolCallId::from("call_1"),
+                        name: "read".into(),
+                        arguments: json!({"path": "README.md"}),
+                    }),
+                ],
+            ),
+            Message::Tool(ToolResultMessage {
+                id: MessageId::from("tool_output_1"),
+                call_id: ToolCallId::from("call_1"),
+                content: ToolResult::Json {
+                    value: json!({"ok": true}),
+                },
+                error: None,
+                created_at: Utc::now(),
+            }),
+        ];
+        let second_turn = first_turn
+            .iter()
+            .cloned()
+            .chain([
+                assistant_from(
+                    "msg_h2",
+                    SAME,
+                    vec![
+                        thinking(GLM_REASONING),
+                        AssistantPart::Text {
+                            text: "done".to_owned(),
+                        },
+                    ],
+                ),
+                Message::User(UserMessage::text("next")),
+            ])
+            .collect();
+        let mut first = sample_request(ApiKind::OpenAiResponses, ProviderKind::OpenRouter);
+        first.messages = first_turn;
+        let second = ProviderRequest {
+            messages: second_turn,
+            ..first.clone()
+        };
+
+        let serialize = |input: &[Value]| serde_json::to_string(input).expect("serialize input");
+        let first_input = responses_input(&first, Some(false));
+        let second_input = responses_input(&second, Some(false));
+        let first_bytes = serialize(&first_input);
+        let second_prefix = serialize(&second_input[..first_input.len()]);
+
+        assert!(first_bytes.contains(r#""encrypted_content":"enc_1""#));
+        assert_eq!(second_prefix, first_bytes);
+        assert_eq!(
+            second_input[first_input.len()],
+            serde_json::from_str::<Value>(GLM_REASONING).expect("item")
+        );
     }
 
     /// The dedicated `/v1/responses/compact` endpoint takes the compaction
@@ -2107,6 +2563,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -2140,6 +2597,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -2235,7 +2693,7 @@ mod tests {
                     "type": "message",
                     "content": [{"type": "output_text", "text": "## User Intent\n-"}],
                 }],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "usage": {"input_tokens": 7, "output_tokens": 3},
             });
             response
                 .as_object_mut()
@@ -2243,8 +2701,18 @@ mod tests {
                 .extend(status.as_object().expect("object").clone());
             match (decode_openrouter_compact_response(&response), expected) {
                 (Ok(decoded), Ok(items)) => assert_eq!(decoded.output.len(), items, "{case}"),
+                // A rejection still carries what was billed and said.
                 (Err(error), Err(fragment)) => {
-                    assert!(error.to_string().contains(fragment), "{case}: {error}");
+                    let rejected = error
+                        .downcast_ref::<ProviderCompactionRejected>()
+                        .unwrap_or_else(|| panic!("{case}: untyped {error}"));
+                    assert!(rejected.reason.contains(fragment), "{case}: {error}");
+                    assert_eq!(rejected.text, "## User Intent\n-", "{case}");
+                    assert_eq!(
+                        (rejected.usage.input_tokens, rejected.usage.output_tokens),
+                        (7, 3),
+                        "{case}"
+                    );
                 }
                 (got, want) => panic!("{case}: got {got:?}, want {want:?}"),
             }
@@ -2304,6 +2772,7 @@ mod tests {
                 store: Some(false),
                 prompt_cache_key: None,
                 include_encrypted_reasoning: false,
+                strict_tools: false,
                 reasoning_summary: None,
                 instruction_mode: ResponsesInstructionMode::DeveloperMessage,
                 temperature: None,
@@ -2678,9 +3147,11 @@ mod tests {
             event,
             StreamEvent::ThinkingDelta { delta, .. } if delta == "think"
         )));
+        // The signature is the whole done item, so it replays verbatim.
         assert!(decoded.iter().any(|event| matches!(
             event,
-            StreamEvent::ThinkingEnd { signature, .. } if signature.as_deref() == Some("enc_123")
+            StreamEvent::ThinkingEnd { signature: Some(signature), .. }
+                if signature == r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think"}],"encrypted_content":"enc_123","status":"completed"}"#
         )));
         assert!(decoded.iter().any(|event| matches!(
             event,

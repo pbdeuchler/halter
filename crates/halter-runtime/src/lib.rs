@@ -22,6 +22,8 @@ mod hooks_runtime;
 mod model_judge;
 mod model_selection;
 mod model_summary;
+#[cfg(test)]
+mod prefix_stability_tests;
 mod prompt;
 mod provider_default;
 mod session;
@@ -52,7 +54,10 @@ pub use context::{
     CompactionEffects, ContextManager, DefaultContextManager, prompt_segments,
     resolve_response_chain,
 };
-pub use model_summary::{CHECKPOINT_PREFIX, ModelSummary, TODO_NUDGE, TODO_REMINDER};
+pub use model_summary::{
+    CARRIED_REQUEST_MAX_BYTES, CHECKPOINT_PREFIX, FIRST_REQUEST_LABEL, LATEST_REQUEST_LABEL,
+    ModelSummary, TODO_NUDGE, TODO_REMINDER,
+};
 pub use provider_default::ProviderDefault;
 
 pub use event_bus::EventBus;
@@ -75,7 +80,7 @@ pub(crate) use session::SessionExecutor;
 pub use session::{
     ParentStreamRegistry, ResourceHandle, RuntimeServices, SessionInit, SessionRuntime,
 };
-pub use session_driver::{SessionError, SessionHandle, Submission};
+pub use session_driver::{FORCED_RECOVERY_GRACE, SessionError, SessionHandle, Submission};
 pub use session_lease::SessionLeases;
 pub use tool_output::ToolOutputSettings;
 pub use trace_export::export_session_trace;

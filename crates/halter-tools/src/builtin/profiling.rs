@@ -199,8 +199,7 @@ impl TypedTool for ProfilingTool {
         context: ToolContext,
         input: serde_json::Value,
     ) -> anyhow::Result<WorkProfile> {
-        let last_seconds = input
-            .get("last_seconds")
+        let last_seconds = super::common::provided(&input, "last_seconds")
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(30.0);
         Ok(get_work_profile_for_session(

@@ -708,7 +708,7 @@ impl RuntimeSubagentControl {
         }) == Some(true);
         if !already_ended {
             SessionExecutor::new(self.inner.services.clone(), session_id.clone())?
-                .shutdown("parent_session_closed")
+                .shutdown("parent_session_closed", CancellationToken::new())
                 .await?;
         }
         Ok(())
@@ -914,7 +914,7 @@ impl RuntimeSubagentControl {
                         state: SubagentState::Failed,
                         last_message: None,
                         usage: None,
-                        error: Some(error.to_string()),
+                        error: Some(format!("{error:#}")),
                     },
                 )
                 .await;
@@ -1015,6 +1015,7 @@ impl RuntimeSubagentControl {
         let mut resubmissions = 0u32;
         let outcome = loop {
             let turn = Turn::user(next_input.clone());
+            let turn_id = turn.id.clone();
             *current_turn
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = Some(turn.id.clone());
@@ -1030,7 +1031,7 @@ impl RuntimeSubagentControl {
                             },
                             last_message: None,
                             usage: None,
-                            error: Some(error.to_string()),
+                            error: Some(format!("{error:#}")),
                         };
                     }
                 },
@@ -1043,7 +1044,7 @@ impl RuntimeSubagentControl {
                         },
                         last_message: None,
                         usage: None,
-                        error: Some(error.to_string()),
+                        error: Some(format!("{error:#}")),
                     };
                 }
             };
@@ -1061,6 +1062,31 @@ impl RuntimeSubagentControl {
                 .filter(|event| event.session_id == session_id)
                 .cloned()
                 .collect::<Vec<_>>();
+
+            // A turn that failed inside the child (a provider error, say)
+            // still yields its events; it must not read as completed.
+            if let Some((error, cancelled)) = own_turn_events.iter().find_map(|event| match &event
+                .payload
+            {
+                halter_protocol::SessionEventPayload::TurnFailed {
+                    turn_id: failed,
+                    error,
+                    cancelled,
+                    ..
+                } if failed == &turn_id => Some((error.clone(), *cancelled)),
+                _ => None,
+            }) {
+                break TurnOutcome {
+                    state: if cancelled {
+                        SubagentState::Cancelled
+                    } else {
+                        SubagentState::Failed
+                    },
+                    last_message: extract_subagent_output(&own_turn_events),
+                    usage: None,
+                    error: Some(error),
+                };
+            }
 
             let Some(parent_session_id) = parent_session_id.as_ref() else {
                 break TurnOutcome {
@@ -1087,7 +1113,7 @@ impl RuntimeSubagentControl {
                         state: SubagentState::Failed,
                         last_message: None,
                         usage: None,
-                        error: Some(error.to_string()),
+                        error: Some(format!("{error:#}")),
                     };
                 }
             };
@@ -1503,13 +1529,21 @@ impl SubagentControl for RuntimeSubagentControl {
         if let Some(completion) = completion {
             match deadline {
                 Some(deadline) => {
-                    match tokio::time::timeout_at(deadline, completion.result()).await {
-                        Ok(result) => result?,
-                        Err(_) => {
-                            self.force_close_session(&previous_status.session_id).await;
-                            return Err(anyhow::Error::new(crate::SessionError::TimedOut));
-                        }
+                    // Force at the caller's deadline (this close may be
+                    // bounding an earlier unbounded one), then give forced
+                    // closure the same grace as session interrupt/shutdown.
+                    if tokio::time::timeout_at(deadline, completion.result())
+                        .await
+                        .is_err()
+                    {
+                        self.force_close_session(&previous_status.session_id).await;
                     }
+                    tokio::time::timeout_at(
+                        crate::session_driver::caller_deadline(deadline),
+                        completion.result(),
+                    )
+                    .await
+                    .map_err(|_| anyhow::Error::new(crate::SessionError::TimedOut))??;
                 }
                 None => completion.result().await?,
             }
@@ -2210,28 +2244,21 @@ mod tests {
                         !initial.is_finished(),
                         "unlimited close retains ownership while waiting"
                     );
-                    let error = control
+                    // Forced closure settles inside the caller's grace.
+                    control
                         .close(CloseSubagentRequest {
                             target: agent_id.clone(),
                             timeout_ms: Some(0),
                         })
                         .await
-                        .unwrap_err();
-                    assert!(matches!(
-                        error.downcast_ref::<crate::SessionError>(),
-                        Some(crate::SessionError::TimedOut)
-                    ));
+                        .unwrap();
                     tokio::time::timeout(Duration::from_secs(5), initial)
                         .await
                         .unwrap()
                         .unwrap()
                         .unwrap();
                 } else {
-                    let error = initial.await.unwrap().unwrap_err();
-                    assert!(matches!(
-                        error.downcast_ref::<crate::SessionError>(),
-                        Some(crate::SessionError::TimedOut)
-                    ));
+                    initial.await.unwrap().unwrap();
                 }
                 tokio::time::timeout(
                     Duration::from_secs(5),
@@ -3846,6 +3873,54 @@ mod tests {
             snapshot: Arc::new(halter_protocol::ResourceSnapshot::empty()),
             model: ModelId::from("default"),
             subagent_model: ModelId::from("subagent"),
+        }
+    }
+
+    /// A child's failed turn reports its error's whole context chain, so the
+    /// parent model sees the cause and not only the outermost message.
+    #[tokio::test]
+    async fn failed_child_turn_reports_the_whole_error_chain() {
+        let services = test_services(Arc::new(FailingProvider));
+        let control = RuntimeSubagentControl::new(services.clone());
+        let parent = parent_context();
+        store_parent_session(&services, &parent).await;
+        let spawned = control
+            .spawn(&parent, spawn_request("fail"), CancellationToken::new())
+            .await
+            .expect("spawn");
+        let waited = control
+            .wait(
+                WaitSubagentRequest {
+                    targets: vec![spawned.agent_id],
+                    timeout_ms: Some(30_000),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("wait");
+        let status = waited.status.expect("terminal status");
+        assert_eq!(status.state, SubagentState::Failed);
+        let error = status.error.expect("turn error");
+        assert!(
+            error.contains("opening the stream: upstream refused"),
+            "{error}"
+        );
+    }
+
+    struct FailingProvider;
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<BoxStream<'static, Result<StreamEvent, ProviderError>>> {
+            Err(anyhow::anyhow!("upstream refused").context("opening the stream"))
         }
     }
 

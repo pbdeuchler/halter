@@ -58,7 +58,12 @@ fn cleanup(session: SessionExecutor, turn_id: TurnId) -> BoxFuture<'static, anyh
         for outcome in [
             session.force_interrupt_turn(&turn_id).await,
             tools.shutdown_session(session_id).await,
-            session.shutdown("temporary_session_closed").await,
+            session
+                .shutdown(
+                    "temporary_session_closed",
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await,
         ] {
             if let Err(error) = outcome {
                 tracing::warn!(%session_id, %error, "failed to clean up temporary session");

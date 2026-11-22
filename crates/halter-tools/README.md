@@ -90,6 +90,13 @@ The runtime asks for a tool by name. This crate decides:
 
 ### Built-in tools
 
+Tool input is read leniently, because models fill strict schemas with whatever
+they have. No built-in tool rejects a field it does not know, and an optional
+parameter given as `null`, a blank string, `0`, `[]` or `{}` counts as absent
+(no optional parameter gives one of those a meaning of its own; `false` is
+always read as `false`). A required field still has to be there with the right
+type, and a real value of the wrong type is still an error.
+
 - `ReadTool`
 - `WriteTool`
 - `EditTool`
@@ -158,6 +165,8 @@ Defaults:
 - `process_tree_root = None` (Phase 2 threads the live session's root)
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
+- `max_tool_timeout_secs = 3600` (the longest `timeout_ms` a model may pass to
+  `shell`, `pty`, `wait_agent` or `close_agent`; larger values are rejected)
 
 When the high-level `halter` builder constructs policy from `PolicyConfig`, it
 also adds configured `allowed_write_roots` to the runtime read roots. This lets
@@ -254,6 +263,9 @@ Characteristics:
 - whole-file write
 - atomic replacement semantics
 - constrained by `allowed_write_roots`
+- the parent directory must exist, unless `create_dirs` is `true`; then each
+  missing directory is created after the write policy approves it, shallowest
+  first, so a denied directory stops the call before anything under it exists
 
 Use `write` when you want to create or fully replace a file.
 
@@ -261,24 +273,55 @@ Use `write` when you want to create or fully replace a file.
 
 ## `edit`
 
-Performs exact string replacement in a UTF-8 file using an atomic write.
-
-Typical input:
+Replaces exact strings in UTF-8 files. One call carries a list of edits, which
+can span files:
 
 ```json
 {
-  "path": "Cargo.toml",
-  "old_string": "edition = \"2021\"",
-  "new_string": "edition = \"2024\"",
-  "replace_all": false
+  "edits": [
+    { "path": "Cargo.toml", "old_string": "edition = \"2021\"", "new_string": "edition = \"2024\"" },
+    { "path": "src/lib.rs", "old_string": "old_name", "new_string": "new_name", "replace_all": true }
+  ]
 }
 ```
 
-Optional safety field:
+- Each edit needs `path`, `old_string` (non-empty, matched exactly) and
+  `new_string` (empty deletes the match). `replace_all` (default `false`)
+  replaces every occurrence; without it an `old_string` that occurs more than
+  once fails the call.
+- Edits apply in array order. A later edit to the same file matches the text
+  the earlier ones left. Two spellings of one path (`a.rs`, `./a.rs`) are the
+  same file.
+- There is no single-edit shorthand: a call with `path`/`old_string`/
+  `new_string` at the top level is refused with an error that shows the shape
+  above.
+
+The result lists each file once, with `file_hash_before` and `file_hash_after`,
+and each edit, in array order, with `occurrences_in_file` (counted in the text
+that edit ran against) and `replacements_applied`. The model sees one
+`Edited <path> (<counts> replaced); sha256=<new hash>` line per file.
+
+Optional safety field, beside `edits`:
 
 - `expected_sha256`
 
-This is useful when you want optimistic concurrency protection against editing stale file contents.
+This is useful when you want optimistic concurrency protection against editing stale file contents. A value that is not a 64-digit hex sha256 (`""`, `"unused"`) is ignored; a real sha256 that no longer matches refuses the call and reports the file's current hash. A real sha256 is only accepted when every edit targets the same file; with edits to several files the call is refused, telling the model to omit the hash or split the call.
+
+### What "all-or-nothing" covers
+
+Every path passes the write policy (roots and sensitive paths), every file is
+read, and every edit is applied in memory before anything is written. A
+failure in any of those steps (no match, an ambiguous match, a denied path, a
+stale hash, an unreadable file, a malformed edit) writes nothing, and the
+error names the failing edit by index (and path, once it has one), for example
+`edits[1] ('/w/b.rs'): old_string was not found; nothing was written`.
+
+Then each file gets one atomic write (temp file and rename), one after the
+other in order of first mention. If one of those writes fails, the files
+already written are rewritten with their original text and the error says
+whether that worked. That is as far as it goes: there is no cross-file
+transaction. A crash or power loss between two renames leaves the earlier
+files edited and the later ones not, and restored files are new inodes.
 
 Use `edit` rather than `write` when:
 
@@ -681,10 +724,12 @@ Typical input:
 ```
 
 Use it to clean up control surfaces once delegated work is done.
-Omit `timeout_ms` to wait for cancellation and cleanup without a deadline. Set
-it to bound the caller's wait, for example `{ "target": "agent-uuid",
-"timeout_ms": 1000 }`. On expiry the operation returns a timeout error and
-requests forced cleanup. Storage writes or already-running blocking work may
+Omit `timeout_ms` to wait for cancellation and cleanup without a deadline;
+cancelling the tool call still ends that wait. Set it to bound the caller's
+wait, for example `{ "target": "agent-uuid", "timeout_ms": 1000 }`. At the
+deadline cleanup is forced, and the call waits up to
+`halter_runtime::FORCED_RECOVERY_GRACE` (5s) more for it to settle before
+returning a timeout error. Storage writes or already-running blocking work may
 delay final settlement; closing continues after the caller stops waiting.
 
 ---

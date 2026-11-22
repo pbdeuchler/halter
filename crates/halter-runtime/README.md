@@ -298,7 +298,8 @@ propagates to the caller, who asked for compaction explicitly.
 When there is nothing to compact the call still returns `Ok(())` and logs
 `ContextCompacted { summary: "No compaction needed.", effects: None }`, a
 marker that changes no state. `PostCompact` does not fire and the
-`SessionStart` hooks are not re-armed. `PreCompact` fires only if the
+`SessionStart` hooks are not re-armed. A rewrite, manual or automatic, arms
+them with source `compact` for the next turn. `PreCompact` fires only if the
 strategy's `needs_compaction` could not rule the pass out up front.
 
 With `ProviderDefault` installed by hand on a provider that cannot compact
@@ -406,10 +407,15 @@ contribute tools and system-prompt segments. At each boundary,
 threshold, and persisted notification ids; it returns exactly-once reminders
 for the current window and nothing else: the trigger stays the runtime's.
 Each delivered reminder is logged as `CompactionNotified { id }` followed by
-its `MessageItem`, so the delivered set replays from the log.
+its `MessageItem`, so the delivered set replays from the log. A
+`Message::System` reminder lands at the end of the history, not in the
+system prompt, so it does not invalidate the prompt cache.
 When a pass returns `Err` or `Ok(None)` after appending, the runtime records a
 `ContextRestored` event that puts the window back; the pass's messages, tool
-runs, and usage stay in the log and the session totals. Before any hook, the
+runs, and usage stay in the log and the session totals. An error whose chain
+holds a `ProviderCompactionRejected` was billed: the runtime first logs its
+text and usage as a `MessageRecorded` assistant reply, so that usage reaches
+the session totals and, for an automatic pass, the turn's usage. Before any hook, the
 runtime asks `needs_compaction(state, capabilities, trigger)` (default
 `true`); `false` skips the pass without `PreCompact`, `PostCompact`, or a
 state change, which is how `ModelSummary` skips an empty session and
@@ -417,7 +423,9 @@ state change, which is how `ModelSummary` skips an empty session and
 an existing prefix still runs). A strategy that
 can only tell by doing the work returns `Ok(None)` from `compact`: `PreCompact`
 has fired, `PostCompact` does not, and an automatic pass backs off as after
-a failure. Install one with `HalterBuilder::with_compaction`.
+a failure. So does a rewrite that leaves the context still at or over the
+threshold, with a `Warning`, so the turn does not pay for the same rewrite at
+every boundary. Install one with `HalterBuilder::with_compaction`.
 
 `ModelSummary` runs up to two inferences: when the `task` tool is registered,
 a nudge to persist remaining work (only that reply's `task` calls run; its text
@@ -425,7 +433,12 @@ and other calls never reach the next request, though the event log keeps the
 whole reply), then the built-in checkpoint instructions
 (`default_compaction_prompt`, plus a manual pass's custom instructions). The
 reply becomes the next window as one user-role message after the static
-prefix, with a todo reminder when the nudge ran calls. `ProviderDefault`
+prefix, with a todo reminder when the nudge ran calls. The same message
+carries the user's first request and, when it differs, the latest one,
+verbatim up to 4,000 bytes each (`CARRIED_REQUEST_MAX_BYTES`), as separate
+text parts; the first is copied from the previous checkpoint, so it stays
+byte-identical across compactions. A reply that stopped
+early (`max_tokens`, a refusal, a pause) or has no text fails the pass. `ProviderDefault`
 hands `Provider::compact` the window its
 `ProviderCapabilities::compaction_strategy` allows: everything before the
 latest assistant block for a dedicated endpoint; for an inline request,
@@ -450,22 +463,84 @@ window transition. A successful `new_context` call requests rollover at the
 next consistent boundary, after all pending tool results have been recorded.
 It does not spend another inference asking for a checkpoint.
 
-For forced rollover, the runtime allows at most two checkpoint replies:
-one to save notes, then one to call `new_context`. Only `notes` and
-`new_context` calls execute. Other calls and text remain in the event log,
-but do not enter the next request. The wipe happens even if neither tool is
-called, a notes operation fails, or the checkpoint provider is unavailable.
-Cancellation still stops the turn. A PreCompact hook that blocks rollover
-fails the turn before another provider request. PostCompact hooks run after
-successful rollover.
+For forced rollover, the runtime asks for a checkpoint and allows at most
+four checkpoint replies. Only `notes`, `session_search`, and `new_context`
+calls execute. Every other call gets an error result naming those three, so
+each call is answered and the model learns why it did nothing; the offered
+tools are not narrowed, because that would make the window's largest request
+miss the prompt cache. Text stays in the reply. The reminder does not ask for
+item IDs, which the model cannot see; it asks for what only the model knows,
+and the model can use `session_search` to quote earlier requests exactly. A
+failed or refused call, such as a rejected `notes` write, gets its error back
+and another reply, even if `new_context` succeeded in the same reply. The
+exchange ends, and the window is wiped, when `new_context` succeeds in a
+reply with no failed call, when a reply makes no tool call, when the provider
+request fails or the hard cap blocks it, when tool execution fails, or when
+the four replies are spent. Cancellation stops the turn and keeps the window
+for the next boundary. A PreCompact hook that blocks rollover fails the turn
+before another provider request. PostCompact hooks run after successful
+rollover.
 
-`ContextWindowRolledOver` commits the new bootstrap, advances the logical
-window, clears the old transcript, provider response chain, dynamic prompt
-additions, and file-view cache, and rebuilds the token ledger. The static
-system prefix stays unchanged. The current turn continues with:
+PreToolUse hooks govern the three recovery tools like any other tool; they
+are not exempt. A blocked call returns the hook's reason to the model as a
+tool error. A blocked `notes` write is not counted as saved, so the notice
+says "nothing was saved". A blocked `new_context` gets another reply, and a
+window whose `new_context` stays blocked is still wiped when the reply
+budget runs out (or, outside the exchange, by the forced rollover above
+90%), so a hook cannot strand the session in a full window.
 
-> Session context has been wiped. Use the todo (task), notes, and
-> session_search tools to regain context and continue your tasks.
+`ContextWindowRolledOver` commits the new window's opening notice, advances
+the logical window, clears the old transcript, provider response chain,
+dynamic prompt additions, and file-view cache, and rebuilds the token
+ledger. The static system prefix stays unchanged. The current turn continues
+from one user message, built once and never edited, so it stays a stable
+cache prefix for the whole window. It opens with `CLEAN_WINDOW_BOOTSTRAP`
+and says how the window ended, for example:
+
+> Session context has been wiped. This notice comes from the harness, not
+> the user.
+> Window 0 ended: it filled up and was wiped automatically; notes were
+> saved during the checkpoint exchange, which ended because new_context was
+> called.
+> Notes files written in window 0: "checkpoint". Read one with notes
+> read_file; notes list_files_by_prefix lists every file, older ones
+> included.
+> The full history of every window stays searchable: session_search
+> list_items with role "user" lists every user request, read_item reads any
+> item in full, and search_contents finds text.
+> First: read your notes, re-read the user requests quoted below and check
+> the notes against them, check the task list, then continue the work.
+
+The other endings are "you called new_context, so no checkpoint exchange
+ran", or "nothing was saved" with "a reply made no tool call", "the model
+request failed", "the tool calls could not run", or "its reply budget ran
+out". The notice names only tools the session offers: without `task` it
+skips the task list. It lists at most ten notes paths,
+then "and N more", and points to `notes list_files_by_prefix` for the rest.
+When background jobs, running subagents, or the PTY session outlive the
+wipe, it lists them by id under "Still running across the wipe; manage them
+by these ids:", ten at most and 200 bytes each.
+
+The notice then quotes the session's first user request and the latest one
+before the wipe, each as a separate text part labelled as history and capped
+at 4,000 bytes with a pointer to `session_search`. Messages the harness wrote
+(this notice, the checkpoint reminder, Stop-hook continuations, skill
+injections) are never quoted as requests: they carry `UserMessage::harness`
+IDs, and `session_search` indexes them under role `harness`, so `list_items`
+with role `user` returns only real requests. The first request is carried
+verbatim from notice to notice. If window 0 had no text request, a later
+window labels its first one "Earliest user request this notice can quote,
+from window N" rather than the session's first. With both quotes the notice
+costs at most about 2,000 tokens per window, and only when requests are
+long.
+
+The notice has to fit: the turn fails if the new window starts above 90% of
+the threshold. CleanWindow gives the notice half of what the static prefix
+leaves under that line and, when it does not fit, rebuilds it with quotes
+capped at 1,000 bytes, then 250, then none. Shorter quotes also list fewer
+notes paths and running items (none once quotes are 250 bytes; counts
+remain). The wipe statement, how the window ended, the `session_search`
+instructions, and the first steps never shrink.
 
 The session-scoped `task` list survives rollover. Its default store is still
 in memory; it does not survive restarting the harness process. Notes survive
@@ -474,10 +549,11 @@ session store (SQLite for persistence across process restarts).
 
 The remaining 10% of the threshold, plus the default 20,000-token gap to the
 model limit, provides room for the checkpoint exchange. Large tool results
-can consume that room in one step. The hard cap applies to checkpoint
-requests too; if it prevents a checkpoint, CleanWindow warns and wipes
-without one. Choose a threshold that leaves room for your tools and model.
-If the bootstrap itself exceeds the rollover threshold, the turn fails with
+can consume that room in one step, and so can a `session_search` read
+during the checkpoint. The hard cap applies to checkpoint requests too; if
+it prevents a checkpoint, CleanWindow warns and wipes, and the notice says
+the model request failed. Choose a threshold that leaves room for your tools and model.
+If even the bare notice exceeds the rollover threshold, the turn fails with
 an actionable configuration error instead of repeatedly wiping the window.
 
 | Tool | Actions and limits |
@@ -548,8 +624,33 @@ A realistic prompt assembly pass can include:
 - configured prompt overrides
 - compiled resource instructions
 - the skill index (names and descriptions; bodies arrive as user messages when the model calls `skill`)
-- hook-injected system messages
-- selected conversation history
+- selected conversation history, including hook system messages and hook
+  additional context
+
+System messages after the first other message stay where they are in the
+history: providers encode them in place rather than in the system prompt, so
+adding one leaves the cached prefix intact (see `SystemMessage`). Hook
+additional context is appended to the history as a system message too; it no
+longer edits the system prompt.
+
+### Keeping the cached prefix stable
+
+Within one context window, each request repeats the previous request's
+system prompt, tools, cache breakpoints and messages byte for byte and only
+adds messages. Compaction and CleanWindow rollover start a new window, and
+system messages added before a window's first other message join its system
+prompt. `prefix_stability_tests` checks this over a scripted session with
+hooks on every event, tool batches, a compaction and a resume.
+
+The embedder can still change the prefix mid-window, and each of these costs
+one cache write of the whole window:
+
+- `replace_resources` with different skills changes the skill index and the
+  tool list from the next turn.
+- Registering a tool on the shared `ToolRuntime` changes the tool list from
+  the next request.
+- A turn with a different model (`Turn::default_model`) uses that model's
+  cache, and a different reasoning effort changes the request options.
 
 This is important because the final model request is not just "the last user message".
 
@@ -636,6 +737,8 @@ ignored. `SessionRuntime::resume` rebuilds the registry from that state, so
 new process. A child that was still running when its process stopped comes
 back `Cancelled`, with an error that says it was interrupted; `send_input`
 continues it.
+A child turn that fails (a provider error, for example) ends the child
+`Failed`, with the turn's error and its whole cause chain.
 
 ---
 
@@ -652,7 +755,29 @@ It is responsible for invoking hook dispatch around meaningful lifecycle boundar
 - compaction
 - subagent lifecycle
 
-If you're debugging why a tool call was blocked or why extra system guidance appeared in a prompt, the hook invocation path through `halter-runtime` is usually where to look.
+If you're debugging why a tool call was blocked or why extra system guidance appeared in the conversation, the hook invocation path through `halter-runtime` is usually where to look.
+
+### How a failed tool call reaches the model
+
+A call fails, and the tool result carries a `ToolError`, when:
+
+- a `PreToolUse` hook blocks it (the error is the block reason);
+- its arguments are not valid JSON. The provider stream keeps the text it
+  received in `ToolCall::arguments` as a JSON string, and the runtime answers
+  `invalid tool input: the arguments are not valid JSON (<serde error>), so the
+  tool did not run; send the call again with its arguments as one JSON object.
+  Received: <text>`. The check runs after `PreToolUse` hooks, so a hook that
+  returns `updated_input` can repair the call;
+- the tool returns an error. The message is the whole `anyhow` chain (`{:#}`);
+- the tool panics. The message is `tool '<name>' panicked: <payload>; it may
+  have partially completed`, and the turn goes on.
+
+Error text is bounded like any other output (`tools.output`). Anthropic gets
+the message with `is_error: true`. The OpenAI Responses and Chat Completions
+dialects have no such flag, so a failed result with no content is sent as
+`error: <message>`, one with text as `<text>\n\nerror: <message>`, and one
+with JSON as `{"error":<message>,"result":<value>}`. Successful results are
+sent unchanged.
 
 ---
 

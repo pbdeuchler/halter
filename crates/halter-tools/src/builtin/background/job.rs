@@ -26,7 +26,7 @@ const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// its completion, including output drains and child reaping.
 pub(super) struct BackgroundJob {
     pub(super) id: String,
-    command: String,
+    pub(super) command: String,
     cwd: std::path::PathBuf,
     pid: u32,
     started_at_ms: u128,
@@ -280,7 +280,7 @@ impl BackgroundJob {
                 {
                     Ok(status) => status,
                     Err(error) => JobStatus::Failed {
-                        error: error.to_string(),
+                        error: format!("{error:#}"),
                     },
                 };
                 status_tx.send_replace(status);

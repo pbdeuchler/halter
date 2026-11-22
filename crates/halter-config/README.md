@@ -161,6 +161,10 @@ api_key = "..."
 [providers.openrouter]
 base_url = "https://openrouter.ai/api"
 api_key = "..."
+# OpenAI and OpenRouter only: the `strict` value sent on every function tool.
+strict_tools = false
+# OpenAI and OpenRouter only: request encrypted reasoning for replay.
+include_encrypted_reasoning = true
 
 # OpenRouter only: which upstream provider should serve the model. Sent as the
 # `provider` object of every OpenRouter request body, compaction included.
@@ -179,6 +183,29 @@ provider fails validation.
 The rules themselves live on `halter_protocol::OpenRouterRouting::normalized`,
 which this crate applies while resolving the config and `OpenRouterProvider`
 applies to values supplied directly.
+
+`strict_tools` (default `false`) is sent as `strict` on every function tool of
+an OpenAI or OpenRouter request; halter always sends the field, because the
+Responses API treats an omitted `strict` as `true`. Strict mode requires every
+tool schema to list all of its properties in `required` (optional ones become
+nullable) and to set `additionalProperties = false`. Halter sends schemas
+unchanged, so with `strict_tools = true` a tool whose schema does not qualify
+fails the request with the upstream's invalid-request error, which is not
+retried. Halter's built-in tools have optional properties, so enable it only
+for a tool set built for strict mode. Configuring `strict_tools` for
+`[providers.anthropic]` fails validation.
+
+`include_encrypted_reasoning` (default `true`) adds
+`include = ["reasoning.encrypted_content"]` to OpenAI and OpenRouter requests
+for models with a `reasoning` effort. Halter replays each reasoning item the
+model returned on later requests to the same provider and model; on a
+stateless request (`store = false`, which OpenRouter always sends) the
+encrypted content is what carries the model's reasoning forward. With
+`false`, items are still replayed with whatever the upstream returned
+(OpenRouter adds encrypted content for OpenAI models regardless); OpenAI
+itself rejects, on a `store = false` request, a reasoning item that has
+neither encrypted content nor a stored response behind it.
+Configuring it for `[providers.anthropic]` fails validation.
 
 Each provider also accepts an optional `headers` sub-table. Entries override
 the provider's default or hardcoded HTTP headers (`Authorization`, `x-api-key`,
@@ -202,6 +229,7 @@ block and can override only the fields that need to differ:
 connect_secs = 10
 request_secs = 60
 stream_idle_secs = 60
+compact_secs = 300
 
 [resilience.request_retry]
 max_attempts = 5
@@ -216,8 +244,14 @@ max_attempts = 3
 
 For streaming calls, `request_secs` bounds request setup through response
 headers and `stream_idle_secs` bounds the idle gap between stream items; it is
-not a total stream lifetime cap. `max_attempts` includes the initial provider
-request. Timeout and retry values must be positive, and `jitter_pct` must be in
+not a total stream lifetime cap. `compact_secs` bounds one whole unary
+compaction request, response body included. `max_attempts` includes the
+initial provider request. `deadline_secs` caps the total backoff slept between attempts; time
+inside an attempt never counts, so an attempt timeout cannot spend it. Validation
+runs on the global block and on each provider's effective (merged) config, and
+rejects a `connect_secs` that is not less than `request_secs` and
+`compact_secs`, with an error naming both keys.
+Timeout and retry values must be positive, and `jitter_pct` must be in
 `0..=100`.
 
 ### Resolution rules
@@ -429,7 +463,9 @@ Derivation, applied by `HarnessConfig::resolved_context` (`ContextConfig::resolv
   then recovers with `session_search`. Reminders fire once per window at
   50% and 75% of the threshold. Above 90%, the runtime requests a checkpoint
   and wipes the conversation even if the model ignores it. `new_context`
-  requests an earlier wipe. The turn continues from a recovery prompt.
+  requests an earlier wipe. The next window opens with a harness notice
+  that says whether a checkpoint was saved, lists the notes written, and
+  quotes the first and latest user requests.
 
 `notes_root` is fixed when the harness is built; changing a session's working
 directory does not move its notes. With an explicit `sessions.sqlite_path`,
@@ -538,6 +574,11 @@ Defaults:
 - `max_read_bytes = 1_048_576`
 - `max_subagent_depth = 3`
 - `max_concurrent_subagents = 8`
+- `max_tool_timeout_secs = 3600` — the longest `timeout_ms` a model may pass
+  to `shell`, `pty`, `wait_agent` or `close_agent`. A larger value is
+  rejected with the maximum named, so the model retries with a smaller one
+- `policy.shell.timeout_secs` and `max_tool_timeout_secs` must be greater
+  than zero
 - shell enabled by default
 - `[policy.shell]` takes only `enabled` and `timeout_secs`. The `allow` and
   `mode` keys were removed with the shell allowlist and are rejected as
