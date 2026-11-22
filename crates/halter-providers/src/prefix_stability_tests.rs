@@ -358,6 +358,7 @@ fn encode(api_kind: ApiKind, request: &ProviderRequest, mode: ResponsesInstructi
                 stream: false,
                 store: None,
                 prompt_cache_key: None,
+                strict_tools: false,
                 include_encrypted_reasoning: false,
                 reasoning_summary: None,
                 instruction_mode: mode,

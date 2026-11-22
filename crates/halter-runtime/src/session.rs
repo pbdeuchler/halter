@@ -15,9 +15,9 @@ use halter_protocol::{
     HookSessionStartSource, HookWarning, Message, MessageId, ModelId, ObservedState, PendingEvent,
     PendingToolCall, PromptSegment, ProviderCompactionRejected, ProviderError, ProviderRequest,
     ReplayMeta, ResolvedModel, ResourceSnapshot, SessionBlueprint, SessionEvent,
-    SessionEventPayload, SessionId, SessionState, StopReason, StreamEvent,
-    SubagentEventForwarding, SubagentRecord, SubagentState, SubagentStatus, SystemMessage,
-    ToolCall, ToolError, ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn, TurnId, Usage,
+    SessionEventPayload, SessionId, SessionState, StopReason, StreamEvent, SubagentEventForwarding,
+    SubagentRecord, SubagentState, SubagentStatus, SystemMessage, ToolCall, ToolError,
+    ToolExecutionOutcome, ToolResult, ToolResultMessage, Turn, TurnId, Usage,
 };
 use halter_providers::{ModelRegistry, Provider};
 
@@ -10302,11 +10302,11 @@ mod tests {
                     ("write", json!({"path":"must-not-exist","content":"bad"})),
                 ]
             };
-            // Strict-mode style filler that `notes` rejects as an unknown field.
+            // A wrong-typed required field, which `notes` rejects even with lenient input.
             let rejected = || {
                 (
                     "notes",
-                    json!({"action":"write_file","path":"checkpoint","content":"x","after":""}),
+                    json!({"action":"write_file","path":"checkpoint","content":7}),
                 )
             };
             let new_context = || vec![("new_context", json!({}))];
@@ -10446,7 +10446,7 @@ mod tests {
                 assert!(!notice.contains("Latest user request"), "{mode}");
                 if mode == "rejected_then_retried" {
                     assert!(requests[1].messages.iter().any(|message| matches!(message,
-                        Message::Tool(result) if result.error.as_ref().is_some_and(|error| error.message.contains("unknown field `after`")))));
+                        Message::Tool(result) if result.error.as_ref().is_some_and(|error| error.message.contains("invalid type")))));
                 }
                 if mode == "searches_first" {
                     assert!(requests[1].messages.iter().any(|message| matches!(message,
@@ -11045,7 +11045,10 @@ mod tests {
                 "\nStill running across the wipe; manage them by these ids:\n- background job {}: $ sleep 30\nFirst:",
                 jobs[0].0
             )), "{notice}");
-            session.shutdown("test done").await.unwrap();
+            session
+                .shutdown("test done", CancellationToken::new())
+                .await
+                .unwrap();
         }
 
         #[tokio::test]

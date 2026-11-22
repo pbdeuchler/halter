@@ -160,7 +160,8 @@ fn carried_requests(messages: &[Message]) -> Vec<UserPart> {
                         UserPart::Image { .. } | UserPart::Document { .. } => None,
                     })
                     .collect()
-            } else if text.trim().is_empty() {
+            } else if user.is_harness() || text.trim().is_empty() {
+                // A harness-authored message is not a request.
                 Vec::new()
             } else {
                 vec![clip(text)]
@@ -430,6 +431,15 @@ mod tests {
             (
                 "repeat",
                 vec![user("port the parser"), user("port the parser")],
+                vec![(first.0, first.1.to_owned())],
+            ),
+            // Kills dropping the `is_harness` filter.
+            (
+                "a harness message is not a request",
+                vec![
+                    user("port the parser"),
+                    Message::User(UserMessage::harness("Continue.")),
+                ],
                 vec![(first.0, first.1.to_owned())],
             ),
             (
