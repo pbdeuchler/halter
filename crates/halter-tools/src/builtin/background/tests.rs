@@ -254,8 +254,50 @@ async fn prune_releases_finished_records_and_output_while_preserving_running_job
             .await
             .unwrap_err()
             .to_string()
-            .contains("unknown job")
+            .ends_with(&format!(
+                "unknown job '{finished_id}'; this session's jobs: [{running_id}]"
+            ))
     );
+    // A caller's id names the job and comes back; one already in use, or one
+    // that is not a string, is refused before anything starts; a blank one is
+    // no id at all.
+    let named = execute(
+        &context,
+        json!({"action": "spawn", "command": "sleep 30", "id": "mine"}),
+    )
+    .await;
+    assert_eq!(named["id"], "mine");
+    for (id, reason) in [
+        (json!("mine"), "job id 'mine' is already in use"),
+        (json!(running_id), "is already in use"),
+        (json!(7), "id must be a string"),
+    ] {
+        let refused = BackgroundTool
+            .execute(
+                context.clone(),
+                json!({"action": "spawn", "command": "sleep 30", "id": id}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(reason), "{refused}");
+    }
+    assert_eq!(
+        execute(&context, json!({"action": "list"})).await["jobs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    execute(&context, json!({"action": "kill", "id": "mine"})).await;
+    for blank in [json!(null), json!(""), json!("  ")] {
+        let job = execute(
+            &context,
+            json!({"action": "spawn", "command": "true", "id": blank}),
+        )
+        .await;
+        assert!(job["id"].as_str().unwrap().starts_with("bg-"));
+    }
     execute(&context, json!({"action": "kill", "id": running_id})).await;
     context
         .tool_sessions

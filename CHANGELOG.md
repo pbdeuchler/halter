@@ -257,6 +257,12 @@ once a `1.0.0` line is cut.
 
 ### Fixed
 
+- The `background` tool's spawn takes the `id` it is passed: the job runs
+  under that id and spawn returns it, where it used to ignore the id, start
+  the job under another, and leave the model addressing one that did not
+  exist. An id already in use in the session is refused before anything
+  starts; an omitted or blank id is assigned as before. The schema says what
+  `id` is, and an unknown id's error lists the session's job ids.
 - Anthropic requests replay a thinking block only to the provider that recorded
   it. Before, every block was sent with its signature whatever its origin, so
   after a switch from OpenAI or OpenRouter a Responses reasoning item reached
