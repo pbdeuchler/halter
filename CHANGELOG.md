@@ -8,6 +8,27 @@ once a `1.0.0` line is cut.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-22
+
+The shell tool drops the embedded brush interpreter for a fresh detected
+shell per call, guarded by a tree-sitter-bash argv allowlist. `edit` takes a
+list of edits applied all-or-nothing. Compaction gets its own timeout,
+rejects refused or truncated summaries, sheds long tool turns, and stops
+firing `PostCompact` for passes that changed nothing. Hook context and
+mid-conversation system messages move in-band so they no longer invalidate
+the prompt cache, and a round of timer fixes stops timeouts pre-empting,
+tying with or outliving the recovery they guard. Public struct fields
+(`ProviderTimeouts::compact`, `ReplayMeta::wire_model`,
+`PolicySettings::max_tool_timeout_secs`), a new `PolicyError` variant,
+changed constructor signatures, removed types, and changed tool input
+schemas and hook semantics make this a minor release on the pre-1.0 line.
+
+Published crates: `halter-protocol`, `halter-hooks`, `halter-config`,
+`halter-providers`, `halter-session`, `halter-tools`, `halter-runtime`, and
+`halter` at `0.11.0`. `halter-cli` also moves to `0.11.0` but remains
+`publish = false`. The vendored `halter-brush-core` and
+`halter-brush-builtins` crates are gone and will not be published again.
+
 ### Added
 
 - [docs/timeouts.md](docs/timeouts.md) lists every timeout and retry in the
@@ -323,9 +344,6 @@ once a `1.0.0` line is cut.
   the turn paid for another rewrite. This happens with `ModelSummary` when
   the static prompt, tools and checkpoint alone reach the threshold, and with
   any strategy whose kept window does.
-- After an automatic compaction fails, the turn waits for the ledger to grow by
-  half the threshold before trying again (`ContextSettings::compaction_due_after`).
-  Before, the same request was resent at every boundary.
 - OpenAI and OpenRouter Responses requests send `"strict": false` on every
   function tool. Before, `strict` was omitted, which the Responses API defines
   as `true`, so whether tool schemas were enforced depended on the upstream.
@@ -487,6 +505,50 @@ once a `1.0.0` line is cut.
 - `spawn_agent`, `send_input`, `wait_agent` and `close_agent` return serde's account
   of what is wrong with a malformed input ("invalid tool input: missing field
   `target`") instead of a bare "invalid input" that hid it from the model.
+
+### Upgrading from 0.10
+
+- Building `halter-tools` now compiles tree-sitter's C sources, so a C
+  compiler must be available. The brush crates are no longer dependencies.
+- `edit` calls send `{"edits": [{path, old_string, new_string,
+  replace_all}], expected_sha256}`. Hooks that read an `edit` call's `path`
+  read `edits[].path`; code that reads its output reads `files[]` and
+  `edits[]`.
+- `shell` no longer keeps state between calls: pass `cwd` and `env` instead
+  of `cd` and `export`, and use `background` for anything started with `&`.
+- `policy.shell.allow` entries are argv patterns: append ` *` to a bare
+  program name (`"git"` becomes `"git *"`). The list now also gates
+  `background` and `pty` commands, and every command in a pipeline or
+  substitution, so a custom list may need entries it did not before.
+  `policy.shell.mode` must be removed from configs.
+- Code that used `ShellMode`, `PolicySettings::shell_mode`,
+  `ToolPolicy::{shell_mode, check_shell_command_strict}`, `ShellModeConfig`
+  or `ToolSessionStore::shell_session` moves to
+  `ToolPolicy::check_shell_command`. Exhaustive matches on `PolicyError`
+  need a `ShellCommandRejected` arm.
+- `ProviderTimeouts` literals set `compact`, `ResilienceTimeoutsConfig`
+  literals `compact_secs`, `PolicySettings` and `PolicyConfig` literals
+  `max_tool_timeout_secs`, and `ReplayMeta` literals `wire_model` (or use
+  `..Default::default()`).
+- `OpenAiProvider::new_with_headers_and_resilience`,
+  `new_with_oauth_headers_and_resilience` and
+  `OpenRouterProvider::new_with_headers_and_resilience` take a
+  `ResponsesOptions` before the policy; pass `ResponsesOptions::default()`.
+- Replace `SessionCommand::AppendSystemPrompt` with
+  `SessionInit::append_system_prompt` or a hook's `with_system_message`.
+- Configs fail to load with `policy.shell.timeout_secs = 0`,
+  `policy.max_tool_timeout_secs = 0`, or a `connect_secs` not below
+  `request_secs`. Model tool timeouts above one hour are rejected.
+- `[resilience.request_retry] deadline_secs` now budgets backoff sleep only;
+  a value raised to cover attempt time can come down.
+- A `PostCompact` hook no longer runs for a pass that changed nothing; use
+  `PreCompact` or `ContextCompacted` for "a compaction was attempted". A
+  `SessionStart` hook matching `compact` now also runs after automatic
+  rewrites; read the `PostCompact` `trigger` to tell them apart. A custom
+  `CompactionStrategy` whose `compact` returns `Ok(None)` without working
+  should implement `needs_compaction`.
+- Match `CLEAN_WINDOW_BOOTSTRAP` with `starts_with`, and read the first part
+  of a `ModelSummary` checkpoint rather than its whole `plain_text()`.
 
 ## [0.10.0] - 2026-11-14
 
