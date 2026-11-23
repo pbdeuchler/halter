@@ -72,6 +72,7 @@ impl BackgroundRegistry {
         command: &str,
         cwd: CanonicalPath,
         env: Option<HashMap<String, String>>,
+        id: Option<&str>,
     ) -> anyhow::Result<JobSummary> {
         let mut state = self.state.lock().await;
         ensure_not_cancelled(&context.cancel)?;
@@ -79,7 +80,11 @@ impl BackgroundRegistry {
             !state.closed && !self.lifetime.is_cancelled(),
             "failed to spawn background job: session is closed"
         );
-        let id = format!("bg-{}", SessionId::new().0);
+        let id = id.map_or_else(|| format!("bg-{}", SessionId::new().0), str::to_owned);
+        anyhow::ensure!(
+            !state.jobs.contains_key(&id),
+            "invalid tool input: job id '{id}' is already in use in this session; pass another, or omit `id` to have one assigned"
+        );
         // Spawn and registration have no await between them. Once registered,
         // the session owns the process; the originating turn token no longer
         // controls it. Holding the registry lock also serializes shutdown.
@@ -98,13 +103,15 @@ impl BackgroundRegistry {
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Arc<BackgroundJob>> {
-        self.state
-            .lock()
-            .await
-            .jobs
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("failed to execute background tool: unknown job '{id}'"))
+        let state = self.state.lock().await;
+        state.jobs.get(id).cloned().ok_or_else(|| {
+            let mut known: Vec<_> = state.jobs.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            anyhow::anyhow!(
+                "failed to execute background tool: unknown job '{id}'; this session's jobs: [{}]",
+                known.join(", ")
+            )
+        })
     }
 
     async fn list(&self) -> Vec<JobSummary> {
@@ -181,7 +188,7 @@ impl TypedTool for BackgroundTool {
     fn describe(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::from("background"),
-            description: "Spawn, list, read output from, stop, or prune finished managed background commands. Prune removes finished job records and retained output; running jobs are preserved. Jobs survive interruption of agent execution and are terminated when the session closes. Commands run in the same shell as the `shell` tool, started fresh with explicit cwd/env. Output is bounded and cursors count bytes of combined stdout/stderr.".to_owned(),
+            description: "Spawn, list, read output from, stop, or prune finished managed background commands. Spawn returns the job's `id`, which `output` and `kill` take: the `id` you pass to spawn, which must not be in use by another job in the session, or one it assigns when you pass none. Prune removes finished job records and retained output; running jobs are preserved. Jobs survive interruption of agent execution and are terminated when the session closes. Commands run in the same shell as the `shell` tool, started fresh with explicit cwd/env. Output is bounded and cursors count bytes of combined stdout/stderr.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -189,7 +196,7 @@ impl TypedTool for BackgroundTool {
                     "command": {"type": "string", "minLength": 1},
                     "cwd": {"type": "string"},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                    "id": {"type": "string"},
+                    "id": {"type": "string", "description": "A job's id. Required by output and kill. Optional on spawn: names the new job, and is assigned when omitted or blank."},
                     "cursor": {"type": "integer", "minimum": 0}
                 },
                 "required": ["action"]
@@ -209,6 +216,11 @@ impl TypedTool for BackgroundTool {
             .background_session(&context.session_id);
         Ok(match action {
             "spawn" => {
+                let id = match provided(&input, "id") {
+                    None => None,
+                    Some(Value::String(id)) => Some(id.as_str()),
+                    Some(_) => anyhow::bail!("invalid tool input: id must be a string"),
+                };
                 let command = required_string(&input, "command")?;
                 anyhow::ensure!(
                     !command.trim().is_empty(),
@@ -223,7 +235,7 @@ impl TypedTool for BackgroundTool {
                 // The read policy prevents starting in a denied/sensitive directory.
                 let cwd = context.policy.check_read_path(&cwd, 0).await?;
                 let env = parse_env_map(input.get("env"))?;
-                BackgroundOutput::Job(registry.spawn(&context, command, cwd, env).await?)
+                BackgroundOutput::Job(registry.spawn(&context, command, cwd, env, id).await?)
             }
             "list" => BackgroundOutput::Jobs {
                 jobs: registry.list().await,
